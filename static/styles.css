@@ -409,6 +409,52 @@ button:hover {
   padding: 14px;
 }
 
+.backtest-controls {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.backtest-controls label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.backtest-controls input,
+.backtest-controls select {
+  width: 100%;
+  max-width: none;
+}
+
+.backtest-actions {
+  display: flex;
+  gap: 8px;
+  align-items: end;
+}
+
+.allow-short-toggle {
+  display: flex !important;
+  align-items: center;
+  gap: 8px !important;
+}
+
+.allow-short-toggle input {
+  width: 15px;
+  height: 15px;
+}
+
+.modal-note {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -592,5 +638,9 @@ button:hover {
 
   .metric-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .backtest-controls {
+    grid-template-columns: 1fr;
   }
 }

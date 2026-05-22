@@ -203,7 +203,7 @@ function createPane(node, index) {
     saveState();
   });
 
-  pane.backtestButton.addEventListener("click", () => runBacktest(pane));
+  pane.backtestButton.addEventListener("click", () => openBacktestControls(pane));
 
   startPane(pane);
   return pane;
@@ -505,20 +505,78 @@ function clearBacktestMarkers(pane) {
   }
 }
 
-async function runBacktest(pane) {
+function openBacktestControls(pane) {
+  const options = (config.strategy_presets || [])
+    .map((preset) => `<option value="${preset.id}" ${preset.id === pane.presetSelect.value ? "selected" : ""}>${preset.label}</option>`)
+    .join("");
+  openBacktestModal(`
+    <div class="backtest-controls">
+      <label>
+        <span>Preset</span>
+        <select id="modal-preset-select">${options}</select>
+      </label>
+      <label>
+        <span>Limit</span>
+        <input id="modal-limit-input" type="number" min="100" max="5000" value="5000">
+      </label>
+      <label>
+        <span>Fee % / side</span>
+        <input id="modal-fee-input" type="number" min="0" step="0.01" value="0">
+      </label>
+      <label>
+        <span>Slippage % / side</span>
+        <input id="modal-slippage-input" type="number" min="0" step="0.01" value="0">
+      </label>
+      <label class="allow-short-toggle">
+        <input id="modal-allow-shorts" type="checkbox">
+        <span>Allow shorts</span>
+      </label>
+      <div class="backtest-actions">
+        <button id="modal-run-backtest" type="button">Run Backtest</button>
+        <button id="modal-test-presets" type="button">Test presets</button>
+      </div>
+      <p id="modal-preset-note" class="modal-note"></p>
+    </div>
+    <div id="modal-results"></div>
+  `);
+
+  const presetSelect = document.querySelector("#modal-preset-select");
+  const note = document.querySelector("#modal-preset-note");
+  const syncNote = () => {
+    const preset = (config.strategy_presets || []).find((item) => item.id === presetSelect.value);
+    note.textContent = preset?.intended_timeframes ? `Recommended timeframe: ${preset.intended_timeframes}` : "";
+  };
+  presetSelect.addEventListener("change", syncNote);
+  syncNote();
+
+  document.querySelector("#modal-run-backtest").addEventListener("click", () => runBacktest(pane, presetSelect.value));
+  document.querySelector("#modal-test-presets").addEventListener("click", () => testPresets(pane));
+}
+
+function backtestSettings(presetId) {
+  return {
+    preset: presetId,
+    limit: document.querySelector("#modal-limit-input")?.value || "5000",
+    fee_pct: document.querySelector("#modal-fee-input")?.value || "0",
+    slippage_pct: document.querySelector("#modal-slippage-input")?.value || "0",
+    allowShorts: document.querySelector("#modal-allow-shorts")?.checked ? "true" : "false",
+  };
+}
+
+async function runBacktest(pane, presetId) {
   pane.backtestButton.disabled = true;
   pane.backtestButton.textContent = "Testing...";
-  openBacktestModal(`<p class="pane-status">Running backtest for ${pane.symbolSelect.value}...</p>`);
+  const resultsEl = document.querySelector("#modal-results") || backtestContent;
+  resultsEl.innerHTML = `<p class="pane-status">Running backtest for ${pane.symbolSelect.value}...</p>`;
 
   try {
+    const settings = backtestSettings(presetId);
     const params = new URLSearchParams({
       source: pane.sourceSelect.value,
       symbol: pane.symbolSelect.value,
       timeframe: pane.timeframeSelect.value,
       period: "60d",
-      preset: pane.presetSelect.value,
-      fee_pct: "0",
-      slippage_pct: "0",
+      ...settings,
     });
     const response = await fetch(`/api/backtest?${params}`);
     const payload = await response.json();
@@ -526,13 +584,35 @@ async function runBacktest(pane) {
 
     pane.backtestMarkers = payload.markers || [];
     updateChartMarkers(pane);
-    openBacktestModal(renderBacktestResults(payload));
+    resultsEl.innerHTML = renderBacktestResults(payload);
   } catch (error) {
-    openBacktestModal(`<p>${escapeHtml(error.message)}</p>`);
+    resultsEl.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
   } finally {
     pane.backtestButton.disabled = false;
     pane.backtestButton.textContent = "Backtest";
   }
+}
+
+async function testPresets(pane) {
+  const resultsEl = document.querySelector("#modal-results") || backtestContent;
+  resultsEl.innerHTML = `<p class="pane-status">Testing all presets for ${pane.symbolSelect.value}...</p>`;
+  const rows = [];
+
+  for (const preset of config.strategy_presets || []) {
+    const settings = backtestSettings(preset.id);
+    const params = new URLSearchParams({
+      source: pane.sourceSelect.value,
+      symbol: pane.symbolSelect.value,
+      timeframe: pane.timeframeSelect.value,
+      period: "60d",
+      ...settings,
+    });
+    const response = await fetch(`/api/backtest?${params}`);
+    const payload = await response.json();
+    if (response.ok) rows.push(payload);
+  }
+
+  resultsEl.innerHTML = renderPresetComparison(rows);
 }
 
 function openBacktestModal(html) {
@@ -564,15 +644,19 @@ function renderBacktestResults(payload) {
     ["Candles loaded", diagnostics.number_of_candles_loaded],
     ["Timeframe", diagnostics.timeframe],
     ["Actual days", diagnostics.actual_days_returned],
+    ["Reliability", diagnostics.backtest_reliability],
     ["Warmup skipped", diagnostics.warmup_candles_skipped],
+    ["Warmup %", `${diagnostics.warmup_pct ?? 0}%`],
     ["Average ATR %", diagnostics.average_atr_pct],
     ["Average volume", formatCompact(diagnostics.average_volume)],
     ["Trades/day", diagnostics.trades_per_day],
     ["Fee/side", `${diagnostics.fee_pct_per_side ?? payload.fee_pct}%`],
     ["Slippage/side", `${diagnostics.slippage_pct_per_side ?? payload.slippage_pct}%`],
+    ["Raw score", diagnostics.raw_latest_score],
+    ["Smoothed score", diagnostics.smoothed_latest_score],
   ];
   const skipped = diagnostics.skipped_trade_reasons || {};
-  const skippedRows = Object.entries(skipped).map(([reason, count]) => `
+  const skippedRows = Object.entries(skipped).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `
     <tr><td>${formatReason(reason)}</td><td>${count}</td></tr>
   `).join("");
   const warnings = (diagnostics.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
@@ -615,6 +699,42 @@ function renderBacktestResults(payload) {
         </tr>
       </thead>
       <tbody>${rows || `<tr><td colspan="7">No trades for this period.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+function renderPresetComparison(results) {
+  if (!results.length) return "<p>No preset results returned.</p>";
+  const bestReturn = Math.max(...results.map((item) => Number(item.total_return_pct || 0)));
+  const bestProfitFactor = Math.max(...results.map((item) => Number(item.profit_factor || 0)));
+  const rows = results.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.preset)}</td>
+      <td class="${item.total_return_pct >= 0 ? "positive" : "negative"}">${formatSigned(item.total_return_pct)}%</td>
+      <td>${item.number_of_trades}</td>
+      <td>${item.win_rate}%</td>
+      <td>${item.max_drawdown}%</td>
+      <td>${item.profit_factor}</td>
+      <td>${item.average_bars_held}</td>
+      <td>${item.total_return_pct === bestReturn ? "Best return" : ""} ${item.profit_factor === bestProfitFactor ? "Best PF" : ""}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Preset Comparison</h3>
+    <table class="trade-table">
+      <thead>
+        <tr>
+          <th>Preset</th>
+          <th>Return</th>
+          <th>Trades</th>
+          <th>Win Rate</th>
+          <th>Max DD</th>
+          <th>Profit Factor</th>
+          <th>Avg Bars</th>
+          <th>Highlight</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
     </table>
   `;
 }

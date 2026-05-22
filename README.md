@@ -223,6 +223,7 @@ Available presets:
 
 - Conservative Trend
 - Momentum Scalping
+- Pullback Trend
 - Mean Reversion
 - Current Original Strategy
 
@@ -253,14 +254,19 @@ Diagnostics include:
 - number of candles loaded
 - timeframe
 - requested period
+- effective source period
 - actual days returned
 - warmup candles skipped
+- warmup percentage
 - average ATR %
 - average volume
 - trades per day
 - average bars held
+- backtest reliability: LOW, MEDIUM, or HIGH
 - fee percent per side
 - slippage percent per side
+- raw latest score
+- smoothed latest score
 - source period warnings
 - skipped trade reason counts
 
@@ -271,9 +277,25 @@ Skipped trade reasons include:
 - RSI filter failed
 - volume filter failed
 - ATR filter failed
+- chasing filter failed
+- pullback filter failed
+- candle confirmation failed
+- Bollinger filter failed
 - cooldown active
 - warmup active
 - confirmation missing
+
+The Backtest modal includes:
+
+- preset selection
+- recommended timeframe for the selected preset
+- candle limit selection
+- fee and slippage inputs
+- optional short-side toggle, disabled by default in normal use
+- `Run Backtest` for one preset
+- `Test presets` to compare all presets on the same pane
+
+Preset comparison shows return, trades, win rate, max drawdown, profit factor, and average bars held, with best return and best profit factor highlighted.
 
 ## API Endpoints
 
@@ -345,6 +367,7 @@ requirements.txt               Python dependencies
 
 - yfinance intraday history can be limited. The backtest diagnostics show how many days were actually returned.
 - Bybit history currently uses the latest candle limit returned by the public endpoint, so a request like `period=60d` may return fewer actual days depending on timeframe and limit.
+- Backtests prefer candle count over requested days. The default endpoint limit is 5000 candles when the source supports it.
 - Backtests are simplified research simulations. They do not include market depth, real spreads, partial fills, exchange outages, borrow costs, or broker-specific order rules.
 - Fees and slippage default to `0` but are exposed in backtest results and API parameters.
 

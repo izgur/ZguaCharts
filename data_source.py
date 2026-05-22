@@ -71,7 +71,7 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240) ->
     if provider is None:
         raise ValueError(f"Unknown data source: {source}")
 
-    normalized_limit = max(50, min(int(limit), 500))
+    normalized_limit = max(50, min(int(limit), 5000))
     candles = provider(symbol, timeframe, normalized_limit)
     return {
         "source": source,
@@ -81,15 +81,17 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240) ->
     }
 
 
-def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: str = "60d", limit: int = 500) -> dict:
+def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: str = "60d", limit: int = 5000) -> dict:
     """Historical candle entry point for analytics such as backtests.
 
     Broker adapters should still return plain OHLCV dictionaries. yfinance can
     honor period directly; exchange websocket-style sources use the latest limit.
     """
     if source == "yfinance":
-        candles = fetch_yfinance_candles_for_period(symbol, timeframe, period)
+        effective_period = yfinance_backtest_period(timeframe)
+        candles = fetch_yfinance_candles_for_period(symbol, timeframe, effective_period)
     else:
+        effective_period = period
         candles = fetch_candles(source, symbol, timeframe, limit=limit)["candles"]
 
     return {
@@ -97,28 +99,45 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
         "symbol": symbol,
         "timeframe": timeframe,
         "period": period,
+        "effective_period": effective_period,
+        "limit": limit,
         "candles": candles,
     }
 
 
 def fetch_bybit_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
-    response = requests.get(
-        BYBIT_KLINE_URL,
-        params={
+    rows = []
+    end_time = None
+    remaining = max(1, min(int(limit), 5000))
+
+    while remaining > 0:
+        batch_limit = min(1000, remaining)
+        params = {
             "category": "linear",
             "symbol": symbol.upper(),
             "interval": bybit_interval(timeframe),
-            "limit": limit,
-        },
-        timeout=10,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if payload.get("retCode") != 0:
-        raise ValueError(payload.get("retMsg", "Bybit returned an error"))
+            "limit": batch_limit,
+        }
+        if end_time is not None:
+            params["end"] = end_time
 
-    rows = payload.get("result", {}).get("list", [])
-    rows.reverse()
+        response = requests.get(BYBIT_KLINE_URL, params=params, timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("retCode") != 0:
+            raise ValueError(payload.get("retMsg", "Bybit returned an error"))
+
+        batch = payload.get("result", {}).get("list", [])
+        if not batch:
+            break
+        rows.extend(batch)
+        oldest_time = min(int(row[0]) for row in batch)
+        end_time = oldest_time - 1
+        remaining -= len(batch)
+        if len(batch) < batch_limit:
+            break
+
+    rows = sorted({row[0]: row for row in rows}.values(), key=lambda item: int(item[0]))
 
     return [
         {
@@ -239,6 +258,21 @@ def period_for_yfinance(interval: str, limit: int) -> str:
         days = max(2, min(60, int((minutes * limit / 390) + 3)))
         return f"{days}d"
     return "2y"
+
+
+def yfinance_backtest_period(interval: str) -> str:
+    mapping = {
+        "1m": "7d",
+        "2m": "60d",
+        "5m": "60d",
+        "15m": "60d",
+        "30m": "60d",
+        "90m": "60d",
+        "60m": "730d",
+        "1h": "730d",
+        "1d": "max",
+    }
+    return mapping.get(interval, "60d")
 
 
 PROVIDERS: dict[str, Callable[[str, str, int], list[dict]]] = {

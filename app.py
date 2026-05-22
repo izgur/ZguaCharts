@@ -92,6 +92,8 @@ def backtest():
     preset = request.args.get("preset", DEFAULT_PRESET_ID)
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
+    limit = int(request.args.get("limit", "5000"))
+    allow_shorts = request.args.get("allowShorts", "false").lower() == "true"
 
     try:
         payload = run_signal_backtest(
@@ -102,6 +104,8 @@ def backtest():
             preset_id=preset,
             fee_pct=fee_pct,
             slippage_pct=slippage_pct,
+            limit=limit,
+            allow_shorts=allow_shorts,
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400

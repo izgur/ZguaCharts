@@ -11,10 +11,13 @@ from strategy import (
     DEFAULT_PRESET_ID,
     SKIPPED_REASON_KEYS,
     build_strategy_frame,
+    dynamic_warmup,
     evaluate_entry,
     evaluate_exit,
     get_preset,
+    initial_stop_price,
     preset_options,
+    take_profit_price,
     update_trailing_stop,
 )
 
@@ -27,6 +30,8 @@ def run_signal_backtest(
     preset_id: str = DEFAULT_PRESET_ID,
     fee_pct: float = 0,
     slippage_pct: float = 0,
+    limit: int = 5000,
+    allow_shorts: bool = False,
     use_atr_exits: bool = True,
 ) -> dict:
     """Long-only signal-score backtest with diagnostics.
@@ -35,12 +40,13 @@ def run_signal_backtest(
     trade simulation, stats, and response formatting.
     """
     preset = get_preset(preset_id)
-    candle_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=500)
+    candle_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
     df = candles_to_frame(candle_payload["candles"])
     if df.empty or len(df) < 50:
         return empty_result(source, symbol, timeframe, period, preset_id, preset.name)
 
     frame = build_strategy_frame(df)
+    warmup = dynamic_warmup(len(frame))
     skipped = {key: 0 for key in SKIPPED_REASON_KEYS}
     trades = []
     equity_curve = []
@@ -50,7 +56,7 @@ def run_signal_backtest(
 
     for index, row in frame.iterrows():
         if position is not None:
-            update_trailing_stop(position, row)
+            update_trailing_stop(position, row, preset)
             exit_price, exit_reason = evaluate_exit(frame, index, position, preset)
             if exit_price is not None:
                 equity, position = close_trade(
@@ -67,13 +73,13 @@ def run_signal_backtest(
 
         if position is None:
             should_track_skip = row["score"] >= preset.entry_score
-            should_enter, reasons = evaluate_entry(frame, index, preset, cooldown_remaining)
+            should_enter, reasons, side = evaluate_entry(frame, index, preset, cooldown_remaining, warmup, allow_shorts=allow_shorts)
             if should_track_skip and not should_enter:
                 for reason in reasons:
                     if reason in skipped:
                         skipped[reason] += 1
             if should_enter:
-                position = open_position(index, row, use_atr_exits, fee_pct, slippage_pct)
+                position = open_position(frame, index, preset, side, use_atr_exits, fee_pct, slippage_pct)
 
         mark_to_market = equity
         if position is not None:
@@ -96,7 +102,19 @@ def run_signal_backtest(
             slippage_pct,
         )
 
-    diagnostics = build_diagnostics(df, frame, trades, period, timeframe, preset.warmup, source, fee_pct, slippage_pct)
+    diagnostics = build_diagnostics(
+        df,
+        frame,
+        trades,
+        period,
+        candle_payload.get("effective_period", period),
+        timeframe,
+        warmup,
+        source,
+        fee_pct,
+        slippage_pct,
+        limit,
+    )
     diagnostics["skipped_trade_reasons"] = skipped
     diagnostics["preset"] = preset.name
     diagnostics["preset_id"] = preset_id
@@ -110,6 +128,8 @@ def run_signal_backtest(
         "preset_id": preset_id,
         "fee_pct": fee_pct,
         "slippage_pct": slippage_pct,
+        "limit": limit,
+        "allow_shorts": allow_shorts,
         "total_return_pct": round((equity - 1) * 100, 2),
         "number_of_trades": len(trades),
         "win_rate": round(win_rate(trades), 2),
@@ -125,17 +145,27 @@ def run_signal_backtest(
     }
 
 
-def open_position(index: int, row: pd.Series, use_atr_exits: bool, fee_pct: float, slippage_pct: float) -> dict:
+def open_position(
+    frame: pd.DataFrame,
+    index: int,
+    preset,
+    side: str,
+    use_atr_exits: bool,
+    fee_pct: float,
+    slippage_pct: float,
+) -> dict:
+    row = frame.iloc[index]
     entry_price = float(row["close"]) * (1 + slippage_pct / 100)
-    current_atr = float(row["atr"]) if not pd.isna(row["atr"]) else 0
     return {
         "entry_index": index,
         "entry_time": int(row["time"]),
         "entry_price": entry_price,
-        "entry_score": int(round(row["score"])),
+        "entry_score": int(round(row["raw_score"])),
+        "entry_smoothed_score": int(round(row["score"])),
+        "side": side,
         "entry_fee_pct": fee_pct,
-        "stop": entry_price - (1.5 * current_atr) if use_atr_exits and current_atr > 0 else None,
-        "take_profit": entry_price + (3 * current_atr) if use_atr_exits and current_atr > 0 else None,
+        "stop": initial_stop_price(frame, index, entry_price, preset) if use_atr_exits and row["atr"] > 0 else None,
+        "take_profit": take_profit_price(frame, index, entry_price, preset) if use_atr_exits and row["atr"] > 0 else None,
         "highest_close": float(row["close"]),
         "trail_active": False,
         "trailing_stop": None,
@@ -164,7 +194,9 @@ def close_trade(
             "entry_price": round(position["entry_price"], 6),
             "exit_price": round(adjusted_exit, 6),
             "entry_score": position["entry_score"],
-            "exit_score": int(round(row["score"])),
+            "entry_smoothed_score": position["entry_smoothed_score"],
+            "exit_score": int(round(row["raw_score"])),
+            "exit_smoothed_score": int(round(row["score"])),
             "return_pct": round(net_return * 100, 2),
             "bars_held": int(row.name - position["entry_index"]),
             "exit_reason": exit_reason,
@@ -178,16 +210,18 @@ def build_diagnostics(
     frame: pd.DataFrame,
     trades: list[dict],
     requested_period: str,
+    effective_period: str,
     timeframe: str,
     warmup: int,
     source: str,
     fee_pct: float,
     slippage_pct: float,
+    requested_limit: int,
 ) -> dict:
     first_time = int(df["time"].iloc[0])
     last_time = int(df["time"].iloc[-1])
     actual_days = max((last_time - first_time) / 86400, 0)
-    warnings = period_warnings(source, requested_period, actual_days, len(df))
+    warnings = period_warnings(source, requested_period, effective_period, actual_days, len(df), requested_limit)
     avg_atr_pct = frame["atr_pct"].dropna().mean() * 100 if "atr_pct" in frame else 0
     avg_volume = frame["volume"].dropna().mean() if "volume" in frame else 0
     trades_per_day = len(trades) / actual_days if actual_days > 0 else 0
@@ -198,28 +232,46 @@ def build_diagnostics(
         "number_of_candles_loaded": int(len(df)),
         "timeframe": timeframe,
         "requested_period": requested_period,
+        "effective_period": effective_period,
+        "requested_limit": requested_limit,
         "actual_days_returned": round(actual_days, 2),
         "warmup_candles_skipped": int(min(warmup, len(df))),
+        "warmup_pct": round((min(warmup, len(df)) / len(df)) * 100, 2) if len(df) else 0,
         "average_atr_pct": round(float(avg_atr_pct) if not pd.isna(avg_atr_pct) else 0, 4),
         "average_volume": round(float(avg_volume) if not pd.isna(avg_volume) else 0, 2),
         "trades_per_day": round(trades_per_day, 4),
         "average_bars_held": round(average_bars_held(trades), 2),
         "fee_pct_per_side": fee_pct,
         "slippage_pct_per_side": slippage_pct,
+        "raw_latest_score": round(float(frame["raw_score"].iloc[-1]), 2),
+        "smoothed_latest_score": round(float(frame["score"].iloc[-1]), 2),
+        "backtest_reliability": reliability_label(len(df)),
         "warnings": warnings,
     }
 
 
-def period_warnings(source: str, requested_period: str, actual_days: float, candle_count: int) -> list[str]:
+def period_warnings(source: str, requested_period: str, effective_period: str, actual_days: float, candle_count: int, requested_limit: int) -> list[str]:
     warnings = []
     requested_days = parse_period_days(requested_period)
     if requested_days and actual_days < requested_days * 0.85:
         warnings.append(f"Requested {requested_period}, but source returned about {actual_days:.1f} days.")
+    if effective_period != requested_period:
+        warnings.append(f"Using {effective_period} for this source/timeframe instead of requested {requested_period}.")
     if source == "yfinance" and requested_days and actual_days < requested_days * 0.85:
         warnings.append("yfinance intraday history is limited; fewer days may be available for this timeframe.")
-    if candle_count <= 250:
-        warnings.append("Candle count is near or below the EMA200 warmup requirement.")
+    if candle_count < requested_limit:
+        warnings.append(f"Requested up to {requested_limit} candles, but source returned {candle_count}.")
+    if candle_count < 1000:
+        warnings.append("Not enough data: fewer than 1000 candles loaded.")
     return warnings
+
+
+def reliability_label(candle_count: int) -> str:
+    if candle_count < 1000:
+        return "LOW"
+    if candle_count <= 5000:
+        return "MEDIUM"
+    return "HIGH"
 
 
 def parse_period_days(period: str) -> Optional[float]:
