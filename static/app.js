@@ -156,6 +156,7 @@ function createPane(node, index) {
     indicatorCharts: [],
     signalMarkers: [],
     backtestMarkers: [],
+    candles: [],
     signalMarkerPrimitive: null,
     ws: null,
     pollTimer: null,
@@ -334,14 +335,16 @@ async function startPane(pane) {
   }
 
   try {
-    const candles = await loadCandles(pane);
+    const candles = await loadCandles(pane, { limit: 1000 });
     if (requestId !== pane.requestId) return;
+    pane.candles = candles;
     pane.series.setData(candles);
     pane.chart.timeScale().fitContent();
     if (candles.length) updateTicker(pane, candles[candles.length - 1].close);
     await renderIndicators(pane, requestId);
     await renderSignals(pane, requestId);
     pane.status.textContent = `${candles.length} candles loaded`;
+    loadOlderHistory(pane, requestId);
   } catch (error) {
     if (requestId !== pane.requestId) return;
     pane.series.setData([]);
@@ -350,6 +353,23 @@ async function startPane(pane) {
 
   if (pane.sourceSelect.value === "yfinance") {
     startYfinancePolling(pane);
+  }
+}
+
+async function loadOlderHistory(pane, requestId) {
+  if (pane.sourceSelect.value !== "bybit") return;
+  try {
+    const candles = await loadCandles(pane, { limit: 20000 });
+    if (requestId !== pane.requestId) return;
+    if (candles.length <= pane.candles.length) return;
+    pane.candles = candles;
+    pane.series.setData(candles);
+    pane.chart.timeScale().fitContent();
+    pane.status.textContent = `${candles.length} candles loaded`;
+    await renderIndicators(pane, requestId);
+    await renderSignals(pane, requestId);
+  } catch (error) {
+    if (requestId === pane.requestId) pane.status.textContent = `Older history unavailable: ${error.message}`;
   }
 }
 
@@ -373,17 +393,22 @@ async function renderSignals(pane, requestId) {
   updateChartMarkers(pane);
 }
 
-async function loadCandles(pane) {
+async function loadCandles(pane, options = {}) {
   const params = new URLSearchParams({
     source: pane.sourceSelect.value,
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
-    limit: "240",
+    limit: String(options.limit || 240),
+    visible_charts: String(visibleChartCount()),
   });
   const response = await fetch(`/api/candles?${params}`);
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Candle request failed");
   return payload.candles;
+}
+
+function visibleChartCount() {
+  return panes.length || Number(countSelect.value) || 1;
 }
 
 async function renderIndicators(pane, requestId) {
@@ -582,7 +607,7 @@ async function runBacktest(pane, presetId) {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Backtest failed");
 
-    pane.backtestMarkers = payload.markers || [];
+    pane.backtestMarkers = markersFromBacktestPayload(payload);
     updateChartMarkers(pane);
     resultsEl.innerHTML = renderBacktestResults(payload);
   } catch (error) {
@@ -591,6 +616,56 @@ async function runBacktest(pane, presetId) {
     pane.backtestButton.disabled = false;
     pane.backtestButton.textContent = "Backtest";
   }
+}
+
+function markersFromBacktestPayload(payload) {
+  const trades = normalizedTrades(payload);
+  const markers = [];
+  trades.forEach((trade) => {
+    const entryTime = normalizeMarkerTime(trade.entry_time ?? trade.entryTime);
+    const exitTime = normalizeMarkerTime(trade.exit_time ?? trade.exitTime);
+    if (entryTime !== null) {
+      markers.push({
+        time: entryTime,
+        position: "belowBar",
+        color: "#12b886",
+        shape: "arrowUp",
+        text: "BT BUY",
+      });
+    }
+    if (exitTime !== null) {
+      markers.push({
+        time: exitTime,
+        position: "aboveBar",
+        color: "#ff5c7a",
+        shape: "arrowDown",
+        text: "BT SELL",
+      });
+    }
+  });
+  return markers;
+}
+
+function normalizedTrades(payload) {
+  if (Array.isArray(payload.trade_list)) return payload.trade_list;
+  if (Array.isArray(payload.tradeList)) {
+    return payload.tradeList.map((trade) => ({
+      entry_time: trade.entryTime,
+      exit_time: trade.exitTime,
+      entry_price: trade.entryPrice,
+      exit_price: trade.exitPrice,
+      return_pct: trade.returnPct,
+      bars_held: trade.barsHeld,
+      exit_reason: trade.exitReason,
+    }));
+  }
+  return [];
+}
+
+function normalizeMarkerTime(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return number > 1_000_000_000_000 ? Math.floor(number / 1000) : Math.floor(number);
 }
 
 async function testPresets(pane) {
@@ -660,7 +735,8 @@ function renderBacktestResults(payload) {
     <tr><td>${formatReason(reason)}</td><td>${count}</td></tr>
   `).join("");
   const warnings = (diagnostics.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
-  const rows = (payload.trades || []).map((trade) => `
+  const trades = normalizedTrades(payload);
+  const rows = trades.map((trade) => `
     <tr>
       <td>${formatDateTime(trade.entry_time)}</td>
       <td>${formatDateTime(trade.exit_time)}</td>

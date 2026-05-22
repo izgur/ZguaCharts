@@ -1,0 +1,6 @@
+{
+  "emaFast": [10],
+  "emaSlow": [50, 100],
+  "rsiMin": [45],
+  "rsiMax": [68]
+}

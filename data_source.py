@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from pathlib import Path
+import threading
+import time
 from typing import Callable
 
 import requests
@@ -9,10 +12,80 @@ import yfinance as yf
 
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_REQUEST_LIMIT = 1000
+BYBIT_MAX_REQUESTS_IN_FLIGHT = 2
+BYBIT_MIN_REQUEST_DELAY_SECONDS = 0.18
+BYBIT_MAX_CACHE_CANDLES = 50000
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 YFINANCE_CACHE_DIR = Path(__file__).resolve().parent / ".yfinance-cache"
 YFINANCE_CACHE_DIR.mkdir(exist_ok=True)
 yf.cache.set_cache_location(str(YFINANCE_CACHE_DIR))
+LOGGER = logging.getLogger(__name__)
+
+VISIBLE_CHART_LIMITS = {
+    1: 20000,
+    2: 12000,
+    4: 8000,
+    6: 5000,
+    8: 3000,
+}
+
+_bybit_cache = {}
+_bybit_cache_lock = threading.Lock()
+
+
+class BybitRateLimiter:
+    def __init__(self) -> None:
+        self._semaphore = threading.BoundedSemaphore(BYBIT_MAX_REQUESTS_IN_FLIGHT)
+        self._lock = threading.Lock()
+        self._next_request_time = 0.0
+        self.total_wait_seconds = 0.0
+
+    def acquire(self) -> None:
+        self._semaphore.acquire()
+        with self._lock:
+            now = time.time()
+            wait = max(0.0, self._next_request_time - now)
+            if wait:
+                self.total_wait_seconds += wait
+                time.sleep(wait)
+            self._next_request_time = time.time() + BYBIT_MIN_REQUEST_DELAY_SECONDS
+
+    def release(self, response=None) -> None:
+        try:
+            self._apply_headers(response)
+        finally:
+            self._semaphore.release()
+
+    def backoff(self, seconds: float) -> None:
+        with self._lock:
+            self.total_wait_seconds += seconds
+            self._next_request_time = max(self._next_request_time, time.time() + seconds)
+
+    def _apply_headers(self, response) -> None:
+        if response is None:
+            return
+        headers = response.headers
+        remaining = safe_int(headers.get("X-Bapi-Limit-Status"))
+        limit = safe_int(headers.get("X-Bapi-Limit"))
+        reset_ms = safe_int(headers.get("X-Bapi-Limit-Reset-Timestamp"))
+        if remaining is None or limit is None:
+            return
+        if remaining <= max(2, int(limit * 0.1)):
+            wait = BYBIT_MIN_REQUEST_DELAY_SECONDS * 2
+            if reset_ms:
+                wait = max(wait, min(3.0, (reset_ms / 1000) - time.time()))
+            self.backoff(max(wait, 0.25))
+
+
+_bybit_rate_limiter = BybitRateLimiter()
+
+
+def safe_int(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 DATA_SOURCE_CONFIG = {
     "sources": {
@@ -61,7 +134,7 @@ DATA_SOURCE_CONFIG = {
 }
 
 
-def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240) -> dict:
+def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, visible_charts: int | None = None) -> dict:
     """Single public data entry point used by Flask.
 
     To add a broker later, implement a fetch function with this signature and
@@ -71,12 +144,20 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240) ->
     if provider is None:
         raise ValueError(f"Unknown data source: {source}")
 
-    normalized_limit = max(50, min(int(limit), 5000))
-    candles = provider(symbol, timeframe, normalized_limit)
+    normalized_limit = max(50, int(limit))
+    diagnostics = {}
+    if source == "bybit":
+        normalized_limit = adaptive_bybit_limit(normalized_limit, visible_charts)
+        candles, diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, normalized_limit, visible_charts)
+    else:
+        normalized_limit = min(normalized_limit, 5000)
+        candles = provider(symbol, timeframe, normalized_limit)
     return {
         "source": source,
         "symbol": symbol,
         "timeframe": timeframe,
+        "requested_limit": normalized_limit,
+        "diagnostics": diagnostics,
         "candles": candles,
     }
 
@@ -92,7 +173,7 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
         candles = fetch_yfinance_candles_for_period(symbol, timeframe, effective_period)
     else:
         effective_period = period
-        candles = fetch_candles(source, symbol, timeframe, limit=limit)["candles"]
+        candles = fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)["candles"]
 
     return {
         "source": source,
@@ -105,51 +186,195 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
     }
 
 
+def adaptive_bybit_limit(requested_limit: int, visible_charts: int | None) -> int:
+    return max(50, min(int(requested_limit), bybit_visible_chart_cap(visible_charts)))
+
+
+def bybit_visible_chart_cap(visible_charts: int | None) -> int:
+    chart_count = int(visible_charts or 1)
+    allowed_counts = sorted(VISIBLE_CHART_LIMITS)
+    closest_count = min(allowed_counts, key=lambda count: abs(count - chart_count))
+    return VISIBLE_CHART_LIMITS[closest_count]
+
+
+def clear_bybit_cache() -> None:
+    with _bybit_cache_lock:
+        _bybit_cache.clear()
+
+
 def fetch_bybit_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
-    rows = []
-    end_time = None
-    remaining = max(1, min(int(limit), 5000))
+    candles, _diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, limit)
+    return candles
 
-    while remaining > 0:
-        batch_limit = min(1000, remaining)
-        params = {
-            "category": "linear",
-            "symbol": symbol.upper(),
-            "interval": bybit_interval(timeframe),
-            "limit": batch_limit,
-        }
-        if end_time is not None:
-            params["end"] = end_time
 
-        response = requests.get(BYBIT_KLINE_URL, params=params, timeout=10)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("retCode") != 0:
-            raise ValueError(payload.get("retMsg", "Bybit returned an error"))
+def fetch_bybit_candles_with_diagnostics(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    visible_charts: int | None = None,
+) -> tuple[list[dict], dict]:
+    symbol = symbol.upper()
+    interval = bybit_interval(timeframe)
+    requested = max(1, int(limit))
+    diagnostics = {
+        "symbol": symbol,
+        "interval": interval,
+        "requested_candles": requested,
+        "returned_candles": 0,
+        "bybit_requests": 0,
+        "cache_hits": 0,
+        "cache_misses": 0,
+        "rate_limit_wait_seconds": 0.0,
+        "visible_charts": visible_charts or 1,
+        "max_candles_per_chart": bybit_visible_chart_cap(visible_charts),
+    }
+    cache_key = (symbol, timeframe)
 
-        batch = payload.get("result", {}).get("list", [])
+    with _bybit_cache_lock:
+        cached = list(_bybit_cache.get(cache_key, []))
+
+    if len(cached) >= requested:
+        diagnostics["cache_hits"] = 1
+        candles = cached[-requested:]
+        diagnostics["returned_candles"] = len(candles)
+        log_bybit_diagnostics(diagnostics)
+        return candles, diagnostics
+
+    diagnostics["cache_misses"] = 1
+    rows = [bybit_candle_to_row(candle) for candle in cached]
+    end_time = (min((row[0] for row in rows), default=None) - 1) if rows else None
+    seen_oldest = set()
+    waits_before = _bybit_rate_limiter.total_wait_seconds
+
+    while len(rows) < requested:
+        batch = request_bybit_kline_batch(symbol, interval, end_time)
+        diagnostics["bybit_requests"] += 1
         if not batch:
             break
-        rows.extend(batch)
+
         oldest_time = min(int(row[0]) for row in batch)
-        end_time = oldest_time - 1
-        remaining -= len(batch)
-        if len(batch) < batch_limit:
+        if oldest_time in seen_oldest:
+            break
+        seen_oldest.add(oldest_time)
+
+        rows.extend(batch)
+        new_end_time = oldest_time - 1
+        if end_time is not None and new_end_time >= end_time:
+            break
+        end_time = new_end_time
+
+        if len(batch) < BYBIT_REQUEST_LIMIT:
             break
 
-    rows = sorted({row[0]: row for row in rows}.values(), key=lambda item: int(item[0]))
+    candles = bybit_rows_to_candles(rows)
+    with _bybit_cache_lock:
+        _bybit_cache[cache_key] = candles[-BYBIT_MAX_CACHE_CANDLES:]
 
+    candles = candles[-requested:]
+    diagnostics["returned_candles"] = len(candles)
+    diagnostics["rate_limit_wait_seconds"] = round(_bybit_rate_limiter.total_wait_seconds - waits_before, 3)
+    log_bybit_diagnostics(diagnostics)
+    return candles, diagnostics
+
+
+def request_bybit_kline_batch(symbol: str, interval: str, end_time: int | None = None) -> list:
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": interval,
+        "limit": BYBIT_REQUEST_LIMIT,
+    }
+    if end_time is not None:
+        params["end"] = end_time
+
+    for attempt in range(4):
+        response = None
+        _bybit_rate_limiter.acquire()
+        try:
+            response = requests.get(BYBIT_KLINE_URL, params=params, timeout=10)
+        except requests.RequestException as exc:
+            wait = min(5.0, 0.5 * (2 ** attempt))
+            LOGGER.warning("Bybit request error %s. Retrying in %.2fs.", exc, wait)
+            _bybit_rate_limiter.backoff(wait)
+            time.sleep(wait)
+            continue
+        finally:
+            _bybit_rate_limiter.release(response)
+
+        if response.status_code == 429 or 500 <= response.status_code < 600:
+            wait = bybit_retry_wait(response, attempt)
+            LOGGER.warning("Bybit temporary error %s. Retrying in %.2fs.", response.status_code, wait)
+            _bybit_rate_limiter.backoff(wait)
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("retCode") == 10006:
+            wait = bybit_retry_wait(response, attempt)
+            LOGGER.warning("Bybit rate limit retCode 10006. Retrying in %.2fs.", wait)
+            _bybit_rate_limiter.backoff(wait)
+            time.sleep(wait)
+            continue
+        if payload.get("retCode") != 0:
+            raise ValueError(payload.get("retMsg", "Bybit returned an error"))
+        return payload.get("result", {}).get("list", [])
+
+    raise RuntimeError("Bybit request failed after retries")
+
+
+def bybit_retry_wait(response, attempt: int) -> float:
+    reset_ms = safe_int(response.headers.get("X-Bapi-Limit-Reset-Timestamp")) if response is not None else None
+    if reset_ms:
+        wait = (reset_ms / 1000) - time.time()
+        if wait > 0:
+            return min(5.0, max(0.5, wait))
+    return min(5.0, 0.5 * (2 ** attempt))
+
+
+def bybit_rows_to_candles(rows: list) -> list[dict]:
+    deduped = {}
+    for row in rows:
+        try:
+            deduped[int(row[0])] = row
+        except (TypeError, ValueError, IndexError):
+            continue
     return [
         {
-            "time": int(int(row[0]) / 1000),
+            "time": int(timestamp / 1000),
             "open": float(row[1]),
             "high": float(row[2]),
             "low": float(row[3]),
             "close": float(row[4]),
             "volume": float(row[5]),
         }
-        for row in rows
+        for timestamp, row in sorted(deduped.items())
     ]
+
+
+def bybit_candle_to_row(candle: dict) -> list:
+    return [
+        int(candle["time"]) * 1000,
+        candle["open"],
+        candle["high"],
+        candle["low"],
+        candle["close"],
+        candle.get("volume", 0),
+    ]
+
+
+def log_bybit_diagnostics(diagnostics: dict) -> None:
+    LOGGER.info(
+        "Bybit candles symbol=%s interval=%s requested=%s returned=%s requests=%s cache_hits=%s cache_misses=%s waits=%ss",
+        diagnostics.get("symbol"),
+        diagnostics.get("interval"),
+        diagnostics.get("requested_candles"),
+        diagnostics.get("returned_candles"),
+        diagnostics.get("bybit_requests"),
+        diagnostics.get("cache_hits"),
+        diagnostics.get("cache_misses"),
+        diagnostics.get("rate_limit_wait_seconds"),
+    )
 
 
 def fetch_hyperliquid_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:

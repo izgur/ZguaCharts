@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: zguacharts
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt && npm install
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 180
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: NODE_VERSION
+        value: 20
+      - key: ZGUA_QUIET
+        value: "1"

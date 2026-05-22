@@ -2,7 +2,7 @@
 
 ZguaCharts is a local trading dashboard built with Flask, plain HTML/CSS/JavaScript, and TradingView Lightweight Charts. It runs on your machine, uses public/no-key data sources by default, and provides multi-chart monitoring, technical indicators, signal scoring, and simple strategy backtesting.
 
-The app is intentionally modular: broker/data integrations live in `data_source.py`, indicator calculations live in `indicators.py`, signal scoring lives in `signals.py`, strategy rules live in `strategy.py`, and backtest simulation lives in `backtest.py`.
+The app is intentionally modular. Browser charting remains Flask + plain JavaScript, while automated research now runs through a reusable Node core under `/core`. The Flask UI calls the same shared engine used by the CLI, so optimization and manual chart backtests do not drift into separate logic.
 
 ## What It Does
 
@@ -19,6 +19,8 @@ The app is intentionally modular: broker/data integrations live in `data_source.
 - Optionally plots signal BUY/SELL markers.
 - Runs simple local long-only backtests and plots backtest trade markers.
 - Shows diagnostics so you can see whether the requested data period was actually returned.
+- Runs UI-independent research from the command line with `npm run backtest` and `npm run optimize`.
+- Exports optimizer reports as CSV and JSON.
 
 Signals and backtests are technical-analysis research tools only. They do not place trades and are not financial advice.
 
@@ -38,6 +40,35 @@ http://127.0.0.1:5000
 ```
 
 The chart library is also vendored in `static/lightweight-charts.standalone.production.js`, so the browser does not need to wait on a CDN before rendering charts.
+
+## Deploy On Render
+
+ZguaCharts is still designed for local research first, but the Flask dashboard can run on Render as a web service. The app uses Python for Flask/yfinance and Node for the shared backtest engine, so the Render build installs both Python packages and the small Node package metadata.
+
+### Recommended Render Settings
+
+Create a new Render Web Service from the GitHub repository and use:
+
+```text
+Language: Python 3
+Build Command: pip install -r requirements.txt && npm install
+Start Command: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 180
+Health Check Path: /healthz
+```
+
+Environment variables:
+
+```text
+PYTHON_VERSION=3.11.9
+NODE_VERSION=20
+ZGUA_QUIET=1
+```
+
+The repository also includes `render.yaml`, so you can deploy it as a Render Blueprint instead of typing the commands manually.
+
+### Docker Fallback
+
+If Render's native Python environment does not provide Node for the CLI backtest bridge, deploy with the included `Dockerfile`. It installs Python, Node, Flask dependencies, and starts Gunicorn on Render's assigned port.
 
 ## Data Sources
 
@@ -177,6 +208,50 @@ signals.py
 
 ## Backtesting
 
+The reusable research engine lives in:
+
+```text
+core/backtest
+core/strategies
+core/indicators
+core/optimizer
+core/data
+core/reporting
+```
+
+Its programmatic entry point is:
+
+```js
+runBacktest({
+  symbol,
+  interval,
+  from,
+  to,
+  strategy,
+  params
+})
+```
+
+It runs without browser interaction and returns deterministic JSON:
+
+```json
+{
+  "totalReturn": 0,
+  "trades": 0,
+  "winRate": 0,
+  "averageWin": 0,
+  "averageLoss": 0,
+  "maxDrawdown": 0,
+  "profitFactor": 0,
+  "sharpeRatio": 0,
+  "avgBarsHeld": 0,
+  "equityCurve": [],
+  "tradeList": []
+}
+```
+
+The Flask `/api/backtest` route fetches candles through existing Python broker adapters, then calls this same Node engine. The browser only visualizes returned results and markers.
+
 Endpoint:
 
 ```text
@@ -297,6 +372,103 @@ The Backtest modal includes:
 
 Preset comparison shows return, trades, win rate, max drawdown, profit factor, and average bars held, with best return and best profit factor highlighted.
 
+## CLI Research
+
+Install Python dependencies for the dashboard as usual. The Node research core is dependency-free, so no `npm install` is required for the current scripts.
+
+Run one backtest:
+
+```powershell
+npm run backtest -- --symbol BTCUSDT --interval 1h --days 365 --strategy ConservativeTrend
+```
+
+Validate the engine mechanically with the deliberate test strategy:
+
+```powershell
+npm run backtest -- --symbol BTCUSDT --interval 1h --days 7 --strategy AlwaysLongTest --limit 300 --debug
+```
+
+Debug Conservative Trend entries:
+
+```powershell
+npm run backtest -- --symbol BTCUSDT --interval 1h --days 60 --strategy ConservativeTrend --limit 1000 --debug
+```
+
+Prove the trend framework can generate trades with relaxed gates:
+
+```powershell
+npm run backtest -- --symbol BTCUSDT --interval 1h --days 60 --strategy ConservativeTrendLoose --limit 1000 --debug
+```
+
+Expected validation result:
+
+- `trades > 0`
+- `tradeList` is not empty
+- `equityCurve` is not empty
+- `reports/debug-last-backtest.json` is written
+
+Run with explicit params:
+
+```powershell
+npm run backtest -- --symbol BTCUSDT --interval 15m --days 90 --strategy MomentumScalping --params "{\"rsiMin\":48,\"rsiMax\":70,\"stopAtr\":1.8}"
+```
+
+Run optimization:
+
+```powershell
+npm run optimize -- --symbol BTCUSDT --interval 1h --days 365 --strategy ConservativeTrend --output reports
+```
+
+Run optimization with a custom grid:
+
+```powershell
+npm run optimize -- --symbol BTCUSDT --interval 1h --days 365 --strategy ConservativeTrend --ranges "{\"emaFast\":[10,20,30],\"emaSlow\":[50,100,200],\"rsiMin\":[45,50,55],\"rsiMax\":[60,68]}"
+```
+
+Optimizer outputs:
+
+```text
+reports/optimization-results.csv
+reports/optimization-results.json
+reports/ranked-summary.json
+```
+
+CSV columns:
+
+```text
+symbol, interval, strategy, params, totalReturn, maxDrawdown, profitFactor, winRate, trades, sharpeRatio
+```
+
+The optimizer uses a default 70/30 train/test split. Ranking is based on training performance, and each row includes unseen test metrics for out-of-sample validation.
+
+The ranked summary also includes a simple walk-forward section for the best parameter set. Each fold expands the training window and tests on the next unseen segment, which gives a quick stability check before you trust an optimized result.
+
+If every tested parameter combination produces zero trades, optimization now stops early and tells you to run a debug backtest first.
+
+The summary highlights:
+
+- best by profit factor
+- best by Sharpe ratio
+- best by drawdown-adjusted return
+
+## Strategy Plugins
+
+Strategies register themselves in `core/strategies/index.js`:
+
+```js
+registerStrategy({
+  name: "ConservativeTrend",
+  params: {},
+  entry(ctx) {},
+  exit(ctx) {},
+  risk(ctx) {}
+})
+```
+
+This shape is intentionally small so future modules can add multi-symbol testing, portfolio simulation, Monte Carlo analysis, paper trading, or live trading integration without rewriting the simulator.
+
+`AlwaysLongTest` is included only to validate the engine. It enters on candle 10, exits on candle 30, and repeats every 50 candles. Do not use it for trading research.
+
 ## API Endpoints
 
 ### App
@@ -355,21 +527,38 @@ data_source.py                 Broker/source adapters
 indicators.py                  Indicator calculations
 signals.py                     Signal scoring
 strategy.py                    Backtest strategy presets and rules
-backtest.py                    Backtest simulation and reporting
+backtest.py                    Legacy Python backtest kept for reference/fallback
+core/backtest                  Shared Node backtest engine
+core/strategies                Plug-in strategy registry
+core/indicators                Dependency-free indicator engine for research
+core/optimizer                 Grid search, train/test split, ranking
+core/data                      Node candle loading and cache
+core/reporting                 CSV/JSON exports
+cli/backtest.js                npm run backtest entry point
+cli/optimize.js                npm run optimize entry point
 templates/index.html           Dashboard HTML
 static/app.js                  Plain JavaScript UI
 static/styles.css              Dashboard styling
 static/lightweight-charts...   Vendored Lightweight Charts
 requirements.txt               Python dependencies
+package.json                   Node CLI scripts
 ```
 
 ## Notes and Limitations
 
 - yfinance intraday history can be limited. The backtest diagnostics show how many days were actually returned.
-- Bybit history currently uses the latest candle limit returned by the public endpoint, so a request like `period=60d` may return fewer actual days depending on timeframe and limit.
+- Bybit history uses paginated `limit=1000` requests with caching and throttling.
 - Backtests prefer candle count over requested days. The default endpoint limit is 5000 candles when the source supports it.
 - Backtests are simplified research simulations. They do not include market depth, real spreads, partial fills, exchange outages, borrow costs, or broker-specific order rules.
 - Fees and slippage default to `0` but are exposed in backtest results and API parameters.
+
+## Developer Checks
+
+```powershell
+python -m py_compile app.py data_source.py indicators.py signals.py strategy.py backtest.py
+python -m unittest discover -s tests
+npm run test:research
+```
 
 ## Safety
 

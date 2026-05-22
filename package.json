@@ -1,0 +1,12 @@
+{
+  "name": "zguacharts",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local trading dashboard and automatable backtest research framework.",
+  "scripts": {
+    "backtest": "node cli/backtest.js",
+    "optimize": "node cli/optimize.js",
+    "test:research": "node tests/research_smoke.js",
+    "test:cli-exit": "node tests/cli_exit_smoke.js"
+  }
+}
