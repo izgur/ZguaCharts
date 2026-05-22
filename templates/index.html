@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ZguaCharts</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark"></span>
+        <h1>ZguaCharts</h1>
+      </div>
+      <label class="count-control">
+        <span>Number of charts</span>
+        <select id="chart-count">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+        </select>
+      </label>
+      <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
+    </header>
+
+    <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>
+
+    <template id="pane-template">
+      <section class="pane">
+        <div class="pane-toolbar">
+          <div class="selectors">
+            <select class="source-select" aria-label="Data source"></select>
+            <select class="symbol-select" aria-label="Symbol"></select>
+            <select class="timeframe-select" aria-label="Timeframe"></select>
+            <select class="preset-select" aria-label="Strategy preset"></select>
+            <button class="backtest-button" type="button">Backtest</button>
+            <div class="indicator-control">
+              <button class="indicator-button" type="button">Indicators</button>
+              <div class="indicator-menu" hidden>
+                <label class="indicator-option signal-marker-setting">
+                  <input class="signal-marker-toggle" type="checkbox">
+                  <span>Show signal markers</span>
+                </label>
+                <div class="indicator-list"></div>
+              </div>
+            </div>
+          </div>
+          <div class="pane-right">
+            <div class="signal-badge neutral">NEUTRAL</div>
+            <div class="ticker neutral">
+              <span class="ticker-symbol">--</span>
+              <strong class="ticker-price">Loading</strong>
+            </div>
+          </div>
+        </div>
+        <div class="chart-stack">
+          <div class="chart"></div>
+          <div class="indicator-panes"></div>
+        </div>
+        <div class="pane-status"></div>
+      </section>
+    </template>
+
+    <div id="backtest-modal" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="backtest-title">
+        <div class="modal-header">
+          <h2 id="backtest-title">Backtest</h2>
+          <button id="backtest-close" class="modal-close" type="button" aria-label="Close">Close</button>
+        </div>
+        <div id="backtest-content" class="modal-content"></div>
+      </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </body>
+</html>

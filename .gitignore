@@ -1,0 +1,8 @@
+__pycache__/
+.yfinance-cache/
+.venv/
+*.pyc
+*.pyo
+*.log
+server.out.log
+server.err.log
