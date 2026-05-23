@@ -45,6 +45,12 @@ python -m py_compile app.py data_source.py indicators.py signals.py strategy.py
 python app.py
 ```
 
+On Windows, you can also start a persistent local Flask process with:
+
+```powershell
+.\start-local.ps1
+```
+
 Open:
 
 ```text
