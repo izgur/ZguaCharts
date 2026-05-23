@@ -4,6 +4,8 @@ import json
 import math
 import os
 import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
@@ -14,6 +16,8 @@ from strategy import DEFAULT_PRESET_ID, preset_options
 
 
 app = Flask(__name__)
+
+BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
@@ -117,10 +121,14 @@ def signals():
     symbol = request.args.get("symbol", "BTCUSDT")
     timeframe = request.args.get("timeframe", "1m")
     limit = int(request.args.get("limit", "300"))
+    include_timeframes = request.args.get("include_timeframes", "true").lower() != "false"
 
     try:
         candles_payload = fetch_candles(source, symbol, timeframe, limit=limit)
         payload = build_signal_payload(candles_payload["candles"])
+        payload["timeframe"] = timeframe
+        if include_timeframes:
+            payload["timeframeMatrix"] = build_signal_timeframe_matrix(source, symbol, timeframe, limit)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -156,6 +164,7 @@ def backtest():
             "firstChartCandleTime": int(first_chart_candle_time) if first_chart_candle_time else overlay_diag.get("firstChartCandleTime"),
             "lastChartCandleTime": int(last_chart_candle_time) if last_chart_candle_time else overlay_diag.get("lastChartCandleTime"),
         }
+        record_backtest_history(payload)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -182,6 +191,17 @@ def optimize():
     except Exception as exc:
         return jsonify({"error": f"Could not run optimizer: {exc}"}), 502
     return jsonify(payload)
+
+
+@app.get("/api/backtest-history")
+def backtest_history():
+    limit = int(request.args.get("limit", "100"))
+    records = load_backtest_history()
+    return jsonify({
+        "runs": records[-limit:][::-1],
+        "strategySummary": summarize_backtest_history(records),
+        "totalRuns": len(records),
+    })
 
 
 @app.get("/api/strategy-ranking")
@@ -368,6 +388,118 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["diagnostics"]["effective_period"] = candles_payload.get("effective_period", period)
     payload["diagnostics"]["api_candles"] = candle_diagnostics(candles_payload["candles"], requested_limit=limit)
     return payload
+
+
+def build_signal_timeframe_matrix(source: str, symbol: str, selected_timeframe: str, limit: int) -> list[dict]:
+    source_config = DATA_SOURCE_CONFIG.get("sources", {}).get(source, {})
+    timeframes = source_config.get("timeframes", [selected_timeframe])
+    rows = []
+    for timeframe in timeframes:
+        try:
+            candles_payload = fetch_candles(source, symbol, timeframe, limit=max(300, min(limit, 1000)))
+            payload = build_signal_payload(candles_payload["candles"])
+            rows.append({
+                "timeframe": timeframe,
+                "selected": timeframe == selected_timeframe,
+                "score": payload.get("score", 0),
+                "label": payload.get("label", "NEUTRAL"),
+                "tone": payload.get("tone", "neutral"),
+                "buySuggestionPct": payload.get("buySuggestionPct", 0),
+                "components": payload.get("components", []),
+                "warnings": payload.get("warnings", []),
+                "error": None,
+            })
+        except Exception as exc:
+            rows.append({
+                "timeframe": timeframe,
+                "selected": timeframe == selected_timeframe,
+                "score": None,
+                "label": "ERROR",
+                "tone": "neutral",
+                "buySuggestionPct": 0,
+                "components": [],
+                "warnings": [],
+                "error": str(exc),
+            })
+    return rows
+
+
+def load_backtest_history() -> list[dict]:
+    if not BACKTEST_HISTORY_PATH.exists():
+        return []
+    try:
+        with BACKTEST_HISTORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def save_backtest_history(records: list[dict]) -> None:
+    BACKTEST_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with BACKTEST_HISTORY_PATH.open("w", encoding="utf-8") as handle:
+        json.dump(records[-500:], handle, indent=2)
+
+
+def record_backtest_history(payload: dict) -> None:
+    record = {
+        "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"),
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "source": payload.get("source"),
+        "symbol": payload.get("symbol"),
+        "timeframe": payload.get("timeframe"),
+        "period": payload.get("period"),
+        "strategy": payload.get("preset") or payload.get("strategy") or "unknown",
+        "totalReturnPct": safe_float(payload.get("total_return_pct", payload.get("totalReturn", 0))),
+        "trades": int(safe_float(payload.get("number_of_trades", payload.get("trades", 0)))),
+        "winRate": safe_float(payload.get("win_rate", payload.get("winRate", 0))),
+        "maxDrawdown": safe_float(payload.get("max_drawdown", payload.get("maxDrawdown", 0))),
+        "profitFactor": safe_float(payload.get("profit_factor", payload.get("profitFactor", 0))),
+        "averageBarsHeld": safe_float(payload.get("average_bars_held", payload.get("avgBarsHeld", 0))),
+    }
+    records = load_backtest_history()
+    records.append(record)
+    save_backtest_history(records)
+
+
+def summarize_backtest_history(records: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for record in records:
+        strategy = record.get("strategy") or "unknown"
+        item = grouped.setdefault(strategy, {
+            "strategy": strategy,
+            "tests": 0,
+            "totalTrades": 0,
+            "sumReturnPct": 0.0,
+            "avgReturnPct": 0.0,
+            "avgWinRate": 0.0,
+            "avgProfitFactor": 0.0,
+            "worstDrawdown": 0.0,
+            "bestReturnPct": None,
+            "worstReturnPct": None,
+        })
+        item["tests"] += 1
+        item["totalTrades"] += int(record.get("trades") or 0)
+        item["sumReturnPct"] += safe_float(record.get("totalReturnPct"))
+        item["avgWinRate"] += safe_float(record.get("winRate"))
+        item["avgProfitFactor"] += safe_float(record.get("profitFactor"))
+        item["worstDrawdown"] = max(item["worstDrawdown"], safe_float(record.get("maxDrawdown")))
+        total_return = safe_float(record.get("totalReturnPct"))
+        item["bestReturnPct"] = total_return if item["bestReturnPct"] is None else max(item["bestReturnPct"], total_return)
+        item["worstReturnPct"] = total_return if item["worstReturnPct"] is None else min(item["worstReturnPct"], total_return)
+    summaries = []
+    for item in grouped.values():
+        tests = max(1, item["tests"])
+        item["avgReturnPct"] = round(item["sumReturnPct"] / tests, 2)
+        item["avgWinRate"] = round(item["avgWinRate"] / tests, 2)
+        item["avgProfitFactor"] = round(item["avgProfitFactor"] / tests, 3)
+        item["sumReturnPct"] = round(item["sumReturnPct"], 2)
+        item["worstDrawdown"] = round(item["worstDrawdown"], 2)
+        item["bestReturnPct"] = round(item["bestReturnPct"] or 0, 2)
+        item["worstReturnPct"] = round(item["worstReturnPct"] or 0, 2)
+        summaries.append(item)
+    summaries.sort(key=lambda item: (item["tests"], item["sumReturnPct"]), reverse=True)
+    return summaries
 
 
 def candle_diagnostics(candles: list[dict], requested_limit=None) -> dict:

@@ -629,6 +629,12 @@ button:hover {
   border-bottom: 1px solid var(--line);
 }
 
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .modal-header h2 {
   margin: 0;
   font-size: 16px;
@@ -668,8 +674,14 @@ button:hover {
 
 .signal-detail-grid {
   display: grid;
-  grid-template-columns: minmax(260px, 0.75fr) minmax(360px, 1.25fr);
   gap: 12px;
+}
+
+.timeframe-score-table th.selected-timeframe,
+.timeframe-score-table td.selected-timeframe {
+  color: var(--text);
+  font-weight: 800;
+  background: rgba(18, 184, 134, 0.09);
 }
 
 .backtest-controls {

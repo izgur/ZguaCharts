@@ -39,6 +39,7 @@ def build_signal_payload(candles: list[dict]) -> dict:
         "score": latest_score,
         "label": label,
         "tone": tone_for_label(label),
+        "buySuggestionPct": buy_suggestion_pct(latest_score),
         "components": components_for_row(latest_features),
         "details": details_for_row(latest_features),
         "warnings": warnings_for_row(latest_features),
@@ -51,6 +52,7 @@ def empty_payload() -> dict:
         "score": 0,
         "label": "NEUTRAL",
         "tone": "neutral",
+        "buySuggestionPct": 0,
         "components": [],
         "details": [],
         "warnings": ["Not enough candles to score signals."],
@@ -283,3 +285,14 @@ def tone_for_label(label: str) -> str:
     if "SELL" in label:
         return "sell"
     return "neutral"
+
+
+def buy_suggestion_pct(score: int) -> int:
+    """Technical score-to-sizing hint, not financial advice.
+
+    The UI renders this as a signal-derived suggestion only. Real position
+    sizing remains a separate risk-management decision.
+    """
+    if score <= 25:
+        return 0
+    return int(max(0, min(100, round(((score - 25) / 75) * 100))))

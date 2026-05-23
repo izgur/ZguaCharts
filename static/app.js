@@ -32,6 +32,7 @@ const backtestChartHost = document.querySelector("#backtest-chart-host");
 const backtestResults = document.querySelector("#backtest-results");
 const backtestModal = document.querySelector("#backtest-modal");
 const backtestClose = document.querySelector("#backtest-close");
+const backtestHistoryButton = document.querySelector("#backtest-history-button");
 const backtestTitle = document.querySelector("#backtest-title");
 const backtestContent = document.querySelector("#backtest-content");
 const paperTabButton = document.querySelector("#paper-tab-button");
@@ -89,6 +90,7 @@ async function boot() {
 
   setupNavigation();
   backtestClose.addEventListener("click", closeBacktestModal);
+  backtestHistoryButton?.addEventListener("click", openBacktestHistory);
   backtestModal.addEventListener("click", (event) => {
     if (event.target === backtestModal) closeBacktestModal();
   });
@@ -1322,6 +1324,64 @@ function openBacktestModal(html, title = "Backtest", className = "") {
   backtestModal.hidden = false;
 }
 
+async function openBacktestHistory() {
+  if (backtestTitle) backtestTitle.textContent = "Backtest History";
+  backtestModal.classList.remove("signal-modal");
+  backtestModal.hidden = false;
+  backtestContent.innerHTML = `<p class="pane-status">Loading backtest history...</p>`;
+  try {
+    const response = await fetch("/api/backtest-history?limit=150");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Backtest history failed");
+    backtestContent.innerHTML = renderBacktestHistory(payload);
+  } catch (error) {
+    backtestContent.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderBacktestHistory(payload) {
+  const summaries = payload.strategySummary || [];
+  const runs = payload.runs || [];
+  const summaryRows = summaries.map((row) => `
+    <tr>
+      <td>${escapeHtml(row.strategy)}</td>
+      <td>${row.tests}</td>
+      <td>${row.totalTrades}</td>
+      <td class="${row.sumReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.sumReturnPct)}%</td>
+      <td class="${row.avgReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.avgReturnPct)}%</td>
+      <td>${row.avgWinRate}%</td>
+      <td>${row.avgProfitFactor}</td>
+      <td>${row.worstDrawdown}%</td>
+    </tr>
+  `).join("");
+  const runRows = runs.map((run) => `
+    <tr>
+      <td>${escapeHtml(new Date(run.createdAt).toLocaleString())}</td>
+      <td>${escapeHtml(run.strategy)}</td>
+      <td>${escapeHtml(run.symbol)} ${escapeHtml(run.timeframe)}</td>
+      <td>${escapeHtml(run.period || "-")}</td>
+      <td class="${run.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(run.totalReturnPct)}%</td>
+      <td>${run.trades}</td>
+      <td>${run.winRate}%</td>
+      <td>${run.profitFactor}</td>
+      <td>${run.maxDrawdown}%</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Strategy Totals</h3>
+    <p class="modal-note">Stored locally from completed `/api/backtest` runs. Summary values are backend-calculated.</p>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Tests</th><th>Trades</th><th>Sum return</th><th>Avg return</th><th>Avg win</th><th>Avg PF</th><th>Worst DD</th></tr></thead>
+      <tbody>${summaryRows || `<tr><td colspan="8">No backtests recorded yet.</td></tr>`}</tbody>
+    </table>
+    <h3 class="modal-section-title">Recent Backtests</h3>
+    <table class="trade-table">
+      <thead><tr><th>Time</th><th>Strategy</th><th>Market</th><th>Period</th><th>Return</th><th>Trades</th><th>Win</th><th>PF</th><th>DD</th></tr></thead>
+      <tbody>${runRows || `<tr><td colspan="9">Run a backtest to create history.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
 function openBottomPanelModal() {
   const html = bottomPanelContent?.innerHTML?.trim();
   if (!html) return;
@@ -1354,19 +1414,11 @@ function updateChartsPanels(pane, payload) {
 
 function renderSignalDetails(pane, payload) {
   const components = payload.components || [];
-  const details = payload.details || [];
   const warnings = payload.warnings || [];
   const componentRows = components.map((item) => `
     <tr>
       <td>${escapeHtml(item.name)}</td>
       <td class="${Number(item.score) >= 0 ? "positive" : "negative"}">${formatSigned(item.score)}</td>
-    </tr>
-  `).join("");
-  const detailRows = details.map((item) => `
-    <tr>
-      <td>${escapeHtml(item.name)}</td>
-      <td>${escapeHtml(item.value)}</td>
-      <td>${escapeHtml(item.theory)}</td>
     </tr>
   `).join("");
   return `
@@ -1380,20 +1432,58 @@ function renderSignalDetails(pane, payload) {
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <div class="signal-detail-grid">
       <section>
-        <h3 class="modal-section-title">Score Components</h3>
+        <h3 class="modal-section-title">Score Components - Selected Timeframe</h3>
         <table class="trade-table">
           <thead><tr><th>Component</th><th>Score</th></tr></thead>
           <tbody>${componentRows || `<tr><td colspan="2">No score components available.</td></tr>`}</tbody>
         </table>
       </section>
       <section>
-        <h3 class="modal-section-title">Why This Score</h3>
-        <table class="trade-table signal-detail-table">
-          <thead><tr><th>Input</th><th>Value</th><th>Rule</th></tr></thead>
-          <tbody>${detailRows || `<tr><td colspan="3">No signal details available.</td></tr>`}</tbody>
-        </table>
+        <h3 class="modal-section-title">Score Components - All Timeframes</h3>
+        ${renderTimeframeSignalMatrix(payload)}
       </section>
     </div>
+  `;
+}
+
+function renderTimeframeSignalMatrix(payload) {
+  const matrix = payload.timeframeMatrix || [];
+  if (!matrix.length) return `<p class="pane-status">No timeframe matrix returned.</p>`;
+  const componentNames = Array.from(new Set(matrix.flatMap((item) => (item.components || []).map((component) => component.name))));
+  const header = matrix.map((item) => `
+    <th class="${item.selected ? "selected-timeframe" : ""}">
+      ${escapeHtml(item.timeframe)}
+      <br><span class="${item.tone || "neutral"}">${escapeHtml(item.label || "-")}</span>
+    </th>
+  `).join("");
+  const buyRow = `
+    <tr>
+      <td>BUY suggestion %</td>
+      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""}">${item.error ? "ERR" : `${item.buySuggestionPct ?? 0}%`}</td>`).join("")}
+    </tr>
+  `;
+  const scoreRow = `
+    <tr>
+      <td>Total score</td>
+      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""} ${Number(item.score) >= 0 ? "positive" : "negative"}">${item.score ?? "-"}</td>`).join("")}
+    </tr>
+  `;
+  const rows = componentNames.map((name) => `
+    <tr>
+      <td>${escapeHtml(name)}</td>
+      ${matrix.map((item) => {
+        const component = (item.components || []).find((entry) => entry.name === name);
+        const value = component ? formatSigned(component.score) : "-";
+        return `<td class="${item.selected ? "selected-timeframe" : ""} ${Number(component?.score || 0) >= 0 ? "positive" : "negative"}">${value}</td>`;
+      }).join("")}
+    </tr>
+  `).join("");
+  return `
+    <p class="modal-note">Backend signal score and technical BUY suggestion by timeframe. This is not financial advice.</p>
+    <table class="trade-table timeframe-score-table">
+      <thead><tr><th>Metric</th>${header}</tr></thead>
+      <tbody>${buyRow}${scoreRow}${rows}</tbody>
+    </table>
   `;
 }
 
