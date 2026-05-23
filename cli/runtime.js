@@ -1,4 +1,5 @@
-function readStdinIfPresent() {
+function readStdinIfPresent(options) {
+  options = options || {};
   return new Promise(function (resolve) {
     var raw = "";
     var settled = false;
@@ -31,6 +32,10 @@ function readStdinIfPresent() {
 
     if (process.stdin.isTTY) {
       finish("");
+      return;
+    }
+
+    if (options.waitForEnd === true || process.argv.indexOf("--stdin-json") !== -1) {
       return;
     }
 

@@ -260,8 +260,8 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "candles": candles_payload["candles"],
     }
     completed = subprocess.run(
-        ["node", "cli/backtest.js"],
-        input=json.dumps(engine_input),
+        ["node", "cli/backtest.js", "--stdin-json"],
+        input=json.dumps(engine_input, allow_nan=False),
         text=True,
         capture_output=True,
         cwd=app.root_path,

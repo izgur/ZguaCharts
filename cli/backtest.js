@@ -7,7 +7,7 @@ const runtime = require("./runtime");
 
 var cliArgs = argsUtil.parseArgs(process.argv.slice(2));
 
-runtime.readStdinIfPresent().then(function (raw) {
+runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(function (raw) {
   var args = cliArgs;
   var input = raw.trim() ? JSON.parse(raw) : {};
   var params = args.params ? JSON.parse(args.params) : input.params;
