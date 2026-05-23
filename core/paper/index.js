@@ -19,16 +19,6 @@ function runPaperTick(options) {
   const state = loadState(statePath, config);
   state.warnings = [];
 
-  if (!config.enabled && !options.dryRun) {
-    state.warnings.push("Paper simulation disabled in config. Set enabled=true to process virtual trades.");
-    state.updatedAt = new Date().toISOString();
-    if (!options.dryRun) {
-      writeState(statePath, state);
-      writeStatusReports(reportDir, state, config, []);
-    }
-    return Promise.resolve(summary(state, config, [], "disabled"));
-  }
-
   const markets = normalizeMarkets(config);
   const refreshPromise = options.refreshFirst
     ? refreshPaperCandles({ configPath, reportDir, advanceBaseline: false, statePath })
@@ -42,6 +32,18 @@ function runPaperTick(options) {
     const jobs = markets.map((market) => () => processMarket(config, state, market, regimeCandles, options));
     return jobs.reduce((p, job) => p.then((events) => job().then((next) => events.concat(next))), Promise.resolve([]));
   }).then((events) => {
+    if (!config.enabled) {
+      state.warnings.push("Paper simulation disabled in config. Signals/freshness checked, but virtual trades were not opened or closed.");
+      events = events.filter((event) => event.eventType === "SIGNAL" || event.eventType === "WARNING" || event.eventType === "SKIP");
+      if (options.dryRun) {
+        return summary(state, config, events, "disabled-dry-run");
+      }
+      appendJournal(reportDir, events);
+      state.updatedAt = new Date().toISOString();
+      writeState(statePath, state);
+      writeStatusReports(reportDir, state, config, events);
+      return summary(state, config, events, "disabled-watch");
+    }
     if (options.dryRun) {
       return summary(state, config, events, "dry-run");
     }
@@ -228,11 +230,28 @@ function processMarket(config, state, market, regimeCandles, options) {
       params
     });
     const events = warningEvents(config, state, market, warnings);
-    applyResultToState(config, state, market, result, lastProcessed, events);
+    if (!config.enabled) {
+      addDisabledSignalEvents(config, state, market, result, lastProcessed, events);
+    } else {
+      applyResultToState(config, state, market, result, lastProcessed, events);
+    }
     state.lastProcessedCandleTime[key] = candles[candles.length - 1].time;
     state.processedCandles += newCandles.length;
     return events;
   });
+}
+
+function addDisabledSignalEvents(config, state, market, result, lastProcessed, events) {
+  const key = marketKey(market);
+  const trades = result.tradeList || [];
+  trades.forEach((trade) => {
+    const candleTime = Number(trade.entrySignalTime || trade.entryTime || 0);
+    if (candleTime > lastProcessed) {
+      addEvent(events, config, market, "SIGNAL", "Paper disabled; signal observed only.", trade);
+      state.pendingSignals.push({ marketKey: key, candleTime, symbol: market.symbol, interval: market.interval });
+    }
+  });
+  if (state.pendingSignals.length > 500) state.pendingSignals = state.pendingSignals.slice(-500);
 }
 
 function applyResultToState(config, state, market, result, lastProcessed, events) {
