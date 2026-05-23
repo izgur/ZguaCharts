@@ -143,6 +143,15 @@ h1 {
   background: #0b0f14;
 }
 
+.compact-toolbar {
+  justify-content: flex-start;
+}
+
+.toolbar-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .workspace-toolbar label {
   display: flex;
   align-items: center;
@@ -459,6 +468,7 @@ button:hover {
 }
 
 .chart-stack {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -502,6 +512,61 @@ button:hover {
   pointer-events: none;
 }
 
+.marker-detail-popover {
+  position: absolute;
+  z-index: 15;
+  right: 12px;
+  top: 12px;
+  width: min(390px, calc(100% - 24px));
+  max-height: min(430px, calc(100% - 24px));
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(12, 16, 21, 0.96);
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.42);
+  font-size: 12px;
+  pointer-events: none;
+}
+
+.marker-detail-popover[hidden] {
+  display: none;
+}
+
+.marker-detail-popover h3 {
+  margin: 0 0 7px;
+  font-size: 13px;
+}
+
+.marker-detail-popover p {
+  margin: 0 0 7px;
+  color: var(--muted);
+}
+
+.marker-detail-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.marker-detail-list div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 4px;
+}
+
+.marker-detail-list dt {
+  color: var(--muted);
+}
+
+.marker-detail-list dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .pane-status {
   min-height: 22px;
   padding: 3px 10px;
@@ -543,7 +608,7 @@ button:hover {
 }
 
 .modal {
-  width: min(920px, 100%);
+  width: min(1120px, 100%);
   max-height: min(760px, 92vh);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -599,6 +664,12 @@ button:hover {
 
 .signal-detail-table td:last-child {
   color: var(--muted);
+}
+
+.signal-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.75fr) minmax(360px, 1.25fr);
+  gap: 12px;
 }
 
 .backtest-controls {
@@ -902,6 +973,10 @@ button:hover {
   overflow: hidden;
 }
 
+.signal-modal .modal {
+  width: min(1280px, 100%);
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1046,6 +1121,10 @@ button:hover {
 
   .metric-grid {
     grid-template-columns: 1fr 1fr;
+  }
+
+  .signal-detail-grid {
+    grid-template-columns: 1fr;
   }
 
   .backtest-controls,

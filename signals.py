@@ -42,7 +42,7 @@ def build_signal_payload(candles: list[dict]) -> dict:
         "components": components_for_row(latest_features),
         "details": details_for_row(latest_features),
         "warnings": warnings_for_row(latest_features),
-        "markers": markers_from_scores(scored),
+        "markers": markers_from_scores(scored, features),
     }
 
 
@@ -232,27 +232,36 @@ def warnings_for_row(row: pd.Series) -> list[str]:
     return warnings
 
 
-def markers_from_scores(scored: pd.DataFrame) -> list[dict]:
+def markers_from_scores(scored: pd.DataFrame, features: pd.DataFrame) -> list[dict]:
     markers = []
     prior_score = None
-    for _, row in scored.dropna(subset=["score"]).iterrows():
+    for index, row in scored.dropna(subset=["score"]).iterrows():
         current = float(row["score"])
         if prior_score is not None:
             if prior_score <= BUY_THRESHOLD < current:
-                markers.append(signal_marker(row["time"], "BUY", "belowBar", "#12b886", "arrowUp"))
+                markers.append(signal_marker(row["time"], "BUY", "belowBar", "#12b886", "arrowUp", row, features.loc[index]))
             elif prior_score >= SELL_THRESHOLD > current:
-                markers.append(signal_marker(row["time"], "SELL", "aboveBar", "#ff5c7a", "arrowDown"))
+                markers.append(signal_marker(row["time"], "SELL", "aboveBar", "#ff5c7a", "arrowDown", row, features.loc[index]))
         prior_score = current
     return markers[-80:]
 
 
-def signal_marker(time_value: float, text: str, position: str, color: str, shape: str) -> dict:
+def signal_marker(time_value: float, text: str, position: str, color: str, shape: str, scored_row: pd.Series, feature_row: pd.Series) -> dict:
+    score = int(scored_row["score"])
+    label = label_for_score(score)
     return {
         "time": int(time_value),
         "position": position,
         "color": color,
         "shape": shape,
         "text": text,
+        "score": score,
+        "label": label,
+        "tone": tone_for_label(label),
+        "reason": f"{text} marker: signal score crossed {'above' if text == 'BUY' else 'below'} the configured threshold.",
+        "components": components_for_row(feature_row),
+        "details": details_for_row(feature_row),
+        "warnings": warnings_for_row(feature_row),
     }
 
 

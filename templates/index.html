@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-routes">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-ui-details">
   </head>
   <body>
     <header class="topbar">
@@ -24,21 +24,9 @@
 
     <main class="app-shell">
       <section id="charts-page" class="route-page charts-page" data-page="charts">
-        <div class="workspace-toolbar">
-          <label>
-            <span>Source</span>
-            <select id="global-source-select"></select>
-          </label>
-          <label>
-            <span>Symbol</span>
-            <select id="global-symbol-select"></select>
-          </label>
-          <label>
-            <span>Timeframe</span>
-            <select id="global-timeframe-select"></select>
-          </label>
+        <div class="workspace-toolbar compact-toolbar">
           <label class="count-control">
-            <span>Charts</span>
+            <span>Number of charts</span>
             <select id="chart-count">
               <option value="1">1</option>
               <option value="2">2</option>
@@ -47,16 +35,7 @@
               <option value="8">8</option>
             </select>
           </label>
-          <div class="indicator-control global-indicator-control">
-            <button id="global-indicator-button" class="indicator-button" type="button">Indicators</button>
-            <div id="global-indicator-menu" class="indicator-menu" hidden>
-              <div id="global-indicator-list"></div>
-            </div>
-          </div>
-          <label class="toolbar-toggle">
-            <input id="global-signal-toggle" type="checkbox">
-            <span>Signal markers</span>
-          </label>
+          <span class="toolbar-note">Each pane has its own source, symbol, timeframe, indicators, and backtest controls.</span>
         </div>
 
         <div class="charts-workspace">
@@ -195,6 +174,7 @@
         <div class="chart-stack">
           <div class="chart"></div>
           <div class="indicator-panes"></div>
+          <div class="marker-detail-popover" hidden></div>
         </div>
         <div class="pane-status"></div>
       </section>
@@ -221,6 +201,6 @@
       <div id="paper-panel-content" class="paper-panel-content"></div>
     </section>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-routes" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-ui-details" defer></script>
   </body>
 </html>

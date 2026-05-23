@@ -26,11 +26,13 @@ const globalIndicatorMenu = document.querySelector("#global-indicator-menu");
 const globalIndicatorList = document.querySelector("#global-indicator-list");
 const globalSignalToggle = document.querySelector("#global-signal-toggle");
 const activeSignalsList = document.querySelector("#active-signals-list");
+const bottomPanel = document.querySelector(".bottom-panel");
 const bottomPanelContent = document.querySelector("#bottom-panel-content");
 const backtestChartHost = document.querySelector("#backtest-chart-host");
 const backtestResults = document.querySelector("#backtest-results");
 const backtestModal = document.querySelector("#backtest-modal");
 const backtestClose = document.querySelector("#backtest-close");
+const backtestTitle = document.querySelector("#backtest-title");
 const backtestContent = document.querySelector("#backtest-content");
 const paperTabButton = document.querySelector("#paper-tab-button");
 const paperPanel = document.querySelector("#paper-panel");
@@ -96,6 +98,10 @@ async function boot() {
       paperPanel.hidden = true;
     });
   }
+  bottomPanel?.querySelector("summary")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    openBottomPanelModal();
+  });
 
   document.addEventListener("click", (event) => {
     panes.forEach((pane) => {
@@ -396,6 +402,7 @@ function createPane(node, index) {
     tickerPrice: node.querySelector(".ticker-price"),
     chartEl: node.querySelector(".chart"),
     indicatorPanesEl: node.querySelector(".indicator-panes"),
+    markerDetailEl: node.querySelector(".marker-detail-popover"),
     status: node.querySelector(".pane-status"),
     dataDiagnosticsEl: null,
     chart: null,
@@ -405,6 +412,7 @@ function createPane(node, index) {
     indicatorCharts: [],
     signalMarkers: [],
     backtestMarkers: [],
+    markerDetailsByTime: new Map(),
     candles: [],
     signalMarkerPrimitive: null,
     ws: null,
@@ -498,6 +506,9 @@ function setupChart(pane) {
   pane.resizeObserver.observe(pane.chartEl);
   if (pane.chart.timeScale().subscribeVisibleTimeRangeChange) {
     pane.chart.timeScale().subscribeVisibleTimeRangeChange(() => syncIndicatorTimeRanges(pane));
+  }
+  if (pane.chart.subscribeCrosshairMove) {
+    pane.chart.subscribeCrosshairMove((param) => showMarkerDetailsForCrosshair(pane, param));
   }
 }
 
@@ -660,7 +671,7 @@ async function renderSignals(pane, requestId) {
     source: pane.sourceSelect.value,
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
-    limit: "300",
+    limit: String(Math.max(pane.candles.length, 300)),
   });
   const response = await fetch(`/api/signals?${params}`);
   const payload = await response.json();
@@ -861,6 +872,7 @@ function updateChartMarkers(pane) {
     ...(pane.signalMarkerToggle.checked ? pane.signalMarkers : []),
     ...pane.backtestMarkers,
   ].sort((a, b) => a.time - b.time);
+  pane.markerDetailsByTime = buildMarkerDetailsMap(visibleMarkers);
   if (pane.series.setMarkers) {
     pane.series.setMarkers(visibleMarkers);
     return;
@@ -875,11 +887,13 @@ function updateChartMarkers(pane) {
 
 function clearSignalMarkers(pane) {
   pane.signalMarkers = [];
+  hideMarkerDetails(pane);
   updateChartMarkers(pane);
 }
 
 function clearBacktestMarkers(pane) {
   pane.backtestMarkers = [];
+  hideMarkerDetails(pane);
   clearBacktestOverlaySeries(pane);
   if (pane.series && pane.series.setMarkers) {
     updateChartMarkers(pane);
@@ -976,6 +990,79 @@ function backtestSettings(presetId) {
     slippage_pct: document.querySelector("#modal-slippage-input")?.value || "0",
     allowShorts: document.querySelector("#modal-allow-shorts")?.checked ? "true" : "false",
   };
+}
+
+function buildMarkerDetailsMap(markers) {
+  const map = new Map();
+  markers.forEach((marker) => {
+    const time = normalizeMarkerTime(marker.time);
+    if (time === null) return;
+    if (!map.has(time)) map.set(time, []);
+    map.get(time).push(marker);
+  });
+  return map;
+}
+
+function showMarkerDetailsForCrosshair(pane, param) {
+  if (!pane.markerDetailEl) return;
+  const time = normalizeMarkerTime(param?.time);
+  if (time === null) {
+    hideMarkerDetails(pane);
+    return;
+  }
+  const markers = pane.markerDetailsByTime?.get(time);
+  if (!markers?.length) {
+    hideMarkerDetails(pane);
+    return;
+  }
+  pane.markerDetailEl.innerHTML = renderMarkerDetails(markers, time);
+  pane.markerDetailEl.hidden = false;
+}
+
+function hideMarkerDetails(pane) {
+  if (pane.markerDetailEl) pane.markerDetailEl.hidden = true;
+}
+
+function renderMarkerDetails(markers, time) {
+  return markers.map((marker) => {
+    const rows = markerRows(marker);
+    return `
+      <section>
+        <h3>${escapeHtml(marker.text || marker.type || "Marker")} - ${formatDateTime(time)}</h3>
+        <p>${escapeHtml(marker.reason || marker.summary || "Backend-returned marker detail.")}</p>
+        <dl class="marker-detail-list">
+          ${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}
+        </dl>
+      </section>
+    `;
+  }).join("");
+}
+
+function markerRows(marker) {
+  const rows = [];
+  if (marker.score !== undefined) rows.push(["Score", String(marker.score)]);
+  if (marker.label) rows.push(["Label", marker.label]);
+  if (marker.components) {
+    marker.components.forEach((item) => rows.push([item.name, formatSigned(item.score)]));
+  }
+  if (marker.details) {
+    marker.details.forEach((item) => rows.push([item.name, `${item.value} (${item.theory})`]));
+  }
+  if (rows.length) {
+    return rows;
+  }
+  if (marker.trade) {
+    return [
+      ["Entry", `${formatDateTime(marker.trade.entry_time)} @ ${formatPrice(Number(marker.trade.entry_price || 0))}`],
+      ["Exit", `${formatDateTime(marker.trade.exit_time)} @ ${formatPrice(Number(marker.trade.exit_price || 0))}`],
+      ["Return", `${formatSigned(marker.trade.return_pct)}%`],
+      ["Exit reason", marker.trade.exit_reason || "-"],
+    ];
+  }
+  return [
+    ["Score", marker.score ?? "-"],
+    ["Label", marker.label || marker.text || "-"],
+  ];
 }
 
 function initBacktestPage() {
@@ -1142,6 +1229,8 @@ function markersFromBacktestPayload(payload) {
         color: "#12b886",
         shape: "arrowUp",
         text: "BT BUY",
+        reason: "Backtest entry returned by the backend strategy engine.",
+        trade,
       });
     }
     if (exitTime !== null) {
@@ -1151,6 +1240,8 @@ function markersFromBacktestPayload(payload) {
         color: "#ff5c7a",
         shape: "arrowDown",
         text: "BT SELL",
+        reason: `Backtest exit: ${trade.exit_reason || "strategy exit"}.`,
+        trade,
       });
     }
   });
@@ -1224,9 +1315,17 @@ async function optimizeStrategy(pane, presetId) {
   }
 }
 
-function openBacktestModal(html) {
+function openBacktestModal(html, title = "Backtest", className = "") {
+  if (backtestTitle) backtestTitle.textContent = title;
   backtestContent.innerHTML = html;
+  backtestModal.classList.toggle("signal-modal", className === "signal-modal");
   backtestModal.hidden = false;
+}
+
+function openBottomPanelModal() {
+  const html = bottomPanelContent?.innerHTML?.trim();
+  if (!html) return;
+  openBacktestModal(`<div class="signal-modal-content">${html}</div>`, "Indicators and Signal Details", "signal-modal");
 }
 
 function openSignalDetails(pane) {
@@ -1235,7 +1334,7 @@ function openSignalDetails(pane) {
   if (bottomPanelContent && !document.querySelector("#charts-page")?.hidden) {
     bottomPanelContent.innerHTML = renderSignalDetails(pane, payload);
   }
-  openBacktestModal(renderSignalDetails(pane, payload));
+  openBacktestModal(renderSignalDetails(pane, payload), "Signal Details", "signal-modal");
 }
 
 function updateChartsPanels(pane, payload) {
@@ -1279,16 +1378,22 @@ function renderSignalDetails(pane, payload) {
       <div class="signal-badge ${payload.tone || "neutral"}">${escapeHtml(payload.label)} ${escapeHtml(String(payload.score))}</div>
     </div>
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
-    <h3 class="modal-section-title">Score Components</h3>
-    <table class="trade-table">
-      <thead><tr><th>Component</th><th>Score</th></tr></thead>
-      <tbody>${componentRows || `<tr><td colspan="2">No score components available.</td></tr>`}</tbody>
-    </table>
-    <h3 class="modal-section-title">Why This Score</h3>
-    <table class="trade-table signal-detail-table">
-      <thead><tr><th>Input</th><th>Value</th><th>Rule</th></tr></thead>
-      <tbody>${detailRows || `<tr><td colspan="3">No signal details available.</td></tr>`}</tbody>
-    </table>
+    <div class="signal-detail-grid">
+      <section>
+        <h3 class="modal-section-title">Score Components</h3>
+        <table class="trade-table">
+          <thead><tr><th>Component</th><th>Score</th></tr></thead>
+          <tbody>${componentRows || `<tr><td colspan="2">No score components available.</td></tr>`}</tbody>
+        </table>
+      </section>
+      <section>
+        <h3 class="modal-section-title">Why This Score</h3>
+        <table class="trade-table signal-detail-table">
+          <thead><tr><th>Input</th><th>Value</th><th>Rule</th></tr></thead>
+          <tbody>${detailRows || `<tr><td colspan="3">No signal details available.</td></tr>`}</tbody>
+        </table>
+      </section>
+    </div>
   `;
 }
 
