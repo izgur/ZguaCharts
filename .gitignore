@@ -6,6 +6,7 @@ __pycache__/
 *.log
 server.out.log
 server.err.log
+server.pid
 .research-cache/
 data/
 reports/
