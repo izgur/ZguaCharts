@@ -16,6 +16,19 @@ const CHART_LIBRARY_URLS = [
 const grid = document.querySelector("#chart-grid");
 const countSelect = document.querySelector("#chart-count");
 const template = document.querySelector("#pane-template");
+const routePages = Array.from(document.querySelectorAll(".route-page"));
+const navLinks = Array.from(document.querySelectorAll("[data-route]"));
+const globalSourceSelect = document.querySelector("#global-source-select");
+const globalSymbolSelect = document.querySelector("#global-symbol-select");
+const globalTimeframeSelect = document.querySelector("#global-timeframe-select");
+const globalIndicatorButton = document.querySelector("#global-indicator-button");
+const globalIndicatorMenu = document.querySelector("#global-indicator-menu");
+const globalIndicatorList = document.querySelector("#global-indicator-list");
+const globalSignalToggle = document.querySelector("#global-signal-toggle");
+const activeSignalsList = document.querySelector("#active-signals-list");
+const bottomPanelContent = document.querySelector("#bottom-panel-content");
+const backtestChartHost = document.querySelector("#backtest-chart-host");
+const backtestResults = document.querySelector("#backtest-results");
 const backtestModal = document.querySelector("#backtest-modal");
 const backtestClose = document.querySelector("#backtest-close");
 const backtestContent = document.querySelector("#backtest-content");
@@ -27,6 +40,10 @@ const paperPanelContent = document.querySelector("#paper-panel-content");
 let config = null;
 let state = loadState();
 let panes = [];
+let chartsInitialized = false;
+let chartsToolbarInitialized = false;
+let backtestInitialized = false;
+let backtestPane = null;
 
 function loadState() {
   try {
@@ -67,10 +84,7 @@ async function boot() {
     throw new Error("Dashboard HTML is incomplete. Please restart Flask and hard-refresh the page.");
   }
 
-  countSelect.value = CHART_COUNTS.includes(state.count) ? String(state.count) : "1";
-  countSelect.addEventListener("change", () => renderPanes(Number(countSelect.value)));
-  renderPanes(Number(countSelect.value));
-
+  setupNavigation();
   backtestClose.addEventListener("click", closeBacktestModal);
   backtestModal.addEventListener("click", (event) => {
     if (event.target === backtestModal) closeBacktestModal();
@@ -88,7 +102,152 @@ async function boot() {
         pane.indicatorMenu.hidden = true;
       }
     });
+    if (globalIndicatorMenu && globalIndicatorButton && !globalIndicatorMenu.contains(event.target) && event.target !== globalIndicatorButton) {
+      globalIndicatorMenu.hidden = true;
+    }
   });
+
+  window.addEventListener("popstate", () => showPage(pathToPage(window.location.pathname)));
+  showPage(pathToPage(window.location.pathname));
+}
+
+function setupNavigation() {
+  navLinks.forEach((link) => {
+    link.addEventListener("click", (event) => {
+      const page = link.dataset.route;
+      if (!page) return;
+      event.preventDefault();
+      const path = page === "charts" ? "/charts" : `/${page}`;
+      history.pushState({}, "", path);
+      showPage(page);
+    });
+  });
+}
+
+function pathToPage(pathname) {
+  if (pathname === "/backtest") return "backtest";
+  if (pathname === "/analysis") return "analysis";
+  if (pathname === "/settings") return "settings";
+  return "charts";
+}
+
+function showPage(page) {
+  routePages.forEach((section) => {
+    section.hidden = section.dataset.page !== page;
+  });
+  navLinks.forEach((link) => {
+    link.classList.toggle("active", link.dataset.route === page);
+  });
+  if (page === "charts") initChartsPage();
+  if (page === "backtest") initBacktestPage();
+  if (page === "analysis") renderAnalysisPage();
+  if (page === "settings") renderSettingsPage();
+}
+
+function initChartsPage() {
+  if (!chartsToolbarInitialized) setupChartsToolbar();
+  if (!chartsInitialized) {
+    countSelect.value = CHART_COUNTS.includes(state.count) ? String(state.count) : "1";
+    renderPanes(Number(countSelect.value));
+    chartsInitialized = true;
+  }
+}
+
+function setupChartsToolbar() {
+  chartsToolbarInitialized = true;
+  populateGlobalMarketControls();
+  populateGlobalIndicatorMenu();
+  countSelect.addEventListener("change", () => renderPanes(Number(countSelect.value)));
+  [globalSourceSelect, globalSymbolSelect, globalTimeframeSelect].forEach((select) => {
+    select?.addEventListener("change", applyGlobalMarketControls);
+  });
+  globalIndicatorButton?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    globalIndicatorMenu.hidden = !globalIndicatorMenu.hidden;
+  });
+  globalIndicatorList?.addEventListener("change", applyGlobalIndicatorControls);
+  globalSignalToggle?.addEventListener("change", applyGlobalSignalToggle);
+}
+
+function populateGlobalMarketControls() {
+  if (!hasElement(globalSourceSelect, globalSymbolSelect, globalTimeframeSelect)) return;
+  globalSourceSelect.innerHTML = Object.entries(config.sources)
+    .map(([value, item]) => `<option value="${value}">${item.label}</option>`)
+    .join("");
+  globalSourceSelect.value = config.sources[state.panes?.[0]?.source] ? state.panes[0].source : "bybit";
+  populateGlobalSymbolAndTimeframe(state.panes?.[0] || {});
+}
+
+function populateGlobalSymbolAndTimeframe(saved = {}) {
+  const sourceConfig = config.sources[globalSourceSelect.value];
+  globalSymbolSelect.innerHTML = sourceConfig.symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
+  globalTimeframeSelect.innerHTML = sourceConfig.timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`).join("");
+  globalSymbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols[0];
+  globalTimeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes[0];
+}
+
+function populateGlobalIndicatorMenu() {
+  if (!globalIndicatorList) return;
+  globalIndicatorList.innerHTML = (config.indicators || [])
+    .map((indicator) => `
+      <label class="indicator-option">
+        <input type="checkbox" value="${indicator.id}">
+        <span>${indicator.label}</span>
+      </label>
+    `)
+    .join("");
+  restoreGlobalIndicators(state.panes?.[0]?.indicators || []);
+  if (globalSignalToggle) globalSignalToggle.checked = state.panes?.[0]?.signalMarkers !== false;
+  updateGlobalIndicatorButton();
+}
+
+function restoreGlobalIndicators(ids) {
+  const selected = new Set(ids || []);
+  globalIndicatorList?.querySelectorAll("input[type='checkbox']").forEach((input) => {
+    input.checked = selected.has(input.value);
+  });
+}
+
+function selectedGlobalIndicators() {
+  return Array.from(globalIndicatorList?.querySelectorAll("input[type='checkbox']:checked") || []).map((input) => input.value);
+}
+
+function updateGlobalIndicatorButton() {
+  if (!globalIndicatorButton) return;
+  const count = selectedGlobalIndicators().length;
+  globalIndicatorButton.textContent = count ? `Indicators ${count}` : "Indicators";
+}
+
+function applyGlobalMarketControls() {
+  if (!panes.length) return;
+  if (document.activeElement === globalSourceSelect) populateGlobalSymbolAndTimeframe({});
+  panes.forEach((pane) => {
+    pane.sourceSelect.value = globalSourceSelect.value;
+    populateSymbolAndTimeframe(pane, {
+      symbol: globalSymbolSelect.value,
+      timeframe: globalTimeframeSelect.value,
+    });
+    startPane(pane);
+  });
+  saveState();
+}
+
+function applyGlobalIndicatorControls() {
+  updateGlobalIndicatorButton();
+  const selected = selectedGlobalIndicators();
+  panes.forEach((pane) => {
+    restoreIndicators(pane, selected);
+    startPane(pane);
+  });
+  saveState();
+}
+
+function applyGlobalSignalToggle() {
+  panes.forEach((pane) => {
+    pane.signalMarkerToggle.checked = globalSignalToggle.checked;
+    updateChartMarkers(pane);
+  });
+  saveState();
 }
 
 async function openPaperPanel() {
@@ -204,6 +363,7 @@ function renderPanes(count) {
   }
 
   saveState();
+  syncChartsToolbarFromPane(panes[0]);
 }
 
 function cleanupPanes() {
@@ -303,6 +463,18 @@ function createPane(node, index) {
 
   startPane(pane);
   return pane;
+}
+
+function syncChartsToolbarFromPane(pane) {
+  if (!pane || !hasElement(globalSourceSelect, globalSymbolSelect, globalTimeframeSelect)) return;
+  globalSourceSelect.value = pane.sourceSelect.value;
+  populateGlobalSymbolAndTimeframe({
+    symbol: pane.symbolSelect.value,
+    timeframe: pane.timeframeSelect.value,
+  });
+  restoreGlobalIndicators(selectedIndicators(pane));
+  if (globalSignalToggle) globalSignalToggle.checked = pane.signalMarkerToggle.checked;
+  updateGlobalIndicatorButton();
 }
 
 function setupChart(pane) {
@@ -498,6 +670,7 @@ async function renderSignals(pane, requestId) {
   pane.lastSignalPayload = payload;
   updateSignalBadge(pane, payload);
   updateChartMarkers(pane);
+  updateChartsPanels(pane, payload);
 }
 
 async function loadCandles(pane, options = {}) {
@@ -795,6 +968,109 @@ function backtestSettings(presetId) {
   };
 }
 
+function initBacktestPage() {
+  if (backtestInitialized) return;
+  backtestInitialized = true;
+  populateLabControls();
+  const node = template.content.firstElementChild.cloneNode(true);
+  node.classList.add("lab-chart-pane");
+  backtestChartHost.appendChild(node);
+  backtestPane = createPane(node, 0);
+  backtestPane.backtestButton.hidden = true;
+  document.querySelector("#lab-run-backtest")?.addEventListener("click", runLabBacktest);
+  ["#lab-source-select", "#lab-symbol-select", "#lab-timeframe-select", "#lab-preset-select"].forEach((selector) => {
+    document.querySelector(selector)?.addEventListener("change", applyLabControlsToPane);
+  });
+}
+
+function populateLabControls() {
+  const sourceSelect = document.querySelector("#lab-source-select");
+  const presetSelect = document.querySelector("#lab-preset-select");
+  if (!hasElement(sourceSelect, presetSelect)) return;
+  sourceSelect.innerHTML = Object.entries(config.sources)
+    .map(([value, item]) => `<option value="${value}">${item.label}</option>`)
+    .join("");
+  sourceSelect.value = "bybit";
+  presetSelect.innerHTML = (config.strategy_presets || [])
+    .map((preset) => `<option value="${preset.id}">${preset.label}</option>`)
+    .join("");
+  presetSelect.value = config.default_strategy_preset;
+  populateLabSymbolAndTimeframe();
+  sourceSelect.addEventListener("change", populateLabSymbolAndTimeframe);
+}
+
+function populateLabSymbolAndTimeframe() {
+  const source = document.querySelector("#lab-source-select")?.value || "bybit";
+  const symbolSelect = document.querySelector("#lab-symbol-select");
+  const timeframeSelect = document.querySelector("#lab-timeframe-select");
+  if (!hasElement(symbolSelect, timeframeSelect)) return;
+  const sourceConfig = config.sources[source];
+  symbolSelect.innerHTML = sourceConfig.symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
+  timeframeSelect.innerHTML = sourceConfig.timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`).join("");
+  symbolSelect.value = sourceConfig.symbols.includes("BTCUSDT") ? "BTCUSDT" : sourceConfig.symbols[0];
+  timeframeSelect.value = sourceConfig.timeframes.includes("1h") ? "1h" : sourceConfig.timeframes[0];
+}
+
+function applyLabControlsToPane() {
+  if (!backtestPane) return;
+  backtestPane.sourceSelect.value = document.querySelector("#lab-source-select")?.value || "bybit";
+  populateSymbolAndTimeframe(backtestPane, {
+    symbol: document.querySelector("#lab-symbol-select")?.value,
+    timeframe: document.querySelector("#lab-timeframe-select")?.value,
+  });
+  backtestPane.presetSelect.value = document.querySelector("#lab-preset-select")?.value || config.default_strategy_preset;
+  return startPane(backtestPane);
+}
+
+function labBacktestSettings() {
+  return {
+    preset: document.querySelector("#lab-preset-select")?.value || config.default_strategy_preset,
+    period: document.querySelector("#lab-period-input")?.value || "60d",
+    limit: document.querySelector("#lab-limit-input")?.value || "5000",
+    fee_pct: document.querySelector("#lab-fee-input")?.value || "0",
+    slippage_pct: document.querySelector("#lab-slippage-input")?.value || "0",
+    allowShorts: document.querySelector("#lab-allow-shorts")?.checked ? "true" : "false",
+  };
+}
+
+async function runLabBacktest() {
+  if (!backtestPane) return;
+  const button = document.querySelector("#lab-run-backtest");
+  button.disabled = true;
+  backtestResults.innerHTML = `<p class="pane-status">Running strategy test...</p>`;
+  const settings = labBacktestSettings();
+  try {
+    await applyLabControlsToPane();
+    const params = new URLSearchParams({
+      source: document.querySelector("#lab-source-select")?.value || "bybit",
+      symbol: document.querySelector("#lab-symbol-select")?.value || "BTCUSDT",
+      timeframe: document.querySelector("#lab-timeframe-select")?.value || "1h",
+      period: settings.period,
+      preset: settings.preset,
+      limit: settings.limit,
+      fee_pct: settings.fee_pct,
+      slippage_pct: settings.slippage_pct,
+      allowShorts: settings.allowShorts,
+      chart_candles_count: String(backtestPane.candles.length),
+      first_chart_candle_time: String(backtestPane.candles[0]?.time || ""),
+      last_chart_candle_time: String(backtestPane.candles[backtestPane.candles.length - 1]?.time || ""),
+    });
+    const response = await fetch(`/api/backtest?${params}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Backtest failed");
+    backtestPane.backtestMarkers = markersFromBacktestPayload(payload);
+    renderBacktestOverlays(backtestPane, payload);
+    backtestPane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
+    updateChartMarkers(backtestPane);
+    renderDataDiagnostics(backtestPane);
+    backtestResults.innerHTML = renderBacktestResults(payload);
+  } catch (error) {
+    backtestResults.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function runBacktest(pane, presetId) {
   // Backtest trades, markers, overlays, metrics, and diagnostics are produced
   // by /api/backtest. The UI renders the payload without duplicating strategy
@@ -946,7 +1222,25 @@ function openBacktestModal(html) {
 function openSignalDetails(pane) {
   const payload = pane.lastSignalPayload;
   if (!payload) return;
+  if (bottomPanelContent && !document.querySelector("#charts-page")?.hidden) {
+    bottomPanelContent.innerHTML = renderSignalDetails(pane, payload);
+  }
   openBacktestModal(renderSignalDetails(pane, payload));
+}
+
+function updateChartsPanels(pane, payload) {
+  if (pane.index !== 0) return;
+  if (activeSignalsList) {
+    activeSignalsList.innerHTML = `
+      <div class="sidebar-signal">
+        <strong>${escapeHtml(pane.symbolSelect.value)} ${escapeHtml(pane.timeframeSelect.value)}</strong>
+        <span class="${payload.tone || "neutral"}">${escapeHtml(payload.label)} ${escapeHtml(String(payload.score))}</span>
+      </div>
+    `;
+  }
+  if (bottomPanelContent) {
+    bottomPanelContent.innerHTML = renderSignalDetails(pane, payload);
+  }
 }
 
 function renderSignalDetails(pane, payload) {
@@ -1143,6 +1437,78 @@ function renderOptimizationSummary(payload) {
       <thead><tr><th>Params</th><th>Score</th><th>Train Trades</th><th>Test Return</th><th>Test PF</th><th>Test DD</th><th>Audit</th></tr></thead>
       <tbody>${topRows}</tbody>
     </table>
+  `;
+}
+
+function renderAnalysisPage() {
+  const symbolFilter = document.querySelector("#analysis-symbol-filter");
+  const timeframeFilter = document.querySelector("#analysis-timeframe-filter");
+  if (symbolFilter && !symbolFilter.options.length) {
+    const symbols = config.sources.bybit?.symbols || [];
+    symbolFilter.innerHTML = [`<option value="">All symbols</option>`, ...symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`)].join("");
+  }
+  if (timeframeFilter && !timeframeFilter.options.length) {
+    const timeframes = config.sources.bybit?.timeframes || [];
+    timeframeFilter.innerHTML = [`<option value="">All timeframes</option>`, ...timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`)].join("");
+  }
+
+  // TODO: Replace this mock payload with a backend aggregate/ranking endpoint.
+  // The frontend must render backend-computed ranks and scores, not calculate them.
+  const rows = [
+    { rank: 1, strategy: "Mock: SimpleAtrTrendV2", symbol: "BTCUSDT", timeframe: "1h", returnPct: 4.2, winRate: 42.1, maxDrawdown: 5.4, profitFactor: 1.22, trades: 84, score: 71 },
+    { rank: 2, strategy: "Mock: PullbackReclaimV2", symbol: "ETHUSDT", timeframe: "1h", returnPct: 2.8, winRate: 39.8, maxDrawdown: 4.1, profitFactor: 1.16, trades: 66, score: 64 },
+    { rank: 3, strategy: "Mock: MomentumContinuation", symbol: "SOLUSDT", timeframe: "15m", returnPct: -1.7, winRate: 34.2, maxDrawdown: 8.9, profitFactor: 0.88, trades: 112, score: 31 },
+  ];
+  const cards = [
+    ["Best overall", "Mock: SimpleAtrTrendV2"],
+    ["Best win rate", "Mock: SimpleAtrTrendV2"],
+    ["Lowest drawdown", "Mock: PullbackReclaimV2"],
+    ["Worst result", "Mock: MomentumContinuation"],
+  ];
+  const cardsEl = document.querySelector("#analysis-cards");
+  const body = document.querySelector("#analysis-table-body");
+  if (cardsEl) {
+    cardsEl.innerHTML = cards.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+  }
+  if (body) {
+    body.innerHTML = rows.map((row) => `
+      <tr>
+        <td>${row.rank}</td>
+        <td>${escapeHtml(row.strategy)}</td>
+        <td>${escapeHtml(row.symbol)}</td>
+        <td>${escapeHtml(row.timeframe)}</td>
+        <td class="${row.returnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.returnPct)}%</td>
+        <td>${row.winRate}%</td>
+        <td>${row.maxDrawdown}%</td>
+        <td>${row.profitFactor}</td>
+        <td>${row.trades}</td>
+        <td>${row.score}</td>
+      </tr>
+    `).join("");
+  }
+}
+
+function renderSettingsPage() {
+  const settingsContent = document.querySelector("#settings-content");
+  if (!settingsContent) return;
+  settingsContent.innerHTML = `
+    <div class="metric"><span>Default source</span><strong>Bybit</strong></div>
+    <div class="metric"><span>Default chart count</span><strong>1</strong></div>
+    <div class="metric"><span>Default preset</span><strong>${escapeHtml(config.default_strategy_preset || "-")}</strong></div>
+    <div class="metric"><span>Architecture</span><strong>API-render only</strong></div>
+    <section class="settings-panel">
+      <h3>Available Sources</h3>
+      <table class="trade-table">
+        <thead><tr><th>Source</th><th>Symbols</th><th>Timeframes</th></tr></thead>
+        <tbody>${Object.entries(config.sources || {}).map(([id, source]) => `
+          <tr>
+            <td>${escapeHtml(source.label || id)}</td>
+            <td>${escapeHtml((source.symbols || []).join(", "))}</td>
+            <td>${escapeHtml((source.timeframes || []).join(", "))}</td>
+          </tr>
+        `).join("")}</tbody>
+      </table>
+    </section>
   `;
 }
 

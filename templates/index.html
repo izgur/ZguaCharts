@@ -4,29 +4,158 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-indicators">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-routes">
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">
+      <a class="brand" href="/charts" data-route="charts">
         <span class="brand-mark"></span>
         <h1>ZguaCharts</h1>
-      </div>
-      <label class="count-control">
-        <span>Number of charts</span>
-        <select id="chart-count">
-          <option value="1">1</option>
-          <option value="2">2</option>
-          <option value="4">4</option>
-          <option value="6">6</option>
-          <option value="8">8</option>
-        </select>
-      </label>
+      </a>
+      <nav class="app-nav" aria-label="Main navigation">
+        <a href="/charts" data-route="charts">Charts</a>
+        <a href="/backtest" data-route="backtest">Backtest</a>
+        <a href="/analysis" data-route="analysis">Analysis</a>
+        <a href="/settings" data-route="settings">Settings</a>
+      </nav>
       <button id="paper-tab-button" class="paper-tab-button" type="button">Paper Simulation</button>
       <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
     </header>
 
-    <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>
+    <main class="app-shell">
+      <section id="charts-page" class="route-page charts-page" data-page="charts">
+        <div class="workspace-toolbar">
+          <label>
+            <span>Source</span>
+            <select id="global-source-select"></select>
+          </label>
+          <label>
+            <span>Symbol</span>
+            <select id="global-symbol-select"></select>
+          </label>
+          <label>
+            <span>Timeframe</span>
+            <select id="global-timeframe-select"></select>
+          </label>
+          <label class="count-control">
+            <span>Charts</span>
+            <select id="chart-count">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="4">4</option>
+              <option value="6">6</option>
+              <option value="8">8</option>
+            </select>
+          </label>
+          <div class="indicator-control global-indicator-control">
+            <button id="global-indicator-button" class="indicator-button" type="button">Indicators</button>
+            <div id="global-indicator-menu" class="indicator-menu" hidden>
+              <div id="global-indicator-list"></div>
+            </div>
+          </div>
+          <label class="toolbar-toggle">
+            <input id="global-signal-toggle" type="checkbox">
+            <span>Signal markers</span>
+          </label>
+        </div>
+
+        <div class="charts-workspace">
+          <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>
+          <aside class="right-sidebar">
+            <section>
+              <h2>Watchlist</h2>
+              <div class="sidebar-placeholder">Pinned markets and custom watchlists will live here.</div>
+            </section>
+            <section>
+              <h2>Active Signals</h2>
+              <div id="active-signals-list" class="sidebar-placeholder">Signals render from `/api/signals`; no frontend scoring.</div>
+            </section>
+          </aside>
+        </div>
+
+        <details class="bottom-panel">
+          <summary>Indicators and Signal Details</summary>
+          <div id="bottom-panel-content" class="bottom-panel-content">
+            Select indicators or click a signal badge to inspect backend-returned details.
+          </div>
+        </details>
+      </section>
+
+      <section id="backtest-page" class="route-page backtest-page" data-page="backtest" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>Strategy Lab</h2>
+            <p>Backtests call `/api/backtest`; the browser only renders returned metrics, diagnostics, trades, overlays, and markers.</p>
+          </div>
+        </div>
+        <div class="lab-layout">
+          <aside class="lab-controls">
+            <label><span>Source</span><select id="lab-source-select"></select></label>
+            <label><span>Strategy preset</span><select id="lab-preset-select"></select></label>
+            <label><span>Symbol</span><select id="lab-symbol-select"></select></label>
+            <label><span>Timeframe</span><select id="lab-timeframe-select"></select></label>
+            <label><span>Period</span><input id="lab-period-input" value="60d"></label>
+            <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.01" value="0"></label>
+            <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.01" value="0"></label>
+            <label><span>Candle limit</span><input id="lab-limit-input" type="number" min="100" max="20000" value="5000"></label>
+            <label class="allow-short-toggle">
+              <input id="lab-allow-shorts" type="checkbox">
+              <span>Allow shorts when strategy supports them</span>
+            </label>
+            <button id="lab-run-backtest" type="button">Run Backtest</button>
+          </aside>
+          <section class="lab-main">
+            <div id="backtest-chart-host" class="backtest-chart-host"></div>
+            <div id="backtest-results" class="lab-results">
+              <p class="pane-status">Choose settings and run a backtest.</p>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section id="analysis-page" class="route-page analysis-page" data-page="analysis" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>Strategy Ranking</h2>
+            <p>Placeholder comparison view. Future aggregate/ranking data should come from a backend API.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label><span>Symbol</span><select id="analysis-symbol-filter"></select></label>
+          <label><span>Timeframe</span><select id="analysis-timeframe-filter"></select></label>
+          <label><span>Period</span><input id="analysis-period-filter" value="365d"></label>
+          <label><span>Min trades</span><input id="analysis-min-trades" type="number" value="50"></label>
+        </div>
+        <div id="analysis-cards" class="metric-grid"></div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Strategy</th>
+              <th>Symbol</th>
+              <th>Timeframe</th>
+              <th>Return</th>
+              <th>Win rate</th>
+              <th>Max drawdown</th>
+              <th>Profit factor</th>
+              <th>Trades</th>
+              <th>Score</th>
+            </tr>
+          </thead>
+          <tbody id="analysis-table-body"></tbody>
+        </table>
+      </section>
+
+      <section id="settings-page" class="route-page settings-page" data-page="settings" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>Settings</h2>
+            <p>Application defaults and source metadata. Values here are UI defaults only.</p>
+          </div>
+        </div>
+        <div id="settings-content" class="settings-grid"></div>
+      </section>
+    </main>
 
     <template id="pane-template">
       <section class="pane">
@@ -85,6 +214,6 @@
       <div id="paper-panel-content" class="paper-panel-content"></div>
     </section>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-indicators" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-routes" defer></script>
   </body>
 </html>

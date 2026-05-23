@@ -26,6 +26,10 @@ NODE_STRATEGIES = {
 
 
 @app.get("/")
+@app.get("/charts")
+@app.get("/backtest")
+@app.get("/analysis")
+@app.get("/settings")
 def index():
     return render_template("index.html")
 
