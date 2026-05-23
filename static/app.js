@@ -615,7 +615,7 @@ async function startPane(pane) {
     if (candles.length) updateTicker(pane, candles[candles.length - 1].close);
     await renderIndicators(pane, requestId);
     await renderSignals(pane, requestId);
-    pane.status.textContent = `${candles.length} candles loaded`;
+    pane.status.textContent = candleStatusText(candlePayload);
     renderDataDiagnostics(pane);
     loadOlderHistory(pane, requestId);
   } catch (error) {
@@ -641,7 +641,7 @@ async function loadOlderHistory(pane, requestId) {
     pane.candles = candles;
     pane.series.setData(candles);
     restoreVisibleRange(pane.chart, visibleRange);
-    pane.status.textContent = `${candles.length} candles loaded`;
+    pane.status.textContent = candleStatusText(candlePayload);
     renderDataDiagnostics(pane);
     await renderIndicators(pane, requestId);
     await renderSignals(pane, requestId);
@@ -686,6 +686,15 @@ async function loadCandles(pane, options = {}) {
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Candle request failed");
   return payload;
+}
+
+function candleStatusText(payload) {
+  const count = payload.candles?.length || 0;
+  const warnings = payload.diagnostics?.warnings || [];
+  if (payload.diagnostics?.degraded_to_stale_cache) {
+    return `${count} cached candles loaded; ${warnings[0] || "data may be stale"}`;
+  }
+  return `${count} candles loaded`;
 }
 
 function visibleChartCount() {

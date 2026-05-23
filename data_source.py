@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import logging
 from pathlib import Path
 import threading
@@ -18,6 +19,8 @@ BYBIT_MIN_REQUEST_DELAY_SECONDS = 0.18
 BYBIT_MAX_CACHE_CANDLES = 50000
 BYBIT_CACHE_STALE_MULTIPLIER = 3
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
+BYBIT_DISK_CACHE_DIR = Path(__file__).resolve().parent / ".research-cache"
+BYBIT_DISK_CACHE_DIR.mkdir(exist_ok=True)
 YFINANCE_CACHE_DIR = Path(__file__).resolve().parent / ".yfinance-cache"
 YFINANCE_CACHE_DIR.mkdir(exist_ok=True)
 yf.cache.set_cache_location(str(YFINANCE_CACHE_DIR))
@@ -232,13 +235,32 @@ def fetch_bybit_candles_with_diagnostics(
         "rate_limit_wait_seconds": 0.0,
         "visible_charts": visible_charts or 1,
         "max_candles_per_chart": bybit_visible_chart_cap(visible_charts),
+        "disk_cache_hits": 0,
+        "degraded_to_stale_cache": False,
+        "warnings": [],
     }
     cache_key = (symbol, timeframe)
 
     with _bybit_cache_lock:
         cached = list(_bybit_cache.get(cache_key, []))
+    if not cached:
+        cached = load_bybit_disk_cache(symbol, timeframe)
+        if cached:
+            diagnostics["disk_cache_hits"] = 1
+            with _bybit_cache_lock:
+                _bybit_cache[cache_key] = cached[-BYBIT_MAX_CACHE_CANDLES:]
 
     cache_fresh = not bybit_cache_is_stale(cached, timeframe, diagnostics)
+    if diagnostics["disk_cache_hits"] and len(cached) >= requested:
+        diagnostics["cache_hits"] = 1
+        diagnostics["degraded_to_stale_cache"] = not cache_fresh
+        if not cache_fresh:
+            diagnostics["warnings"].append("Using stale disk cache because this is the first load after restart.")
+        candles = cached[-requested:]
+        diagnostics["returned_candles"] = len(candles)
+        log_bybit_diagnostics(diagnostics)
+        return candles, diagnostics
+
     if len(cached) >= requested and cache_fresh:
         diagnostics["cache_hits"] = 1
         candles = cached[-requested:]
@@ -253,17 +275,28 @@ def fetch_bybit_candles_with_diagnostics(
     # Always refresh the newest page when the cached tail is stale. Otherwise a
     # chart can end yesterday and then websocket updates appear to jump forward.
     if not cache_fresh:
-        latest_batch = request_bybit_kline_batch(symbol, interval)
-        diagnostics["bybit_requests"] += 1
-        rows.extend(latest_batch)
+        try:
+            latest_batch = request_bybit_kline_batch(symbol, interval)
+            diagnostics["bybit_requests"] += 1
+            rows.extend(latest_batch)
+        except Exception as exc:
+            if not rows:
+                raise
+            return stale_cached_bybit_response(rows, requested, diagnostics, f"Bybit refresh failed: {exc}")
 
     oldest_row_time = min((safe_int(row[0]) for row in rows if safe_int(row[0]) is not None), default=None)
     end_time = oldest_row_time - 1 if oldest_row_time is not None else None
     seen_oldest = set()
 
     while len(rows) < requested:
-        batch = request_bybit_kline_batch(symbol, interval, end_time)
-        diagnostics["bybit_requests"] += 1
+        try:
+            batch = request_bybit_kline_batch(symbol, interval, end_time)
+            diagnostics["bybit_requests"] += 1
+        except Exception as exc:
+            if not rows:
+                raise
+            diagnostics["warnings"].append(f"Bybit pagination stopped early: {exc}")
+            break
         if not batch:
             break
 
@@ -284,12 +317,66 @@ def fetch_bybit_candles_with_diagnostics(
     candles = bybit_rows_to_candles(rows)
     with _bybit_cache_lock:
         _bybit_cache[cache_key] = candles[-BYBIT_MAX_CACHE_CANDLES:]
+    save_bybit_disk_cache(symbol, timeframe, candles[-BYBIT_MAX_CACHE_CANDLES:])
 
     candles = candles[-requested:]
     diagnostics["returned_candles"] = len(candles)
     diagnostics["rate_limit_wait_seconds"] = round(_bybit_rate_limiter.total_wait_seconds - waits_before, 3)
     log_bybit_diagnostics(diagnostics)
     return candles, diagnostics
+
+
+def stale_cached_bybit_response(rows: list, requested: int, diagnostics: dict, warning: str) -> tuple[list[dict], dict]:
+    candles = bybit_rows_to_candles(rows)[-requested:]
+    diagnostics["returned_candles"] = len(candles)
+    diagnostics["degraded_to_stale_cache"] = True
+    diagnostics["warnings"].append(warning)
+    log_bybit_diagnostics(diagnostics)
+    return candles, diagnostics
+
+
+def bybit_disk_cache_path(symbol: str, timeframe: str) -> Path:
+    safe_symbol = "".join(char for char in symbol.upper() if char.isalnum())
+    safe_timeframe = "".join(char for char in timeframe if char.isalnum())
+    return BYBIT_DISK_CACHE_DIR / f"bybit_{safe_symbol}_{safe_timeframe}.json"
+
+
+def load_bybit_disk_cache(symbol: str, timeframe: str) -> list[dict]:
+    path = bybit_disk_cache_path(symbol, timeframe)
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    candles = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            candles.append({
+                "time": int(item["time"]),
+                "open": float(item["open"]),
+                "high": float(item["high"]),
+                "low": float(item["low"]),
+                "close": float(item["close"]),
+                "volume": float(item.get("volume", 0)),
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sorted(candles, key=lambda candle: candle["time"])
+
+
+def save_bybit_disk_cache(symbol: str, timeframe: str, candles: list[dict]) -> None:
+    path = bybit_disk_cache_path(symbol, timeframe)
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(candles, handle, separators=(",", ":"))
+    except OSError:
+        LOGGER.warning("Could not write Bybit disk cache %s", path)
 
 
 def bybit_cache_is_stale(candles: list[dict], timeframe: str, diagnostics: dict | None = None) -> bool:
