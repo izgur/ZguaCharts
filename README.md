@@ -4,6 +4,8 @@ ZguaCharts is a local trading dashboard built with Flask, plain HTML/CSS/JavaScr
 
 The app is intentionally modular. Browser charting remains Flask + plain JavaScript, while automated research now runs through a reusable Node core under `/core`. The Flask UI calls the same shared engine used by the CLI, so optimization and manual chart backtests do not drift into separate logic.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the frontend/backend/core separation rules. In short: the browser renders API payloads, while indicators, signal scoring, strategy rules, rankings, and backtest metrics stay in backend/core modules.
+
 ## What It Does
 
 - Displays 1, 2, 4, 6, or 8 chart panes in a responsive split-screen grid.

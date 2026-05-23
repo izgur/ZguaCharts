@@ -1,4 +1,9 @@
 const STORAGE_KEY = "tvk-dashboard-state";
+// Frontend boundary:
+// This file owns UI state, chart rendering, marker rendering, websocket candle
+// display, and API calls only. Indicator formulas, signal scoring, strategy
+// rules, optimizer rankings, and backtest metrics belong in Python backend
+// modules or the shared Node core under /core.
 const BYBIT_WS = "wss://stream.bybit.com/v5/public/linear";
 const HYPERLIQUID_WS = "wss://api.hyperliquid.xyz/ws";
 const CHART_COUNTS = [1, 2, 4, 6, 8];
@@ -473,6 +478,8 @@ async function loadOlderHistory(pane, requestId) {
 }
 
 async function renderSignals(pane, requestId) {
+  // Signals are scored by /api/signals. The browser only renders the returned
+  // badge, details, and optional chart markers.
   resetSignalBadge(pane);
   clearSignalMarkers(pane);
 
@@ -521,6 +528,8 @@ function historyLimitForPane() {
 }
 
 async function renderIndicators(pane, requestId) {
+  // Indicators are calculated by /api/indicators. Keep formula changes in the
+  // backend/core modules and render the returned time-aligned series here.
   const indicators = selectedIndicators(pane);
   const indicatorRequestId = ++pane.indicatorRequestId;
   updateIndicatorButton(pane);
@@ -787,6 +796,9 @@ function backtestSettings(presetId) {
 }
 
 async function runBacktest(pane, presetId) {
+  // Backtest trades, markers, overlays, metrics, and diagnostics are produced
+  // by /api/backtest. The UI renders the payload without duplicating strategy
+  // or metric formulas.
   pane.backtestButton.disabled = true;
   pane.backtestButton.textContent = "Testing...";
   const resultsEl = document.querySelector("#modal-results") || backtestContent;
@@ -1076,8 +1088,6 @@ function renderBacktestResults(payload) {
 
 function renderPresetComparison(results) {
   if (!results.length) return "<p>No preset results returned.</p>";
-  const bestReturn = Math.max(...results.map((item) => Number(item.total_return_pct || 0)));
-  const bestProfitFactor = Math.max(...results.map((item) => Number(item.profit_factor || 0)));
   const rows = results.map((item) => `
     <tr>
       <td>${escapeHtml(item.preset)}</td>
@@ -1087,7 +1097,6 @@ function renderPresetComparison(results) {
       <td>${item.max_drawdown}%</td>
       <td>${item.profit_factor}</td>
       <td>${item.average_bars_held}</td>
-      <td>${item.total_return_pct === bestReturn ? "Best return" : ""} ${item.profit_factor === bestProfitFactor ? "Best PF" : ""}</td>
     </tr>
   `).join("");
   return `
@@ -1102,7 +1111,6 @@ function renderPresetComparison(results) {
           <th>Max DD</th>
           <th>Profit Factor</th>
           <th>Avg Bars</th>
-          <th>Highlight</th>
         </tr>
       </thead>
       <tbody>${rows}</tbody>
