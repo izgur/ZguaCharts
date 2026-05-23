@@ -28,10 +28,20 @@ Signals and backtests are technical-analysis research tools only. They do not pl
 
 ## Run Locally
 
+Recommended local versions:
+
+```text
+Python 3.11
+Node.js 20
+```
+
+Python 3.11 is the safest target for the current `requirements.txt` and matches Render (`PYTHON_VERSION=3.11.9`). Python 3.13/3.14 can fail dependency resolution because this app intentionally pins pandas/numpy to the stable versions used by the Flask/yfinance backend. Node is not required for Flask to start, but Node 20 is required for `/api/backtest`, optimizer, Strategy Lab, and paper-simulation CLI scripts.
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+python -m py_compile app.py data_source.py indicators.py signals.py strategy.py
 python app.py
 ```
 
@@ -41,7 +51,27 @@ Open:
 http://127.0.0.1:5000
 ```
 
+Use `127.0.0.1`, not `172.0.0.1`. The Flask dev server prints `http://127.0.0.1:5000` when it is ready.
+
 The chart library is also vendored in `static/lightweight-charts.standalone.production.js`, so the browser does not need to wait on a CDN before rendering charts.
+
+### Startup Check
+
+If the page does not open, run:
+
+```powershell
+python --version
+node --version
+python -m py_compile app.py data_source.py indicators.py signals.py strategy.py
+python -c "import app; print('import ok')"
+python app.py
+```
+
+Then open `http://127.0.0.1:5000/healthz`. It should return:
+
+```json
+{"app":"ZguaCharts","ok":true}
+```
 
 ## Deploy On Render
 
