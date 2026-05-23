@@ -66,6 +66,8 @@ ZGUA_QUIET=1
 
 The repository also includes `render.yaml`, so you can deploy it as a Render Blueprint instead of typing the commands manually.
 
+`pandas-ta` is intentionally not required on Render. The backend indicators use pure pandas/numpy fallbacks, which avoids deploy failures when beta `pandas-ta` wheels are unavailable for the Render Python environment.
+
 ### Docker Fallback
 
 If Render's native Python environment does not provide Node for the CLI backtest bridge, deploy with the included `Dockerfile`. It installs Python, Node, Flask dependencies, and starts Gunicorn on Render's assigned port.
