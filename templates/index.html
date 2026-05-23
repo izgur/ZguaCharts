@@ -121,11 +121,18 @@
           </div>
         </div>
         <div class="analysis-filters">
-          <label><span>Symbol</span><select id="analysis-symbol-filter"></select></label>
-          <label><span>Timeframe</span><select id="analysis-timeframe-filter"></select></label>
+          <label><span>Source</span><select id="analysis-source-filter"></select></label>
+          <label><span>Symbol</span><select id="analysis-symbol-filter" multiple></select></label>
+          <label><span>Timeframe</span><select id="analysis-timeframe-filter" multiple></select></label>
+          <label><span>Presets</span><select id="analysis-preset-filter" multiple></select></label>
           <label><span>Period</span><input id="analysis-period-filter" value="365d"></label>
           <label><span>Min trades</span><input id="analysis-min-trades" type="number" value="50"></label>
+          <label><span>Candle limit</span><input id="analysis-limit-filter" type="number" min="100" max="20000" value="3000"></label>
+          <label><span>Fee % / side</span><input id="analysis-fee-filter" type="number" min="0" step="0.01" value="0"></label>
+          <label><span>Slippage % / side</span><input id="analysis-slippage-filter" type="number" min="0" step="0.01" value="0"></label>
+          <button id="analysis-run-ranking" type="button">Run Ranking</button>
         </div>
+        <div id="analysis-status" class="pane-status">Set filters and run a backend strategy ranking.</div>
         <div id="analysis-cards" class="metric-grid"></div>
         <table class="trade-table analysis-table">
           <thead>

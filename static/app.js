@@ -43,6 +43,7 @@ let panes = [];
 let chartsInitialized = false;
 let chartsToolbarInitialized = false;
 let backtestInitialized = false;
+let analysisInitialized = false;
 let backtestPane = null;
 
 function loadState() {
@@ -1441,34 +1442,103 @@ function renderOptimizationSummary(payload) {
 }
 
 function renderAnalysisPage() {
+  if (!analysisInitialized) {
+    setupAnalysisControls();
+    analysisInitialized = true;
+  }
+}
+
+function setupAnalysisControls() {
+  const sourceFilter = document.querySelector("#analysis-source-filter");
   const symbolFilter = document.querySelector("#analysis-symbol-filter");
   const timeframeFilter = document.querySelector("#analysis-timeframe-filter");
-  if (symbolFilter && !symbolFilter.options.length) {
-    const symbols = config.sources.bybit?.symbols || [];
-    symbolFilter.innerHTML = [`<option value="">All symbols</option>`, ...symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`)].join("");
-  }
-  if (timeframeFilter && !timeframeFilter.options.length) {
-    const timeframes = config.sources.bybit?.timeframes || [];
-    timeframeFilter.innerHTML = [`<option value="">All timeframes</option>`, ...timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`)].join("");
-  }
+  const presetFilter = document.querySelector("#analysis-preset-filter");
+  if (!hasElement(sourceFilter, symbolFilter, timeframeFilter, presetFilter)) return;
 
-  // TODO: Replace this mock payload with a backend aggregate/ranking endpoint.
-  // The frontend must render backend-computed ranks and scores, not calculate them.
-  const rows = [
-    { rank: 1, strategy: "Mock: SimpleAtrTrendV2", symbol: "BTCUSDT", timeframe: "1h", returnPct: 4.2, winRate: 42.1, maxDrawdown: 5.4, profitFactor: 1.22, trades: 84, score: 71 },
-    { rank: 2, strategy: "Mock: PullbackReclaimV2", symbol: "ETHUSDT", timeframe: "1h", returnPct: 2.8, winRate: 39.8, maxDrawdown: 4.1, profitFactor: 1.16, trades: 66, score: 64 },
-    { rank: 3, strategy: "Mock: MomentumContinuation", symbol: "SOLUSDT", timeframe: "15m", returnPct: -1.7, winRate: 34.2, maxDrawdown: 8.9, profitFactor: 0.88, trades: 112, score: 31 },
-  ];
-  const cards = [
-    ["Best overall", "Mock: SimpleAtrTrendV2"],
-    ["Best win rate", "Mock: SimpleAtrTrendV2"],
-    ["Lowest drawdown", "Mock: PullbackReclaimV2"],
-    ["Worst result", "Mock: MomentumContinuation"],
-  ];
+  sourceFilter.innerHTML = Object.entries(config.sources)
+    .map(([value, item]) => `<option value="${value}">${item.label}</option>`)
+    .join("");
+  sourceFilter.value = "bybit";
+  presetFilter.innerHTML = (config.strategy_presets || [])
+    .map((preset) => `<option value="${preset.id}" ${preset.id === config.default_strategy_preset ? "selected" : ""}>${preset.label}</option>`)
+    .join("");
+  populateAnalysisMarketFilters();
+  sourceFilter.addEventListener("change", populateAnalysisMarketFilters);
+  document.querySelector("#analysis-run-ranking")?.addEventListener("click", runStrategyRanking);
+}
+
+function populateAnalysisMarketFilters() {
+  const source = document.querySelector("#analysis-source-filter")?.value || "bybit";
+  const sourceConfig = config.sources[source];
+  const symbolFilter = document.querySelector("#analysis-symbol-filter");
+  const timeframeFilter = document.querySelector("#analysis-timeframe-filter");
+  if (!hasElement(symbolFilter, timeframeFilter, sourceConfig)) return;
+  symbolFilter.innerHTML = (sourceConfig.symbols || [])
+    .map((symbol) => `<option value="${symbol}" ${symbol === "BTCUSDT" ? "selected" : ""}>${symbol}</option>`)
+    .join("");
+  timeframeFilter.innerHTML = (sourceConfig.timeframes || [])
+    .map((timeframe) => `<option value="${timeframe}" ${timeframe === "1h" ? "selected" : ""}>${timeframe}</option>`)
+    .join("");
+}
+
+function selectedOptionValues(select) {
+  return Array.from(select?.selectedOptions || []).map((option) => option.value).filter(Boolean);
+}
+
+async function runStrategyRanking() {
+  const status = document.querySelector("#analysis-status");
+  const body = document.querySelector("#analysis-table-body");
+  const cardsEl = document.querySelector("#analysis-cards");
+  if (status) status.textContent = "Running backend strategy ranking...";
+  if (cardsEl) cardsEl.innerHTML = "";
+  if (body) body.innerHTML = `<tr><td colspan="10">Loading ranking results...</td></tr>`;
+  const symbolSelect = document.querySelector("#analysis-symbol-filter");
+  const timeframeSelect = document.querySelector("#analysis-timeframe-filter");
+  const presetSelect = document.querySelector("#analysis-preset-filter");
+  const params = new URLSearchParams({
+    source: document.querySelector("#analysis-source-filter")?.value || "bybit",
+    symbols: selectedOptionValues(symbolSelect).join(","),
+    timeframes: selectedOptionValues(timeframeSelect).join(","),
+    presets: selectedOptionValues(presetSelect).join(","),
+    period: document.querySelector("#analysis-period-filter")?.value || "365d",
+    min_trades: document.querySelector("#analysis-min-trades")?.value || "0",
+    limit: document.querySelector("#analysis-limit-filter")?.value || "3000",
+    fee_pct: document.querySelector("#analysis-fee-filter")?.value || "0",
+    slippage_pct: document.querySelector("#analysis-slippage-filter")?.value || "0",
+  });
+  try {
+    const response = await fetch(`/api/strategy-ranking?${params}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Strategy ranking failed");
+    renderStrategyRanking(payload);
+    if (status) {
+      const diagnostics = payload.diagnostics || {};
+      status.textContent = `Completed ${diagnostics.combinationsCompleted || 0}/${diagnostics.combinationsRequested || 0} combinations. ${payload.errors?.length || 0} errors.`;
+    }
+  } catch (error) {
+    if (status) status.textContent = error.message;
+    if (body) body.innerHTML = `<tr><td colspan="10">${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderStrategyRanking(payload) {
+  const rows = payload.rows || [];
+  const summary = payload.summary || {};
   const cardsEl = document.querySelector("#analysis-cards");
   const body = document.querySelector("#analysis-table-body");
   if (cardsEl) {
-    cardsEl.innerHTML = cards.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
+    const cards = [
+      ["Best overall", summary.bestOverall],
+      ["Best win rate", summary.bestWinRate],
+      ["Lowest drawdown", summary.lowestDrawdown],
+      ["Worst result", summary.worstResult],
+    ];
+    cardsEl.innerHTML = cards.map(([label, row]) => `
+      <div class="metric">
+        <span>${label}</span>
+        <strong>${row ? `${escapeHtml(row.strategy)} ${escapeHtml(row.symbol)} ${escapeHtml(row.timeframe)}` : "-"}</strong>
+      </div>
+    `).join("");
   }
   if (body) {
     body.innerHTML = rows.map((row) => `
@@ -1484,7 +1554,7 @@ function renderAnalysisPage() {
         <td>${row.trades}</td>
         <td>${row.score}</td>
       </tr>
-    `).join("");
+    `).join("") || `<tr><td colspan="10">No rows matched the filters.</td></tr>`;
   }
 }
 

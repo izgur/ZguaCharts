@@ -848,6 +848,11 @@ button:hover {
   max-width: none;
 }
 
+.analysis-filters select[multiple] {
+  height: 86px;
+  padding: 6px;
+}
+
 .lab-main {
   min-width: 0;
   display: grid;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 
@@ -183,6 +184,89 @@ def optimize():
     return jsonify(payload)
 
 
+@app.get("/api/strategy-ranking")
+def strategy_ranking():
+    source = request.args.get("source", "bybit")
+    symbols = parse_csv_arg(request.args.get("symbols"), ["BTCUSDT"])
+    timeframes = parse_csv_arg(request.args.get("timeframes"), ["1h"])
+    period = request.args.get("period", "60d")
+    presets = parse_csv_arg(request.args.get("presets"), [DEFAULT_PRESET_ID])
+    limit = int(request.args.get("limit", "3000"))
+    fee_pct = float(request.args.get("fee_pct", "0"))
+    slippage_pct = float(request.args.get("slippage_pct", "0"))
+    min_trades = int(request.args.get("min_trades", "0"))
+
+    rows = []
+    errors = []
+    rankable_rows = []
+    # TODO: Move this synchronous matrix run to a background job/cache when the
+    # requested symbol/timeframe/preset matrix becomes too slow for one request.
+    for symbol in symbols:
+        for timeframe in timeframes:
+            for preset in presets:
+                try:
+                    payload = run_shared_backtest_engine(
+                        source,
+                        symbol,
+                        timeframe,
+                        period,
+                        preset,
+                        fee_pct,
+                        slippage_pct,
+                        limit,
+                    )
+                    metrics = ranking_metrics_from_backtest(payload)
+                    row = {
+                        "strategy": payload.get("preset") or preset,
+                        "preset": preset,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "period": period,
+                        "returnPct": metrics["totalReturn"],
+                        "winRate": metrics["winRate"],
+                        "maxDrawdown": metrics["maxDrawdown"],
+                        "profitFactor": metrics["profitFactor"],
+                        "trades": metrics["trades"],
+                        "averageBarsHeld": metrics["averageBarsHeld"],
+                        "score": ranking_score(metrics),
+                    }
+                    rows.append(row)
+                    if row["trades"] >= min_trades:
+                        rankable_rows.append(row)
+                except Exception as exc:
+                    errors.append({
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "preset": preset,
+                        "error": str(exc),
+                    })
+
+    rankable_rows.sort(key=lambda item: item["score"], reverse=True)
+    for index, row in enumerate(rankable_rows, start=1):
+        row["rank"] = index
+
+    return jsonify({
+        "source": source,
+        "period": period,
+        "limit": limit,
+        "feePct": fee_pct,
+        "slippagePct": slippage_pct,
+        "minTrades": min_trades,
+        "rows": rankable_rows,
+        "allRows": rows,
+        "errors": errors,
+        "summary": ranking_summary(rankable_rows),
+        "diagnostics": {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "presets": presets,
+            "combinationsRequested": len(symbols) * len(timeframes) * len(presets),
+            "combinationsCompleted": len(rows),
+            "rowsAfterMinTrades": len(rankable_rows),
+        },
+    })
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -354,6 +438,68 @@ def run_shared_optimizer_engine(source: str, symbol: str, timeframe: str, period
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "Node optimizer failed")
     return json.loads(completed.stdout)
+
+
+def parse_csv_arg(value: str | None, fallback: list[str]) -> list[str]:
+    if not value:
+        return fallback
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    return items or fallback
+
+
+def ranking_metrics_from_backtest(payload: dict) -> dict:
+    return {
+        "totalReturn": safe_float(payload.get("total_return_pct", payload.get("totalReturn", 0))),
+        "winRate": safe_float(payload.get("win_rate", payload.get("winRate", 0))),
+        "maxDrawdown": safe_float(payload.get("max_drawdown", payload.get("maxDrawdown", 0))),
+        "profitFactor": safe_float(payload.get("profit_factor", payload.get("profitFactor", 0))),
+        "trades": int(safe_float(payload.get("number_of_trades", payload.get("trades", 0)))),
+        "averageBarsHeld": safe_float(payload.get("average_bars_held", payload.get("avgBarsHeld", 0))),
+    }
+
+
+def safe_float(value, fallback: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    if math.isnan(number) or math.isinf(number):
+        return fallback
+    return number
+
+
+def ranking_score(metrics: dict) -> float:
+    """Backend-only ranking score for the /analysis page.
+
+    The frontend must render this score as data and must not duplicate this
+    formula in JavaScript.
+    """
+    profit_factor = min(metrics["profitFactor"], 5)
+    trades_component = min(metrics["trades"], 200) / 10
+    score = (
+        metrics["totalReturn"]
+        + profit_factor * 18
+        + metrics["winRate"] * 0.25
+        + trades_component
+        - metrics["maxDrawdown"] * 1.3
+    )
+    return round(score, 2)
+
+
+def ranking_summary(rows: list[dict]) -> dict:
+    if not rows:
+        return {
+            "bestOverall": None,
+            "bestWinRate": None,
+            "lowestDrawdown": None,
+            "worstResult": None,
+        }
+    return {
+        "bestOverall": rows[0],
+        "bestWinRate": max(rows, key=lambda item: item["winRate"]),
+        "lowestDrawdown": min(rows, key=lambda item: item["maxDrawdown"]),
+        "worstResult": min(rows, key=lambda item: item["score"]),
+    }
 
 
 if __name__ == "__main__":
