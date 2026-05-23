@@ -25,6 +25,12 @@ function writeTradeAuditReport(audit, outputDir) {
   fs.writeFileSync(path.join(outputDir, "trade-audit-last.json"), JSON.stringify(audit, null, 2));
 }
 
+function writeRegimeDebugReport(result, outputDir) {
+  outputDir = outputDir || "reports";
+  ensureDir(outputDir);
+  fs.writeFileSync(path.join(outputDir, "regime-debug-last.json"), JSON.stringify(result, null, 2));
+}
+
 function toCsv(results) {
   var columns = [
     "symbol",
@@ -84,5 +90,6 @@ module.exports = {
   writeOptimizationReport: writeOptimizationReport,
   writeDebugReport: writeDebugReport,
   writeTradeAuditReport: writeTradeAuditReport,
+  writeRegimeDebugReport: writeRegimeDebugReport,
   toCsv: toCsv
 };

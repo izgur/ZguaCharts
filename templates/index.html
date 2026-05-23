@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-indicators">
   </head>
   <body>
     <header class="topbar">
@@ -22,6 +22,7 @@
           <option value="8">8</option>
         </select>
       </label>
+      <button id="paper-tab-button" class="paper-tab-button" type="button">Paper Simulation</button>
       <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
     </header>
 
@@ -73,6 +74,17 @@
       </div>
     </div>
 
-    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+    <section id="paper-panel" class="paper-panel" hidden>
+      <div class="paper-panel-header">
+        <div>
+          <h2>Paper Simulation</h2>
+          <p>Simulated forward testing only. No real trading or order execution is implemented.</p>
+        </div>
+        <button id="paper-panel-close" type="button">Close</button>
+      </div>
+      <div id="paper-panel-content" class="paper-panel-content"></div>
+    </section>
+
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-indicators" defer></script>
   </body>
 </html>

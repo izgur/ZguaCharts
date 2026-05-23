@@ -40,6 +40,7 @@ def build_signal_payload(candles: list[dict]) -> dict:
         "label": label,
         "tone": tone_for_label(label),
         "components": components_for_row(latest_features),
+        "details": details_for_row(latest_features),
         "warnings": warnings_for_row(latest_features),
         "markers": markers_from_scores(scored),
     }
@@ -51,6 +52,7 @@ def empty_payload() -> dict:
         "label": "NEUTRAL",
         "tone": "neutral",
         "components": [],
+        "details": [],
         "warnings": ["Not enough candles to score signals."],
         "markers": [],
     }
@@ -77,14 +79,25 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
         {
             "close": df["close"],
             "close_change": df["close"].diff(),
+            "ema9": ema9,
+            "ema21": ema21,
+            "ema50": ema50,
+            "ema200": ema200,
             "ema_trend": np.where(ema50 > ema200, 1, -1),
             "ema_momentum": np.where(ema9 > ema21, 1, -1),
+            "supertrend_line": supertrend_line,
             "supertrend": np.where(df["close"] >= supertrend_line, 1, -1),
             "rsi": rsi14,
+            "macd_line": macd_line,
+            "macd_signal": macd_signal,
             "macd": np.where(macd_line > macd_signal, 1, -1),
+            "vwap": vwap_line,
             "price_vwap": np.where(df["close"] > vwap_line, 1, -1),
             "bb_width": bb_width,
             "bb_width_ma": bb_width_ma,
+            "bb_upper": bb_upper,
+            "bb_middle": bb_middle,
+            "bb_lower": bb_lower,
             "volume": df["volume"],
             "volume_ma20": volume_ma20,
             "atr_pct": atr_pct,
@@ -167,6 +180,38 @@ def components_for_row(row: pd.Series) -> list[dict]:
 
 def component(name: str, score: int) -> dict:
     return {"name": name, "score": int(score)}
+
+
+def details_for_row(row: pd.Series) -> list[dict]:
+    return [
+        detail("Close", row["close"], "Latest candle close used for scoring."),
+        detail("EMA 50 / EMA 200", f"{format_number(row['ema50'])} / {format_number(row['ema200'])}", "Bullish when EMA50 is above EMA200."),
+        detail("EMA 9 / EMA 21", f"{format_number(row['ema9'])} / {format_number(row['ema21'])}", "Short momentum is bullish when EMA9 is above EMA21."),
+        detail("Supertrend", "Bullish" if clean_direction(row["supertrend"]) > 0 else "Bearish", f"Line: {format_number(row['supertrend_line'])}"),
+        detail("RSI 14", row["rsi"], "Above 50 supports bullish score; above 70 is overbought; below 30 is oversold."),
+        detail("MACD / Signal", f"{format_number(row['macd_line'])} / {format_number(row['macd_signal'])}", "Bullish when MACD line is above signal line."),
+        detail("VWAP", row["vwap"], "Price above VWAP supports bullish score."),
+        detail("Bollinger width", f"{format_number(row['bb_width'])} vs MA {format_number(row['bb_width_ma'])}", "Squeeze/expansion affects the score."),
+        detail("Volume / MA20", f"{format_number(row['volume'])} / {format_number(row['volume_ma20'])}", "Large directional volume can add or subtract score."),
+        detail("ATR % / ATR % MA", f"{format_number(row['atr_pct'] * 100)}% / {format_number(row['atr_pct_ma'] * 100)}%", "Elevated ATR warns about volatility."),
+    ]
+
+
+def detail(name: str, value, theory: str) -> dict:
+    return {"name": name, "value": format_number(value), "theory": theory}
+
+
+def format_number(value) -> str:
+    if isinstance(value, str):
+        return value
+    if pd.isna(value):
+        return "-"
+    numeric = float(value)
+    if abs(numeric) >= 1000:
+        return f"{numeric:,.2f}"
+    if abs(numeric) >= 1:
+        return f"{numeric:.4f}"
+    return f"{numeric:.6f}"
 
 
 def warnings_for_row(row: pd.Series) -> list[str]:

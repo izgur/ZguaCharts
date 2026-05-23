@@ -1,0 +1,62 @@
+{
+  "enabled": false,
+  "strategy": "SimpleAtrTrendV2",
+  "regimeMode": "looseBtcBull",
+  "params": {
+    "useRsiFilter": true,
+    "atrMultiplier": 3,
+    "emaFast": 20,
+    "emaSlow": 110,
+    "emaTrend": 100,
+    "rsiMin": 43,
+    "rsiMax": 70,
+    "cooldownBars": 3,
+    "minHoldBars": 3
+  },
+  "symbols": [
+    {
+      "symbol": "BTCUSDT",
+      "interval": "1h",
+      "mode": "active"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "interval": "1h",
+      "mode": "active"
+    },
+    {
+      "symbol": "BNBUSDT",
+      "interval": "1h",
+      "mode": "active"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "interval": "15m",
+      "mode": "watch"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "interval": "15m",
+      "mode": "watch"
+    },
+    {
+      "symbol": "SOLUSDT",
+      "interval": "1h",
+      "mode": "watch"
+    },
+    {
+      "symbol": "XRPUSDT",
+      "interval": "1h",
+      "mode": "watch"
+    }
+  ],
+  "source": "bybit",
+  "fillModel": "next-open",
+  "makerFeePct": 0.02,
+  "takerFeePct": 0.055,
+  "slippageBps": 2,
+  "accountEquity": 10000,
+  "riskPct": 0.005,
+  "maxOpenTrades": 1,
+  "maxNotionalPerTrade": 100000
+}

@@ -80,6 +80,10 @@ h1 {
   white-space: nowrap;
 }
 
+.paper-tab-button {
+  white-space: nowrap;
+}
+
 select {
   min-width: 74px;
   height: 34px;
@@ -245,6 +249,7 @@ button:hover {
   font-weight: 750;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
 }
 
 .signal-badge.buy {
@@ -358,6 +363,21 @@ button:hover {
   white-space: nowrap;
 }
 
+.data-diagnostics {
+  min-height: 22px;
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 3px 10px 5px;
+  color: #7f8da0;
+  font-size: 11px;
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.data-diagnostics span {
+  white-space: nowrap;
+}
+
 .modal-backdrop {
   position: fixed;
   z-index: 100;
@@ -407,6 +427,28 @@ button:hover {
 .modal-content {
   overflow: auto;
   padding: 14px;
+}
+
+.signal-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.signal-detail-header h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+.signal-detail-header p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.signal-detail-table td:last-child {
+  color: var(--muted);
 }
 
 .backtest-controls {
@@ -541,6 +583,59 @@ button:hover {
 
 .negative {
   color: #ffc9d3;
+}
+
+.paper-panel {
+  position: fixed;
+  z-index: 80;
+  top: 64px;
+  right: 0;
+  bottom: 0;
+  width: min(720px, 100%);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border-left: 1px solid var(--line);
+  background: #0e1217;
+  box-shadow: -20px 0 60px rgba(0, 0, 0, 0.35);
+}
+
+.paper-panel[hidden] {
+  display: none;
+}
+
+.paper-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.paper-panel-header h2 {
+  margin: 0 0 3px;
+  font-size: 16px;
+}
+
+.paper-panel-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.paper-panel-content {
+  overflow: auto;
+  padding: 14px;
+}
+
+.paper-warning {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(245, 184, 75, 0.35);
+  border-radius: 8px;
+  background: rgba(245, 184, 75, 0.08);
+  color: #ffe8a3;
+  font-size: 12px;
 }
 
 @media (max-width: 980px) {

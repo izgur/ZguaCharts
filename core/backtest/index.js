@@ -1,6 +1,7 @@
 const data = require("../data");
 const indicators = require("../indicators");
 const strategies = require("../strategies");
+const regimeTrend = require("./regimeTrend");
 
 function runBacktest(options) {
   options = options || {};
@@ -19,6 +20,9 @@ function runBacktest(options) {
 
 function runBacktestOnCandles(options) {
   var strategy = strategies.getStrategy(options.strategy || "ConservativeTrend");
+  if (usesRegimeRunner(strategy.name)) {
+    return regimeTrend.run(options);
+  }
   var params = Object.assign({}, strategy.params || {}, options.params || {});
   var frame = indicators.buildIndicatorFrame(data.normalizeCandles(options.candles || []), params);
   var warmup = strategy.requiresIndicators === false ? 0 : Math.min(250, Math.max(50, Math.floor(frame.length * 0.2)));
@@ -82,6 +86,26 @@ function runBacktestOnCandles(options) {
     warmup: warmup,
     debugDiagnostics: debug ? finalizeDebugState(debugState, frame, strategy, params) : null
   });
+}
+
+function usesRegimeRunner(name) {
+  return [
+    "RegimeFilteredTrendStrategy",
+    "RegimeDonchian20",
+    "RegimeDonchianCloseConfirm",
+    "RegimePullbackTrend",
+    "EmaPullbackContinuation",
+    "TrendBreakoutRetest",
+    "VolatilitySqueezeBreakout",
+    "MeanReversionInBullRegime",
+    "MomentumContinuation",
+    "PullbackReclaimV2",
+    "EmaBounceV2",
+    "BreakoutRetestV2",
+    "RangeExpansionV2",
+    "RelativeStrengthV2",
+    "SimpleAtrTrendV2"
+  ].includes(name);
 }
 
 function evaluateEntry(strategy, frame, index, row, params) {

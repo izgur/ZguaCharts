@@ -5,8 +5,23 @@
   "description": "Local trading dashboard and automatable backtest research framework.",
   "scripts": {
     "backtest": "node cli/backtest.js",
+    "compare-strategies": "node cli/compare-strategies.js",
+    "validate-pullback": "node cli/validate-pullback.js",
+    "validate:candidate": "node cli/validate_candidate.js",
+    "paper:tick": "node cli/paper_tick.js",
+    "paper:init": "node cli/paper_init.js",
+    "paper:refresh": "node cli/paper_refresh.js",
+    "paper:status": "node cli/paper_status.js",
+    "paper:enable": "node cli/paper_config.js --enable",
+    "paper:disable": "node cli/paper_config.js --disable",
+    "optimize:v2": "node cli/optimize_v2.js",
     "optimize": "node cli/optimize.js",
+    "strategy-lab": "node cli/strategy_lab.js",
+    "strategy-lab:v2": "node cli/strategy_lab_v2.js",
     "test:research": "node tests/research_smoke.js",
-    "test:cli-exit": "node tests/cli_exit_smoke.js"
+    "test:cli-exit": "node tests/cli_exit_smoke.js",
+    "test:overlays": "node tests/overlay_alignment_smoke.js",
+    "test:paper": "node tests/paper_smoke.js",
+    "test:regime": "node tests/regime_strategy_smoke.js"
   }
 }

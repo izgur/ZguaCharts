@@ -24,15 +24,35 @@ runtime.readStdinIfPresent().then(function (raw) {
     debug: args.debug === true || input.debug === true
   };
   return data.fetchCandles(options).then(function (candles) {
+    if (String(options.strategy).indexOf("Regime") === 0 && !input.regimeCandles) {
+      return data.fetchCandles({
+        source: options.source,
+        symbol: "BTCUSDT",
+        interval: "4h",
+        from: options.from,
+        to: options.to,
+        limit: Math.ceil(options.limit / 4) + 250
+      }).then(function (regimeCandles) {
+        return { candles: candles, regimeCandles: regimeCandles };
+      });
+    }
+    return { candles: candles, regimeCandles: input.regimeCandles };
+  }).then(function (loaded) {
     return {
-      candles: candles,
-      result: backtest.runBacktestOnCandles(Object.assign({}, options, { candles: candles }))
+      candles: loaded.candles,
+      result: backtest.runBacktestOnCandles(Object.assign({}, options, {
+        candles: loaded.candles,
+        regimeCandles: loaded.regimeCandles
+      }))
     };
   });
 }).then(function (result) {
   var payload = result.result;
   if (payload.diagnostics && payload.diagnostics.debug) {
     reporting.writeDebugReport(payload, "reports");
+  }
+  if (String(payload.strategy).indexOf("Regime") === 0) {
+    reporting.writeRegimeDebugReport(payload, "reports");
   }
   if (cliArgs["audit-trades"] === true) {
     payload.tradeAudit = tradeAudit.auditTrades(payload, result.candles);

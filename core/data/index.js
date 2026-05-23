@@ -7,6 +7,9 @@ const CACHE_DIR = path.join(process.cwd(), ".research-cache");
 const BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline";
 const BYBIT_REQUEST_LIMIT = 1000;
 const memoryCache = {};
+const pendingFetches = {};
+var activeHttpRequests = 0;
+const httpQueue = [];
 
 function ensureCacheDir() {
   if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR);
@@ -79,6 +82,8 @@ function parseDateToSeconds(value) {
 }
 
 function intervalToBybit(interval) {
+  if (String(interval) === "240") return "240";
+  if (String(interval).toUpperCase() === "D") return "D";
   if (/^\d+m$/.test(interval)) return interval.slice(0, -1);
   if (/^\d+h$/.test(interval)) return String(Number(interval.slice(0, -1)) * 60);
   if (interval === "1d") return "D";
@@ -86,6 +91,9 @@ function intervalToBybit(interval) {
 }
 
 function intervalToMs(interval) {
+  interval = String(interval);
+  if (/^\d+$/.test(interval)) return Number(interval) * 60 * 1000;
+  if (interval.toUpperCase() === "D") return 24 * 60 * 60 * 1000;
   var amount = Number(interval.slice(0, -1));
   var unit = interval.slice(-1);
   if (unit === "m") return amount * 60 * 1000;
@@ -107,40 +115,87 @@ function fetchCandles(options) {
 function fetchBybitCandles(options) {
   var symbol = options.symbol;
   var interval = options.interval;
+  var pendingKey = JSON.stringify({
+    symbol: symbol,
+    interval: interval,
+    from: options.from || null,
+    to: options.to || null,
+    limit: options.limit || null,
+    forceRefresh: !!options.forceRefresh,
+    withMetadata: !!options.withMetadata
+  });
+  if (pendingFetches[pendingKey]) return pendingFetches[pendingKey];
   var requested = Number(options.limit || candlesForRange(options.from, options.to, interval) || 1000);
   var cached = loadCachedCandles("bybit", symbol, interval);
   var filtered = filterCandles(cached, options.from, options.to);
-  if (filtered.length >= requested) {
+  if (!options.forceRefresh && filtered.length >= requested) {
     logger.info("Candle cache hit", { symbol: symbol, interval: interval, candles: filtered.length });
-    return Promise.resolve(filtered.slice(-requested));
+    return Promise.resolve(withMetadata(filtered.slice(-requested), {
+      cacheHit: true,
+      cacheMiss: false,
+      fetchedFromBybit: false,
+      bybitRequests: 0
+    }, options));
   }
 
   logger.info("Candle cache miss", { symbol: symbol, interval: interval, requested: requested, cached: cached.length });
   var rows = cached.map(candleToBybitRow);
-  var endTime = rows.length ? Math.min.apply(null, rows.map(function (row) { return Number(row[0]); })) - 1 : undefined;
+  var endTime = options.forceRefresh ? undefined : (rows.length ? Math.min.apply(null, rows.map(function (row) { return Number(row[0]); })) - 1 : undefined);
   var maxRequests = Math.ceil(requested / BYBIT_REQUEST_LIMIT) + 2;
   var requestCount = 0;
 
   function loop() {
-    if (normalizeCandles(rows.map(bybitRowToCandle)).length >= requested || requestCount >= maxRequests) {
+    if ((!options.forceRefresh || requestCount > 0) && (normalizeCandles(rows.map(bybitRowToCandle)).length >= requested || requestCount >= maxRequests)) {
       var candles = normalizeCandles(rows.map(bybitRowToCandle));
       saveCachedCandles("bybit", symbol, interval, candles);
-      return filterCandles(candles, options.from, options.to).slice(-requested);
+      return withMetadata(filterCandles(candles, options.from, options.to).slice(-requested), {
+        cacheHit: false,
+        cacheMiss: true,
+        fetchedFromBybit: requestCount > 0,
+        bybitRequests: requestCount
+      }, options);
     }
     requestCount += 1;
     return requestBybitKline(symbol, interval, endTime).then(function (batch) {
-      if (!batch.length) return normalizeCandles(rows.map(bybitRowToCandle)).slice(-requested);
+      if (!batch.length) return withMetadata(normalizeCandles(rows.map(bybitRowToCandle)).slice(-requested), {
+        cacheHit: false,
+        cacheMiss: true,
+        fetchedFromBybit: requestCount > 0,
+        bybitRequests: requestCount
+      }, options);
       var oldest = Math.min.apply(null, batch.map(function (row) { return Number(row[0]); }));
       rows = rows.concat(batch);
       if (endTime !== undefined && oldest >= endTime) {
-        return normalizeCandles(rows.map(bybitRowToCandle)).slice(-requested);
+        return withMetadata(normalizeCandles(rows.map(bybitRowToCandle)).slice(-requested), {
+          cacheHit: false,
+          cacheMiss: true,
+          fetchedFromBybit: requestCount > 0,
+          bybitRequests: requestCount
+        }, options);
       }
       endTime = oldest - 1;
       return delay(180).then(loop);
     });
   }
 
-  return loop();
+  pendingFetches[pendingKey] = Promise.resolve(loop()).then(function (candles) {
+    delete pendingFetches[pendingKey];
+    return candles;
+  }).catch(function (error) {
+    delete pendingFetches[pendingKey];
+    throw error;
+  });
+  return pendingFetches[pendingKey];
+}
+
+function withMetadata(candles, metadata, options) {
+  if (options && options.withMetadata) {
+    return {
+      candles: normalizeCandles(candles),
+      metadata: metadata || {}
+    };
+  }
+  return normalizeCandles(candles);
 }
 
 function candlesForRange(from, to, interval) {
@@ -194,8 +249,32 @@ function httpGetJson(url, params) {
   var query = Object.keys(params).map(function (key) {
     return encodeURIComponent(key) + "=" + encodeURIComponent(params[key]);
   }).join("&");
+  return enqueueHttp(function () {
+    return rawHttpGetJson(url + "?" + query);
+  });
+}
+
+function enqueueHttp(task) {
   return new Promise(function (resolve, reject) {
-    https.get(url + "?" + query, function (res) {
+    httpQueue.push({ task: task, resolve: resolve, reject: reject });
+    pumpHttpQueue();
+  });
+}
+
+function pumpHttpQueue() {
+  while (activeHttpRequests < 2 && httpQueue.length) {
+    var item = httpQueue.shift();
+    activeHttpRequests += 1;
+    Promise.resolve(item.task()).then(item.resolve, item.reject).then(function () {
+      activeHttpRequests -= 1;
+      setTimeout(pumpHttpQueue, 150);
+    });
+  }
+}
+
+function rawHttpGetJson(url) {
+  return new Promise(function (resolve, reject) {
+    https.get(url, function (res) {
       var chunks = "";
       res.on("data", function (chunk) { chunks += chunk; });
       res.on("end", function () {

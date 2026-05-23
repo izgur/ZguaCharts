@@ -16,6 +16,7 @@ BYBIT_REQUEST_LIMIT = 1000
 BYBIT_MAX_REQUESTS_IN_FLIGHT = 2
 BYBIT_MIN_REQUEST_DELAY_SECONDS = 0.18
 BYBIT_MAX_CACHE_CANDLES = 50000
+BYBIT_CACHE_STALE_MULTIPLIER = 3
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 YFINANCE_CACHE_DIR = Path(__file__).resolve().parent / ".yfinance-cache"
 YFINANCE_CACHE_DIR.mkdir(exist_ok=True)
@@ -224,6 +225,10 @@ def fetch_bybit_candles_with_diagnostics(
         "bybit_requests": 0,
         "cache_hits": 0,
         "cache_misses": 0,
+        "cache_stale": False,
+        "latest_cached_candle_time": None,
+        "latest_cached_candle_age_seconds": None,
+        "stale_threshold_seconds": bybit_stale_threshold_seconds(timeframe),
         "rate_limit_wait_seconds": 0.0,
         "visible_charts": visible_charts or 1,
         "max_candles_per_chart": bybit_visible_chart_cap(visible_charts),
@@ -233,7 +238,8 @@ def fetch_bybit_candles_with_diagnostics(
     with _bybit_cache_lock:
         cached = list(_bybit_cache.get(cache_key, []))
 
-    if len(cached) >= requested:
+    cache_fresh = not bybit_cache_is_stale(cached, timeframe, diagnostics)
+    if len(cached) >= requested and cache_fresh:
         diagnostics["cache_hits"] = 1
         candles = cached[-requested:]
         diagnostics["returned_candles"] = len(candles)
@@ -242,9 +248,18 @@ def fetch_bybit_candles_with_diagnostics(
 
     diagnostics["cache_misses"] = 1
     rows = [bybit_candle_to_row(candle) for candle in cached]
-    end_time = (min((row[0] for row in rows), default=None) - 1) if rows else None
-    seen_oldest = set()
     waits_before = _bybit_rate_limiter.total_wait_seconds
+
+    # Always refresh the newest page when the cached tail is stale. Otherwise a
+    # chart can end yesterday and then websocket updates appear to jump forward.
+    if not cache_fresh:
+        latest_batch = request_bybit_kline_batch(symbol, interval)
+        diagnostics["bybit_requests"] += 1
+        rows.extend(latest_batch)
+
+    oldest_row_time = min((safe_int(row[0]) for row in rows if safe_int(row[0]) is not None), default=None)
+    end_time = oldest_row_time - 1 if oldest_row_time is not None else None
+    seen_oldest = set()
 
     while len(rows) < requested:
         batch = request_bybit_kline_batch(symbol, interval, end_time)
@@ -275,6 +290,34 @@ def fetch_bybit_candles_with_diagnostics(
     diagnostics["rate_limit_wait_seconds"] = round(_bybit_rate_limiter.total_wait_seconds - waits_before, 3)
     log_bybit_diagnostics(diagnostics)
     return candles, diagnostics
+
+
+def bybit_cache_is_stale(candles: list[dict], timeframe: str, diagnostics: dict | None = None) -> bool:
+    if not candles:
+        if diagnostics is not None:
+            diagnostics["cache_stale"] = True
+        return True
+
+    latest_time = int(candles[-1]["time"])
+    age_seconds = max(0, int(datetime.now(timezone.utc).timestamp()) - latest_time)
+    threshold = bybit_stale_threshold_seconds(timeframe)
+    stale = age_seconds > threshold
+    if diagnostics is not None:
+        diagnostics["cache_stale"] = stale
+        diagnostics["latest_cached_candle_time"] = latest_time
+        diagnostics["latest_cached_candle_age_seconds"] = age_seconds
+    return stale
+
+
+def bybit_stale_threshold_seconds(timeframe: str) -> int:
+    interval_seconds = int(interval_to_ms(timeframe) / 1000)
+    if timeframe == "15m":
+        return 45 * 60
+    if timeframe == "1h":
+        return 3 * 60 * 60
+    if timeframe == "4h":
+        return 10 * 60 * 60
+    return max(interval_seconds * BYBIT_CACHE_STALE_MULTIPLIER, interval_seconds + 300)
 
 
 def request_bybit_kline_batch(symbol: str, interval: str, end_time: int | None = None) -> list:

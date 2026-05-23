@@ -10,3 +10,5 @@ server.err.log
 reports/
 reports-smoke/
 reports-cli-smoke/
+zguacharts-*.patch
+zguacharts-local-commits.txt

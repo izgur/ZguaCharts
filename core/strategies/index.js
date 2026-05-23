@@ -39,6 +39,60 @@ function previous(frame, index) {
 }
 
 registerStrategy({
+  name: "RegimeFilteredTrendStrategy",
+  label: "Regime Filtered Trend Strategy",
+  params: {
+    accountEquity: 10000,
+    riskPct: 0.005,
+    atrMultiplier: 2.5,
+    takerFeePct: 0,
+    makerFeePct: 0,
+    slippagePct: 0,
+    maxOpenTrades: 1,
+    maxNotional: 100000,
+    donchianEntry: 55,
+    donchianExit: 20,
+    adxThreshold: 18,
+    emaTrendLength: 200,
+    volumeFilter: true,
+    shortMode: false
+  },
+  entry: function () { return false; },
+  exit: function () { return false; },
+  risk: function () {
+    return { stop: null, takeProfit: null, trailingActivation: null, trailingDistance: null };
+  }
+});
+
+[
+  "RegimeDonchian20",
+  "RegimeDonchianCloseConfirm",
+  "RegimePullbackTrend",
+  "EmaPullbackContinuation",
+  "TrendBreakoutRetest",
+  "VolatilitySqueezeBreakout",
+  "MeanReversionInBullRegime",
+  "MomentumContinuation",
+  "PullbackReclaimV2",
+  "EmaBounceV2",
+  "BreakoutRetestV2",
+  "RangeExpansionV2",
+  "RelativeStrengthV2",
+  "SimpleAtrTrendV2"
+].forEach(function (name) {
+  registerStrategy({
+    name: name,
+    label: name.replace(/([a-z])([A-Z])/g, "$1 $2"),
+    params: {},
+    entry: function () { return false; },
+    exit: function () { return false; },
+    risk: function () {
+      return { stop: null, takeProfit: null, trailingActivation: null, trailingDistance: null };
+    }
+  });
+});
+
+registerStrategy({
   name: "AlwaysLongTest",
   label: "Always Long Test",
   requiresIndicators: false,

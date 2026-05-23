@@ -453,6 +453,103 @@ The summary highlights:
 - best by Sharpe ratio
 - best by drawdown-adjusted return
 
+## Strategy Research and Paper Simulation
+
+This project includes a strategy research lab and a forward paper-simulation layer. These tools are for local research only. They are not financial advice, they do not make any profitability claim, and they do not place real orders. There is no exchange order execution, no broker account connection, and no API-key trading path.
+
+The current audited research candidate is:
+
+```text
+strategy: SimpleAtrTrendV2
+regimeMode: looseBtcBull
+fillModel: next-open
+```
+
+The candidate config lives at:
+
+```text
+config/paper-candidate.json
+```
+
+Paper simulation is disabled by default:
+
+```json
+{ "enabled": false }
+```
+
+### Paper Simulation Commands
+
+Initialize baselines without importing historical trades:
+
+```powershell
+npm run paper:init -- --config config/paper-candidate.json
+```
+
+Refresh latest Bybit candles and write freshness diagnostics:
+
+```powershell
+npm run paper:refresh -- --config config/paper-candidate.json
+```
+
+Check current paper status:
+
+```powershell
+npm run paper:status -- --config config/paper-candidate.json
+```
+
+Enable simulated paper processing after initialization:
+
+```powershell
+npm run paper:enable -- --config config/paper-candidate.json
+```
+
+Run one safe forward paper tick:
+
+```powershell
+npm run paper:tick -- --config config/paper-candidate.json --refresh-first
+```
+
+Disable paper simulation:
+
+```powershell
+npm run paper:disable -- --config config/paper-candidate.json
+```
+
+Dry-run mode previews processing without mutating state or appending journals:
+
+```powershell
+npm run paper:tick -- --config config/paper-candidate.json --dry-run --refresh-first
+```
+
+Paper state and outputs:
+
+```text
+data/paper-state.json
+reports/paper-status.json
+reports/paper-summary.json
+reports/paper-freshness.json
+reports/paper-journal.csv
+reports/paper-journal.jsonl
+```
+
+The journal files are local generated outputs and are ignored by git through the `reports/` ignore rule.
+
+### Research Commands
+
+```powershell
+npm run backtest
+npm run optimize
+npm run strategy-lab
+npm run strategy-lab:v2
+npm run optimize:v2
+npm run validate:candidate
+npm run test:paper
+npm run test:research
+npm run test:regime
+npm run test:cli-exit
+npm run test:overlays
+```
+
 ## Strategy Plugins
 
 Strategies register themselves in `core/strategies/index.js`:
