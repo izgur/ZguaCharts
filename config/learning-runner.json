@@ -36,8 +36,8 @@
   "maxRankingRuns": 20,
   "maxOptimizationCombos": 300,
   "minTrades": 20,
-  "feePct": 0,
-  "slippagePct": 0,
+  "feePct": 0.055,
+  "slippagePct": 0.02,
   "allowShorts": false,
   "autoPromote": false,
   "autoEnablePaper": false

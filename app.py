@@ -362,6 +362,14 @@ def learning_status():
     })
 
 
+@app.get("/api/learning/audit")
+def learning_audit():
+    try:
+        return jsonify(build_learning_quality_audit())
+    except Exception as exc:
+        return jsonify({"error": f"Could not build learning audit: {exc}"}), 502
+
+
 @app.post("/api/learning/run")
 def learning_run():
     config = load_learning_config()
@@ -802,8 +810,8 @@ def default_learning_config() -> dict:
         "maxRankingRuns": 20,
         "maxOptimizationCombos": 300,
         "minTrades": 20,
-        "feePct": 0,
-        "slippagePct": 0,
+        "feePct": 0.055,
+        "slippagePct": 0.02,
         "allowShorts": False,
         "autoPromote": False,
         "autoEnablePaper": False,
@@ -1049,6 +1057,192 @@ def run_due_learning_cycle(force: bool = False) -> dict:
         config["lock"] = {"running": False, "startedAt": None}
         save_learning_config(config)
         return {"ran": False, "reason": f"Learning cycle failed: {exc}", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
+
+
+def build_learning_quality_audit(window: int = 5) -> dict:
+    reports = load_learning_reports()
+    research_runs = load_research_runs()
+    current_candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    paper_health = build_candidate_health(candidate_health_rules({}))["health"]
+    recent = reports[-window:]
+    latest = reports[-1] if reports else None
+    previous = reports[-2] if len(reports) >= 2 else None
+    stability = learning_candidate_stability(recent)
+    trend = learning_score_trend(recent)
+    best_candidate = best_saved_candidate(research_runs)
+    robustness_score = learning_robustness_score(stability, trend, paper_health, best_candidate, len(reports))
+    warnings = learning_audit_warnings(reports, stability, trend, paper_health, best_candidate)
+    status, recommendation = learning_audit_status(robustness_score, warnings, stability, paper_health, best_candidate, len(reports))
+    return {
+        "status": status,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "summary": {
+            "learningReports": len(reports),
+            "researchRuns": len(research_runs),
+            "window": window,
+            "robustnessScore": robustness_score,
+            "currentCandidate": candidate_summary(current_candidate),
+            "bestSavedCandidate": best_candidate,
+        },
+        "latestRecommendation": (latest or {}).get("recommendation"),
+        "previousRecommendation": (previous or {}).get("recommendation"),
+        "candidateStability": stability,
+        "scoreTrend": trend,
+        "paperHealth": paper_health,
+        "trustRules": learning_trust_rules(),
+        "warnings": warnings,
+        "recommendation": recommendation,
+    }
+
+
+def learning_trust_rules() -> dict:
+    return {
+        "minReports": 3,
+        "minRepeatedRecommendations": 2,
+        "minTrades": 20,
+        "minProfitFactor": 1.1,
+        "maxDrawdown": 25,
+        "maxChurn": 0.6,
+        "paperHealthCannotBe": ["FAILED"],
+        "severeWarningsRejected": ["overfit", "audit failed", "zero-trade"],
+    }
+
+
+def learning_candidate_stability(reports: list[dict]) -> dict:
+    keys = [learning_recommendation_key((report.get("recommendation") or {}).get("candidate")) for report in reports]
+    candidate_keys = [key for key in keys if key]
+    counts = {}
+    for key in candidate_keys:
+        counts[key] = counts.get(key, 0) + 1
+    top_key = max(counts, key=counts.get) if counts else None
+    changes = sum(1 for previous, current in zip(candidate_keys, candidate_keys[1:]) if previous != current)
+    churn = (changes / max(1, len(candidate_keys) - 1)) if len(candidate_keys) > 1 else 0
+    return {
+        "reportsChecked": len(reports),
+        "recommendationsWithCandidates": len(candidate_keys),
+        "topCandidateKey": top_key,
+        "topCandidateCount": counts.get(top_key, 0) if top_key else 0,
+        "uniqueCandidates": len(counts),
+        "recommendationChurn": round(churn, 4),
+        "unstable": churn > learning_trust_rules()["maxChurn"] or len(counts) > max(2, len(candidate_keys) // 2 + 1),
+        "counts": counts,
+    }
+
+
+def learning_recommendation_key(candidate: dict | None) -> str | None:
+    if not candidate:
+        return None
+    params = candidate.get("params") or {}
+    params_key = json.dumps(params, sort_keys=True, separators=(",", ":"))
+    return "|".join([
+        str(candidate.get("strategy") or candidate.get("preset") or ""),
+        str(candidate.get("symbol") or ""),
+        str(candidate.get("timeframe") or ""),
+        params_key,
+    ])
+
+
+def learning_score_trend(reports: list[dict]) -> dict:
+    values = []
+    for report in reports:
+        candidate = report.get("bestSavedCandidate") or (report.get("recommendation") or {}).get("candidate") or {}
+        if candidate.get("score") is not None:
+            values.append(safe_float(candidate.get("score")))
+    if len(values) < 2:
+        direction = "insufficient"
+        delta = 0
+    else:
+        delta = values[-1] - values[0]
+        if abs(delta) < max(1, abs(values[0]) * 0.05):
+            direction = "flat"
+        elif delta > 0:
+            direction = "improving"
+        else:
+            direction = "degrading"
+    volatility = 0
+    if values:
+        mean = sum(values) / len(values)
+        volatility = sum(abs(value - mean) for value in values) / len(values)
+    return {
+        "scores": values,
+        "latestScore": values[-1] if values else None,
+        "previousScore": values[-2] if len(values) >= 2 else None,
+        "delta": round(delta, 4) if values else 0,
+        "direction": "unstable" if volatility > 25 and len(values) >= 3 else direction,
+        "volatility": round(volatility, 4),
+    }
+
+
+def learning_robustness_score(stability: dict, trend: dict, paper_health: dict, candidate: dict | None, report_count: int) -> float:
+    score = 0.0
+    candidate = candidate or {}
+    repeated = stability.get("topCandidateCount", 0)
+    score += min(30, repeated * 12)
+    score -= safe_float(stability.get("recommendationChurn")) * 25
+    score += max(0, safe_float(candidate.get("profitFactor")) - 1) * 18
+    score += min(20, safe_float(candidate.get("trades")) / 5)
+    score -= safe_float(candidate.get("maxDrawdown")) * 0.8
+    if paper_health.get("status") == "HEALTHY":
+        score += 15
+    elif paper_health.get("status") in {"WATCH", "DEGRADED"}:
+        score -= 10
+    elif paper_health.get("status") == "FAILED":
+        score -= 35
+    warnings = " ".join(candidate.get("warnings", []) or []).lower()
+    if "overfit" in warnings:
+        score -= 20
+    if "zero-trade" in warnings:
+        score -= 20
+    if trend.get("direction") == "improving":
+        score += 8
+    elif trend.get("direction") == "degrading":
+        score -= 8
+    elif trend.get("direction") == "unstable":
+        score -= 12
+    if report_count < learning_trust_rules()["minReports"]:
+        score -= 25
+    return round(max(0, min(100, score)), 4)
+
+
+def learning_audit_warnings(reports: list[dict], stability: dict, trend: dict, paper_health: dict, candidate: dict | None) -> list[str]:
+    rules = learning_trust_rules()
+    warnings = []
+    candidate = candidate or {}
+    if len(reports) < rules["minReports"]:
+        warnings.append(f"Only {len(reports)} learning reports exist; need at least {rules['minReports']}.")
+    if stability.get("topCandidateCount", 0) < rules["minRepeatedRecommendations"]:
+        warnings.append("No candidate has repeated enough across recent learning reports.")
+    if stability.get("unstable"):
+        warnings.append("Recommendation churn is too high.")
+    if trend.get("direction") in {"degrading", "unstable"}:
+        warnings.append(f"Best-candidate score trend is {trend.get('direction')}.")
+    if not candidate:
+        warnings.append("No valid saved candidate is available.")
+        return warnings
+    if safe_float(candidate.get("trades")) < rules["minTrades"]:
+        warnings.append(f"Best candidate has too few trades ({candidate.get('trades')} < {rules['minTrades']}).")
+    if safe_float(candidate.get("profitFactor")) < rules["minProfitFactor"]:
+        warnings.append(f"Best candidate profit factor is below threshold ({candidate.get('profitFactor')} < {rules['minProfitFactor']}).")
+    if safe_float(candidate.get("maxDrawdown")) > rules["maxDrawdown"]:
+        warnings.append(f"Best candidate drawdown is above threshold ({candidate.get('maxDrawdown')} > {rules['maxDrawdown']}).")
+    if paper_health.get("status") == "FAILED":
+        warnings.append("Paper health is FAILED.")
+    candidate_warnings = " ".join(candidate.get("warnings", []) or []).lower()
+    if any(term in candidate_warnings for term in rules["severeWarningsRejected"]):
+        warnings.append("Best candidate has severe warning text.")
+    return warnings
+
+
+def learning_audit_status(score: float, warnings: list[str], stability: dict, paper_health: dict, candidate: dict | None, report_count: int) -> tuple[str, dict]:
+    if not candidate or report_count == 0:
+        return "NOT_READY", {"action": "KEEP_MANUAL_ONLY", "reason": "No learning evidence is available yet."}
+    if report_count < learning_trust_rules()["minReports"] or stability.get("unstable"):
+        return "WATCH", {"action": "OBSERVE_MORE", "reason": "More stable learning reports are needed before trusting recommendations."}
+    if warnings:
+        return "NOT_READY", {"action": "KEEP_MANUAL_ONLY", "reason": "Trust rules are not satisfied."}
+    if score >= 75 and paper_health.get("status") != "FAILED":
+        return "READY_FOR_AUTO_PROMOTE_LATER", {"action": "CONSIDER_AUTO_PROMOTE_LATER", "reason": "Recommendation appears stable enough for a future auto-promotion design, but this phase remains manual."}
+    return "READY_FOR_MANUAL", {"action": "KEEP_MANUAL_ONLY", "reason": "Evidence supports manual review only."}
 
 
 def run_learning_cycle(config: dict) -> dict:

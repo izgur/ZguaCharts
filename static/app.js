@@ -2181,6 +2181,7 @@ function renderLearningPage() {
     learningInitialized = true;
   }
   loadLearningConfig();
+  loadLearningAudit();
   loadLearningReports();
 }
 
@@ -2188,6 +2189,7 @@ function setupLearningControls() {
   document.querySelector("#learning-run-button")?.addEventListener("click", runLearningCycle);
   document.querySelector("#learning-save-config")?.addEventListener("click", saveLearningConfig);
   document.querySelector("#learning-tick-button")?.addEventListener("click", runLearningTick);
+  document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-recommendation")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promote-learning]");
     if (button && lastLearningReport?.recommendation?.candidate) {
@@ -2242,6 +2244,7 @@ async function runLearningTick() {
     if (payload.report) {
       lastLearningReport = payload.report;
       renderLearningReport(payload.report);
+      loadLearningAudit();
       loadLearningReports();
     }
     if (status) status.textContent = `${payload.ran ? "Learning tick ran" : "Learning tick skipped"}: ${payload.reason} Next: ${formatLearningTime(payload.nextRunAt)}`;
@@ -2298,6 +2301,7 @@ async function runLearningCycle() {
     const report = await apiPost("/api/learning/run", body);
     lastLearningReport = report;
     renderLearningReport(report);
+    loadLearningAudit();
     loadLearningReports();
     if (status) status.textContent = `Learning cycle ${report.status}. Recommendation: ${report.recommendation?.action || "-"}.`;
   } catch (error) {
@@ -2331,6 +2335,48 @@ async function loadLearningReports() {
   } catch (error) {
     body.innerHTML = `<tr><td colspan="6">Learning reports could not load: ${escapeHtml(error.message)}</td></tr>`;
   }
+}
+
+async function loadLearningAudit() {
+  const host = document.querySelector("#learning-audit");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading learning quality audit...</p>`;
+    const payload = await apiGet("/api/learning/audit");
+    host.innerHTML = renderLearningAudit(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Learning audit could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderLearningAudit(payload) {
+  const stability = payload.candidateStability || {};
+  const trend = payload.scoreTrend || {};
+  const summary = payload.summary || {};
+  const rec = payload.recommendation || {};
+  const statusTone = payload.status === "NOT_READY" ? "negative" : payload.status === "WATCH" ? "neutral" : "positive";
+  return `
+    <h3 class="modal-section-title">Audit <span class="${statusTone}">${escapeHtml(payload.status || "-")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Robustness</span><strong>${formatNumber(summary.robustnessScore)}</strong></div>
+      <div class="metric"><span>Reports</span><strong>${summary.learningReports || 0}</strong></div>
+      <div class="metric"><span>Repeated</span><strong>${stability.topCandidateCount || 0}</strong></div>
+      <div class="metric"><span>Churn</span><strong>${formatNumber(stability.recommendationChurn)}</strong></div>
+      <div class="metric"><span>Trend</span><strong>${escapeHtml(trend.direction || "-")}</strong></div>
+      <div class="metric"><span>Action</span><strong>${escapeHtml(rec.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note">${escapeHtml(rec.reason || "")}</p>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Latest recommendation</th><td>${escapeHtml(payload.latestRecommendation?.action || "-")}</td></tr>
+        <tr><th>Previous recommendation</th><td>${escapeHtml(payload.previousRecommendation?.action || "-")}</td></tr>
+        <tr><th>Top candidate key</th><td><code>${escapeHtml(stability.topCandidateKey || "-")}</code></td></tr>
+        <tr><th>Latest score</th><td>${trend.latestScore === null || trend.latestScore === undefined ? "-" : formatNumber(trend.latestScore)}</td></tr>
+        <tr><th>Paper health</th><td>${escapeHtml(payload.paperHealth?.status || "UNKNOWN")}</td></tr>
+      </tbody>
+    </table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
 }
 
 async function loadLearningReport(reportId) {
