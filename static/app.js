@@ -13,6 +13,7 @@ const CHART_LIBRARY_URLS = [
   "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js",
   "https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js",
 ];
+const WATCHLIST_REFRESH_MS = 30000;
 
 const grid = document.querySelector("#chart-grid");
 const countSelect = document.querySelector("#chart-count");
@@ -55,6 +56,13 @@ let chartsToolbarInitialized = false;
 let backtestInitialized = false;
 let analysisInitialized = false;
 let backtestPane = null;
+let watchlistQuotes = new Map();
+let watchlistRefreshTimer = null;
+let watchlistRefreshInFlight = false;
+
+window.api = window.api || {
+  get: apiGet,
+};
 
 function loadState() {
   try {
@@ -101,6 +109,14 @@ function saveUiPrefs() {
 
 function hasElement(...elements) {
   return elements.every(Boolean);
+}
+
+async function apiGet(url) {
+  const response = await fetch(url);
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
+  if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+  return payload;
 }
 
 async function boot() {
@@ -163,6 +179,7 @@ async function boot() {
 
   window.addEventListener("popstate", () => showPage(pathToPage(window.location.pathname)));
   showPage(pathToPage(window.location.pathname));
+  window.setInterval(() => refreshWatchlistData(), WATCHLIST_REFRESH_MS);
 }
 
 function setupNavigation() {
@@ -231,8 +248,10 @@ function setupSidebar() {
     uiPrefs.watchlist = Array.from(new Set([...uiPrefs.watchlist, ...symbols]));
     saveUiPrefs();
     renderWatchlist();
+    refreshWatchlistData(true);
   });
   renderWatchlist();
+  refreshWatchlistData(true);
 }
 
 function setupChartsToolbar() {
@@ -431,6 +450,7 @@ function addToWatchlist(symbol) {
   uiPrefs.watchlist = Array.from(new Set([...(uiPrefs.watchlist || []), symbol]));
   saveUiPrefs();
   renderWatchlist();
+  refreshWatchlistData(true);
 }
 
 function removeFromWatchlist(symbol) {
@@ -443,22 +463,21 @@ function removeFromWatchlist(symbol) {
 function renderWatchlist() {
   if (!watchlistContent) return;
   const symbols = uiPrefs.watchlist?.length ? uiPrefs.watchlist : ["BTCUSDT"];
-  const paneBySymbol = new Map(panes.map((pane) => [pane.symbolSelect?.value, pane]));
+  const activeSymbol = panes[0]?.symbolSelect?.value || "";
   watchlistContent.innerHTML = `
     <table class="watchlist-table compact-table">
       <thead><tr><th></th><th>Symbol</th><th>Price</th><th>Signal</th></tr></thead>
       <tbody>${symbols.map((symbol) => {
-        const pane = paneBySymbol.get(symbol);
-        const price = pane?.lastPrice ? formatPrice(Number(pane.lastPrice)) : "-";
-        const signal = pane?.lastSignalPayload
-          ? `${escapeHtml(pane.lastSignalPayload.signalDirection || pane.lastSignalPayload.label)} ${escapeHtml(String(pane.lastSignalPayload.score))}`
-          : "-";
+        const quote = watchlistQuotes.get(symbol);
+        const price = quote?.price ? formatPrice(Number(quote.price)) : "-";
+        const signalClass = quote?.tone || "neutral";
+        const signal = quote?.score ?? "-";
         return `
-          <tr>
+          <tr class="${symbol === activeSymbol ? "active-watch-symbol" : ""}">
             <td><button class="star-button active" type="button" data-remove-watch="${escapeHtml(symbol)}" title="Remove from watchlist">★</button></td>
             <td><button class="link-button watch-symbol-button" type="button" data-watch-symbol="${escapeHtml(symbol)}">${escapeHtml(symbol)}</button></td>
             <td>${price}</td>
-            <td>${signal}</td>
+            <td class="${signalClass} watch-score">${signal}</td>
           </tr>
         `;
       }).join("")}</tbody>
@@ -473,6 +492,62 @@ function renderWatchlist() {
   });
 }
 
+function scheduleWatchlistRefresh() {
+  window.clearTimeout(watchlistRefreshTimer);
+  watchlistRefreshTimer = window.setTimeout(() => refreshWatchlistData(), 250);
+}
+
+async function refreshWatchlistData(force = false) {
+  if (!watchlistContent || watchlistRefreshInFlight) return;
+  const symbols = uiPrefs.watchlist?.length ? uiPrefs.watchlist : ["BTCUSDT"];
+  const activeSource = panes[0]?.sourceSelect?.value || "bybit";
+  const activeTimeframe = panes[0]?.timeframeSelect?.value || "1h";
+  const now = Date.now();
+  const staleSymbols = symbols.filter((symbol) => force || !watchlistQuotes.get(symbol) || now - watchlistQuotes.get(symbol).updatedAt > WATCHLIST_REFRESH_MS);
+  if (!staleSymbols.length) return;
+  watchlistRefreshInFlight = true;
+  try {
+    for (const symbol of staleSymbols) {
+      try {
+        const source = sourceForWatchSymbol(symbol, activeSource);
+        const timeframe = timeframeForWatchSymbol(source, activeTimeframe);
+        const [candlesPayload, signalPayload] = await Promise.all([
+          apiGet(`/api/candles?${new URLSearchParams({ source, symbol, timeframe, limit: "1", visible_charts: String(visibleChartCount()) })}`),
+          apiGet(`/api/signals?${new URLSearchParams({ source, symbol, timeframe, limit: "300", include_timeframes: "false" })}`),
+        ]);
+        const candle = candlesPayload.candles?.[candlesPayload.candles.length - 1];
+        watchlistQuotes.set(symbol, {
+          price: candle?.close,
+          score: signalPayload.score,
+          tone: signalPayload.tone || "neutral",
+          direction: signalPayload.signalDirection || "NEUTRAL",
+          updatedAt: Date.now(),
+        });
+        renderWatchlist();
+      } catch (error) {
+        const prior = watchlistQuotes.get(symbol) || {};
+        watchlistQuotes.set(symbol, { ...prior, score: "ERR", tone: "neutral", updatedAt: Date.now() });
+      }
+    }
+  } finally {
+    watchlistRefreshInFlight = false;
+    renderWatchlist();
+  }
+}
+
+function sourceForWatchSymbol(symbol, preferredSource) {
+  const preferred = config?.sources?.[preferredSource];
+  if (preferred?.symbols?.includes(symbol)) return preferredSource;
+  if (config?.sources?.bybit?.symbols?.includes(symbol)) return "bybit";
+  return Object.entries(config?.sources || {}).find(([, source]) => source.symbols?.includes(symbol))?.[0] || preferredSource || "bybit";
+}
+
+function timeframeForWatchSymbol(source, preferredTimeframe) {
+  const timeframes = config?.sources?.[source]?.timeframes || [];
+  if (timeframes.includes(preferredTimeframe)) return preferredTimeframe;
+  return timeframes.includes("1h") ? "1h" : timeframes[0] || "1h";
+}
+
 function setPrimaryChartSymbol(symbol) {
   const pane = panes[0];
   if (!pane || !symbol) return;
@@ -481,6 +556,7 @@ function setPrimaryChartSymbol(symbol) {
   syncChartsToolbarFromPane(pane);
   startPane(pane);
   saveState();
+  refreshWatchlistData(true);
 }
 
 async function loadChartLibrary() {
@@ -613,6 +689,7 @@ function createPane(node, index) {
       startPane(pane);
       saveState();
       renderWatchlist();
+      refreshWatchlistData(true);
     });
   });
 
@@ -861,6 +938,13 @@ async function renderSignals(pane, requestId) {
 
   pane.signalMarkers = payload.markers || [];
   pane.lastSignalPayload = payload;
+  watchlistQuotes.set(pane.symbolSelect.value, {
+    ...(watchlistQuotes.get(pane.symbolSelect.value) || {}),
+    score: payload.score,
+    tone: payload.tone || "neutral",
+    direction: payload.signalDirection || "NEUTRAL",
+    updatedAt: Date.now(),
+  });
   updateSignalBadge(pane, payload);
   updateChartMarkers(pane);
   updateChartsPanels(pane, payload);
@@ -1539,10 +1623,7 @@ async function openBacktestHistory() {
   backtestModal.hidden = false;
   backtestContent.innerHTML = `<p class="pane-status">Loading backtest history...</p>`;
   try {
-    const response = await fetch("/api/backtest-history?limit=150");
-    const contentType = response.headers.get("content-type") || "";
-    const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
-    if (!response.ok) throw new Error(payload.error || "Backtest history failed");
+    const payload = await apiGet("/api/backtest-history?limit=150");
     backtestContent.innerHTML = renderBacktestHistory(payload);
   } catch (error) {
     backtestContent.innerHTML = `
@@ -1582,7 +1663,7 @@ function renderBacktestHistory(payload) {
   `).join("");
   return `
     <h3 class="modal-section-title">Strategy Totals</h3>
-    <p class="modal-note">Stored locally from completed `/api/backtest` runs. Summary values are backend-calculated.</p>
+    <p class="modal-note">Stored locally from completed <code>/api/backtest</code> runs. Summary values are backend-calculated.</p>
     <table class="trade-table">
       <thead><tr><th>Strategy</th><th>Tests</th><th>Trades</th><th>Sum return</th><th>Avg return</th><th>Avg win</th><th>Avg PF</th><th>Worst DD</th></tr></thead>
       <tbody>${summaryRows || `<tr><td colspan="8">No backtests recorded yet.</td></tr>`}</tbody>
@@ -2242,6 +2323,11 @@ function updateTicker(pane, price) {
   pane.tickerPrice.textContent = formatPrice(price);
   pane.ticker.classList.remove("up", "down", "neutral");
   pane.ticker.classList.add(direction);
+  watchlistQuotes.set(pane.symbolSelect.value, {
+    ...(watchlistQuotes.get(pane.symbolSelect.value) || {}),
+    price,
+    updatedAt: Date.now(),
+  });
   renderWatchlist();
 
   window.clearTimeout(pane.flashTimer);

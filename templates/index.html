@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-compact-ui">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-watchlist-history">
   </head>
   <body>
     <header class="topbar">
@@ -204,6 +204,18 @@
       <div id="paper-panel-content" class="paper-panel-content"></div>
     </section>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-compact-ui" defer></script>
+    <script>
+      window.api = window.api || {
+        get: async function(url) {
+          const response = await fetch(url);
+          const contentType = response.headers.get("content-type") || "";
+          const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
+          if (!response.ok) throw new Error(payload.error || "Request failed: " + response.status);
+          return payload;
+        }
+      };
+      var api = window.api;
+    </script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-watchlist-history" defer></script>
   </body>
 </html>
