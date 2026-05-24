@@ -154,6 +154,10 @@ async function boot() {
     paperPanelClose.addEventListener("click", () => {
       paperPanel.hidden = true;
     });
+    paperPanelContent.addEventListener("click", (event) => {
+      const button = event.target.closest("[data-paper-action]");
+      if (button) handlePaperAction(button.dataset.paperAction);
+    });
   }
   bottomPanel?.querySelector("summary")?.addEventListener("click", (event) => {
     event.preventDefault();
@@ -407,6 +411,14 @@ function renderPaperStatus(payload) {
         <tr><th>Ranking</th><td colspan="3">${candidate.promotedFromRanking ? `Rank ${escapeHtml(candidate.promotedFromRanking.rank)} · Score ${escapeHtml(candidate.promotedFromRanking.score)} · PF ${escapeHtml(candidate.promotedFromRanking.profitFactor)} · Trades ${escapeHtml(candidate.promotedFromRanking.trades)}` : "-"}</td></tr>
       </tbody>
     </table>
+    <div class="paper-actions">
+      <button type="button" data-paper-action="validate">Validate Candidate</button>
+      <button type="button" data-paper-action="enable">Enable Paper Simulation</button>
+      <button type="button" data-paper-action="disable">Disable Paper Simulation</button>
+    </div>
+    <div id="paper-validation-result" class="paper-validation-result">
+      <p class="modal-note">Validation must pass before paper simulation can be enabled without force. This is simulated only.</p>
+    </div>
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <h3 class="modal-section-title">Open Positions</h3>
     <table class="trade-table">
@@ -435,6 +447,61 @@ function renderPaperStatus(payload) {
           <td class="${Number(event.netPnl || 0) >= 0 ? "positive" : "negative"}">${event.netPnl === "" ? "-" : formatSigned(event.netPnl)}</td>
         </tr>
       `).join("") || `<tr><td colspan="6">No journal events yet.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+async function handlePaperAction(action) {
+  const resultEl = document.querySelector("#paper-validation-result");
+  try {
+    if (action === "validate") {
+      if (resultEl) resultEl.innerHTML = `<p class="pane-status">Validating candidate...</p>`;
+      const payload = await apiGet("/api/candidate/validate");
+      if (resultEl) resultEl.innerHTML = renderCandidateValidation(payload.validation);
+      return;
+    }
+    if (action === "enable") {
+      const ok = window.confirm("Enable paper simulation for this candidate?\n\nThis is still simulated only. No real exchange orders will be placed.");
+      if (!ok) return;
+      const payload = await apiPost("/api/candidate/enable-paper", { force: false });
+      if (resultEl) resultEl.innerHTML = renderCandidateValidation(payload.validation);
+      await openPaperPanel();
+      return;
+    }
+    if (action === "disable") {
+      const payload = await apiPost("/api/candidate/disable-paper", {});
+      if (resultEl) resultEl.innerHTML = `<p class="pane-status">${escapeHtml(payload.message || "Paper simulation disabled.")}</p>`;
+      await openPaperPanel();
+    }
+  } catch (error) {
+    if (resultEl) resultEl.innerHTML = `<p class="pane-status">Paper action failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderCandidateValidation(validation) {
+  if (!validation) return `<p class="pane-status">No validation returned.</p>`;
+  const statusClass = validation.status === "PASS" ? "positive" : validation.status === "FAIL" ? "negative" : "neutral";
+  return `
+    <h3 class="modal-section-title">Validation <span class="${statusClass}">${escapeHtml(validation.status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Markets</span><strong>${validation.summary?.marketsValidated || 0}</strong></div>
+      <div class="metric"><span>Pass</span><strong>${validation.summary?.pass || 0}</strong></div>
+      <div class="metric"><span>Warn</span><strong>${validation.summary?.warn || 0}</strong></div>
+      <div class="metric"><span>Fail</span><strong>${validation.summary?.fail || 0}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Market</th><th>Status</th><th>Return</th><th>PF</th><th>DD</th><th>Trades</th><th>Reasons</th></tr></thead>
+      <tbody>${(validation.rows || []).map((row) => `
+        <tr>
+          <td>${escapeHtml(row.symbol)} ${escapeHtml(row.timeframe)}</td>
+          <td>${escapeHtml(row.status)}</td>
+          <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+          <td>${formatNumber(row.profitFactor)}</td>
+          <td>${formatNumber(row.maxDrawdown)}%</td>
+          <td>${row.trades}</td>
+          <td>${escapeHtml((row.reasons || []).join(" ")) || "-"}</td>
+        </tr>
+      `).join("")}</tbody>
     </table>
   `;
 }

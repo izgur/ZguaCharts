@@ -40,6 +40,7 @@ Responsibilities:
 - Call the shared Node backtest engine for strategy research and UI backtests.
 - Own `/api/strategy-ranking`, including matrix execution, metric collection, ranking score calculation, validity flags, and ranking cards.
 - Own manual candidate promotion through `/api/candidate/promote`; browser actions may request promotion, but only the backend writes `config/paper-candidate.json` after explicit confirmation.
+- Own candidate validation and paper enablement gates through `/api/candidate/validate`, `/api/candidate/enable-paper`, and `/api/candidate/disable-paper`.
 
 ## Core Strategy / Research Engine
 
@@ -67,6 +68,7 @@ When adding a feature:
 - New signal scoring rule: backend/core only.
 - New strategy, backtest, optimizer, paper simulation, or ranking rule: `core` or backend strategy modules only.
 - New candidate selection or promotion behavior: backend endpoint only; frontend may render the candidate and ask for explicit user approval.
+- New candidate validation, pass/warn/fail rule, or paper-enablement decision: backend/core only.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 If the same trading formula appears in both frontend JavaScript and backend/core code, the frontend copy should be removed.

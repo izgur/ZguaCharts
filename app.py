@@ -388,6 +388,75 @@ def current_candidate():
         return jsonify({"error": f"Could not load current candidate: {exc}"}), 502
 
 
+@app.get("/api/candidate/validate")
+def validate_candidate():
+    try:
+        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
+        return jsonify({
+            "candidate": candidate_summary(candidate),
+            "validation": validation,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not validate candidate: {exc}"}), 502
+
+
+@app.post("/api/candidate/enable-paper")
+def enable_paper_candidate():
+    try:
+        payload = request.get_json(silent=True) or {}
+        force = bool(payload.get("force"))
+        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
+        if validation["status"] != "PASS" and not force:
+            return jsonify({
+                "error": f"Candidate validation status is {validation['status']}; paper simulation was not enabled.",
+                "validation": validation,
+                "candidate": candidate_summary(candidate),
+            }), 400
+
+        backup_path = backup_candidate_config(candidate)
+        updated = dict(candidate)
+        updated["enabled"] = True
+        updated["enabledAt"] = datetime.now(timezone.utc).isoformat()
+        if validation["status"] != "PASS":
+            updated.setdefault("validationWarnings", []).append({
+                "enabledWithForce": True,
+                "enabledAt": updated["enabledAt"],
+                "status": validation["status"],
+                "reasons": collect_validation_reasons(validation),
+            })
+        write_candidate_config(updated)
+        return jsonify({
+            "ok": True,
+            "message": "Paper simulation enabled for the current candidate.",
+            "backupPath": str(backup_path.relative_to(app.root_path)),
+            "candidate": candidate_summary(updated),
+            "validation": validation,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not enable paper simulation: {exc}"}), 502
+
+
+@app.post("/api/candidate/disable-paper")
+def disable_paper_candidate():
+    try:
+        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        backup_path = backup_candidate_config(candidate)
+        updated = dict(candidate)
+        updated["enabled"] = False
+        updated["disabledAt"] = datetime.now(timezone.utc).isoformat()
+        write_candidate_config(updated)
+        return jsonify({
+            "ok": True,
+            "message": "Paper simulation disabled.",
+            "backupPath": str(backup_path.relative_to(app.root_path)),
+            "candidate": candidate_summary(updated),
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not disable paper simulation: {exc}"}), 502
+
+
 @app.post("/api/candidate/promote")
 def promote_candidate():
     try:
@@ -404,10 +473,7 @@ def promote_candidate():
         promoted_symbol = str(payload.get("symbol") or "").strip()
         promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
         updated = merge_promoted_candidate(current, payload, ranking_snapshot, promoted_symbol, promoted_interval)
-        PAPER_CANDIDATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with open(PAPER_CANDIDATE_PATH, "w", encoding="utf-8") as handle:
-            json.dump(updated, handle, indent=2)
-            handle.write("\n")
+        write_candidate_config(updated)
 
         return jsonify({
             "ok": True,
@@ -499,6 +565,13 @@ def backup_candidate_config(candidate: dict) -> Path:
     return backup_path
 
 
+def write_candidate_config(candidate: dict) -> None:
+    PAPER_CANDIDATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PAPER_CANDIDATE_PATH, "w", encoding="utf-8") as handle:
+        json.dump(candidate, handle, indent=2)
+        handle.write("\n")
+
+
 def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dict, promoted_symbol: str, promoted_interval: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     preserved = dict(current)
@@ -544,6 +617,145 @@ def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dic
     return preserved
 
 
+def candidate_validation_rules(args) -> dict:
+    return {
+        "period": args.get("period", "365d"),
+        "limit": int(args.get("limit", "5000")),
+        "minTrades": int(args.get("min_trades", "20")),
+        "minProfitFactor": float(args.get("min_profit_factor", "1.1")),
+        "maxDrawdown": float(args.get("max_drawdown", "25")),
+        "minTotalReturnPct": float(args.get("min_total_return_pct", "0")),
+        "allowShorts": args.get("allowShorts", "false").lower() in {"1", "true", "yes", "on"},
+    }
+
+
+def validate_candidate_config(candidate: dict, rules: dict) -> dict:
+    source = candidate.get("source", "bybit")
+    strategy = candidate.get("strategy")
+    active_markets = candidate_symbols_by_mode(candidate, "active")
+    rows = []
+    if not strategy:
+        rows.append(validation_error_row("-", "-", "-", ["Candidate has no strategy configured."]))
+    if not active_markets:
+        rows.append(validation_error_row("-", "-", strategy or "-", ["Candidate has no active markets configured."]))
+
+    fee_pct = safe_float(candidate.get("takerFeePct", 0))
+    slippage_pct = safe_float(candidate.get("slippageBps", 0)) / 100
+    params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+
+    for market in active_markets:
+        symbol = market.get("symbol")
+        timeframe = market.get("interval") or market.get("timeframe")
+        try:
+            payload = run_shared_backtest_engine(
+                source,
+                symbol,
+                timeframe,
+                rules["period"],
+                strategy,
+                fee_pct,
+                slippage_pct,
+                rules["limit"],
+                allow_shorts=rules["allowShorts"],
+                strategy_params=params,
+            )
+            metrics = ranking_metrics_from_backtest(payload)
+            status, reasons = candidate_market_status(metrics, rules)
+            rows.append({
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "strategy": payload.get("preset") or strategy,
+                "totalReturnPct": metrics["totalReturn"],
+                "winRate": metrics["winRate"],
+                "maxDrawdown": metrics["maxDrawdown"],
+                "profitFactor": metrics["profitFactor"],
+                "trades": metrics["trades"],
+                "averageBarsHeld": metrics["averageBarsHeld"],
+                "score": ranking_score(metrics, min_trades=rules["minTrades"]),
+                "status": status,
+                "reasons": reasons,
+                "warnings": payload.get("warnings", []),
+            })
+        except Exception as exc:
+            rows.append(validation_error_row(symbol, timeframe, strategy, [str(exc)]))
+
+    pass_count = len([row for row in rows if row["status"] == "PASS"])
+    warn_count = len([row for row in rows if row["status"] == "WARN"])
+    fail_count = len([row for row in rows if row["status"] == "FAIL"])
+    overall = "FAIL" if fail_count else "WARN" if warn_count else "PASS"
+    # TODO: Add scheduled ranking, auto candidate suggestion, paper performance
+    # comparison, auto-promotion only after validation, and human approval mode.
+    return {
+        "status": overall,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "period": rules["period"],
+        "rules": {
+            "minTrades": rules["minTrades"],
+            "minProfitFactor": rules["minProfitFactor"],
+            "maxDrawdown": rules["maxDrawdown"],
+            "minTotalReturnPct": rules["minTotalReturnPct"],
+            "limit": rules["limit"],
+            "allowShorts": rules["allowShorts"],
+        },
+        "summary": {
+            "marketsValidated": len(rows),
+            "pass": pass_count,
+            "warn": warn_count,
+            "fail": fail_count,
+        },
+        "rows": rows,
+    }
+
+
+def validation_error_row(symbol: str | None, timeframe: str | None, strategy: str | None, reasons: list[str]) -> dict:
+    return {
+        "symbol": symbol or "-",
+        "timeframe": timeframe or "-",
+        "strategy": strategy or "-",
+        "totalReturnPct": 0,
+        "winRate": 0,
+        "maxDrawdown": 0,
+        "profitFactor": 0,
+        "trades": 0,
+        "averageBarsHeld": 0,
+        "score": -999,
+        "status": "FAIL",
+        "reasons": reasons,
+    }
+
+
+def candidate_market_status(metrics: dict, rules: dict) -> tuple[str, list[str]]:
+    reasons = []
+    hard_fail = False
+    if metrics["trades"] < rules["minTrades"]:
+        hard_fail = True
+        reasons.append(f"FAIL: trades below minimum ({metrics['trades']} < {rules['minTrades']}).")
+    if metrics["profitFactor"] <= 1:
+        hard_fail = True
+        reasons.append(f"FAIL: profit factor is not above 1 ({metrics['profitFactor']}).")
+    if metrics["maxDrawdown"] > rules["maxDrawdown"]:
+        hard_fail = True
+        reasons.append(f"FAIL: max drawdown above limit ({metrics['maxDrawdown']} > {rules['maxDrawdown']}).")
+    if hard_fail:
+        return "FAIL", reasons
+    if metrics["profitFactor"] < rules["minProfitFactor"]:
+        reasons.append(f"WARN: profit factor below target ({metrics['profitFactor']} < {rules['minProfitFactor']}).")
+    close_threshold = max(0.5, abs(rules["minTotalReturnPct"]) + 0.5)
+    if metrics["totalReturn"] < rules["minTotalReturnPct"]:
+        reasons.append(f"WARN: total return below target ({metrics['totalReturn']} < {rules['minTotalReturnPct']}).")
+    elif abs(metrics["totalReturn"] - rules["minTotalReturnPct"]) <= close_threshold:
+        reasons.append("WARN: total return is close to zero.")
+    return ("WARN" if reasons else "PASS"), reasons
+
+
+def collect_validation_reasons(validation: dict) -> list[str]:
+    reasons = []
+    for row in validation.get("rows", []):
+        for reason in row.get("reasons", []):
+            reasons.append(f"{row.get('symbol')} {row.get('timeframe')}: {reason}")
+    return reasons
+
+
 def node_executable() -> str:
     """Return a Node binary new enough for the shared research engine.
 
@@ -582,7 +794,7 @@ def node_executable() -> str:
     return fallback or "node"
 
 
-def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int, debug: bool = False, allow_shorts: bool = False) -> dict:
+def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
     Python keeps responsibility for broker adapters that already work here
@@ -590,6 +802,12 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     the UI, CLI optimizer, and future workers all share one backtest engine.
     """
     candles_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
+    params = {
+        **(strategy_params or {}),
+        "feePct": fee_pct,
+        "slippagePct": slippage_pct,
+        "shortMode": allow_shorts,
+    }
     engine_input = {
         "source": source,
         "symbol": symbol,
@@ -598,11 +816,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "strategy": NODE_STRATEGIES.get(preset, preset),
         "preset": NODE_STRATEGIES.get(preset, preset),
         "limit": limit,
-        "params": {
-            "feePct": fee_pct,
-            "slippagePct": slippage_pct,
-            "shortMode": allow_shorts,
-        },
+        "params": params,
         "debug": debug,
         "candles": candles_payload["candles"],
     }

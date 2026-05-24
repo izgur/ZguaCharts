@@ -989,6 +989,17 @@ button:hover {
   padding: 14px;
 }
 
+.paper-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.paper-validation-result {
+  margin-bottom: 10px;
+}
+
 .paper-warning {
   margin-bottom: 12px;
   padding: 10px 12px;
