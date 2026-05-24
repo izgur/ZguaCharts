@@ -2331,6 +2331,7 @@ function formatOptimizationMetric(metric) {
 async function promoteOptimizedCandidate(row) {
   const status = document.querySelector("#optimization-status");
   const payload = lastOptimizationPayload || {};
+  const minTrades = Number(document.querySelector("#analysis-min-trades")?.value || 20);
   const ok = window.confirm(`Promote optimized ${payload.strategy} on ${payload.symbol} ${payload.timeframe} as the paper candidate?\n\nPaper simulation will stay disabled until validation passes and you explicitly enable it.`);
   if (!ok) return;
   const test = row.test || {};
@@ -2343,7 +2344,7 @@ async function promoteOptimizedCandidate(row) {
     strategy: payload.strategy,
     period: payload.period,
     params: row.params || {},
-    minTrades: Math.min(20, Number(test.trades || 0)),
+    minTrades,
     rankingSnapshot: {
       valid: row.valid,
       rank: row.rank,
