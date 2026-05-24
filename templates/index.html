@@ -241,6 +241,28 @@
         </div>
         <div class="page-heading compact-heading">
           <div>
+            <h2>Automatic Learning Decision Log</h2>
+            <p>Backend audit trail for learning runs, eligibility checks, and auto-promotion decisions.</p>
+          </div>
+          <button id="learning-decisions-refresh" type="button">Refresh Decisions</button>
+        </div>
+        <div id="learning-decision-summary" class="metric-grid"></div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Action</th>
+              <th>Candidate</th>
+              <th>Audit</th>
+              <th>Robustness</th>
+              <th>Promoted</th>
+              <th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="learning-decisions-body"></tbody>
+        </table>
+        <div class="page-heading compact-heading">
+          <div>
             <h2>Learning Reports</h2>
             <p>Saved reports are recommendations only. No config is changed automatically.</p>
           </div>

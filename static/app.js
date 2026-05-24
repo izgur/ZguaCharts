@@ -2182,6 +2182,7 @@ function renderLearningPage() {
   }
   loadLearningConfig();
   loadLearningAudit();
+  loadLearningDecisions();
   loadLearningReports();
 }
 
@@ -2192,6 +2193,7 @@ function setupLearningControls() {
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
   document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
+  document.querySelector("#learning-decisions-refresh")?.addEventListener("click", loadLearningDecisions);
   document.querySelector("#learning-recommendation")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promote-learning]");
     if (button && lastLearningReport?.recommendation?.candidate) {
@@ -2222,7 +2224,7 @@ async function loadLearningConfig() {
     document.querySelector("#learning-run-minute").value = config.schedule?.runAtMinute ?? 0;
     document.querySelector("#learning-auto-promote").checked = Boolean(config.autoPromote);
     loadAutoPromoteStatus();
-    if (status) status.textContent = `Learning config loaded. Last: ${formatLearningTime(scheduleStatus.lastRunAt)} Next: ${formatLearningTime(scheduleStatus.nextRunAt)}. Auto-promotion is disabled.`;
+    if (status) status.textContent = `Learning config loaded. Last: ${formatLearningTime(scheduleStatus.lastRunAt)} Next: ${formatLearningTime(scheduleStatus.nextRunAt)}. Auto-promotion is ${config.autoPromote ? "enabled for candidate-only mode" : "disabled"}.`;
   } catch (error) {
     if (status) status.textContent = `Learning config unavailable: ${error.message}`;
   }
@@ -2249,6 +2251,7 @@ async function runLearningTick() {
       lastLearningReport = payload.report;
       renderLearningReport(payload.report);
       loadLearningAudit();
+      loadLearningDecisions();
       loadLearningReports();
     }
     if (status) status.textContent = `${payload.ran ? "Learning tick ran" : "Learning tick skipped"}: ${payload.reason} Next: ${formatLearningTime(payload.nextRunAt)}`;
@@ -2309,6 +2312,7 @@ async function runLearningCycle() {
     lastLearningReport = report;
     renderLearningReport(report);
     loadLearningAudit();
+    loadLearningDecisions();
     loadLearningReports();
     if (status) status.textContent = `Learning cycle ${report.status}. Recommendation: ${report.recommendation?.action || "-"}.`;
   } catch (error) {
@@ -2342,6 +2346,51 @@ async function loadLearningReports() {
   } catch (error) {
     body.innerHTML = `<tr><td colspan="6">Learning reports could not load: ${escapeHtml(error.message)}</td></tr>`;
   }
+}
+
+async function loadLearningDecisions() {
+  const summary = document.querySelector("#learning-decision-summary");
+  const body = document.querySelector("#learning-decisions-body");
+  if (!summary || !body) return;
+  try {
+    const payload = await apiGet("/api/learning/decisions?limit=50");
+    renderLearningDecisionSummary(payload.summary || {});
+    body.innerHTML = (payload.decisions || []).map((decision) => {
+      const candidate = decision.candidate || {};
+      const candidateLabel = candidate.strategy
+        ? `${candidate.strategy} ${candidate.symbol || ""} ${candidate.timeframe || ""}`.trim()
+        : "-";
+      return `
+        <tr>
+          <td>${decision.createdAt ? escapeHtml(new Date(decision.createdAt).toLocaleString()) : "-"}</td>
+          <td>${escapeHtml(decision.action || "-")}</td>
+          <td>${escapeHtml(candidateLabel)}</td>
+          <td>${escapeHtml(decision.auditStatus || "-")}</td>
+          <td>${formatNumber(decision.robustnessScore)}</td>
+          <td class="${decision.promoted ? "positive" : "neutral"}">${decision.promoted ? "yes" : "no"}</td>
+          <td>${escapeHtml(decision.reason || "")}</td>
+        </tr>
+      `;
+    }).join("") || `<tr><td colspan="7">No learning decisions recorded yet.</td></tr>`;
+  } catch (error) {
+    summary.innerHTML = "";
+    body.innerHTML = `<tr><td colspan="7">Decision log could not load: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderLearningDecisionSummary(summary) {
+  const host = document.querySelector("#learning-decision-summary");
+  if (!host) return;
+  const churn = summary.candidateChurn || {};
+  const latestPromoted = summary.latestPromotedCandidate || {};
+  host.innerHTML = `
+    <div class="metric"><span>Total decisions</span><strong>${summary.totalDecisions || 0}</strong></div>
+    <div class="metric"><span>Auto-promoted</span><strong>${summary.autoPromotions || 0}</strong></div>
+    <div class="metric"><span>Rejected</span><strong>${summary.rejectedAutoPromotions || 0}</strong></div>
+    <div class="metric"><span>Latest action</span><strong>${escapeHtml(summary.latestAction || "-")}</strong></div>
+    <div class="metric"><span>Candidate churn</span><strong>${churn.uniqueCandidates || 0}/${churn.observations || 0}</strong></div>
+    <div class="metric"><span>Last promoted</span><strong>${latestPromoted.strategy ? `${escapeHtml(latestPromoted.strategy)} ${escapeHtml(latestPromoted.symbol || "")}` : "-"}</strong></div>
+  `;
 }
 
 async function loadLearningAudit() {
@@ -2393,6 +2442,7 @@ async function loadAutoPromoteStatus() {
     host.innerHTML = `<p class="pane-status">Checking auto-promotion eligibility...</p>`;
     const payload = await apiGet("/api/learning/auto-promote/status");
     host.innerHTML = renderAutoPromoteResult(payload);
+    loadLearningDecisions();
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Auto-promote status unavailable: ${escapeHtml(error.message)}</p>`;
   }
@@ -2404,9 +2454,11 @@ async function runAutoPromote() {
   try {
     const payload = await apiPost("/api/learning/auto-promote", {});
     if (host) host.innerHTML = renderAutoPromoteResult(payload);
+    loadLearningDecisions();
     openPaperPanel();
   } catch (error) {
     if (host) host.innerHTML = `<p class="pane-status">Auto-promote rejected: ${escapeHtml(error.message)}</p>`;
+    loadLearningDecisions();
   }
 }
 

@@ -48,6 +48,7 @@ Responsibilities:
 - Own learning-cycle execution and reports through `/api/learning/*`; reports are recommendations only, promotion remains manual, and paper enablement remains manual.
 - Own scheduled learning due checks and file-backed learning locks; local scheduling should call `python scripts/learning_tick.py` and only the backend decides whether a cycle is due.
 - Own automatic learning v1 decisions. Auto-promotion may only write a paper candidate config with `enabled=false`; paper simulation enablement remains manual, auto-enable paper is intentionally blocked, and real trading is not implemented.
+- Own automatic learning decision logs through `/api/learning/decisions` and `/api/learning/decision-summary`; every learning recommendation, scheduled tick, eligibility check, rejection, and auto-promotion must be auditable from backend-owned records.
 
 ## Core Strategy / Research Engine
 
@@ -81,6 +82,7 @@ When adding a feature:
 - New paper-performance health rule, degradation threshold, or replacement suggestion rule: backend/core only.
 - New learning-runner schedule, cycle step, candidate comparison, or recommendation rule: backend/core only.
 - New auto-promotion rule or eligibility check: backend/core only, and it must not enable paper simulation or place trades.
+- New automatic-learning decision record or audit summary: backend/core only; frontend may render the records but must not invent reasons, scores, checks, or outcomes.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 ## Scheduled Learning

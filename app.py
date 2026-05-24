@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import uuid
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -24,9 +25,11 @@ PAPER_CANDIDATE_PATH = Path(app.root_path) / "config" / "paper-candidate.json"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
 LEARNING_CONFIG_PATH = Path(app.root_path) / "config" / "learning-runner.json"
 LEARNING_REPORTS_PATH = Path(app.root_path) / "data" / "learning-reports.json"
+LEARNING_DECISIONS_PATH = Path(app.root_path) / "data" / "learning-decisions.json"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
 MAX_LEARNING_REPORTS = 100
+MAX_LEARNING_DECISIONS = 300
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
@@ -375,7 +378,7 @@ def learning_auto_promote_status():
     latest = (load_learning_reports() or [None])[-1]
     audit = build_learning_quality_audit()
     result = evaluate_auto_promotion(config, audit, latest, read_json_file(str(PAPER_CANDIDATE_PATH), {}))
-    return jsonify({
+    payload = {
         "autoPromote": bool(config.get("autoPromote", False)),
         "autoPromoteMode": config.get("autoPromoteMode", "candidate_only"),
         "autoEnablePaper": False,
@@ -385,15 +388,32 @@ def learning_auto_promote_status():
         "reason": result.get("reason"),
         "candidate": result.get("candidate"),
         "checks": result.get("checks", []),
-    })
+    }
+    append_learning_decision_from_context(
+        source="audit",
+        action="PROMOTE_CANDIDATE" if result.get("allowed") else "REJECT_AUTO_PROMOTE",
+        reason=result.get("reason", "Auto-promotion eligibility evaluated."),
+        candidate=result.get("candidate"),
+        audit=audit,
+        checks=result.get("checks", []),
+        report_id=(latest or {}).get("id"),
+    )
+    return jsonify(payload)
 
 
 @app.post("/api/learning/auto-promote")
 def learning_auto_promote():
     latest = (load_learning_reports() or [None])[-1]
     if not latest:
-        return jsonify({"promoted": False, "reason": "No learning reports exist.", "checks": []}), 400
-    result = auto_promote_candidate_if_allowed(load_learning_config(), latest)
+        result = {"promoted": False, "reason": "No learning reports exist.", "checks": []}
+        append_learning_decision_from_context(
+            source="manual_auto_promote",
+            action="REJECT_AUTO_PROMOTE",
+            reason=result["reason"],
+            checks=[],
+        )
+        return jsonify(result), 400
+    result = auto_promote_candidate_if_allowed(load_learning_config(), latest, decision_source="manual_auto_promote")
     if not result.get("promoted"):
         result["error"] = result.get("reason", "Auto-promotion rejected.")
     status_code = 200 if result.get("promoted") else 400
@@ -408,6 +428,7 @@ def learning_run():
     config["autoEnablePaper"] = False
     report = run_learning_cycle(config)
     append_learning_report(report)
+    append_learning_decision_for_report("learning_run", report)
     return jsonify(report)
 
 
@@ -438,6 +459,29 @@ def learning_report(report_id):
     if not report:
         return jsonify({"error": f"Learning report not found: {report_id}"}), 404
     return jsonify(report)
+
+
+@app.get("/api/learning/decisions")
+def learning_decisions():
+    limit = max(1, min(300, int(request.args.get("limit", "50"))))
+    decisions = load_learning_decisions()
+    return jsonify({
+        "decisions": decisions[-limit:][::-1],
+        "summary": summarize_learning_decisions(decisions),
+    })
+
+
+@app.get("/api/learning/decisions/<decision_id>")
+def learning_decision(decision_id):
+    decision = get_learning_decision_by_id(decision_id)
+    if not decision:
+        return jsonify({"error": f"Learning decision not found: {decision_id}"}), 404
+    return jsonify(decision)
+
+
+@app.get("/api/learning/decision-summary")
+def learning_decision_summary():
+    return jsonify(summarize_learning_decisions())
 
 
 @app.get("/api/backtest-history")
@@ -1037,6 +1081,149 @@ def latest_learning_report_summary() -> dict | None:
     }
 
 
+def load_learning_decisions() -> list[dict]:
+    if not LEARNING_DECISIONS_PATH.exists():
+        return []
+    try:
+        with open(LEARNING_DECISIONS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return data
+        return data.get("decisions", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def save_learning_decisions(decisions: list[dict]) -> None:
+    LEARNING_DECISIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    capped = decisions[-MAX_LEARNING_DECISIONS:]
+    with open(LEARNING_DECISIONS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(capped, handle, indent=2)
+        handle.write("\n")
+
+
+def append_learning_decision(record: dict) -> str:
+    decision = dict(record)
+    decision.setdefault("id", f"decision-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}")
+    decision.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
+    decision.setdefault("promoted", False)
+    decision.setdefault("paperEnabledAfter", bool(read_json_file(str(PAPER_CANDIDATE_PATH), {}).get("enabled", False)))
+    decision.setdefault("errors", [])
+    decision.setdefault("warnings", [])
+    decisions = load_learning_decisions()
+    decisions.append(decision)
+    save_learning_decisions(decisions)
+    return decision["id"]
+
+
+def get_learning_decision_by_id(decision_id: str) -> dict | None:
+    return next((decision for decision in load_learning_decisions() if decision.get("id") == decision_id), None)
+
+
+def summarize_learning_decisions(decisions: list[dict] | None = None) -> dict:
+    items = decisions if decisions is not None else load_learning_decisions()
+    latest = items[-1] if items else None
+    auto_promotions = [item for item in items if item.get("promoted") or item.get("action") == "AUTO_PROMOTED"]
+    rejected = [item for item in items if item.get("action") == "REJECT_AUTO_PROMOTE"]
+    reason_counts = Counter((item.get("reason") or "Unknown").strip() for item in rejected)
+    candidate_keys = [learning_recommendation_key(item.get("candidate")) for item in items if item.get("candidate")]
+    candidate_keys = [key for key in candidate_keys if key]
+    candidate_counts = Counter(candidate_keys)
+    latest_promoted = next((item.get("candidate") for item in reversed(auto_promotions) if item.get("candidate")), None)
+    return {
+        "totalDecisions": len(items),
+        "autoPromotions": len(auto_promotions),
+        "rejectedAutoPromotions": len(rejected),
+        "mostCommonRejectReasons": [
+            {"reason": reason, "count": count}
+            for reason, count in reason_counts.most_common(5)
+        ],
+        "latestAction": latest.get("action") if latest else None,
+        "latestDecisionAt": latest.get("createdAt") if latest else None,
+        "latestPromotedCandidate": latest_promoted,
+        "candidateChurn": {
+            "observations": len(candidate_keys),
+            "uniqueCandidates": len(candidate_counts),
+            "topCandidateKey": candidate_counts.most_common(1)[0][0] if candidate_counts else None,
+            "topCandidateCount": candidate_counts.most_common(1)[0][1] if candidate_counts else 0,
+        },
+    }
+
+
+def compact_learning_candidate(candidate: dict | None) -> dict | None:
+    if not candidate:
+        return None
+    source = candidate.get("source") or candidate.get("dataSource") or "bybit"
+    return {
+        "source": source,
+        "strategy": candidate.get("strategy") or candidate.get("preset"),
+        "preset": candidate.get("preset") or candidate.get("strategy"),
+        "symbol": candidate.get("symbol"),
+        "timeframe": candidate.get("timeframe") or candidate.get("interval"),
+        "period": candidate.get("period"),
+        "score": candidate.get("score"),
+        "trades": candidate.get("trades") or candidate.get("numberOfTrades"),
+        "profitFactor": candidate.get("profitFactor"),
+        "maxDrawdown": candidate.get("maxDrawdown"),
+        "totalReturnPct": candidate.get("totalReturnPct") or candidate.get("totalReturn"),
+        "winRate": candidate.get("winRate"),
+        "params": candidate.get("params", {}),
+        "origin": candidate.get("origin"),
+    }
+
+
+def append_learning_decision_from_context(
+    source: str,
+    action: str,
+    reason: str,
+    candidate: dict | None = None,
+    audit: dict | None = None,
+    checks: list[dict] | None = None,
+    report_id: str | None = None,
+    promoted: bool = False,
+    errors: list | None = None,
+    warnings: list | None = None,
+) -> str:
+    current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    audit_summary = (audit or {}).get("summary", {})
+    record = {
+        "source": source,
+        "action": action,
+        "candidate": compact_learning_candidate(candidate),
+        "currentCandidate": candidate_summary(current),
+        "auditStatus": (audit or {}).get("status"),
+        "robustnessScore": audit_summary.get("robustnessScore"),
+        "checks": checks or [],
+        "reason": reason,
+        "reportId": report_id,
+        "promoted": bool(promoted),
+        "paperEnabledAfter": bool(current.get("enabled", False)),
+        "errors": errors or [],
+        "warnings": warnings or [],
+    }
+    return append_learning_decision(record)
+
+
+def append_learning_decision_for_report(source: str, report: dict) -> str:
+    rec = report.get("recommendation") or {}
+    action = rec.get("action") or ("ERROR" if report.get("status") == "failed" else "KEEP_CURRENT")
+    if report.get("status") == "failed":
+        action = "ERROR"
+    audit = build_learning_quality_audit()
+    return append_learning_decision_from_context(
+        source=source,
+        action=action,
+        reason=rec.get("reason") or f"Learning report {report.get('status', 'completed')}.",
+        candidate=rec.get("candidate") or report.get("bestSavedCandidate"),
+        audit=audit,
+        checks=(report.get("autoPromotion") or {}).get("checks", []),
+        report_id=report.get("id"),
+        promoted=bool((report.get("autoPromotion") or {}).get("promoted")),
+        errors=report.get("errors", []),
+        warnings=report.get("warnings", []),
+    )
+
+
 def parse_learning_time(value: str | None):
     if not value:
         return None
@@ -1103,10 +1290,24 @@ def run_due_learning_cycle(force: bool = False) -> dict:
     due, reason = (True, "Forced learning tick.") if force else should_run_learning_cycle(config, now)
     if not due:
         next_run = config.get("nextRunAt") or compute_next_learning_run(config, now).isoformat()
-        return {"ran": False, "reason": reason, "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": next_run}
+        result = {"ran": False, "reason": reason, "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": next_run}
+        append_learning_decision_from_context(
+            source="scheduled_tick",
+            action="WAIT_FOR_MORE_DATA",
+            reason=reason,
+            warnings=["Learning tick skipped because no cycle was due."],
+        )
+        return result
     if not acquire_learning_lock():
         config = load_learning_config()
-        return {"ran": False, "reason": "Learning cycle already running.", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
+        reason = "Learning cycle already running."
+        append_learning_decision_from_context(
+            source="scheduled_tick",
+            action="WAIT_FOR_MORE_DATA",
+            reason=reason,
+            warnings=["Learning lock was already active."],
+        )
+        return {"ran": False, "reason": reason, "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
     try:
         config = load_learning_config()
         report = run_learning_cycle(config)
@@ -1117,12 +1318,20 @@ def run_due_learning_cycle(force: bool = False) -> dict:
         config["lock"] = {"running": False, "startedAt": None}
         config["autoEnablePaper"] = False
         save_learning_config(config)
+        append_learning_decision_for_report("scheduled_tick", report)
         return {"ran": True, "reason": reason, "report": report, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
     except Exception as exc:
         config = load_learning_config()
         config["lock"] = {"running": False, "startedAt": None}
         save_learning_config(config)
-        return {"ran": False, "reason": f"Learning cycle failed: {exc}", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
+        reason = f"Learning cycle failed: {exc}"
+        append_learning_decision_from_context(
+            source="scheduled_tick",
+            action="ERROR",
+            reason=reason,
+            errors=[str(exc)],
+        )
+        return {"ran": False, "reason": reason, "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
 
 
 def build_learning_quality_audit(window: int = 5, extra_report: dict | None = None) -> dict:
@@ -1350,7 +1559,7 @@ def evaluate_auto_promotion(config: dict, audit: dict, latest_report: dict | Non
     return {"allowed": allowed, "reason": reason, "candidate": candidate if allowed else candidate, "checks": checks}
 
 
-def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None) -> dict:
+def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None, decision_source: str = "learning_run") -> dict:
     attempted = bool(safe_learning_config(config).get("autoPromote"))
     audit = build_learning_quality_audit(extra_report=learning_report)
     current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
@@ -1363,6 +1572,15 @@ def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None
         "checks": evaluation.get("checks", []),
     }
     if not attempted or not evaluation.get("allowed"):
+        append_learning_decision_from_context(
+            source=decision_source,
+            action="REJECT_AUTO_PROMOTE",
+            reason=evaluation["reason"],
+            candidate=evaluation.get("candidate"),
+            audit=audit,
+            checks=evaluation.get("checks", []),
+            report_id=(learning_report or {}).get("id"),
+        )
         return result
     candidate = evaluation.get("candidate") or {}
     payload = {
@@ -1409,6 +1627,16 @@ def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None
         "backupPath": str(backup_path.relative_to(app.root_path)),
         "candidate": candidate_summary(updated),
     })
+    append_learning_decision_from_context(
+        source=decision_source,
+        action="AUTO_PROMOTED",
+        reason=result["reason"],
+        candidate=result.get("candidate"),
+        audit=audit,
+        checks=evaluation.get("checks", []),
+        report_id=(learning_report or {}).get("id"),
+        promoted=True,
+    )
     return result
 
 
