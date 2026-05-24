@@ -14,8 +14,8 @@ Responsibilities:
 
 - Render layout, controls, charts, markers, modals, tables, diagnostics, and paper-simulation status.
 - Manage UI state such as chart count, selected source, symbol, timeframe, indicators, signal marker visibility, and selected strategy preset.
-- Call API routes such as `/api/config`, `/api/candles`, `/api/indicators`, `/api/signals`, and `/api/backtest`.
-- Render returned candles, indicator series, signal payloads, trade markers, backtest metrics, diagnostics, and optimizer summaries.
+- Call API routes such as `/api/config`, `/api/candles`, `/api/indicators`, `/api/signals`, `/api/backtest`, and `/api/strategy-ranking`.
+- Render returned candles, indicator series, signal payloads, trade markers, backtest metrics, diagnostics, optimizer summaries, and strategy ranking rows.
 - Maintain live websocket candle display for Bybit/Hyperliquid as transport and rendering only.
 
 Frontend code must not calculate EMA, RSI, MACD, ATR, VWAP, Supertrend, Donchian channels, signal scores, strategy entries/exits, optimizer rankings, or backtest metrics.
@@ -38,6 +38,7 @@ Responsibilities:
 - Calculate Python-side indicators and signal payloads.
 - Provide JSON shaped for Lightweight Charts.
 - Call the shared Node backtest engine for strategy research and UI backtests.
+- Own `/api/strategy-ranking`, including matrix execution, metric collection, ranking score calculation, validity flags, and ranking cards.
 
 ## Core Strategy / Research Engine
 
@@ -55,7 +56,7 @@ Responsibilities:
 
 - Implement reusable backtest execution, trade auditing, strategy rules, optimizer runs, reporting, and paper-simulation logic.
 - Produce deterministic JSON results for CLI tools, Flask API routes, and future automation.
-- Own strategy ranking and validation decisions.
+- Own strategy ranking and validation decisions. Frontend analysis pages must display backend/core ranking payloads without recalculating scores.
 
 ## Change Rule
 

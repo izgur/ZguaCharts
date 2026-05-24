@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-watchlist-history">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-ranking-api">
   </head>
   <body>
     <header class="topbar">
@@ -96,7 +96,7 @@
         <div class="page-heading">
           <div>
             <h2>Strategy Ranking</h2>
-            <p>Placeholder comparison view. Future aggregate/ranking data should come from a backend API.</p>
+            <p>Backend-calculated strategy rankings. The browser renders returned metrics only.</p>
           </div>
         </div>
         <div class="analysis-filters">
@@ -216,6 +216,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-watchlist-history" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-ranking-api" defer></script>
   </body>
 </html>

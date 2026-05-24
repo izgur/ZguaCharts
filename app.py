@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -209,16 +210,32 @@ def strategy_ranking():
     source = request.args.get("source", "bybit")
     symbols = parse_csv_arg(request.args.get("symbols"), ["BTCUSDT"])
     timeframes = parse_csv_arg(request.args.get("timeframes"), ["1h"])
-    period = request.args.get("period", "60d")
-    presets = parse_csv_arg(request.args.get("presets"), [DEFAULT_PRESET_ID])
-    limit = int(request.args.get("limit", "3000"))
+    period = request.args.get("period", "365d")
+    default_presets = [item["id"] for item in preset_options()] + ["regime_filtered_trend"]
+    presets = parse_csv_arg(request.args.get("presets"), default_presets)
+    limit = int(request.args.get("limit", "5000"))
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
-    min_trades = int(request.args.get("min_trades", "0"))
+    min_trades = int(request.args.get("min_trades", "10"))
+    allow_shorts = request.args.get("allowShorts", "false").lower() in {"1", "true", "yes", "on"}
+    max_runs = int(request.args.get("max_runs", "30"))
+    runs_requested = len(symbols) * len(timeframes) * len(presets)
+
+    if runs_requested > max_runs:
+        return jsonify({
+            "error": f"Requested {runs_requested} ranking runs, but max_runs is {max_runs}. Narrow symbols, timeframes, presets, or raise max_runs intentionally.",
+            "requested": {
+                "symbols": symbols,
+                "timeframes": timeframes,
+                "presets": presets,
+                "limit": limit,
+                "minTrades": min_trades,
+                "maxRuns": max_runs,
+            },
+        }), 400
 
     rows = []
     errors = []
-    rankable_rows = []
     # TODO: Move this synchronous matrix run to a background job/cache when the
     # requested symbol/timeframe/preset matrix becomes too slow for one request.
     for symbol in symbols:
@@ -234,56 +251,89 @@ def strategy_ranking():
                         fee_pct,
                         slippage_pct,
                         limit,
+                        allow_shorts=allow_shorts,
                     )
                     metrics = ranking_metrics_from_backtest(payload)
+                    valid = metrics["trades"] >= min_trades
+                    warnings = list(payload.get("warnings") or [])
+                    if metrics["trades"] == 0:
+                        warnings.append("zero-trade result")
+                    if metrics["trades"] < min_trades:
+                        warnings.append(f"trades below min_trades ({metrics['trades']} < {min_trades})")
                     row = {
+                        "rank": None,
+                        "valid": valid,
                         "strategy": payload.get("preset") or preset,
                         "preset": preset,
                         "symbol": symbol,
                         "timeframe": timeframe,
                         "period": period,
-                        "returnPct": metrics["totalReturn"],
+                        "totalReturnPct": metrics["totalReturn"],
                         "winRate": metrics["winRate"],
                         "maxDrawdown": metrics["maxDrawdown"],
                         "profitFactor": metrics["profitFactor"],
                         "trades": metrics["trades"],
                         "averageBarsHeld": metrics["averageBarsHeld"],
-                        "score": ranking_score(metrics),
+                        "score": ranking_score(metrics, min_trades=min_trades),
+                        "diagnostics": payload.get("diagnostics") or {},
+                        "warnings": warnings,
                     }
                     rows.append(row)
-                    if row["trades"] >= min_trades:
-                        rankable_rows.append(row)
                 except Exception as exc:
-                    errors.append({
+                    error = {
                         "symbol": symbol,
                         "timeframe": timeframe,
                         "preset": preset,
                         "error": str(exc),
+                    }
+                    errors.append(error)
+                    rows.append({
+                        "rank": None,
+                        "valid": False,
+                        "strategy": NODE_STRATEGIES.get(preset, preset),
+                        "preset": preset,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "period": period,
+                        "totalReturnPct": 0,
+                        "winRate": 0,
+                        "maxDrawdown": 0,
+                        "profitFactor": 0,
+                        "trades": 0,
+                        "averageBarsHeld": 0,
+                        "score": -999,
+                        "diagnostics": {},
+                        "warnings": [str(exc)],
                     })
 
-    rankable_rows.sort(key=lambda item: item["score"], reverse=True)
-    for index, row in enumerate(rankable_rows, start=1):
+    rows.sort(key=lambda item: item["score"], reverse=True)
+    for index, row in enumerate(rows, start=1):
         row["rank"] = index
 
     return jsonify({
         "source": source,
         "period": period,
-        "limit": limit,
-        "feePct": fee_pct,
-        "slippagePct": slippage_pct,
-        "minTrades": min_trades,
-        "rows": rankable_rows,
-        "allRows": rows,
-        "errors": errors,
-        "summary": ranking_summary(rankable_rows),
-        "diagnostics": {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "requested": {
             "symbols": symbols,
             "timeframes": timeframes,
             "presets": presets,
-            "combinationsRequested": len(symbols) * len(timeframes) * len(presets),
-            "combinationsCompleted": len(rows),
-            "rowsAfterMinTrades": len(rankable_rows),
+            "limit": limit,
+            "minTrades": min_trades,
+            "maxRuns": max_runs,
+            "allowShorts": allow_shorts,
+            "feePct": fee_pct,
+            "slippagePct": slippage_pct,
         },
+        "summary": {
+            "runsRequested": runs_requested,
+            "runsCompleted": len(rows) - len(errors),
+            "validCandidates": len([row for row in rows if row.get("valid")]),
+            "errors": len(errors),
+        },
+        "cards": ranking_cards(rows),
+        "rows": rows,
+        "errors": errors,
     })
 
 
@@ -343,6 +393,44 @@ def read_jsonl_tail(path: str, limit: int):
     return rows
 
 
+def node_executable() -> str:
+    """Return a Node binary new enough for the shared research engine.
+
+    Some local Windows machines have an old `node.exe` earlier on PATH while
+    npm uses a newer bundled runtime. Render normally resolves `node` directly,
+    so this only changes behavior when multiple local candidates are present.
+    """
+    env_node = os.environ.get("NODE_BINARY") or os.environ.get("NODE_EXE")
+    candidates = [env_node] if env_node else []
+    path_node = shutil.which("node")
+    if path_node:
+        candidates.append(path_node)
+    if os.name == "nt":
+        try:
+            where = subprocess.run(["where.exe", "node"], text=True, capture_output=True, timeout=5)
+            if where.returncode == 0:
+                candidates.extend(line.strip() for line in where.stdout.splitlines() if line.strip())
+        except Exception:
+            pass
+
+    seen = set()
+    fallback = None
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        fallback = fallback or candidate
+        try:
+            completed = subprocess.run([candidate, "-v"], text=True, capture_output=True, timeout=5)
+            version = (completed.stdout or completed.stderr).strip().lstrip("v")
+            major = int(version.split(".", 1)[0])
+            if major >= 18:
+                return candidate
+        except Exception:
+            continue
+    return fallback or "node"
+
+
 def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int, debug: bool = False, allow_shorts: bool = False) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
@@ -368,7 +456,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "candles": candles_payload["candles"],
     }
     completed = subprocess.run(
-        ["node", "cli/backtest.js", "--stdin-json"],
+        [node_executable(), "cli/backtest.js", "--stdin-json"],
         input=json.dumps(engine_input, allow_nan=False),
         text=True,
         capture_output=True,
@@ -548,7 +636,7 @@ def run_shared_optimizer_engine(source: str, symbol: str, timeframe: str, period
     days = period[:-1] if period.endswith("d") else "365"
     completed = subprocess.run(
         [
-            "node",
+            node_executable(),
             "cli/optimize.js",
             "--staged",
             "--source",
@@ -606,25 +694,28 @@ def safe_float(value, fallback: float = 0.0) -> float:
     return number
 
 
-def ranking_score(metrics: dict) -> float:
+def ranking_score(metrics: dict, min_trades: int = 10) -> float:
     """Backend-only ranking score for the /analysis page.
 
     The frontend must render this score as data and must not duplicate this
     formula in JavaScript.
     """
     profit_factor = min(metrics["profitFactor"], 5)
-    trades_component = min(metrics["trades"], 200) / 10
+    trades = metrics["trades"]
     score = (
-        metrics["totalReturn"]
-        + profit_factor * 18
-        + metrics["winRate"] * 0.25
-        + trades_component
-        - metrics["maxDrawdown"] * 1.3
+        metrics["totalReturn"] * 2
+        + max(0, profit_factor - 1) * 30
+        + min(trades, 100) * 0.1
+        - metrics["maxDrawdown"] * 2
     )
+    if trades == 0:
+        score -= 100
+    elif trades < min_trades:
+        score -= (min_trades - trades) * 8
     return round(score, 2)
 
 
-def ranking_summary(rows: list[dict]) -> dict:
+def ranking_cards(rows: list[dict]) -> dict:
     if not rows:
         return {
             "bestOverall": None,
@@ -632,10 +723,11 @@ def ranking_summary(rows: list[dict]) -> dict:
             "lowestDrawdown": None,
             "worstResult": None,
         }
+    metric_rows = [row for row in rows if not row.get("warnings") or row.get("trades", 0) > 0] or rows
     return {
         "bestOverall": rows[0],
-        "bestWinRate": max(rows, key=lambda item: item["winRate"]),
-        "lowestDrawdown": min(rows, key=lambda item: item["maxDrawdown"]),
+        "bestWinRate": max(metric_rows, key=lambda item: item["winRate"]),
+        "lowestDrawdown": min(metric_rows, key=lambda item: item["maxDrawdown"]),
         "worstResult": min(rows, key=lambda item: item["score"]),
     }
 

@@ -2063,8 +2063,8 @@ async function runStrategyRanking() {
     if (!response.ok) throw new Error(payload.error || "Strategy ranking failed");
     renderStrategyRanking(payload);
     if (status) {
-      const diagnostics = payload.diagnostics || {};
-      status.textContent = `Completed ${diagnostics.combinationsCompleted || 0}/${diagnostics.combinationsRequested || 0} combinations. ${payload.errors?.length || 0} errors.`;
+      const summary = payload.summary || {};
+      status.textContent = `Completed ${summary.runsCompleted || 0}/${summary.runsRequested || 0} backend runs. ${summary.validCandidates || 0} valid candidates. ${summary.errors || 0} errors.`;
     }
   } catch (error) {
     if (status) status.textContent = error.message;
@@ -2074,36 +2074,36 @@ async function runStrategyRanking() {
 
 function renderStrategyRanking(payload) {
   const rows = payload.rows || [];
-  const summary = payload.summary || {};
+  const cardsPayload = payload.cards || {};
   const cardsEl = document.querySelector("#analysis-cards");
   const body = document.querySelector("#analysis-table-body");
   if (cardsEl) {
     const cards = [
-      ["Best overall", summary.bestOverall],
-      ["Best win rate", summary.bestWinRate],
-      ["Lowest drawdown", summary.lowestDrawdown],
-      ["Worst result", summary.worstResult],
+      ["Best overall", cardsPayload.bestOverall],
+      ["Best win rate", cardsPayload.bestWinRate],
+      ["Lowest drawdown", cardsPayload.lowestDrawdown],
+      ["Worst result", cardsPayload.worstResult],
     ];
     cardsEl.innerHTML = cards.map(([label, row]) => `
       <div class="metric">
         <span>${label}</span>
-        <strong>${row ? `${escapeHtml(row.strategy)} ${escapeHtml(row.symbol)} ${escapeHtml(row.timeframe)}` : "-"}</strong>
+        <strong>${row ? `${escapeHtml(row.strategy)} ${escapeHtml(row.symbol)} ${escapeHtml(row.timeframe)} · ${formatSigned(row.totalReturnPct)}%` : "-"}</strong>
       </div>
     `).join("");
   }
   if (body) {
     body.innerHTML = rows.map((row) => `
-      <tr>
+      <tr class="${row.valid ? "" : "invalid-row"}">
         <td>${row.rank}</td>
-        <td>${escapeHtml(row.strategy)}</td>
+        <td>${escapeHtml(row.strategy)}${row.valid ? "" : " <span class=\"status-pill muted\">invalid</span>"}</td>
         <td>${escapeHtml(row.symbol)}</td>
         <td>${escapeHtml(row.timeframe)}</td>
-        <td class="${row.returnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.returnPct)}%</td>
-        <td>${row.winRate}%</td>
-        <td>${row.maxDrawdown}%</td>
-        <td>${row.profitFactor}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.winRate)}%</td>
+        <td>${formatNumber(row.maxDrawdown)}%</td>
+        <td>${formatNumber(row.profitFactor)}</td>
         <td>${row.trades}</td>
-        <td>${row.score}</td>
+        <td title="${escapeHtml((row.warnings || []).join("; "))}">${formatNumber(row.score)}</td>
       </tr>
     `).join("") || `<tr><td colspan="10">No rows matched the filters.</td></tr>`;
   }
@@ -2188,6 +2188,11 @@ function formatReason(reason) {
 function formatSigned(value) {
   const number = Number(value || 0);
   return `${number > 0 ? "+" : ""}${number.toFixed(2)}`;
+}
+
+function formatNumber(value, digits = 2) {
+  const number = Number(value || 0);
+  return number.toFixed(digits);
 }
 
 function formatDateTime(timestamp) {
