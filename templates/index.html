@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-strategy-optimize">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-research-history">
   </head>
   <body>
     <header class="topbar">
@@ -163,6 +163,29 @@
           </thead>
           <tbody id="optimization-table-body"></tbody>
         </table>
+        <div class="page-heading compact-heading">
+          <div>
+            <h2>Research Memory</h2>
+            <p>Saved backend research runs for future learning. Suggestions require manual approval.</p>
+          </div>
+          <button id="research-suggest-candidate" type="button">Suggest candidate</button>
+        </div>
+        <div id="research-summary-cards" class="metric-grid"></div>
+        <div id="research-suggestion" class="pane-status">No suggestion loaded.</div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Type</th>
+              <th>Market</th>
+              <th>Best candidate</th>
+              <th>Score</th>
+              <th>Status</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="research-runs-table-body"></tbody>
+        </table>
       </section>
 
       <section id="settings-page" class="route-page settings-page" data-page="settings" hidden>
@@ -249,6 +272,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-strategy-optimize" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-research-history" defer></script>
   </body>
 </html>

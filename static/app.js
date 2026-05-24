@@ -58,6 +58,7 @@ let analysisInitialized = false;
 let backtestPane = null;
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
+let lastResearchSuggestion = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
 let watchlistRefreshInFlight = false;
@@ -2090,6 +2091,7 @@ function renderAnalysisPage() {
     setupAnalysisControls();
     analysisInitialized = true;
   }
+  loadResearchRuns();
 }
 
 function setupAnalysisControls() {
@@ -2124,6 +2126,15 @@ function setupAnalysisControls() {
     const index = Number(button.dataset.promoteOptimization);
     const row = lastOptimizationPayload?.topCandidates?.[index];
     if (row) promoteOptimizedCandidate(row);
+  });
+  document.querySelector("#research-runs-table-body")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-load-research-run]");
+    if (button) loadResearchRun(button.dataset.loadResearchRun);
+  });
+  document.querySelector("#research-suggest-candidate")?.addEventListener("click", suggestResearchCandidate);
+  document.querySelector("#research-suggestion")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-promote-suggestion]");
+    if (button && lastResearchSuggestion?.candidate) promoteResearchCandidate(lastResearchSuggestion.candidate, lastResearchSuggestion);
   });
 }
 
@@ -2191,6 +2202,7 @@ async function runStrategyRanking() {
     if (!response.ok) throw new Error(payload.error || "Strategy ranking failed");
     lastStrategyRankingPayload = payload;
     renderStrategyRanking(payload);
+    loadResearchRuns();
     if (status) {
       const summary = payload.summary || {};
       status.textContent = `Completed ${summary.runsCompleted || 0}/${summary.runsRequested || 0} backend runs. ${summary.validCandidates || 0} valid candidates. ${summary.errors || 0} errors.`;
@@ -2295,6 +2307,7 @@ async function runStrategyOptimization() {
     const payload = await apiGet(`/api/strategy-optimize?${params}`);
     lastOptimizationPayload = payload;
     renderStrategyOptimization(payload);
+    loadResearchRuns();
     if (status) {
       const summary = payload.summary || {};
       status.textContent = `Optimization complete. Tested ${JSON.stringify(summary.combinationsTested || 0)} combos. ${summary.validCandidates || 0} valid candidates.`;
@@ -2373,6 +2386,148 @@ async function promoteOptimizedCandidate(row) {
     if (!paperPanel?.hidden) openPaperPanel();
   } catch (error) {
     if (status) status.textContent = `Promotion failed: ${error.message}`;
+  }
+}
+
+async function loadResearchRuns() {
+  const body = document.querySelector("#research-runs-table-body");
+  const cards = document.querySelector("#research-summary-cards");
+  if (!body || !cards) return;
+  try {
+    const payload = await apiGet("/api/research/runs?limit=20");
+    renderResearchRuns(payload);
+  } catch (error) {
+    body.innerHTML = `<tr><td colspan="7">Research history could not load: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderResearchRuns(payload) {
+  const body = document.querySelector("#research-runs-table-body");
+  const cards = document.querySelector("#research-summary-cards");
+  const summary = payload.summary || {};
+  const best = summary.bestSavedCandidate;
+  if (cards) {
+    cards.innerHTML = `
+      <div class="metric"><span>Total runs</span><strong>${summary.totalRuns || 0}</strong></div>
+      <div class="metric"><span>Ranking runs</span><strong>${summary.rankingRuns || 0}</strong></div>
+      <div class="metric"><span>Optimization runs</span><strong>${summary.optimizationRuns || 0}</strong></div>
+      <div class="metric"><span>Best saved</span><strong>${best ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol)} ${escapeHtml(best.timeframe)} · ${formatNumber(best.score)}` : "-"}</strong></div>
+    `;
+  }
+  if (!body) return;
+  body.innerHTML = (payload.runs || []).map((run) => {
+    const candidate = run.bestCandidate || {};
+    return `
+      <tr>
+        <td>${run.createdAt ? escapeHtml(new Date(run.createdAt).toLocaleString()) : "-"}</td>
+        <td>${escapeHtml(run.type || "-")}</td>
+        <td>${escapeHtml((run.symbols || []).join(","))} ${escapeHtml((run.timeframes || []).join(","))}</td>
+        <td>${candidate ? `${escapeHtml(candidate.strategy || "-")} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</td>
+        <td>${candidate?.score !== undefined ? formatNumber(candidate.score) : "-"}</td>
+        <td>${escapeHtml(run.status || "-")}</td>
+        <td><button type="button" class="small-action-button" data-load-research-run="${escapeHtml(run.id)}">Load run</button></td>
+      </tr>
+    `;
+  }).join("") || `<tr><td colspan="7">No saved research runs yet.</td></tr>`;
+}
+
+async function loadResearchRun(runId) {
+  const suggestion = document.querySelector("#research-suggestion");
+  try {
+    const run = await apiGet(`/api/research/runs/${encodeURIComponent(runId)}`);
+    if (run.type === "ranking") {
+      const payload = {
+        source: run.source,
+        period: run.period,
+        requested: { symbols: run.symbols || [], timeframes: run.timeframes || [], presets: run.presets || [] },
+        summary: run.summary || {},
+        cards: { bestOverall: run.bestCandidate, bestWinRate: run.bestCandidate, lowestDrawdown: run.bestCandidate, worstResult: run.bestCandidate },
+        rows: run.rows || [],
+        errors: run.errors || [],
+      };
+      lastStrategyRankingPayload = payload;
+      renderStrategyRanking(payload);
+    } else if (run.type === "optimization") {
+      const payload = {
+        source: run.source,
+        strategy: (run.strategies || [])[0],
+        symbol: (run.symbols || [])[0],
+        timeframe: (run.timeframes || [])[0],
+        period: run.period,
+        requested: { limit: run.limit, maxCombos: run.max_combos, trainRatio: run.train_ratio, feePct: run.fee_pct, slippagePct: run.slippage_pct },
+        summary: run.summary || {},
+        topCandidates: run.topCandidates || [],
+      };
+      lastOptimizationPayload = payload;
+      renderStrategyOptimization(payload);
+    }
+    if (suggestion) suggestion.textContent = `Loaded saved ${run.type} run ${run.id}.`;
+  } catch (error) {
+    if (suggestion) suggestion.textContent = `Could not load research run: ${error.message}`;
+  }
+}
+
+async function suggestResearchCandidate() {
+  const suggestion = document.querySelector("#research-suggestion");
+  try {
+    if (suggestion) suggestion.textContent = "Asking backend for candidate suggestion...";
+    const payload = await apiPost("/api/research/suggest-candidate", {});
+    lastResearchSuggestion = payload;
+    renderResearchSuggestion(payload);
+  } catch (error) {
+    if (suggestion) suggestion.textContent = `Suggestion failed: ${error.message}`;
+  }
+}
+
+function renderResearchSuggestion(payload) {
+  const suggestion = document.querySelector("#research-suggestion");
+  const candidate = payload.candidate;
+  if (!suggestion) return;
+  suggestion.innerHTML = `
+    <strong>${escapeHtml(payload.action || "-")}</strong>
+    <span>${escapeHtml(payload.reason || "")}</span>
+    ${candidate ? `<button type="button" class="small-action-button" data-promote-suggestion="1">Promote suggested candidate</button>` : ""}
+  `;
+}
+
+async function promoteResearchCandidate(candidate, suggestionPayload) {
+  const suggestion = document.querySelector("#research-suggestion");
+  const ok = window.confirm(`Promote saved ${candidate.strategy} on ${candidate.symbol} ${candidate.timeframe} as the paper candidate?\n\nPaper simulation will stay disabled until validation passes and you explicitly enable it.`);
+  if (!ok) return;
+  const requestBody = {
+    source: candidate.source || "bybit",
+    symbol: candidate.symbol,
+    timeframe: candidate.timeframe,
+    preset: candidate.preset || candidate.strategy,
+    strategy: candidate.strategy,
+    period: candidate.period,
+    params: candidate.params || {},
+    minTrades: Number(document.querySelector("#analysis-min-trades")?.value || 20),
+    rankingSnapshot: {
+      valid: candidate.valid,
+      rank: candidate.rank,
+      score: candidate.score,
+      totalReturnPct: candidate.totalReturnPct,
+      winRate: candidate.winRate,
+      maxDrawdown: candidate.maxDrawdown,
+      profitFactor: candidate.profitFactor,
+      trades: candidate.trades,
+    },
+    optimizationSnapshot: candidate.origin === "optimization" ? {
+      researchRunId: candidate.researchRunId,
+      score: candidate.score,
+      train: candidate.train,
+      test: candidate.test,
+      full: candidate.full,
+      warnings: candidate.warnings,
+    } : undefined,
+  };
+  try {
+    const result = await apiPost("/api/candidate/promote", requestBody);
+    if (suggestion) suggestion.textContent = `${result.message} Candidate remains disabled.`;
+    if (!paperPanel?.hidden) openPaperPanel();
+  } catch (error) {
+    if (suggestion) suggestion.textContent = `Promotion failed: ${error.message}`;
   }
 }
 

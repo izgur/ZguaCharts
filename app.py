@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +21,9 @@ app = Flask(__name__)
 
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
 PAPER_CANDIDATE_PATH = Path(app.root_path) / "config" / "paper-candidate.json"
+RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
+MAX_RESEARCH_RUNS = 200
+MAX_RESEARCH_ROWS = 50
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
@@ -207,12 +211,72 @@ def strategy_optimize():
     train_ratio = float(request.args.get("train_ratio", "0.7"))
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
+    save_run = request.args.get("save", "true").lower() not in {"0", "false", "no", "off"}
 
     try:
         raw = run_strategy_optimizer_engine(source, symbol, timeframe, period, strategy, limit, max_combos, train_ratio, fee_pct, slippage_pct)
-        return jsonify(normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct))
+        payload = normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct)
+        if save_run:
+            payload["researchRunId"] = append_research_run(research_record_from_optimization(payload))
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": f"Could not run strategy optimizer: {exc}"}), 502
+
+
+@app.get("/api/research/runs")
+def research_runs():
+    limit = int(request.args.get("limit", "50"))
+    run_type = request.args.get("type")
+    runs = load_research_runs()
+    if run_type:
+        runs = [run for run in runs if run.get("type") == run_type]
+    return jsonify({
+        "runs": runs[-limit:][::-1],
+        "summary": summarize_research_runs(load_research_runs()),
+    })
+
+
+@app.get("/api/research/runs/<run_id>")
+def research_run(run_id):
+    run = get_research_run_by_id(run_id)
+    if not run:
+        return jsonify({"error": f"Research run not found: {run_id}"}), 404
+    return jsonify(run)
+
+
+@app.get("/api/research/best-candidate")
+def research_best_candidate():
+    candidate = best_saved_candidate(load_research_runs())
+    if not candidate:
+        return jsonify({"candidate": None, "reason": "No valid saved research candidate found."})
+    return jsonify({"candidate": candidate})
+
+
+@app.post("/api/research/suggest-candidate")
+def research_suggest_candidate():
+    candidate = best_saved_candidate(load_research_runs())
+    current = candidate_summary(read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    if not candidate:
+        return jsonify({
+            "action": "NO_VALID_CANDIDATE",
+            "reason": "No valid saved research candidate found.",
+            "candidate": None,
+            "currentCandidate": current,
+        })
+    current_score = current_candidate_score(current)
+    if current_score is not None and current_score >= safe_float(candidate.get("score")):
+        return jsonify({
+            "action": "KEEP_CURRENT",
+            "reason": f"Current candidate score ({current_score}) is at least as strong as best saved candidate ({candidate.get('score')}).",
+            "candidate": candidate,
+            "currentCandidate": current,
+        })
+    return jsonify({
+        "action": "PROMOTE",
+        "reason": "Best saved candidate has a stronger backend research score than the current promoted candidate.",
+        "candidate": candidate,
+        "currentCandidate": current,
+    })
 
 
 @app.get("/api/backtest-history")
@@ -240,6 +304,7 @@ def strategy_ranking():
     min_trades = int(request.args.get("min_trades", "10"))
     allow_shorts = request.args.get("allowShorts", "false").lower() in {"1", "true", "yes", "on"}
     max_runs = int(request.args.get("max_runs", "30"))
+    save_run = request.args.get("save", "true").lower() not in {"0", "false", "no", "off"}
     runs_requested = len(symbols) * len(timeframes) * len(presets)
 
     if runs_requested > max_runs:
@@ -332,7 +397,7 @@ def strategy_ranking():
     for index, row in enumerate(rows, start=1):
         row["rank"] = index
 
-    return jsonify({
+    payload = {
         "source": source,
         "period": period,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -356,7 +421,10 @@ def strategy_ranking():
         "cards": ranking_cards(rows),
         "rows": rows,
         "errors": errors,
-    })
+    }
+    if save_run:
+        payload["researchRunId"] = append_research_run(research_record_from_ranking(payload))
+    return jsonify(payload)
 
 
 @app.get("/api/paper/status")
@@ -524,6 +592,183 @@ def read_jsonl_tail(path: str, limit: int):
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def load_research_runs() -> list[dict]:
+    if not RESEARCH_RUNS_PATH.exists():
+        return []
+    try:
+        with open(RESEARCH_RUNS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return data
+        return data.get("runs", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def save_research_runs(runs: list[dict]) -> None:
+    RESEARCH_RUNS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    capped = runs[-MAX_RESEARCH_RUNS:]
+    with open(RESEARCH_RUNS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(capped, handle, indent=2)
+        handle.write("\n")
+
+
+def append_research_run(record: dict) -> str:
+    runs = load_research_runs()
+    record = dict(record)
+    record.setdefault("id", f"research-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}")
+    record.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
+    runs.append(record)
+    save_research_runs(runs)
+    return record["id"]
+
+
+def get_research_run_by_id(run_id: str) -> dict | None:
+    return next((run for run in load_research_runs() if run.get("id") == run_id), None)
+
+
+def summarize_research_runs(runs: list[dict]) -> dict:
+    best = best_saved_candidate(runs)
+    return {
+        "totalRuns": len(runs),
+        "rankingRuns": len([run for run in runs if run.get("type") == "ranking"]),
+        "optimizationRuns": len([run for run in runs if run.get("type") == "optimization"]),
+        "latestRunAt": runs[-1].get("createdAt") if runs else None,
+        "bestSavedCandidate": best,
+    }
+
+
+def research_record_from_ranking(payload: dict) -> dict:
+    rows = payload.get("rows", [])
+    return {
+        "id": f"ranking-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "type": "ranking",
+        "status": "completed" if not payload.get("errors") else "failed" if not rows else "completed",
+        "source": payload.get("source"),
+        "symbols": payload.get("requested", {}).get("symbols", []),
+        "timeframes": payload.get("requested", {}).get("timeframes", []),
+        "strategies": payload.get("requested", {}).get("presets", []),
+        "presets": payload.get("requested", {}).get("presets", []),
+        "period": payload.get("period"),
+        "limit": payload.get("requested", {}).get("limit"),
+        "fee_pct": payload.get("requested", {}).get("feePct"),
+        "slippage_pct": payload.get("requested", {}).get("slippagePct"),
+        "summary": payload.get("summary", {}),
+        "bestCandidate": research_candidate_from_ranking_row(best_valid_or_first(rows), payload),
+        "rows": [research_candidate_from_ranking_row(row, payload) for row in rows[:MAX_RESEARCH_ROWS]],
+        "errors": payload.get("errors", []),
+    }
+
+
+def research_record_from_optimization(payload: dict) -> dict:
+    candidates = payload.get("topCandidates", [])
+    return {
+        "id": f"optimization-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "createdAt": datetime.now(timezone.utc).isoformat(),
+        "type": "optimization",
+        "status": "completed" if not payload.get("errors") else "failed" if not candidates else "completed",
+        "source": payload.get("source"),
+        "symbols": [payload.get("symbol")],
+        "timeframes": [payload.get("timeframe")],
+        "strategies": [payload.get("strategy")],
+        "presets": [payload.get("strategy")],
+        "period": payload.get("period"),
+        "limit": payload.get("requested", {}).get("limit"),
+        "fee_pct": payload.get("requested", {}).get("feePct"),
+        "slippage_pct": payload.get("requested", {}).get("slippagePct"),
+        "train_ratio": payload.get("requested", {}).get("trainRatio"),
+        "max_combos": payload.get("requested", {}).get("maxCombos"),
+        "summary": payload.get("summary", {}),
+        "bestCandidate": research_candidate_from_optimization_row(best_valid_or_first(candidates), payload),
+        "topCandidates": [research_candidate_from_optimization_row(row, payload) for row in candidates[:MAX_RESEARCH_ROWS]],
+        "errors": payload.get("errors", []),
+    }
+
+
+def best_valid_or_first(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    return next((row for row in rows if row.get("valid")), rows[0])
+
+
+def research_candidate_from_ranking_row(row: dict | None, payload: dict) -> dict | None:
+    if not row:
+        return None
+    return {
+        "source": payload.get("source"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "strategy": row.get("strategy"),
+        "preset": row.get("preset"),
+        "period": row.get("period", payload.get("period")),
+        "params": row.get("params", {}),
+        "valid": row.get("valid", False),
+        "rank": row.get("rank"),
+        "score": row.get("score"),
+        "totalReturnPct": row.get("totalReturnPct"),
+        "winRate": row.get("winRate"),
+        "maxDrawdown": row.get("maxDrawdown"),
+        "profitFactor": row.get("profitFactor"),
+        "trades": row.get("trades"),
+        "warnings": row.get("warnings", []),
+        "origin": "ranking",
+    }
+
+
+def research_candidate_from_optimization_row(row: dict | None, payload: dict) -> dict | None:
+    if not row:
+        return None
+    test = row.get("test") or {}
+    full = row.get("full") or {}
+    return {
+        "source": payload.get("source"),
+        "symbol": payload.get("symbol"),
+        "timeframe": payload.get("timeframe"),
+        "strategy": payload.get("strategy"),
+        "preset": payload.get("strategy"),
+        "period": payload.get("period"),
+        "params": row.get("params", {}),
+        "valid": row.get("valid", False),
+        "rank": row.get("rank"),
+        "score": row.get("score"),
+        "totalReturnPct": test.get("totalReturn", full.get("totalReturn", 0)),
+        "winRate": test.get("winRate", full.get("winRate", 0)),
+        "maxDrawdown": test.get("maxDrawdown", full.get("maxDrawdown", 0)),
+        "profitFactor": test.get("profitFactor", full.get("profitFactor", 0)),
+        "trades": test.get("trades", full.get("trades", 0)),
+        "train": row.get("train", {}),
+        "test": test,
+        "full": full,
+        "warnings": row.get("warnings", []),
+        "overfitWarning": row.get("overfitWarning"),
+        "origin": "optimization",
+    }
+
+
+def best_saved_candidate(runs: list[dict]) -> dict | None:
+    candidates = []
+    for run in runs:
+        for candidate in ([run.get("bestCandidate")] + run.get("rows", []) + run.get("topCandidates", [])):
+            if candidate and candidate.get("valid"):
+                item = dict(candidate)
+                item["researchRunId"] = run.get("id")
+                item["researchRunType"] = run.get("type")
+                item["createdAt"] = run.get("createdAt")
+                candidates.append(item)
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: safe_float(item.get("score")), reverse=True)[0]
+
+
+def current_candidate_score(current: dict) -> float | None:
+    for key in ("promotedFromOptimization", "promotedFromRanking"):
+        source = current.get(key)
+        if isinstance(source, dict) and source.get("score") is not None:
+            return safe_float(source.get("score"))
+    return None
 
 
 def candidate_symbols_by_mode(candidate: dict, mode: str) -> list[dict]:

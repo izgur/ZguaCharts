@@ -40,6 +40,7 @@ Responsibilities:
 - Call the shared Node backtest engine for strategy research and UI backtests.
 - Own `/api/strategy-ranking`, including matrix execution, metric collection, ranking score calculation, validity flags, and ranking cards.
 - Own `/api/strategy-optimize`, including parameter search, train/test scoring, overfit warnings, and optimized candidate summaries.
+- Own persistent research memory through `/api/research/runs`, `/api/research/best-candidate`, and `/api/research/suggest-candidate`.
 - Own manual candidate promotion through `/api/candidate/promote`; browser actions may request promotion, but only the backend writes `config/paper-candidate.json` after explicit confirmation.
 - Own candidate validation and paper enablement gates through `/api/candidate/validate`, `/api/candidate/enable-paper`, and `/api/candidate/disable-paper`.
 
@@ -71,6 +72,7 @@ When adding a feature:
 - New candidate selection or promotion behavior: backend endpoint only; frontend may render the candidate and ask for explicit user approval.
 - New candidate validation, pass/warn/fail rule, or paper-enablement decision: backend/core only.
 - New optimization range, scoring rule, or overfit penalty: backend/core only.
+- New research-memory comparison or learning suggestion rule: backend/core only; frontend may only start runs, load records, and request explicit manual promotion.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 If the same trading formula appears in both frontend JavaScript and backend/core code, the frontend copy should be removed.
