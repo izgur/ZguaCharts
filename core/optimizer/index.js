@@ -8,7 +8,7 @@ const tradeAudit = require("../backtest/tradeAudit");
 function optimize(options) {
   options = options || {};
   var ranges = options.ranges || defaultRanges();
-  var combos = expandGrid(ranges).filter(validCombo);
+  var combos = expandGrid(ranges).filter(validCombo).slice(0, Number(options.maxCombos || 1000));
   return data.fetchCandles({
     source: options.source || "bybit",
     symbol: options.symbol,
@@ -23,14 +23,14 @@ function optimize(options) {
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: split.train
       });
       var test = backtest.runBacktestOnCandles({
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: split.test
       });
       return buildOptimizationRow(options, params, train, test);
@@ -172,7 +172,7 @@ function evaluateRegimeCombos(stageName, combos, loaded, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: params,
+      params: paramsWithCosts(options, params),
       candles: split.train,
       regimeCandles: regimeSplit.train
     });
@@ -180,7 +180,7 @@ function evaluateRegimeCombos(stageName, combos, loaded, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: params,
+      params: paramsWithCosts(options, params),
       candles: split.test,
       regimeCandles: regimeSplit.test
     });
@@ -230,7 +230,7 @@ function validateRegimeTopCandidates(topRows, loaded, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: loaded.candles,
       regimeCandles: loaded.regimeCandles
     });
@@ -239,7 +239,7 @@ function validateRegimeTopCandidates(topRows, loaded, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: split.train,
       regimeCandles: regimeSplit.train
     }));
@@ -247,13 +247,13 @@ function validateRegimeTopCandidates(topRows, loaded, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: split.test,
       regimeCandles: regimeSplit.test
     }));
     return {
       rank: index + 1,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       score: robustnessScore(train, test),
       valid: validRegimeCandidate({ train: train, test: test, full: metrics(full), walkForward: [] }),
       train: train,
@@ -290,7 +290,7 @@ function buildRegimeOptimizationRow(options, params, train, test) {
     symbol: options.symbol,
     interval: options.interval,
     strategy: options.strategy,
-    params: params,
+    params: paramsWithCosts(options, params),
     totalReturn: train.totalReturn,
     maxDrawdown: train.maxDrawdown,
     profitFactor: train.profitFactor,
@@ -341,7 +341,7 @@ function walkForwardRegime(loaded, options, params, folds) {
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: train,
         regimeCandles: loaded.regimeCandles.filter(function (c) { return c.time <= train[train.length - 1].time && c.time >= trainStartTime - 86400; })
       })),
@@ -349,7 +349,7 @@ function walkForwardRegime(loaded, options, params, folds) {
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: test,
         regimeCandles: loaded.regimeCandles.filter(function (c) { return c.time <= test[test.length - 1].time && c.time >= testStartTime - 86400; })
       }))
@@ -394,14 +394,14 @@ function evaluateCombos(stageName, combos, candles, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: normalized,
+      params: paramsWithCosts(options, normalized),
       candles: split.train
     });
     var test = backtest.runBacktestOnCandles({
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: normalized,
+      params: paramsWithCosts(options, normalized),
       candles: split.test
     });
     var row = buildOptimizationRow(options, normalized, train, test);
@@ -490,7 +490,7 @@ function validateTopCandidates(topRows, candles, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: candles
     });
     var audit = tradeAudit.auditTrades(full, candles);
@@ -498,19 +498,19 @@ function validateTopCandidates(topRows, candles, options) {
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: split.train
     }));
     var test = metrics(backtest.runBacktestOnCandles({
       symbol: options.symbol,
       interval: options.interval,
       strategy: options.strategy,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       candles: split.test
     }));
     return {
       rank: index + 1,
-      params: row.params,
+      params: paramsWithCosts(options, row.params),
       score: robustnessScore(train, test),
       valid: validCandidate({ train: train, test: test }),
       train: train,
@@ -659,14 +659,14 @@ function walkForward(candles, options, params, folds) {
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: train
       })),
       test: metrics(backtest.runBacktestOnCandles({
         symbol: options.symbol,
         interval: options.interval,
         strategy: options.strategy,
-        params: params,
+        params: paramsWithCosts(options, params),
         candles: test
       }))
     });
@@ -706,6 +706,13 @@ function metrics(result) {
     sharpeRatio: result.sharpeRatio,
     avgBarsHeld: result.avgBarsHeld
   };
+}
+
+function paramsWithCosts(options, params) {
+  var merged = Object.assign({}, params || {});
+  if (options.feePct !== undefined) merged.feePct = Number(options.feePct || 0);
+  if (options.slippagePct !== undefined) merged.slippagePct = Number(options.slippagePct || 0);
+  return merged;
 }
 
 function drawdownAdjustedReturn(result) {

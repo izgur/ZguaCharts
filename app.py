@@ -195,6 +195,26 @@ def optimize():
     return jsonify(payload)
 
 
+@app.get("/api/strategy-optimize")
+def strategy_optimize():
+    source = request.args.get("source", "bybit")
+    symbol = request.args.get("symbol", "BTCUSDT")
+    timeframe = request.args.get("timeframe", "1h")
+    strategy = request.args.get("strategy") or request.args.get("preset") or "RegimeFilteredTrendStrategy"
+    period = request.args.get("period", "365d")
+    limit = int(request.args.get("limit", "9000"))
+    max_combos = int(request.args.get("max_combos", "500"))
+    train_ratio = float(request.args.get("train_ratio", "0.7"))
+    fee_pct = float(request.args.get("fee_pct", "0"))
+    slippage_pct = float(request.args.get("slippage_pct", "0"))
+
+    try:
+        raw = run_strategy_optimizer_engine(source, symbol, timeframe, period, strategy, limit, max_combos, train_ratio, fee_pct, slippage_pct)
+        return jsonify(normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct))
+    except Exception as exc:
+        return jsonify({"error": f"Could not run strategy optimizer: {exc}"}), 502
+
+
 @app.get("/api/backtest-history")
 def backtest_history():
     limit = int(request.args.get("limit", "100"))
@@ -524,6 +544,7 @@ def candidate_summary(candidate: dict) -> dict:
         "params": candidate.get("params", {}),
         "promotedAt": candidate.get("promotedAt"),
         "promotedFromRanking": candidate.get("promotedFromRanking"),
+        "promotedFromOptimization": candidate.get("promotedFromOptimization"),
         "fillModel": candidate.get("fillModel"),
         "makerFeePct": candidate.get("makerFeePct"),
         "takerFeePct": candidate.get("takerFeePct"),
@@ -602,6 +623,7 @@ def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dic
         "profitFactor": ranking_snapshot.get("profitFactor"),
         "trades": ranking_snapshot.get("trades"),
     }
+    optimization_snapshot = payload.get("optimizationSnapshot") if isinstance(payload.get("optimizationSnapshot"), dict) else None
     # TODO: Add scheduled ranking runs, automatic candidate suggestions,
     # a human approval queue, and automatic promotion only after paper validation.
     preserved.update({
@@ -613,6 +635,7 @@ def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dic
         "symbols": symbols,
         "promotedAt": now,
         "promotedFromRanking": snapshot,
+        "promotedFromOptimization": optimization_snapshot,
     })
     return preserved
 
@@ -1029,6 +1052,177 @@ def run_shared_optimizer_engine(source: str, symbol: str, timeframe: str, period
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "Node optimizer failed")
     return json.loads(completed.stdout)
+
+
+def run_strategy_optimizer_engine(source: str, symbol: str, timeframe: str, period: str, strategy: str, limit: int, max_combos: int, train_ratio: float, fee_pct: float, slippage_pct: float) -> dict:
+    days = period[:-1] if period.endswith("d") else "365"
+    completed = subprocess.run(
+        [
+            node_executable(),
+            "cli/optimize.js",
+            "--source",
+            source,
+            "--symbol",
+            symbol,
+            "--interval",
+            timeframe,
+            "--days",
+            days,
+            "--strategy",
+            NODE_STRATEGIES.get(strategy, strategy),
+            "--limit",
+            str(limit),
+            "--max-combos",
+            str(max_combos),
+            "--trainRatio",
+            str(train_ratio),
+            "--fee-pct",
+            str(fee_pct),
+            "--slippage-pct",
+            str(slippage_pct),
+            "--progress-every",
+            "999999",
+        ],
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=360,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Node strategy optimizer failed")
+    return json.loads(completed.stdout)
+
+
+def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: str, strategy: str, period: str, limit: int, max_combos: int, train_ratio: float, fee_pct: float, slippage_pct: float) -> dict:
+    candidates = optimizer_candidates(raw)
+    rows = [normalize_optimizer_candidate(row, index + 1) for index, row in enumerate(candidates[:20])]
+    return {
+        "source": source,
+        "strategy": NODE_STRATEGIES.get(strategy, strategy),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "period": period,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "requested": {
+            "limit": limit,
+            "maxCombos": max_combos,
+            "trainRatio": train_ratio,
+            "feePct": fee_pct,
+            "slippagePct": slippage_pct,
+        },
+        "summary": {
+            "combinationsTested": optimizer_combinations_tested(raw),
+            "validCandidates": raw.get("validCandidates", 0),
+            "warnings": optimizer_warnings(raw),
+        },
+        "topCandidates": rows,
+        "rawSummary": raw.get("summary") or {key: raw.get(key) for key in ("robustnessAssessment", "bestTestResult", "combinationsTested")},
+        "errors": [],
+    }
+
+
+def optimizer_candidates(raw: dict) -> list[dict]:
+    if isinstance(raw.get("results"), list):
+        return raw["results"]
+    if isinstance(raw.get("top5"), list):
+        return raw["top5"]
+    if isinstance(raw.get("stage3"), list):
+        return raw["stage3"]
+    best = raw.get("optimizedPerformance") or raw.get("bestTestResult")
+    return [best] if best else []
+
+
+def normalize_optimizer_candidate(row: dict, rank: int) -> dict:
+    train = row.get("train") or {}
+    test = row.get("test") or {}
+    full = row.get("full") or {}
+    walk_forward = row.get("walkForward") or []
+    score = optimizer_candidate_score(row)
+    warnings = optimizer_candidate_warnings(row, train, test, full, walk_forward)
+    return {
+        "rank": rank,
+        "valid": bool(row.get("valid")) and not any(warning.startswith("FAIL") for warning in warnings),
+        "params": row.get("params", {}),
+        "score": score,
+        "train": train,
+        "test": test,
+        "full": full,
+        "walkForward": walk_forward,
+        "warnings": warnings,
+        "overfitWarning": train_test_overfit_warning(train, test),
+    }
+
+
+def optimizer_candidate_score(row: dict) -> float:
+    train = row.get("train") or {}
+    test = row.get("test") or {}
+    full = row.get("full") or {}
+    train_return = safe_float(train.get("totalReturn"))
+    test_return = safe_float(test.get("totalReturn"))
+    full_return = safe_float(full.get("totalReturn", test_return))
+    test_pf = safe_float(test.get("profitFactor"))
+    full_pf = safe_float(full.get("profitFactor", test_pf))
+    test_dd = safe_float(test.get("maxDrawdown"))
+    trades = safe_float(test.get("trades"))
+    mismatch = abs(train_return - test_return)
+    score = (
+        test_return * 2
+        + max(0, test_pf - 1) * 35
+        + max(0, full_pf - 1) * 15
+        + min(trades, 100) * 0.1
+        - test_dd * 2
+        - mismatch
+    )
+    return round(score, 4)
+
+
+def optimizer_candidate_warnings(row: dict, train: dict, test: dict, full: dict, walk_forward: list) -> list[str]:
+    warnings = []
+    if safe_float(test.get("trades")) < 20:
+        warnings.append("FAIL: low test trade count")
+    if safe_float(test.get("profitFactor")) <= 1:
+        warnings.append("FAIL: test profit factor <= 1")
+    elif safe_float(test.get("profitFactor")) < 1.1:
+        warnings.append("WARN: weak test profit factor")
+    if safe_float(test.get("maxDrawdown")) > 25:
+        warnings.append("FAIL: high test drawdown")
+    if train_test_overfit_warning(train, test):
+        warnings.append(train_test_overfit_warning(train, test))
+    if full and safe_float(full.get("profitFactor")) <= 1:
+        warnings.append("WARN: full-period profit factor <= 1")
+    negative_folds = len([fold for fold in walk_forward if safe_float((fold.get("test") or fold).get("totalReturn")) < 0])
+    if walk_forward and negative_folds > len(walk_forward) / 2:
+        warnings.append("WARN: unstable walk-forward result")
+    if not row.get("valid"):
+        warnings.append("WARN: optimizer did not mark this candidate valid")
+    return warnings
+
+
+def train_test_overfit_warning(train: dict, test: dict) -> str | None:
+    train_return = safe_float(train.get("totalReturn"))
+    test_return = safe_float(test.get("totalReturn"))
+    if train_return > 10 and test_return <= 0:
+        return "WARN: strong train result but weak/negative test result"
+    if abs(train_return - test_return) > 25:
+        return "WARN: large train/test mismatch"
+    return None
+
+
+def optimizer_combinations_tested(raw: dict):
+    if isinstance(raw.get("combinationsTested"), dict):
+        return raw["combinationsTested"]
+    return raw.get("combinations") or raw.get("totalResults") or 0
+
+
+def optimizer_warnings(raw: dict) -> list[str]:
+    warnings = []
+    summary = raw.get("summary") or {}
+    for value in (raw.get("warning"), summary.get("warning"), raw.get("robustnessAssessment"), summary.get("robustnessAssessment")):
+        if value:
+            warnings.append(value)
+    # TODO: Add scheduled optimization runs, automatic candidate suggestions,
+    # human approval queues, auto-promotion after validation, and paper-performance monitoring.
+    return warnings
 
 
 def parse_csv_arg(value: str | None, fallback: list[str]) -> list[str]:

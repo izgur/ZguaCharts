@@ -57,6 +57,7 @@ let backtestInitialized = false;
 let analysisInitialized = false;
 let backtestPane = null;
 let lastStrategyRankingPayload = null;
+let lastOptimizationPayload = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
 let watchlistRefreshInFlight = false;
@@ -2106,14 +2107,23 @@ function setupAnalysisControls() {
     .map((preset) => `<option value="${preset.id}" ${preset.id === config.default_strategy_preset ? "selected" : ""}>${preset.label}</option>`)
     .join("");
   populateAnalysisMarketFilters();
+  populateOptimizationControls();
   sourceFilter.addEventListener("change", populateAnalysisMarketFilters);
   document.querySelector("#analysis-run-ranking")?.addEventListener("click", runStrategyRanking);
+  document.querySelector("#analysis-run-optimization")?.addEventListener("click", runStrategyOptimization);
   document.querySelector("#analysis-table-body")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promote-ranking]");
     if (!button) return;
     const index = Number(button.dataset.promoteRanking);
     const row = lastStrategyRankingPayload?.rows?.[index];
     if (row) promoteRankingCandidate(row);
+  });
+  document.querySelector("#optimization-table-body")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-promote-optimization]");
+    if (!button) return;
+    const index = Number(button.dataset.promoteOptimization);
+    const row = lastOptimizationPayload?.topCandidates?.[index];
+    if (row) promoteOptimizedCandidate(row);
   });
 }
 
@@ -2127,6 +2137,25 @@ function populateAnalysisMarketFilters() {
     .map((symbol) => `<option value="${symbol}" ${symbol === "BTCUSDT" ? "selected" : ""}>${symbol}</option>`)
     .join("");
   timeframeFilter.innerHTML = (sourceConfig.timeframes || [])
+    .map((timeframe) => `<option value="${timeframe}" ${timeframe === "1h" ? "selected" : ""}>${timeframe}</option>`)
+    .join("");
+  populateOptimizationControls();
+}
+
+function populateOptimizationControls() {
+  const source = document.querySelector("#analysis-source-filter")?.value || "bybit";
+  const sourceConfig = config.sources?.[source] || {};
+  const strategySelect = document.querySelector("#opt-strategy-filter");
+  const symbolSelect = document.querySelector("#opt-symbol-filter");
+  const timeframeSelect = document.querySelector("#opt-timeframe-filter");
+  if (!hasElement(strategySelect, symbolSelect, timeframeSelect)) return;
+  strategySelect.innerHTML = (config.strategy_presets || [])
+    .map((preset) => `<option value="${preset.id}" ${preset.id === "regime_filtered_trend" ? "selected" : ""}>${preset.label}</option>`)
+    .join("");
+  symbolSelect.innerHTML = (sourceConfig.symbols || [])
+    .map((symbol) => `<option value="${symbol}" ${symbol === "BTCUSDT" ? "selected" : ""}>${symbol}</option>`)
+    .join("");
+  timeframeSelect.innerHTML = (sourceConfig.timeframes || [])
     .map((timeframe) => `<option value="${timeframe}" ${timeframe === "1h" ? "selected" : ""}>${timeframe}</option>`)
     .join("");
 }
@@ -2239,6 +2268,107 @@ async function promoteRankingCandidate(row) {
     if (status) status.textContent = "Promoting candidate...";
     const payload = await apiPost("/api/candidate/promote", requestBody);
     if (status) status.textContent = `${payload.message} Candidate remains disabled.`;
+    if (!paperPanel?.hidden) openPaperPanel();
+  } catch (error) {
+    if (status) status.textContent = `Promotion failed: ${error.message}`;
+  }
+}
+
+async function runStrategyOptimization() {
+  const status = document.querySelector("#optimization-status");
+  const body = document.querySelector("#optimization-table-body");
+  if (status) status.textContent = "Running backend strategy optimization...";
+  if (body) body.innerHTML = `<tr><td colspan="8">Loading optimization results...</td></tr>`;
+  const params = new URLSearchParams({
+    source: document.querySelector("#analysis-source-filter")?.value || "bybit",
+    symbol: document.querySelector("#opt-symbol-filter")?.value || "BTCUSDT",
+    timeframe: document.querySelector("#opt-timeframe-filter")?.value || "1h",
+    strategy: document.querySelector("#opt-strategy-filter")?.value || "regime_filtered_trend",
+    period: document.querySelector("#opt-period-filter")?.value || "365d",
+    limit: document.querySelector("#opt-limit-filter")?.value || "9000",
+    max_combos: document.querySelector("#opt-max-combos-filter")?.value || "500",
+    train_ratio: document.querySelector("#opt-train-ratio-filter")?.value || "0.7",
+    fee_pct: document.querySelector("#analysis-fee-filter")?.value || "0",
+    slippage_pct: document.querySelector("#analysis-slippage-filter")?.value || "0",
+  });
+  try {
+    const payload = await apiGet(`/api/strategy-optimize?${params}`);
+    lastOptimizationPayload = payload;
+    renderStrategyOptimization(payload);
+    if (status) {
+      const summary = payload.summary || {};
+      status.textContent = `Optimization complete. Tested ${JSON.stringify(summary.combinationsTested || 0)} combos. ${summary.validCandidates || 0} valid candidates.`;
+    }
+  } catch (error) {
+    if (status) status.textContent = `Optimization failed: ${error.message}`;
+    if (body) body.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderStrategyOptimization(payload) {
+  const body = document.querySelector("#optimization-table-body");
+  const rows = payload.topCandidates || [];
+  if (!body) return;
+  body.innerHTML = rows.map((row, index) => `
+    <tr class="${row.valid ? "" : "invalid-row"}">
+      <td>${row.rank}</td>
+      <td>${formatNumber(row.score)}</td>
+      <td><code>${escapeHtml(JSON.stringify(row.params || {}))}</code></td>
+      <td>${formatOptimizationMetric(row.train)}</td>
+      <td>${formatOptimizationMetric(row.test)}</td>
+      <td>${row.full && Object.keys(row.full).length ? formatOptimizationMetric(row.full) : "-"}</td>
+      <td title="${escapeHtml((row.warnings || []).join("; "))}">${escapeHtml(row.overfitWarning || (row.warnings || [])[0] || "-")}</td>
+      <td><button type="button" class="small-action-button" data-promote-optimization="${index}">Promote</button></td>
+    </tr>
+  `).join("") || `<tr><td colspan="8">No optimization candidates returned.</td></tr>`;
+}
+
+function formatOptimizationMetric(metric) {
+  if (!metric) return "-";
+  return `R ${formatSigned(metric.totalReturn)}% · PF ${formatNumber(metric.profitFactor)} · DD ${formatNumber(metric.maxDrawdown)}% · T ${metric.trades || 0}`;
+}
+
+async function promoteOptimizedCandidate(row) {
+  const status = document.querySelector("#optimization-status");
+  const payload = lastOptimizationPayload || {};
+  const ok = window.confirm(`Promote optimized ${payload.strategy} on ${payload.symbol} ${payload.timeframe} as the paper candidate?\n\nPaper simulation will stay disabled until validation passes and you explicitly enable it.`);
+  if (!ok) return;
+  const test = row.test || {};
+  const full = row.full || {};
+  const requestBody = {
+    source: payload.source || "bybit",
+    symbol: payload.symbol,
+    timeframe: payload.timeframe,
+    preset: payload.strategy,
+    strategy: payload.strategy,
+    period: payload.period,
+    params: row.params || {},
+    minTrades: Math.min(20, Number(test.trades || 0)),
+    rankingSnapshot: {
+      valid: row.valid,
+      rank: row.rank,
+      score: row.score,
+      totalReturnPct: test.totalReturn ?? full.totalReturn ?? 0,
+      winRate: test.winRate ?? full.winRate ?? 0,
+      maxDrawdown: test.maxDrawdown ?? full.maxDrawdown ?? 0,
+      profitFactor: test.profitFactor ?? full.profitFactor ?? 0,
+      trades: test.trades ?? full.trades ?? 0,
+    },
+    optimizationSnapshot: {
+      rank: row.rank,
+      score: row.score,
+      train: row.train,
+      test: row.test,
+      full: row.full,
+      warnings: row.warnings,
+      overfitWarning: row.overfitWarning,
+      requested: payload.requested,
+    },
+  };
+  try {
+    if (status) status.textContent = "Promoting optimized candidate...";
+    const result = await apiPost("/api/candidate/promote", requestBody);
+    if (status) status.textContent = `${result.message} Candidate remains disabled.`;
     if (!paperPanel?.hidden) openPaperPanel();
   } catch (error) {
     if (status) status.textContent = `Promotion failed: ${error.message}`;

@@ -17,7 +17,9 @@ const options = {
   outputDir: outputDir,
   reportPrefix: args["report-prefix"] || args.reportPrefix || "",
   maxCombos: Number(args["max-combos"] || args.maxCombos || 1000),
-  progressEvery: Number(args["progress-every"] || args.progressEvery || 50)
+  progressEvery: Number(args["progress-every"] || args.progressEvery || 50),
+  feePct: Number(args["fee-pct"] || args.feePct || 0),
+  slippagePct: Number(args["slippage-pct"] || args.slippagePct || 0)
 };
 
 var run = args.staged === true || args.mode === "staged" ? optimizer.optimizeStaged : optimizer.optimize;

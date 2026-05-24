@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-candidate-validate">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-strategy-optimize">
   </head>
   <body>
     <header class="topbar">
@@ -131,6 +131,38 @@
           </thead>
           <tbody id="analysis-table-body"></tbody>
         </table>
+        <div class="page-heading compact-heading">
+          <div>
+            <h2>Strategy Optimization</h2>
+            <p>Backend/core optimization with train/test scoring. Promote only after reviewing results.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label><span>Strategy</span><select id="opt-strategy-filter"></select></label>
+          <label><span>Symbol</span><select id="opt-symbol-filter"></select></label>
+          <label><span>Timeframe</span><select id="opt-timeframe-filter"></select></label>
+          <label><span>Period</span><input id="opt-period-filter" value="365d"></label>
+          <label><span>Candle limit</span><input id="opt-limit-filter" type="number" min="100" max="20000" value="9000"></label>
+          <label><span>Max combos</span><input id="opt-max-combos-filter" type="number" min="1" max="5000" value="500"></label>
+          <label><span>Train ratio</span><input id="opt-train-ratio-filter" type="number" min="0.5" max="0.9" step="0.05" value="0.7"></label>
+          <button id="analysis-run-optimization" type="button">Run Optimization</button>
+        </div>
+        <div id="optimization-status" class="pane-status">Run optimization after selecting one strategy, symbol, and timeframe.</div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Score</th>
+              <th>Params</th>
+              <th>Train</th>
+              <th>Test</th>
+              <th>Full</th>
+              <th>Warnings</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="optimization-table-body"></tbody>
+        </table>
       </section>
 
       <section id="settings-page" class="route-page settings-page" data-page="settings" hidden>
@@ -217,6 +249,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-candidate-validate" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-strategy-optimize" defer></script>
   </body>
 </html>
