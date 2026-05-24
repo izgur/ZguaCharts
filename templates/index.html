@@ -227,6 +227,20 @@
         </div>
         <div class="page-heading compact-heading">
           <div>
+            <h2>Automatic Learning v1</h2>
+            <p>Candidate-only auto-promotion. Paper simulation stays disabled and no trades are placed.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label class="allow-short-toggle"><input id="learning-auto-promote" type="checkbox"><span>Enable auto-promote candidate only</span></label>
+          <button id="learning-auto-status-button" type="button">Check Auto-Promote Eligibility</button>
+          <button id="learning-auto-run-button" type="button">Run Auto-Promote Now</button>
+        </div>
+        <div id="learning-auto-promote-result" class="paper-validation-result">
+          <p class="modal-note">Auto-promotion only changes the paper candidate config. It does not enable paper simulation and does not trade.</p>
+        </div>
+        <div class="page-heading compact-heading">
+          <div>
             <h2>Learning Reports</h2>
             <p>Saved reports are recommendations only. No config is changed automatically.</p>
           </div>

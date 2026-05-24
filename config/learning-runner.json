@@ -40,5 +40,19 @@
   "slippagePct": 0.02,
   "allowShorts": false,
   "autoPromote": false,
+  "autoPromoteMode": "candidate_only",
+  "autoPromoteRules": {
+    "requireAuditStatus": "READY_FOR_AUTO_PROMOTE_LATER",
+    "minLearningReports": 3,
+    "minRepeatedRecommendations": 2,
+    "maxRecommendationChurn": 0.6,
+    "minRobustnessScore": 60,
+    "minTrades": 30,
+    "minProfitFactor": 1.15,
+    "maxDrawdown": 20,
+    "rejectIfPaperHealthFailed": true,
+    "rejectIfSevereOverfitWarning": true,
+    "requireCandidateBetterThanCurrentBy": 5
+  },
   "autoEnablePaper": false
 }

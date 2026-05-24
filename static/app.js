@@ -2190,6 +2190,8 @@ function setupLearningControls() {
   document.querySelector("#learning-save-config")?.addEventListener("click", saveLearningConfig);
   document.querySelector("#learning-tick-button")?.addEventListener("click", runLearningTick);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
+  document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
+  document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
   document.querySelector("#learning-recommendation")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promote-learning]");
     if (button && lastLearningReport?.recommendation?.candidate) {
@@ -2218,6 +2220,8 @@ async function loadLearningConfig() {
     document.querySelector("#learning-interval-minutes").value = config.schedule?.intervalMinutes ?? 1440;
     document.querySelector("#learning-run-hour").value = config.schedule?.runAtHour ?? 3;
     document.querySelector("#learning-run-minute").value = config.schedule?.runAtMinute ?? 0;
+    document.querySelector("#learning-auto-promote").checked = Boolean(config.autoPromote);
+    loadAutoPromoteStatus();
     if (status) status.textContent = `Learning config loaded. Last: ${formatLearningTime(scheduleStatus.lastRunAt)} Next: ${formatLearningTime(scheduleStatus.nextRunAt)}. Auto-promotion is disabled.`;
   } catch (error) {
     if (status) status.textContent = `Learning config unavailable: ${error.message}`;
@@ -2270,6 +2274,9 @@ function learningConfigPayload() {
       runAtMinute: Number(document.querySelector("#learning-run-minute")?.value || 0),
       timezone: "local",
     },
+    autoPromote: document.querySelector("#learning-auto-promote")?.checked || false,
+    autoPromoteMode: "candidate_only",
+    autoEnablePaper: false,
   };
 }
 
@@ -2379,6 +2386,57 @@ function renderLearningAudit(payload) {
   `;
 }
 
+async function loadAutoPromoteStatus() {
+  const host = document.querySelector("#learning-auto-promote-result");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Checking auto-promotion eligibility...</p>`;
+    const payload = await apiGet("/api/learning/auto-promote/status");
+    host.innerHTML = renderAutoPromoteResult(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Auto-promote status unavailable: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function runAutoPromote() {
+  const host = document.querySelector("#learning-auto-promote-result");
+  if (host) host.innerHTML = `<p class="pane-status">Running auto-promotion evaluator...</p>`;
+  try {
+    const payload = await apiPost("/api/learning/auto-promote", {});
+    if (host) host.innerHTML = renderAutoPromoteResult(payload);
+    openPaperPanel();
+  } catch (error) {
+    if (host) host.innerHTML = `<p class="pane-status">Auto-promote rejected: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderAutoPromoteResult(payload) {
+  const checks = payload.checks || [];
+  const promoted = payload.promoted ?? payload.allowed;
+  const candidate = payload.candidate;
+  return `
+    <h3 class="modal-section-title">Auto-Promote <span class="${promoted ? "positive" : "neutral"}">${promoted ? "Allowed" : "Blocked"}</span></h3>
+    <p class="modal-note">${escapeHtml(payload.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Enabled</span><strong>${escapeHtml(String(payload.autoPromote ?? payload.attempted ?? false))}</strong></div>
+      <div class="metric"><span>Mode</span><strong>${escapeHtml(payload.autoPromoteMode || "candidate_only")}</strong></div>
+      <div class="metric"><span>Paper auto-enable</span><strong>${escapeHtml(String(payload.autoEnablePaper || false))}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate ? `${escapeHtml(candidate.strategy || "-")} ${escapeHtml(candidate.symbol || "")}` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Check</th><th>Pass</th><th>Detail</th></tr></thead>
+      <tbody>${checks.map((check) => `
+        <tr>
+          <td>${escapeHtml(check.name || "-")}</td>
+          <td class="${check.passed ? "positive" : "negative"}">${check.passed ? "yes" : "no"}</td>
+          <td>${escapeHtml(check.detail || "")}</td>
+        </tr>
+      `).join("") || `<tr><td colspan="3">No checks returned.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Auto-promotion only changes the paper candidate config. It does not enable paper simulation and does not trade.</p>
+  `;
+}
+
 async function loadLearningReport(reportId) {
   const status = document.querySelector("#learning-status");
   try {
@@ -2422,6 +2480,7 @@ function renderLearningReport(report) {
         <button type="button" class="small-action-button" data-promote-learning="1">Promote Recommended Candidate</button>
       ` : ""}
       ${renderCandidateHealth(health)}
+      ${report.autoPromotion ? `<h3 class="modal-section-title">Auto-Promotion</h3>${renderAutoPromoteResult(report.autoPromotion)}` : ""}
       ${(report.warnings || []).length ? `<ul class="backtest-warnings">${report.warnings.map((warning) => `<li>${escapeHtml(typeof warning === "string" ? warning : JSON.stringify(warning))}</li>`).join("")}</ul>` : ""}
       ${(report.errors || []).length ? `<ul class="backtest-warnings">${report.errors.map((error) => `<li>${escapeHtml(typeof error === "string" ? error : JSON.stringify(error))}</li>`).join("")}</ul>` : ""}
     `;

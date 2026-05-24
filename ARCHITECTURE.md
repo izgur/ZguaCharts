@@ -47,6 +47,7 @@ Responsibilities:
 - Own replacement suggestions through `/api/research/suggest-replacement`; the browser can ask for a suggestion and manually promote it, but it must not auto-promote or disable paper simulation.
 - Own learning-cycle execution and reports through `/api/learning/*`; reports are recommendations only, promotion remains manual, and paper enablement remains manual.
 - Own scheduled learning due checks and file-backed learning locks; local scheduling should call `python scripts/learning_tick.py` and only the backend decides whether a cycle is due.
+- Own automatic learning v1 decisions. Auto-promotion may only write a paper candidate config with `enabled=false`; paper simulation enablement remains manual, auto-enable paper is intentionally blocked, and real trading is not implemented.
 
 ## Core Strategy / Research Engine
 
@@ -79,6 +80,7 @@ When adding a feature:
 - New research-memory comparison or learning suggestion rule: backend/core only; frontend may only start runs, load records, and request explicit manual promotion.
 - New paper-performance health rule, degradation threshold, or replacement suggestion rule: backend/core only.
 - New learning-runner schedule, cycle step, candidate comparison, or recommendation rule: backend/core only.
+- New auto-promotion rule or eligibility check: backend/core only, and it must not enable paper simulation or place trades.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 ## Scheduled Learning

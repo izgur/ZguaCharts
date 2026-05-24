@@ -340,7 +340,6 @@ def update_learning_config():
     payload = request.get_json(silent=True) or {}
     config = load_learning_config()
     config.update(safe_learning_config_updates(payload))
-    config["autoPromote"] = False
     config["autoEnablePaper"] = False
     config["nextRunAt"] = compute_next_learning_run(config, datetime.now().astimezone()).isoformat()
     write_learning_config(config)
@@ -370,12 +369,42 @@ def learning_audit():
         return jsonify({"error": f"Could not build learning audit: {exc}"}), 502
 
 
+@app.get("/api/learning/auto-promote/status")
+def learning_auto_promote_status():
+    config = load_learning_config()
+    latest = (load_learning_reports() or [None])[-1]
+    audit = build_learning_quality_audit()
+    result = evaluate_auto_promotion(config, audit, latest, read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    return jsonify({
+        "autoPromote": bool(config.get("autoPromote", False)),
+        "autoPromoteMode": config.get("autoPromoteMode", "candidate_only"),
+        "autoEnablePaper": False,
+        "rules": config.get("autoPromoteRules", {}),
+        "latestAuditStatus": audit.get("status"),
+        "allowed": result.get("allowed"),
+        "reason": result.get("reason"),
+        "candidate": result.get("candidate"),
+        "checks": result.get("checks", []),
+    })
+
+
+@app.post("/api/learning/auto-promote")
+def learning_auto_promote():
+    latest = (load_learning_reports() or [None])[-1]
+    if not latest:
+        return jsonify({"promoted": False, "reason": "No learning reports exist.", "checks": []}), 400
+    result = auto_promote_candidate_if_allowed(load_learning_config(), latest)
+    if not result.get("promoted"):
+        result["error"] = result.get("reason", "Auto-promotion rejected.")
+    status_code = 200 if result.get("promoted") else 400
+    return jsonify(result), status_code
+
+
 @app.post("/api/learning/run")
 def learning_run():
     config = load_learning_config()
     overrides = safe_learning_config_updates(request.get_json(silent=True) or {})
     config.update(overrides)
-    config["autoPromote"] = False
     config["autoEnablePaper"] = False
     report = run_learning_cycle(config)
     append_learning_report(report)
@@ -814,6 +843,20 @@ def default_learning_config() -> dict:
         "slippagePct": 0.02,
         "allowShorts": False,
         "autoPromote": False,
+        "autoPromoteMode": "candidate_only",
+        "autoPromoteRules": {
+            "requireAuditStatus": "READY_FOR_AUTO_PROMOTE_LATER",
+            "minLearningReports": 3,
+            "minRepeatedRecommendations": 2,
+            "maxRecommendationChurn": 0.6,
+            "minRobustnessScore": 60,
+            "minTrades": 30,
+            "minProfitFactor": 1.15,
+            "maxDrawdown": 20,
+            "rejectIfPaperHealthFailed": True,
+            "rejectIfSevereOverfitWarning": True,
+            "requireCandidateBetterThanCurrentBy": 5,
+        },
         "autoEnablePaper": False,
     }
 
@@ -828,7 +871,6 @@ def load_learning_config() -> dict:
                 config.update(data)
         except Exception:
             pass
-    config["autoPromote"] = False
     config["autoEnablePaper"] = False
     return config
 
@@ -858,13 +900,35 @@ def safe_learning_config(config: dict) -> dict:
     base["optimizationStrategies"] = list_string_values(base.get("optimizationStrategies"), default_learning_config()["optimizationStrategies"])
     base["enabled"] = bool(base.get("enabled", False))
     base["allowShorts"] = bool(base.get("allowShorts", False))
-    base["autoPromote"] = False
+    base["autoPromote"] = bool(base.get("autoPromote", False))
+    base["autoPromoteMode"] = "candidate_only"
+    base["autoPromoteRules"] = safe_auto_promote_rules(base.get("autoPromoteRules", {}))
     base["autoEnablePaper"] = False
     for key in ("rankingLimit", "optimizationLimit", "maxRankingRuns", "maxOptimizationCombos", "minTrades"):
         base[key] = int(safe_float(base.get(key), default_learning_config()[key]))
     for key in ("feePct", "slippagePct"):
         base[key] = safe_float(base.get(key), default_learning_config()[key])
     return base
+
+
+def safe_auto_promote_rules(rules: dict) -> dict:
+    defaults = default_learning_config()["autoPromoteRules"]
+    if not isinstance(rules, dict):
+        rules = {}
+    merged = {**defaults, **rules}
+    return {
+        "requireAuditStatus": str(merged.get("requireAuditStatus") or defaults["requireAuditStatus"]),
+        "minLearningReports": int(safe_float(merged.get("minLearningReports"), defaults["minLearningReports"])),
+        "minRepeatedRecommendations": int(safe_float(merged.get("minRepeatedRecommendations"), defaults["minRepeatedRecommendations"])),
+        "maxRecommendationChurn": safe_float(merged.get("maxRecommendationChurn"), defaults["maxRecommendationChurn"]),
+        "minRobustnessScore": safe_float(merged.get("minRobustnessScore"), defaults["minRobustnessScore"]),
+        "minTrades": int(safe_float(merged.get("minTrades"), defaults["minTrades"])),
+        "minProfitFactor": safe_float(merged.get("minProfitFactor"), defaults["minProfitFactor"]),
+        "maxDrawdown": safe_float(merged.get("maxDrawdown"), defaults["maxDrawdown"]),
+        "rejectIfPaperHealthFailed": bool(merged.get("rejectIfPaperHealthFailed", defaults["rejectIfPaperHealthFailed"])),
+        "rejectIfSevereOverfitWarning": bool(merged.get("rejectIfSevereOverfitWarning", defaults["rejectIfSevereOverfitWarning"])),
+        "requireCandidateBetterThanCurrentBy": safe_float(merged.get("requireCandidateBetterThanCurrentBy"), defaults["requireCandidateBetterThanCurrentBy"]),
+    }
 
 
 def safe_learning_schedule(schedule: dict) -> dict:
@@ -905,10 +969,13 @@ def safe_learning_config_updates(payload: dict) -> dict:
         "slippagePct",
         "allowShorts",
         "schedule",
+        "autoPromote",
+        "autoPromoteMode",
+        "autoPromoteRules",
     }
     updates = {key: value for key, value in payload.items() if key in allowed}
     if "autoPromote" in payload or "autoEnablePaper" in payload:
-        updates["autoPromote"] = False
+        updates["autoPromote"] = bool(payload.get("autoPromote", False))
         updates["autoEnablePaper"] = False
     return safe_learning_config({**load_learning_config(), **updates})
 
@@ -1048,7 +1115,6 @@ def run_due_learning_cycle(force: bool = False) -> dict:
         config["lastRunAt"] = datetime.now().astimezone().isoformat()
         config["nextRunAt"] = compute_next_learning_run(config, datetime.now().astimezone()).isoformat()
         config["lock"] = {"running": False, "startedAt": None}
-        config["autoPromote"] = False
         config["autoEnablePaper"] = False
         save_learning_config(config)
         return {"ran": True, "reason": reason, "report": report, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
@@ -1059,8 +1125,10 @@ def run_due_learning_cycle(force: bool = False) -> dict:
         return {"ran": False, "reason": f"Learning cycle failed: {exc}", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
 
 
-def build_learning_quality_audit(window: int = 5) -> dict:
+def build_learning_quality_audit(window: int = 5, extra_report: dict | None = None) -> dict:
     reports = load_learning_reports()
+    if extra_report:
+        reports = reports + [extra_report]
     research_runs = load_research_runs()
     current_candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
     paper_health = build_candidate_health(candidate_health_rules({}))["health"]
@@ -1245,6 +1313,105 @@ def learning_audit_status(score: float, warnings: list[str], stability: dict, pa
     return "READY_FOR_MANUAL", {"action": "KEEP_MANUAL_ONLY", "reason": "Evidence supports manual review only."}
 
 
+def evaluate_auto_promotion(config: dict, audit: dict, latest_report: dict | None, current_candidate: dict) -> dict:
+    config = safe_learning_config(config)
+    rules = config.get("autoPromoteRules", {})
+    candidate = ((latest_report or {}).get("recommendation") or {}).get("candidate") or audit.get("summary", {}).get("bestSavedCandidate")
+    checks = []
+
+    def check(name: str, passed: bool, detail: str) -> None:
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
+
+    check("autoPromote enabled", bool(config.get("autoPromote")), "autoPromote must be true.")
+    check("mode candidate_only", config.get("autoPromoteMode") == "candidate_only", "Only candidate_only mode is supported.")
+    check("autoEnablePaper disabled", not bool(config.get("autoEnablePaper")), "autoEnablePaper is intentionally blocked.")
+    check("candidate exists", bool(candidate), "A recommended candidate is required.")
+    check("audit status", audit.get("status") == rules["requireAuditStatus"], f"Audit status {audit.get('status')} must equal {rules['requireAuditStatus']}.")
+    check("learning reports", safe_float(audit.get("summary", {}).get("learningReports")) >= rules["minLearningReports"], f"Need at least {rules['minLearningReports']} learning reports.")
+    stability = audit.get("candidateStability", {})
+    check("repeated recommendation", safe_float(stability.get("topCandidateCount")) >= rules["minRepeatedRecommendations"], f"Need candidate repeated at least {rules['minRepeatedRecommendations']} times.")
+    check("recommendation churn", safe_float(stability.get("recommendationChurn")) <= rules["maxRecommendationChurn"], f"Churn must be <= {rules['maxRecommendationChurn']}.")
+    check("robustness score", safe_float(audit.get("summary", {}).get("robustnessScore")) >= rules["minRobustnessScore"], f"Robustness must be >= {rules['minRobustnessScore']}.")
+    if candidate:
+        check("trade count", safe_float(candidate.get("trades")) >= rules["minTrades"], f"Trades must be >= {rules['minTrades']}.")
+        check("profit factor", safe_float(candidate.get("profitFactor")) >= rules["minProfitFactor"], f"Profit factor must be >= {rules['minProfitFactor']}.")
+        check("drawdown", safe_float(candidate.get("maxDrawdown")) <= rules["maxDrawdown"], f"Drawdown must be <= {rules['maxDrawdown']}.")
+        warning_text = " ".join(candidate.get("warnings", []) or []).lower()
+        severe = any(term in warning_text for term in ("overfit", "audit failed", "zero-trade"))
+        check("severe warning", not (rules["rejectIfSevereOverfitWarning"] and severe), "Candidate must not include severe warning text.")
+    paper_failed = audit.get("paperHealth", {}).get("status") == "FAILED"
+    check("paper health", not (rules["rejectIfPaperHealthFailed"] and paper_failed), "Paper health must not be FAILED.")
+    current_score = current_candidate_score(candidate_summary(current_candidate)) or 0
+    candidate_score = safe_float((candidate or {}).get("score"))
+    check("better than current", candidate_score >= current_score + rules["requireCandidateBetterThanCurrentBy"], f"Candidate score must beat current by {rules['requireCandidateBetterThanCurrentBy']}.")
+
+    allowed = all(item["passed"] for item in checks)
+    reason = "All auto-promotion checks passed." if allowed else next((item["detail"] for item in checks if not item["passed"]), "Auto-promotion rejected.")
+    return {"allowed": allowed, "reason": reason, "candidate": candidate if allowed else candidate, "checks": checks}
+
+
+def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None) -> dict:
+    attempted = bool(safe_learning_config(config).get("autoPromote"))
+    audit = build_learning_quality_audit(extra_report=learning_report)
+    current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    evaluation = evaluate_auto_promotion(config, audit, learning_report, current)
+    result = {
+        "attempted": attempted,
+        "promoted": False,
+        "reason": evaluation["reason"],
+        "candidate": evaluation.get("candidate"),
+        "checks": evaluation.get("checks", []),
+    }
+    if not attempted or not evaluation.get("allowed"):
+        return result
+    candidate = evaluation.get("candidate") or {}
+    payload = {
+        "source": candidate.get("source", "bybit"),
+        "symbol": candidate.get("symbol"),
+        "timeframe": candidate.get("timeframe"),
+        "preset": candidate.get("preset") or candidate.get("strategy"),
+        "strategy": candidate.get("strategy"),
+        "period": candidate.get("period"),
+        "params": candidate.get("params", {}),
+        "rankingSnapshot": {
+            "valid": candidate.get("valid", True),
+            "rank": candidate.get("rank"),
+            "score": candidate.get("score"),
+            "totalReturnPct": candidate.get("totalReturnPct"),
+            "winRate": candidate.get("winRate"),
+            "maxDrawdown": candidate.get("maxDrawdown"),
+            "profitFactor": candidate.get("profitFactor"),
+            "trades": candidate.get("trades"),
+        },
+        "optimizationSnapshot": {
+            "researchRunId": candidate.get("researchRunId"),
+            "score": candidate.get("score"),
+            "train": candidate.get("train"),
+            "test": candidate.get("test"),
+            "full": candidate.get("full"),
+            "warnings": candidate.get("warnings"),
+            "autoPromotedFromLearningReport": (learning_report or {}).get("id"),
+        } if candidate.get("origin") == "optimization" else None,
+    }
+    backup_path = backup_candidate_config(current)
+    updated = merge_promoted_candidate(current, payload, payload["rankingSnapshot"], str(candidate.get("symbol") or ""), str(candidate.get("timeframe") or ""))
+    updated.update({
+        "enabled": False,
+        "autoPromoted": True,
+        "autoPromotedAt": datetime.now(timezone.utc).isoformat(),
+        "autoPromotedFromLearningReport": (learning_report or {}).get("id"),
+        "autoPromoteChecks": evaluation.get("checks", []),
+    })
+    write_candidate_config(updated)
+    result.update({
+        "promoted": True,
+        "reason": "Candidate auto-promoted into paper config. Paper simulation remains disabled.",
+        "backupPath": str(backup_path.relative_to(app.root_path)),
+        "candidate": candidate_summary(updated),
+    })
+    return result
+
+
 def run_learning_cycle(config: dict) -> dict:
     config = safe_learning_config(config)
     created_at = datetime.now(timezone.utc).isoformat()
@@ -1315,6 +1482,7 @@ def run_learning_cycle(config: dict) -> dict:
     report["bestSavedCandidate"] = best_saved_candidate(load_research_runs())
     report["replacementSuggestion"] = replacement_suggestion_from_health(report["candidateHealth"])
     report["recommendation"] = learning_recommendation(report["candidateHealth"], report["bestSavedCandidate"], read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    report["autoPromotion"] = auto_promote_candidate_if_allowed(config, report)
     if report["errors"] and (report["rankingRunIds"] or report["optimizationRunIds"]):
         report["status"] = "partial"
     elif report["errors"]:
@@ -1339,7 +1507,7 @@ def learning_config_summary(config: dict) -> dict:
         "feePct": config.get("feePct"),
         "slippagePct": config.get("slippagePct"),
         "allowShorts": bool(config.get("allowShorts", False)),
-        "autoPromote": False,
+        "autoPromote": bool(config.get("autoPromote", False)),
         "autoEnablePaper": False,
     }
 
