@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,7 @@ NODE_STRATEGIES = {
 @app.get("/backtest")
 @app.get("/analysis")
 @app.get("/learning")
+@app.get("/ops")
 @app.get("/settings")
 def index():
     return render_template("index.html")
@@ -55,6 +57,17 @@ def index():
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "app": "ZguaCharts"})
+
+
+@app.get("/api/system/health")
+def system_health():
+    include_optimizer = request.args.get("optimizer", "").lower() in {"1", "true", "yes"}
+    return jsonify(build_system_health(quick=False, include_optimizer=include_optimizer))
+
+
+@app.get("/api/system/health/quick")
+def system_health_quick():
+    return jsonify(build_system_health(quick=True))
 
 
 @app.get("/api/config")
@@ -482,6 +495,239 @@ def learning_decision(decision_id):
 @app.get("/api/learning/decision-summary")
 def learning_decision_summary():
     return jsonify(summarize_learning_decisions())
+
+
+def health_check_item(checks: list[dict], check_id: str, label: str, status: str, message: str, details: dict | None = None) -> None:
+    checks.append({
+        "id": check_id,
+        "label": label,
+        "status": status if status in {"PASS", "WARN", "FAIL"} else "WARN",
+        "message": message,
+        "details": details or {},
+    })
+
+
+def generated_file_info(path: Path) -> dict:
+    if not path.exists():
+        return {"exists": False, "sizeBytes": 0, "sizeKb": 0, "updatedAt": None}
+    stat = path.stat()
+    return {
+        "exists": True,
+        "sizeBytes": stat.st_size,
+        "sizeKb": round(stat.st_size / 1024, 2),
+        "updatedAt": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+    }
+
+
+def readable_json_file(path: Path) -> tuple[str, str, dict]:
+    info = generated_file_info(path)
+    if not path.exists():
+        return "WARN", "File is missing; this is OK before first use.", info
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            json.load(handle)
+        return "PASS", "JSON is readable.", info
+    except Exception as exc:
+        info["error"] = str(exc)
+        return "FAIL", f"JSON is not readable: {exc}", info
+
+
+def latest_record_age(records: list[dict], time_key: str = "createdAt") -> dict:
+    if not records:
+        return {"latestAt": None, "ageHours": None}
+    latest = records[-1].get(time_key)
+    parsed = parse_learning_time(latest)
+    age = None
+    if parsed:
+        age = round((datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600, 2)
+    return {"latestAt": latest, "ageHours": age}
+
+
+def synthetic_health_candles(count: int = 80) -> list[dict]:
+    base = int(datetime(2024, 1, 1, tzinfo=timezone.utc).timestamp())
+    candles = []
+    price = 100.0
+    for index in range(count):
+        drift = 0.15 if index % 9 else -0.4
+        open_price = price
+        close = max(1, open_price + drift)
+        high = max(open_price, close) + 0.6
+        low = min(open_price, close) - 0.6
+        candles.append({
+            "time": base + index * 3600,
+            "open": round(open_price, 4),
+            "high": round(high, 4),
+            "low": round(low, 4),
+            "close": round(close, 4),
+            "volume": 1000 + index,
+        })
+        price = close
+    return candles
+
+
+def run_node_backtest_smoke() -> dict:
+    engine_input = {
+        "source": "synthetic",
+        "symbol": "HEALTH",
+        "interval": "1h",
+        "strategy": "AlwaysLongTest",
+        "preset": "AlwaysLongTest",
+        "limit": 80,
+        "params": {},
+        "candles": synthetic_health_candles(),
+    }
+    completed = subprocess.run(
+        [node_executable(), "cli/backtest.js", "--stdin-json"],
+        input=json.dumps(engine_input, allow_nan=False),
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Node backtest smoke failed")
+    payload = json.loads(completed.stdout)
+    return {
+        "strategy": payload.get("strategy"),
+        "trades": payload.get("trades") or payload.get("numberOfTrades") or len(payload.get("tradeList", [])),
+        "equityPoints": len(payload.get("equityCurve", [])),
+    }
+
+
+def run_optimizer_smoke() -> dict:
+    completed = subprocess.run(
+        [node_executable(), "cli/optimize.js", "--symbol", "BTCUSDT", "--interval", "1h", "--days", "7", "--strategy", "AlwaysLongTest", "--limit", "120", "--max-combos", "1"],
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=45,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Optimizer smoke failed")
+    return {"stdoutPreview": completed.stdout[:300]}
+
+
+def build_system_health(quick: bool = False, include_optimizer: bool = False) -> dict:
+    checks: list[dict] = []
+
+    health_check_item(checks, "python", "Python runtime", "PASS", f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}", {
+        "executable": sys.executable,
+        "version": sys.version.split()[0],
+    })
+    health_check_item(checks, "flask", "Flask app", "PASS", "Flask application object is loaded.", {"appName": app.name})
+
+    generated_files = {
+        "researchRuns": generated_file_info(RESEARCH_RUNS_PATH),
+        "learningReports": generated_file_info(LEARNING_REPORTS_PATH),
+        "learningDecisions": generated_file_info(LEARNING_DECISIONS_PATH),
+        "paperState": generated_file_info(Path(app.root_path) / "data" / "paper-state.json"),
+    }
+
+    for path, label, check_id in (
+        (PAPER_CANDIDATE_PATH, "Paper candidate config", "paper_candidate_config"),
+        (LEARNING_CONFIG_PATH, "Learning runner config", "learning_config"),
+    ):
+        status, message, details = readable_json_file(path)
+        if not path.exists():
+            status = "FAIL"
+            message = "Required config file is missing."
+        health_check_item(checks, check_id, label, status, message, details)
+
+    paper_candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    candidate_ok = bool(paper_candidate.get("strategy") and paper_candidate.get("source") and paper_candidate.get("symbols"))
+    health_check_item(
+        checks,
+        "paper_candidate_summary",
+        "Paper candidate",
+        "PASS" if candidate_ok else "WARN",
+        "Paper candidate has strategy/source/symbols." if candidate_ok else "Paper candidate is incomplete.",
+        candidate_summary(paper_candidate),
+    )
+
+    learning_config_data = safe_learning_config(load_learning_config())
+    health_check_item(checks, "learning_runner_config", "Learning runner safety", "PASS", "Learning runner config parsed with safe defaults.", {
+        "enabled": learning_config_data.get("enabled"),
+        "schedule": learning_config_data.get("schedule"),
+        "lastRunAt": learning_config_data.get("lastRunAt"),
+        "nextRunAt": learning_config_data.get("nextRunAt"),
+        "autoPromote": learning_config_data.get("autoPromote"),
+        "autoEnablePaper": learning_config_data.get("autoEnablePaper"),
+    })
+    auto_status = "WARN" if learning_config_data.get("autoPromote") else "PASS"
+    health_check_item(checks, "auto_promotion", "Auto-promotion mode", auto_status, "Auto-promotion is candidate-only and paper auto-enable is blocked.", {
+        "autoPromote": learning_config_data.get("autoPromote"),
+        "autoPromoteMode": learning_config_data.get("autoPromoteMode"),
+        "autoEnablePaper": False,
+    })
+
+    node_path = node_executable()
+    try:
+        completed = subprocess.run([node_path, "-v"], text=True, capture_output=True, timeout=5)
+        version = (completed.stdout or completed.stderr).strip()
+        major = 0
+        try:
+            major = int(version.lstrip("v").split(".", 1)[0])
+        except Exception:
+            pass
+        status = "PASS" if completed.returncode == 0 and major >= 18 else "FAIL"
+        message = f"Node runtime found: {version}" if status == "PASS" else f"Node 18+ is required; resolved version was {version or 'unknown'}."
+        health_check_item(checks, "node", "Node runtime", status, message, {"path": node_path, "version": version})
+    except Exception as exc:
+        health_check_item(checks, "node", "Node runtime", "FAIL", f"Node runtime unavailable: {exc}", {"path": node_path})
+
+    for script, check_id in (("cli/backtest.js", "cli_backtest"), ("cli/optimize.js", "cli_optimize")):
+        path = Path(app.root_path) / script
+        health_check_item(checks, check_id, script, "PASS" if path.exists() else "FAIL", "Script exists." if path.exists() else "Script is missing.", generated_file_info(path))
+
+    for path, label, check_id in (
+        (RESEARCH_RUNS_PATH, "Research runs memory", "research_runs"),
+        (LEARNING_REPORTS_PATH, "Learning reports", "learning_reports"),
+        (LEARNING_DECISIONS_PATH, "Learning decision log", "learning_decisions"),
+        (Path(app.root_path) / "data" / "paper-state.json", "Paper state", "paper_state"),
+    ):
+        status, message, details = readable_json_file(path)
+        health_check_item(checks, check_id, label, status, message, details)
+
+    health_check_item(checks, "generated_data_sizes", "Generated data file sizes", "PASS", "Generated runtime data sizes collected.", generated_files)
+    health_check_item(checks, "learning_report_age", "Latest learning report age", "PASS" if load_learning_reports() else "WARN", "Latest learning report age calculated." if load_learning_reports() else "No learning reports yet.", latest_record_age(load_learning_reports()))
+    health_check_item(checks, "decision_age", "Latest decision age", "PASS" if load_learning_decisions() else "WARN", "Latest decision age calculated." if load_learning_decisions() else "No learning decisions yet.", latest_record_age(load_learning_decisions()))
+
+    if not quick:
+        try:
+            candles_payload = fetch_candles("bybit", "BTCUSDT", "1h", limit=5, visible_charts=1)
+            health_check_item(checks, "data_bybit", "Bybit data source", "PASS", "Fetched small BTCUSDT 1h candle sample.", {
+                "candles": len(candles_payload.get("candles", [])),
+                "diagnostics": candles_payload.get("diagnostics", {}),
+            })
+        except Exception as exc:
+            health_check_item(checks, "data_bybit", "Bybit data source", "WARN", f"Bybit smoke fetch failed: {exc}", {})
+
+        try:
+            smoke = run_node_backtest_smoke()
+            status = "PASS" if safe_float(smoke.get("trades")) > 0 else "WARN"
+            health_check_item(checks, "node_backtest_smoke", "Node backtest smoke", status, "Synthetic AlwaysLongTest backtest completed.", smoke)
+        except Exception as exc:
+            health_check_item(checks, "node_backtest_smoke", "Node backtest smoke", "FAIL", f"Node backtest smoke failed: {exc}", {})
+
+        if include_optimizer:
+            try:
+                health_check_item(checks, "optimizer_smoke", "Optimizer smoke", "PASS", "Optimizer smoke completed.", run_optimizer_smoke())
+            except Exception as exc:
+                health_check_item(checks, "optimizer_smoke", "Optimizer smoke", "WARN", f"Optimizer smoke is non-blocking and failed: {exc}", {})
+        else:
+            health_check_item(checks, "optimizer_smoke", "Optimizer smoke", "WARN", "Skipped by default; call /api/system/health?optimizer=1 to run the optional optimizer smoke.", {})
+
+    summary = {
+        "pass": sum(1 for check in checks if check["status"] == "PASS"),
+        "warn": sum(1 for check in checks if check["status"] == "WARN"),
+        "fail": sum(1 for check in checks if check["status"] == "FAIL"),
+    }
+    return {
+        "ok": summary["fail"] == 0,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "checks": checks,
+        "summary": summary,
+    }
 
 
 @app.get("/api/backtest-history")

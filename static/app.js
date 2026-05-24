@@ -56,6 +56,7 @@ let chartsToolbarInitialized = false;
 let backtestInitialized = false;
 let analysisInitialized = false;
 let learningInitialized = false;
+let opsInitialized = false;
 let backtestPane = null;
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
@@ -225,6 +226,7 @@ function pathToPage(pathname) {
   if (pathname === "/backtest") return "backtest";
   if (pathname === "/analysis") return "analysis";
   if (pathname === "/learning") return "learning";
+  if (pathname === "/ops") return "ops";
   if (pathname === "/settings") return "settings";
   return "charts";
 }
@@ -240,6 +242,7 @@ function showPage(page) {
   if (page === "backtest") initBacktestPage();
   if (page === "analysis") renderAnalysisPage();
   if (page === "learning") renderLearningPage();
+  if (page === "ops") renderOpsPage();
   if (page === "settings") renderSettingsPage();
 }
 
@@ -2184,6 +2187,104 @@ function renderLearningPage() {
   loadLearningAudit();
   loadLearningDecisions();
   loadLearningReports();
+}
+
+function renderOpsPage() {
+  if (!opsInitialized) {
+    setupOpsControls();
+    opsInitialized = true;
+  }
+  loadSystemHealth(true);
+}
+
+function setupOpsControls() {
+  document.querySelector("#ops-refresh-full")?.addEventListener("click", () => loadSystemHealth(false));
+  document.querySelector("#ops-refresh-quick")?.addEventListener("click", () => loadSystemHealth(true));
+}
+
+async function loadSystemHealth(quick = true) {
+  const status = document.querySelector("#ops-status");
+  const summary = document.querySelector("#ops-summary");
+  const body = document.querySelector("#ops-checks-body");
+  const details = document.querySelector("#ops-details");
+  if (!status || !summary || !body || !details) return;
+  status.textContent = quick ? "Running quick backend health check..." : "Running full backend health check...";
+  summary.innerHTML = "";
+  body.innerHTML = `<tr><td colspan="4">Loading diagnostics...</td></tr>`;
+  details.innerHTML = "";
+  try {
+    const payload = await apiGet(quick ? "/api/system/health/quick" : "/api/system/health");
+    renderSystemHealth(payload, quick);
+  } catch (error) {
+    status.textContent = `System health check failed: ${error.message}`;
+    body.innerHTML = `<tr><td colspan="4">Health check failed: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderSystemHealth(payload, quick) {
+  const status = document.querySelector("#ops-status");
+  const summary = document.querySelector("#ops-summary");
+  const body = document.querySelector("#ops-checks-body");
+  const details = document.querySelector("#ops-details");
+  if (!status || !summary || !body || !details) return;
+  const counts = payload.summary || {};
+  status.textContent = `${quick ? "Quick" : "Full"} health check ${payload.ok ? "passed" : "needs attention"} at ${formatLearningTime(payload.generatedAt)}.`;
+  summary.innerHTML = `
+    <div class="metric"><span>Overall</span><strong class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "Attention"}</strong></div>
+    <div class="metric"><span>PASS</span><strong class="positive">${counts.pass || 0}</strong></div>
+    <div class="metric"><span>WARN</span><strong class="neutral">${counts.warn || 0}</strong></div>
+    <div class="metric"><span>FAIL</span><strong class="negative">${counts.fail || 0}</strong></div>
+  `;
+  const checks = payload.checks || [];
+  body.innerHTML = checks.map((check) => `
+    <tr>
+      <td class="${healthTone(check.status)}">${escapeHtml(check.status || "-")}</td>
+      <td>${escapeHtml(check.label || check.id || "-")}</td>
+      <td>${escapeHtml(check.message || "")}</td>
+      <td><code>${escapeHtml(compactJson(check.details || {}))}</code></td>
+    </tr>
+  `).join("") || `<tr><td colspan="4">No checks returned.</td></tr>`;
+  details.innerHTML = renderOpsDetails(checks);
+}
+
+function healthTone(status) {
+  if (status === "PASS") return "positive";
+  if (status === "FAIL") return "negative";
+  return "neutral";
+}
+
+function compactJson(value) {
+  const json = JSON.stringify(value);
+  return json.length > 260 ? `${json.slice(0, 260)}...` : json;
+}
+
+function findHealthCheck(checks, id) {
+  return checks.find((check) => check.id === id) || {};
+}
+
+function renderOpsDetails(checks) {
+  const generated = findHealthCheck(checks, "generated_data_sizes").details || {};
+  const learning = findHealthCheck(checks, "learning_runner_config").details || {};
+  const candidate = findHealthCheck(checks, "paper_candidate_summary").details || {};
+  const auto = findHealthCheck(checks, "auto_promotion").details || {};
+  const firstActive = (candidate.activeSymbols || [])[0] || {};
+  const fileRows = Object.entries(generated).map(([name, info]) => `
+    <tr><th>${escapeHtml(name)}</th><td>${info.exists ? `${formatNumber(info.sizeKb)} KB` : "missing"}</td><td>${escapeHtml(info.updatedAt || "-")}</td></tr>
+  `).join("");
+  return `
+    <div class="metric-grid">
+      <div class="metric"><span>Learning enabled</span><strong>${escapeHtml(String(learning.enabled ?? false))}</strong></div>
+      <div class="metric"><span>Next run</span><strong>${escapeHtml(formatLearningTime(learning.nextRunAt))}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(firstActive.symbol || "")} ${escapeHtml(firstActive.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Auto-promote</span><strong>${escapeHtml(String(auto.autoPromote ?? false))}</strong></div>
+    </div>
+    <h3 class="modal-section-title">Generated Data Sizes</h3>
+    <table class="trade-table">
+      <thead><tr><th>File</th><th>Size</th><th>Updated</th></tr></thead>
+      <tbody>${fileRows || `<tr><td colspan="3">No generated files reported.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Diagnostics are read-only. Secrets are not read or displayed, and no paper or real trading action is performed.</p>
+  `;
 }
 
 function setupLearningControls() {

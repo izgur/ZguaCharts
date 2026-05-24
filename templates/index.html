@@ -18,6 +18,7 @@
         <a href="/backtest" data-route="backtest">Backtest</a>
         <a href="/analysis" data-route="analysis">Analysis</a>
         <a href="/learning" data-route="learning">Learning</a>
+        <a href="/ops" data-route="ops">Ops</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
       <label class="count-control header-count-control">
@@ -279,6 +280,33 @@
             </tr>
           </thead>
           <tbody id="learning-reports-body"></tbody>
+        </table>
+      </section>
+
+      <section id="ops-page" class="route-page analysis-page" data-page="ops" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>System Health / Ops</h2>
+            <p>Read-only backend diagnostics for runtime, data, research memory, learning, and paper simulation plumbing.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <button id="ops-refresh-full" type="button">Run Full Health Check</button>
+          <button id="ops-refresh-quick" type="button">Run Quick Check</button>
+        </div>
+        <div id="ops-status" class="pane-status">Run a health check to inspect backend-owned diagnostics.</div>
+        <div id="ops-summary" class="metric-grid"></div>
+        <div id="ops-details" class="paper-validation-result"></div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Check</th>
+              <th>Message</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody id="ops-checks-body"></tbody>
         </table>
       </section>
 
