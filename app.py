@@ -279,6 +279,45 @@ def research_suggest_candidate():
     })
 
 
+@app.post("/api/research/suggest-replacement")
+def research_suggest_replacement():
+    health_payload = build_candidate_health(candidate_health_rules(request.args))
+    health = health_payload["health"]
+    current = health_payload["candidate"]
+    if health["status"] == "HEALTHY":
+        return jsonify({
+            "action": "KEEP_CURRENT",
+            "reason": "Current paper candidate health is still aligned with expectations.",
+            "health": health,
+            "candidate": None,
+            "currentCandidate": current,
+        })
+    if health["status"] == "UNKNOWN":
+        return jsonify({
+            "action": "WAIT_FOR_MORE_DATA",
+            "reason": "Not enough paper trades to judge candidate health.",
+            "health": health,
+            "candidate": None,
+            "currentCandidate": current,
+        })
+    candidate = best_saved_candidate(load_research_runs())
+    if not candidate:
+        return jsonify({
+            "action": "NO_VALID_CANDIDATE",
+            "reason": "Candidate health is weak, but no valid saved replacement candidate exists.",
+            "health": health,
+            "candidate": None,
+            "currentCandidate": current,
+        })
+    return jsonify({
+        "action": "PROMOTE",
+        "reason": "Candidate health is weak; a saved research candidate is available for manual review.",
+        "health": health,
+        "candidate": candidate,
+        "currentCandidate": current,
+    })
+
+
 @app.get("/api/backtest-history")
 def backtest_history():
     limit = int(request.args.get("limit", "100"))
@@ -474,6 +513,14 @@ def current_candidate():
         return jsonify(candidate_summary(candidate))
     except Exception as exc:
         return jsonify({"error": f"Could not load current candidate: {exc}"}), 502
+
+
+@app.get("/api/candidate/health")
+def candidate_health():
+    try:
+        return jsonify(build_candidate_health(candidate_health_rules(request.args)))
+    except Exception as exc:
+        return jsonify({"error": f"Could not calculate candidate health: {exc}"}), 502
 
 
 @app.get("/api/candidate/validate")
@@ -1022,6 +1069,189 @@ def collect_validation_reasons(validation: dict) -> list[str]:
         for reason in row.get("reasons", []):
             reasons.append(f"{row.get('symbol')} {row.get('timeframe')}: {reason}")
     return reasons
+
+
+def candidate_health_rules(args) -> dict:
+    return {
+        "minPaperTrades": int(args.get("min_paper_trades", "10")),
+        "failProfitFactorBelow": float(args.get("fail_profit_factor_below", "0.9")),
+        "watchProfitFactorBelow": float(args.get("watch_profit_factor_below", "1.05")),
+        "failDrawdownAbove": float(args.get("fail_drawdown_above", "15")),
+        "failIfRealizedLossPctBelow": float(args.get("fail_if_realized_loss_pct_below", "-5")),
+        "watchIfWinRateUnderExpectedBy": float(args.get("watch_if_win_rate_under_expected_by", "15")),
+    }
+
+
+def build_candidate_health(rules: dict) -> dict:
+    candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 500)
+    expected = expected_metrics_from_candidate(candidate)
+    paper = paper_metrics_from_state(state, candidate, journal)
+    status, reasons, recommendation = candidate_health_status(expected, paper, rules)
+    return {
+        "candidate": candidate_summary(candidate),
+        "health": {
+            "status": status,
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "reason": reasons[0] if reasons else "Paper performance is aligned with expectations.",
+            "rules": rules,
+            "expected": expected,
+            "paper": paper,
+            "reasons": reasons,
+            "recommendation": recommendation,
+        },
+    }
+
+
+def expected_metrics_from_candidate(candidate: dict) -> dict:
+    source = candidate.get("promotedFromOptimization") if isinstance(candidate.get("promotedFromOptimization"), dict) else None
+    if source:
+        test = source.get("test") or {}
+        full = source.get("full") or {}
+        return {
+            "source": "promotedFromOptimization",
+            "totalReturnPct": safe_float(test.get("totalReturn", full.get("totalReturn", source.get("totalReturnPct", 0)))),
+            "winRate": safe_float(test.get("winRate", full.get("winRate", source.get("winRate", 0)))),
+            "maxDrawdown": safe_float(test.get("maxDrawdown", full.get("maxDrawdown", source.get("maxDrawdown", 0)))),
+            "profitFactor": safe_float(test.get("profitFactor", full.get("profitFactor", source.get("profitFactor", 0)))),
+            "trades": int(safe_float(test.get("trades", full.get("trades", source.get("trades", 0))))),
+        }
+    source = candidate.get("promotedFromRanking") if isinstance(candidate.get("promotedFromRanking"), dict) else None
+    if source:
+        return {
+            "source": "promotedFromRanking",
+            "totalReturnPct": safe_float(source.get("totalReturnPct", 0)),
+            "winRate": safe_float(source.get("winRate", 0)),
+            "maxDrawdown": safe_float(source.get("maxDrawdown", 0)),
+            "profitFactor": safe_float(source.get("profitFactor", 0)),
+            "trades": int(safe_float(source.get("trades", 0))),
+        }
+    return {"source": None}
+
+
+def paper_metrics_from_state(state: dict, candidate: dict, journal: list[dict]) -> dict:
+    closed = state.get("closedTrades", []) or []
+    account_equity = safe_float(candidate.get("accountEquity", state.get("accountEquity", 10000)), 10000)
+    returns = [trade_return_pct(trade) for trade in closed]
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value < 0]
+    realized = safe_float(state.get("realizedPnl", state.get("realizedPnL", 0)))
+    realized_pct = (realized / account_equity * 100) if account_equity else 0
+    equity_curve = state.get("equityCurve", []) or []
+    return {
+        "closedTrades": len(closed),
+        "winRate": round(len(wins) / len(returns) * 100, 4) if returns else 0,
+        "totalReturnPct": round(sum(returns), 4),
+        "realizedPnLPct": round(realized_pct, 4),
+        "realizedPnL": round(realized, 4),
+        "maxDrawdown": paper_max_drawdown(equity_curve),
+        "profitFactor": paper_profit_factor(wins, losses, closed),
+        "averageTradeReturn": round(sum(returns) / len(returns), 4) if returns else 0,
+        "averageBarsHeld": paper_average_bars_held(closed),
+        "openPositions": len(state.get("openPositions", []) or []),
+        "timeSincePromotion": seconds_since(candidate.get("promotedAt")),
+        "timeSinceEnabled": seconds_since(candidate.get("enabledAt")),
+        "journalEvents": len(journal),
+    }
+
+
+def trade_return_pct(trade: dict) -> float:
+    for key in ("returnPct", "return_pct", "netReturnPct"):
+        if key in trade:
+            return safe_float(trade.get(key))
+    pnl = safe_float(trade.get("netPnl", trade.get("pnl", 0)))
+    entry = safe_float(trade.get("entryFillPrice", trade.get("entryPrice", 0)))
+    size = abs(safe_float(trade.get("size", 1), 1))
+    notional = entry * size
+    return (pnl / notional * 100) if notional else 0
+
+
+def paper_profit_factor(wins: list[float], losses: list[float], trades: list[dict]) -> float:
+    if trades and any("netPnl" in trade or "pnl" in trade for trade in trades):
+        gross_win = sum(max(0, safe_float(trade.get("netPnl", trade.get("pnl", 0)))) for trade in trades)
+        gross_loss = abs(sum(min(0, safe_float(trade.get("netPnl", trade.get("pnl", 0)))) for trade in trades))
+    else:
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+    if gross_loss == 0:
+        return round(gross_win, 4) if gross_win else 0
+    return round(gross_win / gross_loss, 4)
+
+
+def paper_average_bars_held(trades: list[dict]) -> float:
+    values = [safe_float(trade.get("barsHeld", trade.get("bars_held", 0))) for trade in trades if trade.get("barsHeld") or trade.get("bars_held")]
+    return round(sum(values) / len(values), 4) if values else 0
+
+
+def paper_max_drawdown(equity_curve: list[dict]) -> float:
+    if not equity_curve:
+        return 0
+    peak = -math.inf
+    max_dd = 0
+    for point in equity_curve:
+        equity = safe_float(point.get("equity", 0))
+        peak = max(peak, equity)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - equity) / peak * 100)
+    return round(max_dd, 4)
+
+
+def seconds_since(timestamp: str | None):
+    if not timestamp:
+        return None
+    try:
+        normalized = timestamp.replace("Z", "+00:00")
+        then = datetime.fromisoformat(normalized)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+        return int((datetime.now(timezone.utc) - then).total_seconds())
+    except Exception:
+        return None
+
+
+def candidate_health_status(expected: dict, paper: dict, rules: dict) -> tuple[str, list[str], dict]:
+    if not expected.get("source"):
+        return "UNKNOWN", ["No promoted ranking or optimization expectation is available."], {
+            "action": "WATCH",
+            "reason": "No expected baseline exists for this candidate.",
+        }
+    if paper["closedTrades"] < rules["minPaperTrades"]:
+        return "UNKNOWN", [f"Not enough closed paper trades ({paper['closedTrades']} < {rules['minPaperTrades']})."], {
+            "action": "WATCH",
+            "reason": "Wait for more forward paper trades before judging health.",
+        }
+
+    reasons = []
+    status = "HEALTHY"
+    if paper["profitFactor"] < rules["failProfitFactorBelow"]:
+        status = "FAILED"
+        reasons.append(f"Paper profit factor below failure threshold ({paper['profitFactor']} < {rules['failProfitFactorBelow']}).")
+    elif paper["profitFactor"] < rules["watchProfitFactorBelow"]:
+        status = "WATCH"
+        reasons.append(f"Paper profit factor below watch threshold ({paper['profitFactor']} < {rules['watchProfitFactorBelow']}).")
+    if paper["maxDrawdown"] > rules["failDrawdownAbove"]:
+        status = "FAILED"
+        reasons.append(f"Paper drawdown above failure threshold ({paper['maxDrawdown']} > {rules['failDrawdownAbove']}).")
+    if paper["realizedPnLPct"] < rules["failIfRealizedLossPctBelow"]:
+        status = "FAILED"
+        reasons.append(f"Realized PnL percent below guardrail ({paper['realizedPnLPct']} < {rules['failIfRealizedLossPctBelow']}).")
+    expected_win = safe_float(expected.get("winRate"))
+    if expected_win and paper["winRate"] < expected_win - rules["watchIfWinRateUnderExpectedBy"]:
+        if status == "HEALTHY":
+            status = "WATCH"
+        reasons.append(f"Paper win rate trails expected by more than {rules['watchIfWinRateUnderExpectedBy']} points.")
+    if status == "HEALTHY" and paper["profitFactor"] < safe_float(expected.get("profitFactor", 0)) * 0.75:
+        status = "DEGRADED"
+        reasons.append("Paper profit factor is materially below expected baseline.")
+
+    if status == "FAILED":
+        recommendation = {"action": "DISABLE_PAPER", "reason": "Paper performance breached failure guardrails. Review before continuing."}
+    elif status in {"DEGRADED", "WATCH"}:
+        recommendation = {"action": "SEARCH_REPLACEMENT", "reason": "Search saved research for a replacement candidate, but require manual approval."}
+    else:
+        recommendation = {"action": "KEEP", "reason": "Paper performance is reasonably aligned with expectations."}
+    return status, reasons or ["Paper performance is reasonably aligned with expectations."], recommendation
 
 
 def node_executable() -> str:

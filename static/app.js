@@ -59,6 +59,7 @@ let backtestPane = null;
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
+let lastPaperReplacementSuggestion = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
 let watchlistRefreshInFlight = false;
@@ -159,6 +160,10 @@ async function boot() {
     paperPanelContent.addEventListener("click", (event) => {
       const button = event.target.closest("[data-paper-action]");
       if (button) handlePaperAction(button.dataset.paperAction);
+      const replacementButton = event.target.closest("[data-promote-replacement]");
+      if (replacementButton && lastPaperReplacementSuggestion?.candidate) {
+        promoteResearchCandidate(lastPaperReplacementSuggestion.candidate, lastPaperReplacementSuggestion, "#paper-health-result");
+      }
     });
   }
   bottomPanel?.querySelector("summary")?.addEventListener("click", (event) => {
@@ -421,6 +426,14 @@ function renderPaperStatus(payload) {
     <div id="paper-validation-result" class="paper-validation-result">
       <p class="modal-note">Validation must pass before paper simulation can be enabled without force. This is simulated only.</p>
     </div>
+    <h3 class="modal-section-title">Candidate Health</h3>
+    <div class="paper-actions">
+      <button type="button" data-paper-action="health">Review Health</button>
+      <button type="button" data-paper-action="replacement">Suggest Replacement</button>
+    </div>
+    <div id="paper-health-result" class="paper-validation-result">
+      <p class="modal-note">Health compares forward paper performance against the promoted research baseline.</p>
+    </div>
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <h3 class="modal-section-title">Open Positions</h3>
     <table class="trade-table">
@@ -462,6 +475,21 @@ async function handlePaperAction(action) {
       if (resultEl) resultEl.innerHTML = renderCandidateValidation(payload.validation);
       return;
     }
+    if (action === "health") {
+      const healthEl = document.querySelector("#paper-health-result");
+      if (healthEl) healthEl.innerHTML = `<p class="pane-status">Reviewing paper health...</p>`;
+      const payload = await apiGet("/api/candidate/health");
+      if (healthEl) healthEl.innerHTML = renderCandidateHealth(payload.health);
+      return;
+    }
+    if (action === "replacement") {
+      const healthEl = document.querySelector("#paper-health-result");
+      if (healthEl) healthEl.innerHTML = `<p class="pane-status">Searching saved research for replacement...</p>`;
+      const payload = await apiPost("/api/research/suggest-replacement", {});
+      lastPaperReplacementSuggestion = payload;
+      if (healthEl) healthEl.innerHTML = renderReplacementSuggestion(payload);
+      return;
+    }
     if (action === "enable") {
       const ok = window.confirm("Enable paper simulation for this candidate?\n\nThis is still simulated only. No real exchange orders will be placed.");
       if (!ok) return;
@@ -476,7 +504,10 @@ async function handlePaperAction(action) {
       await openPaperPanel();
     }
   } catch (error) {
-    if (resultEl) resultEl.innerHTML = `<p class="pane-status">Paper action failed: ${escapeHtml(error.message)}</p>`;
+    const targetEl = action === "health" || action === "replacement"
+      ? document.querySelector("#paper-health-result")
+      : resultEl;
+    if (targetEl) targetEl.innerHTML = `<p class="pane-status">Paper action failed: ${escapeHtml(error.message)}</p>`;
   }
 }
 
@@ -505,6 +536,52 @@ function renderCandidateValidation(validation) {
         </tr>
       `).join("")}</tbody>
     </table>
+  `;
+}
+
+function renderCandidateHealth(health) {
+  if (!health) return `<p class="pane-status">No health payload returned.</p>`;
+  const statusClass = health.status === "HEALTHY" ? "positive" : health.status === "FAILED" || health.status === "DEGRADED" ? "negative" : "neutral";
+  return `
+    <h3 class="modal-section-title">Health <span class="${statusClass}">${escapeHtml(health.status)}</span></h3>
+    <p class="modal-note">${escapeHtml(health.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper trades</span><strong>${health.paper?.closedTrades || 0}</strong></div>
+      <div class="metric"><span>Paper PF</span><strong>${formatNumber(health.paper?.profitFactor)}</strong></div>
+      <div class="metric"><span>Paper return</span><strong>${formatSigned(health.paper?.totalReturnPct)}%</strong></div>
+      <div class="metric"><span>Expected PF</span><strong>${formatNumber(health.expected?.profitFactor)}</strong></div>
+      <div class="metric"><span>Expected return</span><strong>${formatSigned(health.expected?.totalReturnPct)}%</strong></div>
+      <div class="metric"><span>Recommendation</span><strong>${escapeHtml(health.recommendation?.action || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Metric</th><th>Expected</th><th>Paper</th></tr></thead>
+      <tbody>
+        <tr><td>Win rate</td><td>${formatNumber(health.expected?.winRate)}%</td><td>${formatNumber(health.paper?.winRate)}%</td></tr>
+        <tr><td>Max drawdown</td><td>${formatNumber(health.expected?.maxDrawdown)}%</td><td>${formatNumber(health.paper?.maxDrawdown)}%</td></tr>
+        <tr><td>Trades</td><td>${health.expected?.trades || 0}</td><td>${health.paper?.closedTrades || 0}</td></tr>
+        <tr><td>Realized PnL</td><td>-</td><td>${formatSigned(health.paper?.realizedPnL)}</td></tr>
+      </tbody>
+    </table>
+    ${(health.reasons || []).length ? `<ul class="backtest-warnings">${health.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+function renderReplacementSuggestion(payload) {
+  const candidate = payload.candidate;
+  return `
+    ${renderCandidateHealth(payload.health)}
+    <h3 class="modal-section-title">Replacement Suggestion</h3>
+    <p class="modal-note"><strong>${escapeHtml(payload.action || "-")}</strong> ${escapeHtml(payload.reason || "")}</p>
+    ${candidate ? `
+      <table class="trade-table">
+        <tbody>
+          <tr><th>Candidate</th><td>${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol)} ${escapeHtml(candidate.timeframe)}</td></tr>
+          <tr><th>Score</th><td>${formatNumber(candidate.score)}</td></tr>
+          <tr><th>PF / Trades</th><td>${formatNumber(candidate.profitFactor)} / ${candidate.trades || 0}</td></tr>
+        </tbody>
+      </table>
+      <button type="button" class="small-action-button" data-promote-replacement="1">Promote Suggested Replacement</button>
+    ` : ""}
   `;
 }
 
@@ -2415,6 +2492,7 @@ function renderResearchRuns(payload) {
     `;
   }
   if (!body) return;
+  if (cards) loadCandidateHealthSummary();
   body.innerHTML = (payload.runs || []).map((run) => {
     const candidate = run.bestCandidate || {};
     return `
@@ -2429,6 +2507,28 @@ function renderResearchRuns(payload) {
       </tr>
     `;
   }).join("") || `<tr><td colspan="7">No saved research runs yet.</td></tr>`;
+}
+
+async function loadCandidateHealthSummary() {
+  const cards = document.querySelector("#research-summary-cards");
+  if (!cards) return;
+  const renderCard = (label) => {
+    const existing = document.querySelector("#research-health-card");
+    const html = `
+      <div class="metric" id="research-health-card">
+        <span>Candidate health</span>
+        <strong>${escapeHtml(label)}</strong>
+      </div>
+    `;
+    if (existing) existing.outerHTML = html;
+    else cards.insertAdjacentHTML("beforeend", html);
+  };
+  try {
+    const payload = await apiGet("/api/candidate/health");
+    renderCard(payload.health?.status || "UNKNOWN");
+  } catch (error) {
+    renderCard("Unavailable");
+  }
 }
 
 async function loadResearchRun(runId) {
@@ -2490,8 +2590,8 @@ function renderResearchSuggestion(payload) {
   `;
 }
 
-async function promoteResearchCandidate(candidate, suggestionPayload) {
-  const suggestion = document.querySelector("#research-suggestion");
+async function promoteResearchCandidate(candidate, suggestionPayload, targetSelector = "#research-suggestion") {
+  const suggestion = document.querySelector(targetSelector);
   const ok = window.confirm(`Promote saved ${candidate.strategy} on ${candidate.symbol} ${candidate.timeframe} as the paper candidate?\n\nPaper simulation will stay disabled until validation passes and you explicitly enable it.`);
   if (!ok) return;
   const requestBody = {
@@ -2519,6 +2619,11 @@ async function promoteResearchCandidate(candidate, suggestionPayload) {
       train: candidate.train,
       test: candidate.test,
       full: candidate.full,
+      warnings: candidate.warnings,
+    } : suggestionPayload?.health ? {
+      replacementSuggestedFromHealth: suggestionPayload.health.status,
+      researchRunId: candidate.researchRunId,
+      score: candidate.score,
       warnings: candidate.warnings,
     } : undefined,
   };
