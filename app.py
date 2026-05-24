@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -342,8 +342,24 @@ def update_learning_config():
     config.update(safe_learning_config_updates(payload))
     config["autoPromote"] = False
     config["autoEnablePaper"] = False
+    config["nextRunAt"] = compute_next_learning_run(config, datetime.now().astimezone()).isoformat()
     write_learning_config(config)
     return jsonify(safe_learning_config(config))
+
+
+@app.get("/api/learning/status")
+def learning_status():
+    config = load_learning_config()
+    latest = latest_learning_report_summary()
+    return jsonify({
+        "enabled": config.get("enabled", False),
+        "schedule": config.get("schedule", {}),
+        "lastRunAt": config.get("lastRunAt"),
+        "nextRunAt": config.get("nextRunAt") or compute_next_learning_run(config, datetime.now().astimezone()).isoformat(),
+        "lock": config.get("lock", {}),
+        "latestReport": latest,
+        "latestRecommendation": (latest or {}).get("recommendation"),
+    })
 
 
 @app.post("/api/learning/run")
@@ -356,6 +372,13 @@ def learning_run():
     report = run_learning_cycle(config)
     append_learning_report(report)
     return jsonify(report)
+
+
+@app.post("/api/learning/tick")
+def learning_tick():
+    payload = request.get_json(silent=True) or {}
+    result = run_due_learning_cycle(force=bool(payload.get("force")))
+    return jsonify(result)
 
 
 @app.get("/api/learning/reports")
@@ -754,6 +777,20 @@ def run_strategy_optimization_payload(
 def default_learning_config() -> dict:
     return {
         "enabled": False,
+        "schedule": {
+            "enabled": False,
+            "mode": "manual",
+            "intervalMinutes": 1440,
+            "runAtHour": 3,
+            "runAtMinute": 0,
+            "timezone": "local",
+        },
+        "lastRunAt": None,
+        "nextRunAt": None,
+        "lock": {
+            "running": False,
+            "startedAt": None,
+        },
         "source": "bybit",
         "symbols": ["BTCUSDT", "ETHUSDT"],
         "timeframes": ["1h"],
@@ -795,9 +832,18 @@ def write_learning_config(config: dict) -> None:
         handle.write("\n")
 
 
+def save_learning_config(config: dict) -> None:
+    write_learning_config(config)
+
+
 def safe_learning_config(config: dict) -> dict:
     base = default_learning_config()
     base.update({key: config.get(key, base[key]) for key in base})
+    base["schedule"] = safe_learning_schedule(base.get("schedule", {}))
+    lock = base.get("lock") if isinstance(base.get("lock"), dict) else {}
+    base["lock"] = {"running": bool(lock.get("running", False)), "startedAt": lock.get("startedAt")}
+    base["lastRunAt"] = base.get("lastRunAt")
+    base["nextRunAt"] = base.get("nextRunAt")
     base["symbols"] = list_string_values(base.get("symbols"), default_learning_config()["symbols"])
     base["timeframes"] = list_string_values(base.get("timeframes"), default_learning_config()["timeframes"])
     base["rankingPresets"] = list_string_values(base.get("rankingPresets"), default_learning_config()["rankingPresets"])
@@ -811,6 +857,26 @@ def safe_learning_config(config: dict) -> dict:
     for key in ("feePct", "slippagePct"):
         base[key] = safe_float(base.get(key), default_learning_config()[key])
     return base
+
+
+def safe_learning_schedule(schedule: dict) -> dict:
+    defaults = default_learning_config()["schedule"]
+    if not isinstance(schedule, dict):
+        schedule = {}
+    interval = max(15, int(safe_float(schedule.get("intervalMinutes", defaults["intervalMinutes"]), defaults["intervalMinutes"])))
+    hour = min(23, max(0, int(safe_float(schedule.get("runAtHour", defaults["runAtHour"]), defaults["runAtHour"]))))
+    minute = min(59, max(0, int(safe_float(schedule.get("runAtMinute", defaults["runAtMinute"]), defaults["runAtMinute"]))))
+    mode = schedule.get("mode", defaults["mode"])
+    if mode not in {"manual", "interval", "daily"}:
+        mode = "manual"
+    return {
+        "enabled": bool(schedule.get("enabled", defaults["enabled"])),
+        "mode": mode,
+        "intervalMinutes": interval,
+        "runAtHour": hour,
+        "runAtMinute": minute,
+        "timezone": schedule.get("timezone") or defaults["timezone"],
+    }
 
 
 def safe_learning_config_updates(payload: dict) -> dict:
@@ -830,6 +896,7 @@ def safe_learning_config_updates(payload: dict) -> dict:
         "feePct",
         "slippagePct",
         "allowShorts",
+        "schedule",
     }
     updates = {key: value for key, value in payload.items() if key in allowed}
     if "autoPromote" in payload or "autoEnablePaper" in payload:
@@ -878,6 +945,110 @@ def append_learning_report(report: dict) -> str:
 
 def get_learning_report_by_id(report_id: str) -> dict | None:
     return next((report for report in load_learning_reports() if report.get("id") == report_id), None)
+
+
+def latest_learning_report_summary() -> dict | None:
+    reports = load_learning_reports()
+    if not reports:
+        return None
+    report = reports[-1]
+    return {
+        "id": report.get("id"),
+        "createdAt": report.get("createdAt"),
+        "status": report.get("status"),
+        "recommendation": report.get("recommendation"),
+        "rankingRunIds": report.get("rankingRunIds", []),
+        "optimizationRunIds": report.get("optimizationRunIds", []),
+    }
+
+
+def parse_learning_time(value: str | None):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return parsed
+    except Exception:
+        return None
+
+
+def compute_next_learning_run(config: dict, now: datetime) -> datetime:
+    config = safe_learning_config(config)
+    schedule = config["schedule"]
+    if now.tzinfo is None:
+        now = now.astimezone()
+    last_run = parse_learning_time(config.get("lastRunAt"))
+    if schedule["mode"] == "daily":
+        candidate = now.replace(hour=schedule["runAtHour"], minute=schedule["runAtMinute"], second=0, microsecond=0)
+        if candidate <= now:
+            candidate = candidate.replace(day=candidate.day) + timedelta(days=1)
+        return candidate
+    base = last_run or now
+    if last_run and last_run.tzinfo is None:
+        last_run = last_run.replace(tzinfo=now.tzinfo)
+    next_run = base + timedelta(minutes=schedule["intervalMinutes"])
+    return next_run if next_run > now else now
+
+
+def should_run_learning_cycle(config: dict, now: datetime) -> tuple[bool, str]:
+    config = safe_learning_config(config)
+    if not config.get("enabled", False):
+        return False, "Learning runner disabled."
+    schedule = config.get("schedule", {})
+    if not schedule.get("enabled", False):
+        return False, "Learning schedule disabled."
+    if schedule.get("mode") == "manual":
+        return False, "Learning schedule mode is manual."
+    next_run = parse_learning_time(config.get("nextRunAt")) or compute_next_learning_run(config, now)
+    if next_run <= now:
+        return True, "Learning cycle is due."
+    return False, f"Next learning cycle is scheduled for {next_run.isoformat()}."
+
+
+def acquire_learning_lock() -> bool:
+    config = load_learning_config()
+    if config.get("lock", {}).get("running"):
+        return False
+    config["lock"] = {"running": True, "startedAt": datetime.now().astimezone().isoformat()}
+    save_learning_config(config)
+    return True
+
+
+def release_learning_lock() -> None:
+    config = load_learning_config()
+    config["lock"] = {"running": False, "startedAt": None}
+    save_learning_config(config)
+
+
+def run_due_learning_cycle(force: bool = False) -> dict:
+    now = datetime.now().astimezone()
+    config = load_learning_config()
+    due, reason = (True, "Forced learning tick.") if force else should_run_learning_cycle(config, now)
+    if not due:
+        next_run = config.get("nextRunAt") or compute_next_learning_run(config, now).isoformat()
+        return {"ran": False, "reason": reason, "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": next_run}
+    if not acquire_learning_lock():
+        config = load_learning_config()
+        return {"ran": False, "reason": "Learning cycle already running.", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
+    try:
+        config = load_learning_config()
+        report = run_learning_cycle(config)
+        append_learning_report(report)
+        config = load_learning_config()
+        config["lastRunAt"] = datetime.now().astimezone().isoformat()
+        config["nextRunAt"] = compute_next_learning_run(config, datetime.now().astimezone()).isoformat()
+        config["lock"] = {"running": False, "startedAt": None}
+        config["autoPromote"] = False
+        config["autoEnablePaper"] = False
+        save_learning_config(config)
+        return {"ran": True, "reason": reason, "report": report, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
+    except Exception as exc:
+        config = load_learning_config()
+        config["lock"] = {"running": False, "startedAt": None}
+        save_learning_config(config)
+        return {"ran": False, "reason": f"Learning cycle failed: {exc}", "report": None, "lastRunAt": config.get("lastRunAt"), "nextRunAt": config.get("nextRunAt")}
 
 
 def run_learning_cycle(config: dict) -> dict:

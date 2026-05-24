@@ -2186,6 +2186,8 @@ function renderLearningPage() {
 
 function setupLearningControls() {
   document.querySelector("#learning-run-button")?.addEventListener("click", runLearningCycle);
+  document.querySelector("#learning-save-config")?.addEventListener("click", saveLearningConfig);
+  document.querySelector("#learning-tick-button")?.addEventListener("click", runLearningTick);
   document.querySelector("#learning-recommendation")?.addEventListener("click", (event) => {
     const button = event.target.closest("[data-promote-learning]");
     if (button && lastLearningReport?.recommendation?.candidate) {
@@ -2202,15 +2204,78 @@ async function loadLearningConfig() {
   const status = document.querySelector("#learning-status");
   try {
     const config = await apiGet("/api/learning/config");
+    const scheduleStatus = await apiGet("/api/learning/status");
     document.querySelector("#learning-symbols").value = (config.symbols || []).join(",");
     document.querySelector("#learning-timeframes").value = (config.timeframes || []).join(",");
     document.querySelector("#learning-period").value = config.period || "365d";
     document.querySelector("#learning-min-trades").value = config.minTrades ?? 20;
     document.querySelector("#learning-max-ranking").value = config.maxRankingRuns ?? 20;
     document.querySelector("#learning-max-opt").value = config.maxOptimizationCombos ?? 300;
-    if (status) status.textContent = "Learning runner config loaded. Auto-promotion and auto paper enablement are disabled.";
+    document.querySelector("#learning-enabled").checked = Boolean(config.enabled);
+    document.querySelector("#learning-schedule-enabled").checked = Boolean(config.schedule?.enabled);
+    document.querySelector("#learning-interval-minutes").value = config.schedule?.intervalMinutes ?? 1440;
+    document.querySelector("#learning-run-hour").value = config.schedule?.runAtHour ?? 3;
+    document.querySelector("#learning-run-minute").value = config.schedule?.runAtMinute ?? 0;
+    if (status) status.textContent = `Learning config loaded. Last: ${formatLearningTime(scheduleStatus.lastRunAt)} Next: ${formatLearningTime(scheduleStatus.nextRunAt)}. Auto-promotion is disabled.`;
   } catch (error) {
     if (status) status.textContent = `Learning config unavailable: ${error.message}`;
+  }
+}
+
+async function saveLearningConfig() {
+  const status = document.querySelector("#learning-status");
+  try {
+    const payload = learningConfigPayload();
+    const config = await apiPost("/api/learning/config", payload);
+    if (status) status.textContent = `Learning config saved. Schedule ${config.schedule?.enabled ? "enabled" : "disabled"}. Auto-promotion remains disabled.`;
+    await loadLearningConfig();
+  } catch (error) {
+    if (status) status.textContent = `Could not save learning config: ${error.message}`;
+  }
+}
+
+async function runLearningTick() {
+  const status = document.querySelector("#learning-status");
+  if (status) status.textContent = "Checking scheduled learning tick...";
+  try {
+    const payload = await apiPost("/api/learning/tick", {});
+    if (payload.report) {
+      lastLearningReport = payload.report;
+      renderLearningReport(payload.report);
+      loadLearningReports();
+    }
+    if (status) status.textContent = `${payload.ran ? "Learning tick ran" : "Learning tick skipped"}: ${payload.reason} Next: ${formatLearningTime(payload.nextRunAt)}`;
+  } catch (error) {
+    if (status) status.textContent = `Learning tick failed: ${error.message}`;
+  }
+}
+
+function learningConfigPayload() {
+  return {
+    enabled: document.querySelector("#learning-enabled")?.checked || false,
+    symbols: csvInputValues("#learning-symbols"),
+    timeframes: csvInputValues("#learning-timeframes"),
+    period: document.querySelector("#learning-period")?.value || "365d",
+    minTrades: Number(document.querySelector("#learning-min-trades")?.value || 20),
+    maxRankingRuns: Number(document.querySelector("#learning-max-ranking")?.value || 20),
+    maxOptimizationCombos: Number(document.querySelector("#learning-max-opt")?.value || 300),
+    schedule: {
+      enabled: document.querySelector("#learning-schedule-enabled")?.checked || false,
+      mode: "interval",
+      intervalMinutes: Number(document.querySelector("#learning-interval-minutes")?.value || 1440),
+      runAtHour: Number(document.querySelector("#learning-run-hour")?.value || 3),
+      runAtMinute: Number(document.querySelector("#learning-run-minute")?.value || 0),
+      timezone: "local",
+    },
+  };
+}
+
+function formatLearningTime(value) {
+  if (!value) return "-";
+  try {
+    return new Date(value).toLocaleString();
+  } catch (error) {
+    return value;
   }
 }
 

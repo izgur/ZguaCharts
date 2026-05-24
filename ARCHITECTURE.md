@@ -46,6 +46,7 @@ Responsibilities:
 - Own paper candidate health scoring and degradation detection through `/api/candidate/health`; the browser renders the returned status and expected-vs-paper metrics only.
 - Own replacement suggestions through `/api/research/suggest-replacement`; the browser can ask for a suggestion and manually promote it, but it must not auto-promote or disable paper simulation.
 - Own learning-cycle execution and reports through `/api/learning/*`; reports are recommendations only, promotion remains manual, and paper enablement remains manual.
+- Own scheduled learning due checks and file-backed learning locks; local scheduling should call `python scripts/learning_tick.py` and only the backend decides whether a cycle is due.
 
 ## Core Strategy / Research Engine
 
@@ -79,5 +80,18 @@ When adding a feature:
 - New paper-performance health rule, degradation threshold, or replacement suggestion rule: backend/core only.
 - New learning-runner schedule, cycle step, candidate comparison, or recommendation rule: backend/core only.
 - New UI view: frontend may call APIs and render returned payloads only.
+
+## Scheduled Learning
+
+Run scheduled learning locally with:
+
+```bash
+python scripts/learning_tick.py
+```
+
+On Windows Task Scheduler, run that command every 15 or 60 minutes. The script checks
+`config/learning-runner.json`, runs only when due, writes recommendation reports, and
+never promotes candidates or enables paper simulation. On Render/free hosting, repeated
+execution needs an external cron/ping or a paid background worker.
 
 If the same trading formula appears in both frontend JavaScript and backend/core code, the frontend copy should be removed.

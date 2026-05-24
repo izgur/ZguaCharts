@@ -203,6 +203,13 @@
           <label><span>Min trades</span><input id="learning-min-trades" type="number" value="20"></label>
           <label><span>Max ranking runs</span><input id="learning-max-ranking" type="number" value="20"></label>
           <label><span>Max opt combos</span><input id="learning-max-opt" type="number" value="300"></label>
+          <label class="allow-short-toggle"><input id="learning-enabled" type="checkbox"><span>Runner enabled</span></label>
+          <label class="allow-short-toggle"><input id="learning-schedule-enabled" type="checkbox"><span>Schedule enabled</span></label>
+          <label><span>Interval min</span><input id="learning-interval-minutes" type="number" min="15" value="1440"></label>
+          <label><span>Run hour</span><input id="learning-run-hour" type="number" min="0" max="23" value="3"></label>
+          <label><span>Run minute</span><input id="learning-run-minute" type="number" min="0" max="59" value="0"></label>
+          <button id="learning-save-config" type="button">Save Config</button>
+          <button id="learning-tick-button" type="button">Run Due Tick Now</button>
           <button id="learning-run-button" type="button">Run Learning Cycle</button>
         </div>
         <div id="learning-status" class="pane-status">Load config or run a backend learning cycle.</div>

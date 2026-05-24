@@ -1,5 +1,19 @@
 {
   "enabled": false,
+  "schedule": {
+    "enabled": false,
+    "mode": "manual",
+    "intervalMinutes": 1440,
+    "runAtHour": 3,
+    "runAtMinute": 0,
+    "timezone": "local"
+  },
+  "lastRunAt": null,
+  "nextRunAt": null,
+  "lock": {
+    "running": false,
+    "startedAt": null
+  },
   "source": "bybit",
   "symbols": [
     "BTCUSDT",
