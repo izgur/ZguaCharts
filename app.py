@@ -22,8 +22,11 @@ app = Flask(__name__)
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
 PAPER_CANDIDATE_PATH = Path(app.root_path) / "config" / "paper-candidate.json"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
+LEARNING_CONFIG_PATH = Path(app.root_path) / "config" / "learning-runner.json"
+LEARNING_REPORTS_PATH = Path(app.root_path) / "data" / "learning-reports.json"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
+MAX_LEARNING_REPORTS = 100
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
@@ -40,6 +43,7 @@ NODE_STRATEGIES = {
 @app.get("/charts")
 @app.get("/backtest")
 @app.get("/analysis")
+@app.get("/learning")
 @app.get("/settings")
 def index():
     return render_template("index.html")
@@ -214,11 +218,19 @@ def strategy_optimize():
     save_run = request.args.get("save", "true").lower() not in {"0", "false", "no", "off"}
 
     try:
-        raw = run_strategy_optimizer_engine(source, symbol, timeframe, period, strategy, limit, max_combos, train_ratio, fee_pct, slippage_pct)
-        payload = normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct)
-        if save_run:
-            payload["researchRunId"] = append_research_run(research_record_from_optimization(payload))
-        return jsonify(payload)
+        return jsonify(run_strategy_optimization_payload(
+            source,
+            symbol,
+            timeframe,
+            period,
+            strategy,
+            limit,
+            max_combos,
+            train_ratio,
+            fee_pct,
+            slippage_pct,
+            save_run=save_run,
+        ))
     except Exception as exc:
         return jsonify({"error": f"Could not run strategy optimizer: {exc}"}), 502
 
@@ -318,6 +330,56 @@ def research_suggest_replacement():
     })
 
 
+@app.get("/api/learning/config")
+def learning_config():
+    return jsonify(safe_learning_config(load_learning_config()))
+
+
+@app.post("/api/learning/config")
+def update_learning_config():
+    payload = request.get_json(silent=True) or {}
+    config = load_learning_config()
+    config.update(safe_learning_config_updates(payload))
+    config["autoPromote"] = False
+    config["autoEnablePaper"] = False
+    write_learning_config(config)
+    return jsonify(safe_learning_config(config))
+
+
+@app.post("/api/learning/run")
+def learning_run():
+    config = load_learning_config()
+    overrides = safe_learning_config_updates(request.get_json(silent=True) or {})
+    config.update(overrides)
+    config["autoPromote"] = False
+    config["autoEnablePaper"] = False
+    report = run_learning_cycle(config)
+    append_learning_report(report)
+    return jsonify(report)
+
+
+@app.get("/api/learning/reports")
+def learning_reports():
+    limit = int(request.args.get("limit", "20"))
+    reports = load_learning_reports()
+    return jsonify({
+        "reports": reports[-limit:][::-1],
+        "summary": {
+            "totalReports": len(reports),
+            "latestReportAt": reports[-1].get("createdAt") if reports else None,
+            "latestRecommendation": (reports[-1].get("recommendation") if reports else None),
+        },
+    })
+
+
+@app.get("/api/learning/reports/<report_id>")
+def learning_report(report_id):
+    report = get_learning_report_by_id(report_id)
+    if not report:
+        return jsonify({"error": f"Learning report not found: {report_id}"}), 404
+    return jsonify(report)
+
+
 @app.get("/api/backtest-history")
 def backtest_history():
     limit = int(request.args.get("limit", "100"))
@@ -344,11 +406,24 @@ def strategy_ranking():
     allow_shorts = request.args.get("allowShorts", "false").lower() in {"1", "true", "yes", "on"}
     max_runs = int(request.args.get("max_runs", "30"))
     save_run = request.args.get("save", "true").lower() not in {"0", "false", "no", "off"}
-    runs_requested = len(symbols) * len(timeframes) * len(presets)
-
-    if runs_requested > max_runs:
+    try:
+        return jsonify(run_strategy_ranking_payload(
+            source,
+            symbols,
+            timeframes,
+            presets,
+            period,
+            limit,
+            fee_pct,
+            slippage_pct,
+            min_trades,
+            allow_shorts,
+            max_runs,
+            save_run=save_run,
+        ))
+    except ValueError as exc:
         return jsonify({
-            "error": f"Requested {runs_requested} ranking runs, but max_runs is {max_runs}. Narrow symbols, timeframes, presets, or raise max_runs intentionally.",
+            "error": str(exc),
             "requested": {
                 "symbols": symbols,
                 "timeframes": timeframes,
@@ -358,112 +433,6 @@ def strategy_ranking():
                 "maxRuns": max_runs,
             },
         }), 400
-
-    rows = []
-    errors = []
-    # TODO: Move this synchronous matrix run to a background job/cache when the
-    # requested symbol/timeframe/preset matrix becomes too slow for one request.
-    for symbol in symbols:
-        for timeframe in timeframes:
-            for preset in presets:
-                try:
-                    payload = run_shared_backtest_engine(
-                        source,
-                        symbol,
-                        timeframe,
-                        period,
-                        preset,
-                        fee_pct,
-                        slippage_pct,
-                        limit,
-                        allow_shorts=allow_shorts,
-                    )
-                    metrics = ranking_metrics_from_backtest(payload)
-                    valid = metrics["trades"] >= min_trades
-                    warnings = list(payload.get("warnings") or [])
-                    if metrics["trades"] == 0:
-                        warnings.append("zero-trade result")
-                    if metrics["trades"] < min_trades:
-                        warnings.append(f"trades below min_trades ({metrics['trades']} < {min_trades})")
-                    row = {
-                        "rank": None,
-                        "valid": valid,
-                        "strategy": payload.get("preset") or preset,
-                        "preset": preset,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "period": period,
-                        "totalReturnPct": metrics["totalReturn"],
-                        "winRate": metrics["winRate"],
-                        "maxDrawdown": metrics["maxDrawdown"],
-                        "profitFactor": metrics["profitFactor"],
-                        "trades": metrics["trades"],
-                        "averageBarsHeld": metrics["averageBarsHeld"],
-                        "score": ranking_score(metrics, min_trades=min_trades),
-                        "diagnostics": payload.get("diagnostics") or {},
-                        "params": (payload.get("diagnostics") or {}).get("params", {}),
-                        "warnings": warnings,
-                    }
-                    rows.append(row)
-                except Exception as exc:
-                    error = {
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "preset": preset,
-                        "error": str(exc),
-                    }
-                    errors.append(error)
-                    rows.append({
-                        "rank": None,
-                        "valid": False,
-                        "strategy": NODE_STRATEGIES.get(preset, preset),
-                        "preset": preset,
-                        "symbol": symbol,
-                        "timeframe": timeframe,
-                        "period": period,
-                        "totalReturnPct": 0,
-                        "winRate": 0,
-                        "maxDrawdown": 0,
-                        "profitFactor": 0,
-                        "trades": 0,
-                        "averageBarsHeld": 0,
-                        "score": -999,
-                        "diagnostics": {},
-                        "warnings": [str(exc)],
-                    })
-
-    rows.sort(key=lambda item: item["score"], reverse=True)
-    for index, row in enumerate(rows, start=1):
-        row["rank"] = index
-
-    payload = {
-        "source": source,
-        "period": period,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "requested": {
-            "symbols": symbols,
-            "timeframes": timeframes,
-            "presets": presets,
-            "limit": limit,
-            "minTrades": min_trades,
-            "maxRuns": max_runs,
-            "allowShorts": allow_shorts,
-            "feePct": fee_pct,
-            "slippagePct": slippage_pct,
-        },
-        "summary": {
-            "runsRequested": runs_requested,
-            "runsCompleted": len(rows) - len(errors),
-            "validCandidates": len([row for row in rows if row.get("valid")]),
-            "errors": len(errors),
-        },
-        "cards": ranking_cards(rows),
-        "rows": rows,
-        "errors": errors,
-    }
-    if save_run:
-        payload["researchRunId"] = append_research_run(research_record_from_ranking(payload))
-    return jsonify(payload)
 
 
 @app.get("/api/paper/status")
@@ -639,6 +608,404 @@ def read_jsonl_tail(path: str, limit: int):
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def run_strategy_ranking_payload(
+    source: str,
+    symbols: list[str],
+    timeframes: list[str],
+    presets: list[str],
+    period: str,
+    limit: int,
+    fee_pct: float,
+    slippage_pct: float,
+    min_trades: int,
+    allow_shorts: bool,
+    max_runs: int,
+    save_run: bool = True,
+) -> dict:
+    runs_requested = len(symbols) * len(timeframes) * len(presets)
+    if runs_requested > max_runs:
+        raise ValueError(
+            f"Requested {runs_requested} ranking runs, but max_runs is {max_runs}. "
+            "Narrow symbols, timeframes, presets, or raise max_runs intentionally."
+        )
+
+    rows = []
+    errors = []
+    # TODO: Move this synchronous matrix run to a background job/cache when the
+    # requested symbol/timeframe/preset matrix becomes too slow for one request.
+    for symbol in symbols:
+        for timeframe in timeframes:
+            for preset in presets:
+                try:
+                    payload = run_shared_backtest_engine(
+                        source,
+                        symbol,
+                        timeframe,
+                        period,
+                        preset,
+                        fee_pct,
+                        slippage_pct,
+                        limit,
+                        allow_shorts=allow_shorts,
+                    )
+                    metrics = ranking_metrics_from_backtest(payload)
+                    valid = metrics["trades"] >= min_trades
+                    warnings = list(payload.get("warnings") or [])
+                    if metrics["trades"] == 0:
+                        warnings.append("zero-trade result")
+                    if metrics["trades"] < min_trades:
+                        warnings.append(f"trades below min_trades ({metrics['trades']} < {min_trades})")
+                    rows.append({
+                        "rank": None,
+                        "valid": valid,
+                        "strategy": payload.get("preset") or preset,
+                        "preset": preset,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "period": period,
+                        "totalReturnPct": metrics["totalReturn"],
+                        "winRate": metrics["winRate"],
+                        "maxDrawdown": metrics["maxDrawdown"],
+                        "profitFactor": metrics["profitFactor"],
+                        "trades": metrics["trades"],
+                        "averageBarsHeld": metrics["averageBarsHeld"],
+                        "score": ranking_score(metrics, min_trades=min_trades),
+                        "diagnostics": payload.get("diagnostics") or {},
+                        "params": (payload.get("diagnostics") or {}).get("params", {}),
+                        "warnings": warnings,
+                    })
+                except Exception as exc:
+                    errors.append({"symbol": symbol, "timeframe": timeframe, "preset": preset, "error": str(exc)})
+                    rows.append({
+                        "rank": None,
+                        "valid": False,
+                        "strategy": NODE_STRATEGIES.get(preset, preset),
+                        "preset": preset,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "period": period,
+                        "totalReturnPct": 0,
+                        "winRate": 0,
+                        "maxDrawdown": 0,
+                        "profitFactor": 0,
+                        "trades": 0,
+                        "averageBarsHeld": 0,
+                        "score": -999,
+                        "diagnostics": {},
+                        "warnings": [str(exc)],
+                    })
+
+    rows.sort(key=lambda item: item["score"], reverse=True)
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
+
+    payload = {
+        "source": source,
+        "period": period,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "requested": {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "presets": presets,
+            "limit": limit,
+            "minTrades": min_trades,
+            "maxRuns": max_runs,
+            "allowShorts": allow_shorts,
+            "feePct": fee_pct,
+            "slippagePct": slippage_pct,
+        },
+        "summary": {
+            "runsRequested": runs_requested,
+            "runsCompleted": len(rows) - len(errors),
+            "validCandidates": len([row for row in rows if row.get("valid")]),
+            "errors": len(errors),
+        },
+        "cards": ranking_cards(rows),
+        "rows": rows,
+        "errors": errors,
+    }
+    if save_run:
+        payload["researchRunId"] = append_research_run(research_record_from_ranking(payload))
+    return payload
+
+
+def run_strategy_optimization_payload(
+    source: str,
+    symbol: str,
+    timeframe: str,
+    period: str,
+    strategy: str,
+    limit: int,
+    max_combos: int,
+    train_ratio: float,
+    fee_pct: float,
+    slippage_pct: float,
+    save_run: bool = True,
+) -> dict:
+    raw = run_strategy_optimizer_engine(source, symbol, timeframe, period, strategy, limit, max_combos, train_ratio, fee_pct, slippage_pct)
+    payload = normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct)
+    if save_run:
+        payload["researchRunId"] = append_research_run(research_record_from_optimization(payload))
+    return payload
+
+
+def default_learning_config() -> dict:
+    return {
+        "enabled": False,
+        "source": "bybit",
+        "symbols": ["BTCUSDT", "ETHUSDT"],
+        "timeframes": ["1h"],
+        "rankingPresets": ["conservative_trend", "regime_filtered_trend", "pullback_trend"],
+        "optimizationStrategies": ["regime_filtered_trend"],
+        "period": "365d",
+        "rankingLimit": 5000,
+        "optimizationLimit": 9000,
+        "maxRankingRuns": 20,
+        "maxOptimizationCombos": 300,
+        "minTrades": 20,
+        "feePct": 0,
+        "slippagePct": 0,
+        "allowShorts": False,
+        "autoPromote": False,
+        "autoEnablePaper": False,
+    }
+
+
+def load_learning_config() -> dict:
+    config = default_learning_config()
+    if LEARNING_CONFIG_PATH.exists():
+        try:
+            with open(LEARNING_CONFIG_PATH, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                config.update(data)
+        except Exception:
+            pass
+    config["autoPromote"] = False
+    config["autoEnablePaper"] = False
+    return config
+
+
+def write_learning_config(config: dict) -> None:
+    LEARNING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LEARNING_CONFIG_PATH, "w", encoding="utf-8") as handle:
+        json.dump(safe_learning_config(config), handle, indent=2)
+        handle.write("\n")
+
+
+def safe_learning_config(config: dict) -> dict:
+    base = default_learning_config()
+    base.update({key: config.get(key, base[key]) for key in base})
+    base["symbols"] = list_string_values(base.get("symbols"), default_learning_config()["symbols"])
+    base["timeframes"] = list_string_values(base.get("timeframes"), default_learning_config()["timeframes"])
+    base["rankingPresets"] = list_string_values(base.get("rankingPresets"), default_learning_config()["rankingPresets"])
+    base["optimizationStrategies"] = list_string_values(base.get("optimizationStrategies"), default_learning_config()["optimizationStrategies"])
+    base["enabled"] = bool(base.get("enabled", False))
+    base["allowShorts"] = bool(base.get("allowShorts", False))
+    base["autoPromote"] = False
+    base["autoEnablePaper"] = False
+    for key in ("rankingLimit", "optimizationLimit", "maxRankingRuns", "maxOptimizationCombos", "minTrades"):
+        base[key] = int(safe_float(base.get(key), default_learning_config()[key]))
+    for key in ("feePct", "slippagePct"):
+        base[key] = safe_float(base.get(key), default_learning_config()[key])
+    return base
+
+
+def safe_learning_config_updates(payload: dict) -> dict:
+    allowed = {
+        "enabled",
+        "source",
+        "symbols",
+        "timeframes",
+        "rankingPresets",
+        "optimizationStrategies",
+        "period",
+        "rankingLimit",
+        "optimizationLimit",
+        "maxRankingRuns",
+        "maxOptimizationCombos",
+        "minTrades",
+        "feePct",
+        "slippagePct",
+        "allowShorts",
+    }
+    updates = {key: value for key, value in payload.items() if key in allowed}
+    if "autoPromote" in payload or "autoEnablePaper" in payload:
+        updates["autoPromote"] = False
+        updates["autoEnablePaper"] = False
+    return safe_learning_config({**load_learning_config(), **updates})
+
+
+def list_string_values(value, fallback: list[str]) -> list[str]:
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = []
+    return items or fallback
+
+
+def load_learning_reports() -> list[dict]:
+    if not LEARNING_REPORTS_PATH.exists():
+        return []
+    try:
+        with open(LEARNING_REPORTS_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return data
+        return data.get("reports", []) if isinstance(data, dict) else []
+    except Exception:
+        return []
+
+
+def save_learning_reports(reports: list[dict]) -> None:
+    LEARNING_REPORTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    capped = reports[-MAX_LEARNING_REPORTS:]
+    with open(LEARNING_REPORTS_PATH, "w", encoding="utf-8") as handle:
+        json.dump(capped, handle, indent=2)
+        handle.write("\n")
+
+
+def append_learning_report(report: dict) -> str:
+    reports = load_learning_reports()
+    reports.append(report)
+    save_learning_reports(reports)
+    return report["id"]
+
+
+def get_learning_report_by_id(report_id: str) -> dict | None:
+    return next((report for report in load_learning_reports() if report.get("id") == report_id), None)
+
+
+def run_learning_cycle(config: dict) -> dict:
+    config = safe_learning_config(config)
+    created_at = datetime.now(timezone.utc).isoformat()
+    report = {
+        "id": f"learning-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "createdAt": created_at,
+        "status": "completed",
+        "config": learning_config_summary(config),
+        "rankingRunIds": [],
+        "optimizationRunIds": [],
+        "candidateHealth": None,
+        "bestSavedCandidate": None,
+        "replacementSuggestion": None,
+        "recommendation": None,
+        "warnings": [],
+        "errors": [],
+    }
+
+    try:
+        ranking_payload = run_strategy_ranking_payload(
+            config["source"],
+            config["symbols"],
+            config["timeframes"],
+            config["rankingPresets"],
+            config["period"],
+            config["rankingLimit"],
+            config["feePct"],
+            config["slippagePct"],
+            config["minTrades"],
+            config["allowShorts"],
+            config["maxRankingRuns"],
+            save_run=True,
+        )
+        if ranking_payload.get("researchRunId"):
+            report["rankingRunIds"].append(ranking_payload["researchRunId"])
+        report["warnings"].extend(ranking_payload.get("errors") or [])
+    except Exception as exc:
+        report["errors"].append({"stage": "ranking", "error": str(exc)})
+
+    optimization_runs = 0
+    for strategy in config["optimizationStrategies"]:
+        for symbol in config["symbols"]:
+            for timeframe in config["timeframes"]:
+                optimization_runs += 1
+                try:
+                    payload = run_strategy_optimization_payload(
+                        config["source"],
+                        symbol,
+                        timeframe,
+                        config["period"],
+                        strategy,
+                        config["optimizationLimit"],
+                        config["maxOptimizationCombos"],
+                        0.7,
+                        config["feePct"],
+                        config["slippagePct"],
+                        save_run=True,
+                    )
+                    if payload.get("researchRunId"):
+                        report["optimizationRunIds"].append(payload["researchRunId"])
+                except Exception as exc:
+                    report["errors"].append({"stage": "optimization", "strategy": strategy, "symbol": symbol, "timeframe": timeframe, "error": str(exc)})
+
+    if optimization_runs == 0:
+        report["warnings"].append("No optimization strategies were configured.")
+
+    report["candidateHealth"] = build_candidate_health(candidate_health_rules({}))["health"]
+    report["bestSavedCandidate"] = best_saved_candidate(load_research_runs())
+    report["replacementSuggestion"] = replacement_suggestion_from_health(report["candidateHealth"])
+    report["recommendation"] = learning_recommendation(report["candidateHealth"], report["bestSavedCandidate"], read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    if report["errors"] and (report["rankingRunIds"] or report["optimizationRunIds"]):
+        report["status"] = "partial"
+    elif report["errors"]:
+        report["status"] = "failed"
+    return report
+
+
+def learning_config_summary(config: dict) -> dict:
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "source": config.get("source"),
+        "symbols": config.get("symbols", []),
+        "timeframes": config.get("timeframes", []),
+        "rankingPresets": config.get("rankingPresets", []),
+        "optimizationStrategies": config.get("optimizationStrategies", []),
+        "period": config.get("period"),
+        "rankingLimit": config.get("rankingLimit"),
+        "optimizationLimit": config.get("optimizationLimit"),
+        "maxRankingRuns": config.get("maxRankingRuns"),
+        "maxOptimizationCombos": config.get("maxOptimizationCombos"),
+        "minTrades": config.get("minTrades"),
+        "feePct": config.get("feePct"),
+        "slippagePct": config.get("slippagePct"),
+        "allowShorts": bool(config.get("allowShorts", False)),
+        "autoPromote": False,
+        "autoEnablePaper": False,
+    }
+
+
+def replacement_suggestion_from_health(health: dict) -> dict:
+    if health.get("status") == "HEALTHY":
+        return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is still aligned with expectations.", "candidate": None}
+    if health.get("status") == "UNKNOWN":
+        return {"action": "WAIT_FOR_MORE_DATA", "reason": "Not enough paper trades or no expected baseline is available.", "candidate": None}
+    candidate = best_saved_candidate(load_research_runs())
+    if not candidate:
+        return {"action": "NO_VALID_CANDIDATE", "reason": "No valid saved candidate exists.", "candidate": None}
+    return {"action": "PROMOTE", "reason": "A valid saved candidate is available for manual review.", "candidate": candidate}
+
+
+def learning_recommendation(health: dict, best_candidate: dict | None, current_candidate: dict) -> dict:
+    health_status = health.get("status")
+    has_current = bool(current_candidate.get("strategy") and (current_candidate.get("promotedAt") or expected_metrics_from_candidate(current_candidate).get("source")))
+    if not best_candidate:
+        return {"action": "NO_VALID_CANDIDATE", "reason": "No valid saved candidate exists.", "candidate": None}
+    if not has_current:
+        return {"action": "PROMOTE_CANDIDATE", "reason": "No promoted candidate with an expected baseline exists; manual promotion is available.", "candidate": best_candidate}
+    current_score = current_candidate_score(candidate_summary(current_candidate))
+    best_score = safe_float(best_candidate.get("score"))
+    if health_status == "HEALTHY":
+        if current_score is not None and best_score > current_score * 1.2:
+            return {"action": "PROMOTE_CANDIDATE", "reason": "Current health is healthy, but saved candidate score is significantly better. Manual review required.", "candidate": best_candidate}
+        return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is aligned with expectations.", "candidate": None}
+    if health_status == "UNKNOWN":
+        return {"action": "WAIT_FOR_MORE_PAPER_DATA", "reason": "Candidate health is unknown; wait for more paper trades before replacement unless manually chosen.", "candidate": None}
+    return {"action": "PROMOTE_CANDIDATE", "reason": f"Current health is {health_status}; a valid saved candidate is available for manual review.", "candidate": best_candidate}
 
 
 def load_research_runs() -> list[dict]:

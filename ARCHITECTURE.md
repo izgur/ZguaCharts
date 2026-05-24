@@ -45,6 +45,7 @@ Responsibilities:
 - Own candidate validation and paper enablement gates through `/api/candidate/validate`, `/api/candidate/enable-paper`, and `/api/candidate/disable-paper`.
 - Own paper candidate health scoring and degradation detection through `/api/candidate/health`; the browser renders the returned status and expected-vs-paper metrics only.
 - Own replacement suggestions through `/api/research/suggest-replacement`; the browser can ask for a suggestion and manually promote it, but it must not auto-promote or disable paper simulation.
+- Own learning-cycle execution and reports through `/api/learning/*`; reports are recommendations only, promotion remains manual, and paper enablement remains manual.
 
 ## Core Strategy / Research Engine
 
@@ -76,6 +77,7 @@ When adding a feature:
 - New optimization range, scoring rule, or overfit penalty: backend/core only.
 - New research-memory comparison or learning suggestion rule: backend/core only; frontend may only start runs, load records, and request explicit manual promotion.
 - New paper-performance health rule, degradation threshold, or replacement suggestion rule: backend/core only.
+- New learning-runner schedule, cycle step, candidate comparison, or recommendation rule: backend/core only.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 If the same trading formula appears in both frontend JavaScript and backend/core code, the frontend copy should be removed.

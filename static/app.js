@@ -55,10 +55,12 @@ let chartsInitialized = false;
 let chartsToolbarInitialized = false;
 let backtestInitialized = false;
 let analysisInitialized = false;
+let learningInitialized = false;
 let backtestPane = null;
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
+let lastLearningReport = null;
 let lastPaperReplacementSuggestion = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
@@ -222,6 +224,7 @@ function setupNavigation() {
 function pathToPage(pathname) {
   if (pathname === "/backtest") return "backtest";
   if (pathname === "/analysis") return "analysis";
+  if (pathname === "/learning") return "learning";
   if (pathname === "/settings") return "settings";
   return "charts";
 }
@@ -236,6 +239,7 @@ function showPage(page) {
   if (page === "charts") initChartsPage();
   if (page === "backtest") initBacktestPage();
   if (page === "analysis") renderAnalysisPage();
+  if (page === "learning") renderLearningPage();
   if (page === "settings") renderSettingsPage();
 }
 
@@ -2169,6 +2173,148 @@ function renderAnalysisPage() {
     analysisInitialized = true;
   }
   loadResearchRuns();
+}
+
+function renderLearningPage() {
+  if (!learningInitialized) {
+    setupLearningControls();
+    learningInitialized = true;
+  }
+  loadLearningConfig();
+  loadLearningReports();
+}
+
+function setupLearningControls() {
+  document.querySelector("#learning-run-button")?.addEventListener("click", runLearningCycle);
+  document.querySelector("#learning-recommendation")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-promote-learning]");
+    if (button && lastLearningReport?.recommendation?.candidate) {
+      promoteResearchCandidate(lastLearningReport.recommendation.candidate, lastLearningReport, "#learning-recommendation");
+    }
+  });
+  document.querySelector("#learning-reports-body")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-load-learning-report]");
+    if (button) loadLearningReport(button.dataset.loadLearningReport);
+  });
+}
+
+async function loadLearningConfig() {
+  const status = document.querySelector("#learning-status");
+  try {
+    const config = await apiGet("/api/learning/config");
+    document.querySelector("#learning-symbols").value = (config.symbols || []).join(",");
+    document.querySelector("#learning-timeframes").value = (config.timeframes || []).join(",");
+    document.querySelector("#learning-period").value = config.period || "365d";
+    document.querySelector("#learning-min-trades").value = config.minTrades ?? 20;
+    document.querySelector("#learning-max-ranking").value = config.maxRankingRuns ?? 20;
+    document.querySelector("#learning-max-opt").value = config.maxOptimizationCombos ?? 300;
+    if (status) status.textContent = "Learning runner config loaded. Auto-promotion and auto paper enablement are disabled.";
+  } catch (error) {
+    if (status) status.textContent = `Learning config unavailable: ${error.message}`;
+  }
+}
+
+async function runLearningCycle() {
+  const status = document.querySelector("#learning-status");
+  const summary = document.querySelector("#learning-summary");
+  const recommendation = document.querySelector("#learning-recommendation");
+  if (status) status.textContent = "Running backend learning cycle...";
+  if (summary) summary.innerHTML = "";
+  if (recommendation) recommendation.innerHTML = `<p class="pane-status">Research cycle running. This may take a while.</p>`;
+  const body = {
+    symbols: csvInputValues("#learning-symbols"),
+    timeframes: csvInputValues("#learning-timeframes"),
+    period: document.querySelector("#learning-period")?.value || "365d",
+    minTrades: Number(document.querySelector("#learning-min-trades")?.value || 20),
+    maxRankingRuns: Number(document.querySelector("#learning-max-ranking")?.value || 20),
+    maxOptimizationCombos: Number(document.querySelector("#learning-max-opt")?.value || 300),
+  };
+  try {
+    const report = await apiPost("/api/learning/run", body);
+    lastLearningReport = report;
+    renderLearningReport(report);
+    loadLearningReports();
+    if (status) status.textContent = `Learning cycle ${report.status}. Recommendation: ${report.recommendation?.action || "-"}.`;
+  } catch (error) {
+    if (status) status.textContent = `Learning cycle failed: ${error.message}`;
+    if (recommendation) recommendation.innerHTML = `<p class="pane-status">${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function csvInputValues(selector) {
+  return (document.querySelector(selector)?.value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+async function loadLearningReports() {
+  const body = document.querySelector("#learning-reports-body");
+  if (!body) return;
+  try {
+    const payload = await apiGet("/api/learning/reports?limit=20");
+    body.innerHTML = (payload.reports || []).map((report) => `
+      <tr>
+        <td>${report.createdAt ? escapeHtml(new Date(report.createdAt).toLocaleString()) : "-"}</td>
+        <td>${escapeHtml(report.status || "-")}</td>
+        <td>${escapeHtml(report.recommendation?.action || "-")}</td>
+        <td>${(report.rankingRunIds || []).length}</td>
+        <td>${(report.optimizationRunIds || []).length}</td>
+        <td><button type="button" class="small-action-button" data-load-learning-report="${escapeHtml(report.id)}">Load</button></td>
+      </tr>
+    `).join("") || `<tr><td colspan="6">No learning reports yet.</td></tr>`;
+  } catch (error) {
+    body.innerHTML = `<tr><td colspan="6">Learning reports could not load: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+async function loadLearningReport(reportId) {
+  const status = document.querySelector("#learning-status");
+  try {
+    const report = await apiGet(`/api/learning/reports/${encodeURIComponent(reportId)}`);
+    lastLearningReport = report;
+    renderLearningReport(report);
+    if (status) status.textContent = `Loaded learning report ${report.id}.`;
+  } catch (error) {
+    if (status) status.textContent = `Could not load learning report: ${error.message}`;
+  }
+}
+
+function renderLearningReport(report) {
+  const summary = document.querySelector("#learning-summary");
+  const recommendation = document.querySelector("#learning-recommendation");
+  const rec = report.recommendation || {};
+  const health = report.candidateHealth || {};
+  const best = report.bestSavedCandidate || {};
+  if (summary) {
+    summary.innerHTML = `
+      <div class="metric"><span>Status</span><strong>${escapeHtml(report.status || "-")}</strong></div>
+      <div class="metric"><span>Ranking runs</span><strong>${(report.rankingRunIds || []).length}</strong></div>
+      <div class="metric"><span>Optimization runs</span><strong>${(report.optimizationRunIds || []).length}</strong></div>
+      <div class="metric"><span>Health</span><strong>${escapeHtml(health.status || "UNKNOWN")}</strong></div>
+      <div class="metric"><span>Best saved</span><strong>${best.strategy ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol)} ${escapeHtml(best.timeframe)}` : "-"}</strong></div>
+      <div class="metric"><span>Action</span><strong>${escapeHtml(rec.action || "-")}</strong></div>
+    `;
+  }
+  if (recommendation) {
+    recommendation.innerHTML = `
+      <h3 class="modal-section-title">Recommendation</h3>
+      <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+      ${rec.candidate ? `
+        <table class="trade-table">
+          <tbody>
+            <tr><th>Candidate</th><td>${escapeHtml(rec.candidate.strategy)} ${escapeHtml(rec.candidate.symbol)} ${escapeHtml(rec.candidate.timeframe)}</td></tr>
+            <tr><th>Score</th><td>${formatNumber(rec.candidate.score)}</td></tr>
+            <tr><th>PF / Trades</th><td>${formatNumber(rec.candidate.profitFactor)} / ${rec.candidate.trades || 0}</td></tr>
+          </tbody>
+        </table>
+        <button type="button" class="small-action-button" data-promote-learning="1">Promote Recommended Candidate</button>
+      ` : ""}
+      ${renderCandidateHealth(health)}
+      ${(report.warnings || []).length ? `<ul class="backtest-warnings">${report.warnings.map((warning) => `<li>${escapeHtml(typeof warning === "string" ? warning : JSON.stringify(warning))}</li>`).join("")}</ul>` : ""}
+      ${(report.errors || []).length ? `<ul class="backtest-warnings">${report.errors.map((error) => `<li>${escapeHtml(typeof error === "string" ? error : JSON.stringify(error))}</li>`).join("")}</ul>` : ""}
+    `;
+  }
 }
 
 function setupAnalysisControls() {

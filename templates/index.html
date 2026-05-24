@@ -17,6 +17,7 @@
         <button id="paper-tab-button" class="paper-tab-button nav-button" type="button">Paper Simulation</button>
         <a href="/backtest" data-route="backtest">Backtest</a>
         <a href="/analysis" data-route="analysis">Analysis</a>
+        <a href="/learning" data-route="learning">Learning</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
       <label class="count-control header-count-control">
@@ -188,6 +189,46 @@
         </table>
       </section>
 
+      <section id="learning-page" class="route-page analysis-page" data-page="learning" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>Learning Runner</h2>
+            <p>Runs backend research cycles and creates recommendation reports. Promotion and paper enablement stay manual.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label><span>Symbols</span><input id="learning-symbols" value="BTCUSDT,ETHUSDT"></label>
+          <label><span>Timeframes</span><input id="learning-timeframes" value="1h"></label>
+          <label><span>Period</span><input id="learning-period" value="365d"></label>
+          <label><span>Min trades</span><input id="learning-min-trades" type="number" value="20"></label>
+          <label><span>Max ranking runs</span><input id="learning-max-ranking" type="number" value="20"></label>
+          <label><span>Max opt combos</span><input id="learning-max-opt" type="number" value="300"></label>
+          <button id="learning-run-button" type="button">Run Learning Cycle</button>
+        </div>
+        <div id="learning-status" class="pane-status">Load config or run a backend learning cycle.</div>
+        <div id="learning-summary" class="metric-grid"></div>
+        <div id="learning-recommendation" class="paper-validation-result"></div>
+        <div class="page-heading compact-heading">
+          <div>
+            <h2>Learning Reports</h2>
+            <p>Saved reports are recommendations only. No config is changed automatically.</p>
+          </div>
+        </div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Created</th>
+              <th>Status</th>
+              <th>Recommendation</th>
+              <th>Ranking</th>
+              <th>Optimization</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="learning-reports-body"></tbody>
+        </table>
+      </section>
+
       <section id="settings-page" class="route-page settings-page" data-page="settings" hidden>
         <div class="page-heading">
           <div>
@@ -272,6 +313,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-paper-health" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-learning-runner" defer></script>
   </body>
 </html>
