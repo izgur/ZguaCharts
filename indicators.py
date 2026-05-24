@@ -129,10 +129,15 @@ def build_indicator_payload(
 
     if "cipherb" in requested_set:
         wt1, wt2, money_flow, rsi_line = cipher_b_style(df)
+        cipher_signal = cipher_b_signal(wt1, wt2, money_flow, rsi_line)
+        cipher_markers = cipher_b_markers(df, wt1, wt2)
         panes.append(
             {
                 "id": "cipherb",
-                "title": "Cipher B-style Oscillator",
+                "title": f"Cipher B-style Oscillator - {cipher_signal['action']}",
+                "signal": cipher_signal,
+                "markers": cipher_markers,
+                "legend": cipher_b_legend(),
                 "series": [
                     guide_line("Extreme high 60", df, 60, "#ff5c7a"),
                     guide_line("Upper 53", df, 53, "#f06595"),
@@ -309,6 +314,120 @@ def cipher_b_style(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, p
     money_flow = ema((raw_flow * volume_weight).clip(-100, 100), 8)
     rsi_line = rsi(df["close"], 14) - 50
     return wt1, wt2, money_flow, rsi_line
+
+
+def cipher_b_signal(wt1: pd.Series, wt2: pd.Series, money_flow: pd.Series, rsi_line: pd.Series) -> dict:
+    latest = {
+        "wt1": last_valid(wt1),
+        "wt2": last_valid(wt2),
+        "moneyFlow": last_valid(money_flow),
+        "rsiLine": last_valid(rsi_line),
+    }
+    score = 0
+    if latest["wt1"] is not None and latest["wt2"] is not None:
+        score += 35 if latest["wt1"] > latest["wt2"] else -35
+        if latest["wt1"] > 53:
+            score += 10
+        elif latest["wt1"] < -53:
+            score -= 10
+    if latest["moneyFlow"] is not None:
+        score += 25 if latest["moneyFlow"] > 0 else -25
+    if latest["rsiLine"] is not None:
+        score += 15 if latest["rsiLine"] > 0 else -15
+    label = "VERY BULLISH" if score >= 55 else "BULLISH" if score >= 20 else "VERY BEARISH" if score <= -55 else "BEARISH" if score <= -20 else "NEUTRAL"
+    action = "LONG" if score >= 20 else "SHORT" if score <= -20 else "NEUTRAL"
+    return {
+        "label": label,
+        "action": action,
+        "score": int(max(-100, min(100, score))),
+        "values": {key: nullable_float(value) for key, value in latest.items()},
+    }
+
+
+def last_valid(series: pd.Series):
+    clean = series.dropna()
+    if clean.empty:
+        return None
+    return float(clean.iloc[-1])
+
+
+def cipher_b_markers(df: pd.DataFrame, wt1: pd.Series, wt2: pd.Series) -> list[dict]:
+    markers = []
+    for index in range(1, len(df)):
+        previous_diff = wt1.iloc[index - 1] - wt2.iloc[index - 1]
+        current_diff = wt1.iloc[index] - wt2.iloc[index]
+        if pd.isna(previous_diff) or pd.isna(current_diff):
+            continue
+        if previous_diff <= 0 < current_diff:
+            markers.append({
+                "time": int(df["time"].iloc[index]),
+                "position": "belowBar",
+                "color": "#12b886",
+                "shape": "arrowUp",
+                "text": "WT LONG",
+            })
+        elif previous_diff >= 0 > current_diff:
+            markers.append({
+                "time": int(df["time"].iloc[index]),
+                "position": "aboveBar",
+                "color": "#ff5c7a",
+                "shape": "arrowDown",
+                "text": "WT SHORT",
+            })
+
+    swing_window = 8
+    for index in range(swing_window * 2, len(df)):
+        prior_slice = slice(index - swing_window * 2, index - swing_window)
+        recent_slice = slice(index - swing_window, index)
+        prior_price_low = df["low"].iloc[prior_slice].min()
+        recent_price_low = df["low"].iloc[recent_slice].min()
+        prior_wt_low = wt1.iloc[prior_slice].min()
+        recent_wt_low = wt1.iloc[recent_slice].min()
+        prior_price_high = df["high"].iloc[prior_slice].max()
+        recent_price_high = df["high"].iloc[recent_slice].max()
+        prior_wt_high = wt1.iloc[prior_slice].max()
+        recent_wt_high = wt1.iloc[recent_slice].max()
+        if recent_price_low < prior_price_low and recent_wt_low > prior_wt_low:
+            markers.append({
+                "time": int(df["time"].iloc[index]),
+                "position": "belowBar",
+                "color": "#69db7c",
+                "shape": "circle",
+                "text": "Bull div",
+            })
+        if recent_price_high > prior_price_high and recent_wt_high < prior_wt_high:
+            markers.append({
+                "time": int(df["time"].iloc[index]),
+                "position": "aboveBar",
+                "color": "#ffa8b6",
+                "shape": "circle",
+                "text": "Bear div",
+            })
+    return markers[-40:]
+
+
+def cipher_b_legend() -> dict:
+    return {
+        "lines": [
+            {"name": "WaveTrend", "color": "#4dabf7", "meaning": "Primary momentum oscillator."},
+            {"name": "WT signal", "color": "#f5b84b", "meaning": "Smoothed trigger line; crosses can mark momentum shifts."},
+            {"name": "Money flow", "color": "green/red histogram", "meaning": "Positive flow supports LONG bias; negative flow supports SHORT bias."},
+            {"name": "RSI scaled", "color": "#b197fc", "meaning": "RSI centered around zero for trend pressure."},
+        ],
+        "zones": [
+            {"zone": "Very bearish", "value": "< -60", "meaning": "Deep downside momentum; watch for exhaustion or bearish continuation."},
+            {"zone": "Bearish", "value": "-60 to -10", "meaning": "Downside pressure dominates."},
+            {"zone": "Neutral", "value": "-10 to +10", "meaning": "Momentum is mixed or transitional."},
+            {"zone": "Bullish", "value": "+10 to +60", "meaning": "Upside pressure dominates."},
+            {"zone": "Very bullish", "value": "> +60", "meaning": "Strong upside momentum; watch overbought risk."},
+        ],
+        "signals": [
+            {"name": "Crosses", "meaning": "WaveTrend crossing above signal supports LONG; crossing below supports SHORT."},
+            {"name": "Divergences", "meaning": "Price lower low with oscillator higher low is bullish; price higher high with oscillator lower high is bearish."},
+            {"name": "Momentum changes", "meaning": "WaveTrend slope and money-flow direction show whether pressure is accelerating or fading."},
+            {"name": "OB/OS zones", "meaning": "Zones near +/-53 and +/-60 highlight stretched conditions."},
+        ],
+    }
 
 
 def line_series(name: str, series: pd.Series, color: str, warmup: int = 1) -> dict:

@@ -1,4 +1,5 @@
 const STORAGE_KEY = "tvk-dashboard-state";
+const UI_PREF_KEY = "zgua-ui-preferences";
 // Frontend boundary:
 // This file owns UI state, chart rendering, marker rendering, websocket candle
 // display, and API calls only. Indicator formulas, signal scoring, strategy
@@ -26,6 +27,11 @@ const globalIndicatorMenu = document.querySelector("#global-indicator-menu");
 const globalIndicatorList = document.querySelector("#global-indicator-list");
 const globalSignalToggle = document.querySelector("#global-signal-toggle");
 const activeSignalsList = document.querySelector("#active-signals-list");
+const watchlistContent = document.querySelector("#watchlist-content");
+const watchlistAddCurrent = document.querySelector("#watchlist-add-current");
+const watchlistAddAll = document.querySelector("#watchlist-add-all");
+const watchlistSection = document.querySelector("#watchlist-section");
+const activeSignalsSection = document.querySelector("#active-signals-section");
 const bottomPanel = document.querySelector(".bottom-panel");
 const bottomPanelContent = document.querySelector("#bottom-panel-content");
 const backtestChartHost = document.querySelector("#backtest-chart-host");
@@ -42,6 +48,7 @@ const paperPanelContent = document.querySelector("#paper-panel-content");
 
 let config = null;
 let state = loadState();
+let uiPrefs = loadUiPrefs();
 let panes = [];
 let chartsInitialized = false;
 let chartsToolbarInitialized = false;
@@ -74,6 +81,24 @@ function saveState() {
   );
 }
 
+function loadUiPrefs() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(UI_PREF_KEY)) || {};
+    return {
+      watchlist: Array.isArray(parsed.watchlist) && parsed.watchlist.length ? parsed.watchlist : ["BTCUSDT"],
+      watchlistOpen: parsed.watchlistOpen !== false,
+      activeSignalsOpen: parsed.activeSignalsOpen !== false,
+      syncIndicators: parsed.syncIndicators !== false,
+    };
+  } catch {
+    return { watchlist: ["BTCUSDT"], watchlistOpen: true, activeSignalsOpen: true, syncIndicators: true };
+  }
+}
+
+function saveUiPrefs() {
+  localStorage.setItem(UI_PREF_KEY, JSON.stringify(uiPrefs));
+}
+
 function hasElement(...elements) {
   return elements.every(Boolean);
 }
@@ -89,6 +114,7 @@ async function boot() {
   }
 
   setupNavigation();
+  setupSidebar();
   backtestClose.addEventListener("click", closeBacktestModal);
   backtestHistoryButton?.addEventListener("click", openBacktestHistory);
   backtestModal.addEventListener("click", (event) => {
@@ -106,6 +132,25 @@ async function boot() {
   });
 
   document.addEventListener("click", (event) => {
+    const infoButton = event.target?.closest?.(".indicator-info-button");
+    const syncButton = event.target?.closest?.(".indicator-sync-button");
+    if (infoButton || syncButton) {
+      const paneNode = event.target.closest(".pane");
+      const pane = panes.find((item) => item.node === paneNode);
+      if (pane && infoButton) {
+        const indicatorPane = pane.indicatorInfoById.get(infoButton.dataset.indicatorId);
+        if (indicatorPane) openIndicatorInfo(indicatorPane);
+        return;
+      }
+      if (pane && syncButton) {
+        pane.syncIndicators = !pane.syncIndicators;
+        uiPrefs.syncIndicators = pane.syncIndicators;
+        syncButton.textContent = pane.syncIndicators ? "Sync on" : "Sync off";
+        saveUiPrefs();
+        syncIndicatorTimeRanges(pane);
+        return;
+      }
+    }
     panes.forEach((pane) => {
       if (!pane.indicatorMenu.contains(event.target) && event.target !== pane.indicatorButton) {
         pane.indicatorMenu.hidden = true;
@@ -114,7 +159,7 @@ async function boot() {
     if (globalIndicatorMenu && globalIndicatorButton && !globalIndicatorMenu.contains(event.target) && event.target !== globalIndicatorButton) {
       globalIndicatorMenu.hidden = true;
     }
-  });
+  }, true);
 
   window.addEventListener("popstate", () => showPage(pathToPage(window.location.pathname)));
   showPage(pathToPage(window.location.pathname));
@@ -160,6 +205,34 @@ function initChartsPage() {
     renderPanes(Number(countSelect.value));
     chartsInitialized = true;
   }
+}
+
+function setupSidebar() {
+  if (watchlistSection) {
+    watchlistSection.open = uiPrefs.watchlistOpen;
+    watchlistSection.addEventListener("toggle", () => {
+      uiPrefs.watchlistOpen = watchlistSection.open;
+      saveUiPrefs();
+    });
+  }
+  if (activeSignalsSection) {
+    activeSignalsSection.open = uiPrefs.activeSignalsOpen;
+    activeSignalsSection.addEventListener("toggle", () => {
+      uiPrefs.activeSignalsOpen = activeSignalsSection.open;
+      saveUiPrefs();
+    });
+  }
+  watchlistAddCurrent?.addEventListener("click", () => {
+    const symbol = panes[0]?.symbolSelect?.value || globalSymbolSelect?.value || "BTCUSDT";
+    addToWatchlist(symbol);
+  });
+  watchlistAddAll?.addEventListener("click", () => {
+    const symbols = config?.sources?.bybit?.symbols || [];
+    uiPrefs.watchlist = Array.from(new Set([...uiPrefs.watchlist, ...symbols]));
+    saveUiPrefs();
+    renderWatchlist();
+  });
+  renderWatchlist();
 }
 
 function setupChartsToolbar() {
@@ -322,6 +395,94 @@ function renderPaperStatus(payload) {
   `;
 }
 
+async function refreshSidebarPaperStatus() {
+  if (!activeSignalsList) return;
+  try {
+    const response = await fetch("/api/paper/status");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Paper status failed");
+    const positions = payload.openPositions || [];
+    const openTradeHtml = positions.length
+      ? `
+        <div class="open-trade-row">
+          <strong>Open simulated trade</strong>
+          <table class="compact-table">
+            <tbody>${positions.slice(0, 4).map((position) => `
+              <tr>
+                <td>${escapeHtml(position.symbol)} ${escapeHtml(position.interval || position.timeframe || "")}</td>
+                <td>${escapeHtml(position.side || position.direction || "-")}</td>
+                <td>${formatPrice(Number(position.entryFillPrice || position.entryPrice || 0))}</td>
+                <td>${formatPrice(Number(position.lastPrice || position.currentPrice || 0))}</td>
+                <td class="${Number(position.unrealizedPnl || 0) >= 0 ? "positive" : "negative"}">${formatSigned(position.unrealizedPnl || 0)}</td>
+              </tr>
+            `).join("")}</tbody>
+          </table>
+        </div>
+      `
+      : `<div class="open-trade-row muted-row">No open simulated trades.</div>`;
+    activeSignalsList.insertAdjacentHTML("beforeend", openTradeHtml);
+  } catch (error) {
+    activeSignalsList.insertAdjacentHTML("beforeend", `<div class="open-trade-row muted-row">Paper status unavailable: ${escapeHtml(error.message)}</div>`);
+  }
+}
+
+function addToWatchlist(symbol) {
+  if (!symbol) return;
+  uiPrefs.watchlist = Array.from(new Set([...(uiPrefs.watchlist || []), symbol]));
+  saveUiPrefs();
+  renderWatchlist();
+}
+
+function removeFromWatchlist(symbol) {
+  uiPrefs.watchlist = (uiPrefs.watchlist || []).filter((item) => item !== symbol);
+  if (!uiPrefs.watchlist.length) uiPrefs.watchlist = ["BTCUSDT"];
+  saveUiPrefs();
+  renderWatchlist();
+}
+
+function renderWatchlist() {
+  if (!watchlistContent) return;
+  const symbols = uiPrefs.watchlist?.length ? uiPrefs.watchlist : ["BTCUSDT"];
+  const paneBySymbol = new Map(panes.map((pane) => [pane.symbolSelect?.value, pane]));
+  watchlistContent.innerHTML = `
+    <table class="watchlist-table compact-table">
+      <thead><tr><th></th><th>Symbol</th><th>Price</th><th>Signal</th></tr></thead>
+      <tbody>${symbols.map((symbol) => {
+        const pane = paneBySymbol.get(symbol);
+        const price = pane?.lastPrice ? formatPrice(Number(pane.lastPrice)) : "-";
+        const signal = pane?.lastSignalPayload
+          ? `${escapeHtml(pane.lastSignalPayload.signalDirection || pane.lastSignalPayload.label)} ${escapeHtml(String(pane.lastSignalPayload.score))}`
+          : "-";
+        return `
+          <tr>
+            <td><button class="star-button active" type="button" data-remove-watch="${escapeHtml(symbol)}" title="Remove from watchlist">★</button></td>
+            <td><button class="link-button watch-symbol-button" type="button" data-watch-symbol="${escapeHtml(symbol)}">${escapeHtml(symbol)}</button></td>
+            <td>${price}</td>
+            <td>${signal}</td>
+          </tr>
+        `;
+      }).join("")}</tbody>
+    </table>
+    <p class="sidebar-help">Use ★ Add current or Add all to fill this list.</p>
+  `;
+  watchlistContent.querySelectorAll("[data-remove-watch]").forEach((button) => {
+    button.addEventListener("click", () => removeFromWatchlist(button.dataset.removeWatch));
+  });
+  watchlistContent.querySelectorAll("[data-watch-symbol]").forEach((button) => {
+    button.addEventListener("click", () => setPrimaryChartSymbol(button.dataset.watchSymbol));
+  });
+}
+
+function setPrimaryChartSymbol(symbol) {
+  const pane = panes[0];
+  if (!pane || !symbol) return;
+  if (!Array.from(pane.symbolSelect.options).some((option) => option.value === symbol)) return;
+  pane.symbolSelect.value = symbol;
+  syncChartsToolbarFromPane(pane);
+  startPane(pane);
+  saveState();
+}
+
 async function loadChartLibrary() {
   if (window.LightweightCharts) return;
 
@@ -412,6 +573,7 @@ function createPane(node, index) {
     overlaySeries: [],
     backtestOverlaySeries: [],
     indicatorCharts: [],
+    indicatorInfoById: new Map(),
     signalMarkers: [],
     backtestMarkers: [],
     markerDetailsByTime: new Map(),
@@ -425,6 +587,7 @@ function createPane(node, index) {
     indicatorRequestId: 0,
     lastSignalPayload: null,
     rangeSyncing: false,
+    syncIndicators: uiPrefs.syncIndicators !== false,
   };
   pane.dataDiagnosticsEl = document.createElement("div");
   pane.dataDiagnosticsEl.className = "data-diagnostics";
@@ -449,6 +612,7 @@ function createPane(node, index) {
       if (select === pane.sourceSelect) populateSymbolAndTimeframe(pane, {});
       startPane(pane);
       saveState();
+      renderWatchlist();
     });
   });
 
@@ -482,6 +646,21 @@ function syncChartsToolbarFromPane(pane) {
   populateGlobalSymbolAndTimeframe({
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
+  });
+  pane.indicatorPanesEl.addEventListener("click", (event) => {
+    const infoButton = event.target?.closest?.(".indicator-info-button");
+    if (infoButton) {
+      const indicatorPane = pane.indicatorInfoById.get(infoButton.dataset.indicatorId);
+      if (indicatorPane) openIndicatorInfo(indicatorPane);
+    }
+    const syncButton = event.target?.closest?.(".indicator-sync-button");
+    if (syncButton) {
+      pane.syncIndicators = !pane.syncIndicators;
+      uiPrefs.syncIndicators = pane.syncIndicators;
+      syncButton.textContent = pane.syncIndicators ? "Sync on" : "Sync off";
+      saveUiPrefs();
+      syncIndicatorTimeRanges(pane);
+    }
   });
   restoreGlobalIndicators(selectedIndicators(pane));
   if (globalSignalToggle) globalSignalToggle.checked = pane.signalMarkerToggle.checked;
@@ -756,6 +935,7 @@ async function renderIndicators(pane, requestId) {
   const nextOverlaySeries = [];
   const nextIndicatorCharts = [];
   const nextPaneElements = [];
+  pane.indicatorInfoById = new Map();
 
   payload.overlays.forEach((overlay) => {
     const series = addSeries(pane.chart, overlay.type, seriesOptions(overlay));
@@ -764,9 +944,17 @@ async function renderIndicators(pane, requestId) {
   });
 
   payload.panes.forEach((indicatorPane) => {
+    const indicatorId = indicatorPane.id || indicatorPane.title || `indicator-${nextPaneElements.length}`;
+    pane.indicatorInfoById.set(indicatorId, indicatorPane);
     const paneEl = document.createElement("div");
     paneEl.className = "indicator-pane";
-    paneEl.innerHTML = `<div class="indicator-title">${indicatorPane.title}</div><div class="indicator-chart"></div>`;
+    paneEl.innerHTML = `
+      <div class="indicator-title">
+        <button class="indicator-info-button" type="button" data-indicator-id="${escapeHtml(indicatorId)}">${escapeHtml(indicatorPane.title)}</button>
+        <button class="indicator-sync-button" type="button">${pane.syncIndicators ? "Sync on" : "Sync off"}</button>
+      </div>
+      <div class="indicator-chart"></div>
+    `;
     nextPaneElements.push({ element: paneEl, pane: indicatorPane });
   });
 
@@ -782,10 +970,14 @@ async function renderIndicators(pane, requestId) {
   nextPaneElements.forEach((item) => {
     pane.indicatorPanesEl.appendChild(item.element);
     const chart = createBaseChart(item.element.querySelector(".indicator-chart"));
+    let markerSeries = null;
     item.pane.series.forEach((seriesConfig) => {
       const series = addSeries(chart, seriesConfig.type, seriesOptions(seriesConfig));
       series.setData(normalizeSeriesData(seriesConfig.data));
+      if (!markerSeries && !seriesConfig.guide) markerSeries = series;
     });
+    const paneMarkers = normalizeMarkers(item.pane.markers || []);
+    if (markerSeries && paneMarkers.length) setSeriesMarkers(markerSeries, paneMarkers);
     nextIndicatorCharts.push({ chart, element: item.element });
   });
   pane.overlaySeries = nextOverlaySeries;
@@ -849,7 +1041,8 @@ function clearBacktestOverlaySeries(pane) {
 }
 
 function updateSignalBadge(pane, payload) {
-  pane.signalBadge.textContent = `${payload.label} ${payload.score}`;
+  const direction = payload.signalDirection || (Number(payload.score) < -25 ? "SHORT" : Number(payload.score) > 25 ? "LONG" : "NEUTRAL");
+  pane.signalBadge.textContent = `${direction} ${payload.score}`;
   pane.signalBadge.setAttribute("role", "button");
   pane.signalBadge.tabIndex = 0;
   pane.signalBadge.title = [
@@ -887,6 +1080,21 @@ function updateChartMarkers(pane) {
   }
 }
 
+function normalizeMarkers(markers) {
+  return (markers || []).map((marker) => ({
+    ...marker,
+    time: normalizeMarkerTime(marker.time),
+  })).filter((marker) => marker.time !== null);
+}
+
+function setSeriesMarkers(series, markers) {
+  if (series.setMarkers) {
+    series.setMarkers(markers);
+    return;
+  }
+  if (LightweightCharts.createSeriesMarkers) LightweightCharts.createSeriesMarkers(series, markers);
+}
+
 function clearSignalMarkers(pane) {
   pane.signalMarkers = [];
   hideMarkerDetails(pane);
@@ -921,6 +1129,7 @@ function restoreVisibleRange(chart, range) {
 }
 
 function syncIndicatorTimeRanges(pane) {
+  if (!pane.syncIndicators) return;
   if (pane.rangeSyncing) return;
   const range = currentVisibleRange(pane.chart);
   if (!range) return;
@@ -1331,11 +1540,15 @@ async function openBacktestHistory() {
   backtestContent.innerHTML = `<p class="pane-status">Loading backtest history...</p>`;
   try {
     const response = await fetch("/api/backtest-history?limit=150");
-    const payload = await response.json();
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
     if (!response.ok) throw new Error(payload.error || "Backtest history failed");
     backtestContent.innerHTML = renderBacktestHistory(payload);
   } catch (error) {
-    backtestContent.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
+    backtestContent.innerHTML = `
+      <p class="pane-status">Backend history could not load: ${escapeHtml(error.message)}</p>
+      <p class="modal-note">History is stored by the Flask backend after successful /api/backtest runs.</p>
+    `;
   }
 }
 
@@ -1388,6 +1601,59 @@ function openBottomPanelModal() {
   openBacktestModal(`<div class="signal-modal-content">${html}</div>`, "Indicators and Signal Details", "signal-modal");
 }
 
+function openIndicatorInfo(indicatorPane) {
+  const legend = indicatorPane.legend || {};
+  const signal = indicatorPane.signal || {};
+  const lines = legend.lines || [];
+  const zones = legend.zones || [];
+  const signals = legend.signals || [];
+  openBacktestModal(`
+    <div class="indicator-info-modal">
+      <div class="signal-detail-header compact">
+        <div>
+          <h3>${escapeHtml(indicatorPane.title || "Indicator")}</h3>
+          <p>${escapeHtml(legend.summary || "Backend-calculated indicator. The UI renders returned values only.")}</p>
+        </div>
+        <div class="signal-badge ${signal.action === "SHORT" ? "sell" : signal.action === "LONG" ? "buy" : "neutral"}">${escapeHtml(signal.action || "INFO")}</div>
+      </div>
+      <div class="indicator-info-grid">
+        <section>
+          <h3 class="modal-section-title">Color / Line Legend</h3>
+          <table class="trade-table compact-table">
+            <tbody>${lines.map((line) => `
+              <tr><td><span class="color-dot" style="background:${escapeHtml(line.color || "#9ca8b7")}"></span>${escapeHtml(line.name)}</td><td>${escapeHtml(line.meaning)}</td></tr>
+            `).join("") || `<tr><td colspan="2">No legend returned.</td></tr>`}</tbody>
+          </table>
+        </section>
+        <section>
+          <h3 class="modal-section-title">Value Zones</h3>
+          <table class="trade-table compact-table">
+            <tbody>${zones.map((zone) => `
+              <tr><td>${escapeHtml(zone.zone)}</td><td>${escapeHtml(zone.range ?? zone.value ?? "-")}</td><td>${escapeHtml(zone.meaning)}</td></tr>
+            `).join("") || `<tr><td colspan="3">No zones returned.</td></tr>`}</tbody>
+          </table>
+        </section>
+        <section>
+          <h3 class="modal-section-title">Signals</h3>
+          <table class="trade-table compact-table">
+            <tbody>${signals.map((item) => `
+              <tr><td>${escapeHtml(item.name)}</td><td>${escapeHtml(item.meaning)}</td></tr>
+            `).join("") || `<tr><td colspan="2">No signal notes returned.</td></tr>`}</tbody>
+          </table>
+        </section>
+        <section>
+          <h3 class="modal-section-title">Current Values</h3>
+          <table class="trade-table compact-table">
+            <tbody>${Object.entries(signal.values || {}).map(([key, value]) => `
+              <tr><td>${escapeHtml(key)}</td><td>${escapeHtml(value)}</td></tr>
+            `).join("") || `<tr><td colspan="2">No current values returned.</td></tr>`}</tbody>
+          </table>
+        </section>
+      </div>
+    </div>
+  `, "Indicator Details", "signal-modal");
+}
+
 function openSignalDetails(pane) {
   const payload = pane.lastSignalPayload;
   if (!payload) return;
@@ -1400,49 +1666,37 @@ function openSignalDetails(pane) {
 function updateChartsPanels(pane, payload) {
   if (pane.index !== 0) return;
   if (activeSignalsList) {
+    const direction = payload.signalDirection || (Number(payload.score) < -25 ? "SHORT" : Number(payload.score) > 25 ? "LONG" : "NEUTRAL");
     activeSignalsList.innerHTML = `
       <div class="sidebar-signal">
         <strong>${escapeHtml(pane.symbolSelect.value)} ${escapeHtml(pane.timeframeSelect.value)}</strong>
-        <span class="${payload.tone || "neutral"}">${escapeHtml(payload.label)} ${escapeHtml(String(payload.score))}</span>
+        <span class="${payload.tone || "neutral"}">${escapeHtml(direction)} ${escapeHtml(payload.label)} ${escapeHtml(String(payload.score))}</span>
       </div>
     `;
+    refreshSidebarPaperStatus();
   }
   if (bottomPanelContent) {
     bottomPanelContent.innerHTML = renderSignalDetails(pane, payload);
   }
+  renderWatchlist();
 }
 
 function renderSignalDetails(pane, payload) {
-  const components = payload.components || [];
   const warnings = payload.warnings || [];
-  const componentRows = components.map((item) => `
-    <tr>
-      <td>${escapeHtml(item.name)}</td>
-      <td class="${Number(item.score) >= 0 ? "positive" : "negative"}">${formatSigned(item.score)}</td>
-    </tr>
-  `).join("");
+  const direction = payload.signalDirection || (Number(payload.score) < -25 ? "SHORT" : Number(payload.score) > 25 ? "LONG" : "NEUTRAL");
   return `
     <div class="signal-detail-header">
       <div>
         <h3>${escapeHtml(pane.symbolSelect.value)} ${escapeHtml(pane.timeframeSelect.value)}</h3>
         <p>Technical-analysis hint only. This is not financial advice and no trade is placed.</p>
       </div>
-      <div class="signal-badge ${payload.tone || "neutral"}">${escapeHtml(payload.label)} ${escapeHtml(String(payload.score))}</div>
+      <div class="signal-badge ${payload.tone || "neutral"}">${escapeHtml(direction)} ${escapeHtml(String(payload.score))}</div>
     </div>
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
-    <div class="signal-detail-grid">
-      <section>
-        <h3 class="modal-section-title">Score Components - Selected Timeframe</h3>
-        <table class="trade-table">
-          <thead><tr><th>Component</th><th>Score</th></tr></thead>
-          <tbody>${componentRows || `<tr><td colspan="2">No score components available.</td></tr>`}</tbody>
-        </table>
-      </section>
-      <section>
-        <h3 class="modal-section-title">Score Components - All Timeframes</h3>
-        ${renderTimeframeSignalMatrix(payload)}
-      </section>
-    </div>
+    <section>
+      <h3 class="modal-section-title">Score Components - All Timeframes</h3>
+      ${renderTimeframeSignalMatrix(payload)}
+    </section>
   `;
 }
 
@@ -1456,10 +1710,22 @@ function renderTimeframeSignalMatrix(payload) {
       <br><span class="${item.tone || "neutral"}">${escapeHtml(item.label || "-")}</span>
     </th>
   `).join("");
-  const buyRow = `
+  const directionRow = `
     <tr>
-      <td>BUY suggestion %</td>
-      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""}">${item.error ? "ERR" : `${item.buySuggestionPct ?? 0}%`}</td>`).join("")}
+      <td>Signal</td>
+      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""}">${item.error ? "ERR" : escapeHtml(item.signalDirection || "NEUTRAL")}</td>`).join("")}
+    </tr>
+  `;
+  const longRow = `
+    <tr>
+      <td>LONG signal %</td>
+      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""}">${item.error ? "ERR" : `${item.longSignalPct ?? item.buySuggestionPct ?? 0}%`}</td>`).join("")}
+    </tr>
+  `;
+  const shortRow = `
+    <tr>
+      <td>SHORT signal %</td>
+      ${matrix.map((item) => `<td class="${item.selected ? "selected-timeframe" : ""}">${item.error ? "ERR" : `${item.shortSignalPct ?? 0}%`}</td>`).join("")}
     </tr>
   `;
   const scoreRow = `
@@ -1479,10 +1745,10 @@ function renderTimeframeSignalMatrix(payload) {
     </tr>
   `).join("");
   return `
-    <p class="modal-note">Backend signal score and technical BUY suggestion by timeframe. This is not financial advice.</p>
+    <p class="modal-note">Backend signal score by timeframe. LONG/SHORT percentages are technical hints only, not financial advice.</p>
     <table class="trade-table timeframe-score-table">
       <thead><tr><th>Metric</th>${header}</tr></thead>
-      <tbody>${buyRow}${scoreRow}${rows}</tbody>
+      <tbody>${directionRow}${longRow}${shortRow}${scoreRow}${rows}</tbody>
     </table>
   `;
 }
@@ -1765,6 +2031,13 @@ function renderStrategyRanking(payload) {
 function renderSettingsPage() {
   const settingsContent = document.querySelector("#settings-content");
   if (!settingsContent) return;
+  const symbolChips = (id, source) => `
+    <div class="symbol-chip-grid">
+      ${(source.symbols || []).map((symbol) => `
+        <button class="symbol-chip" type="button" data-settings-source="${escapeHtml(id)}" data-settings-symbol="${escapeHtml(symbol)}">${escapeHtml(symbol)}</button>
+      `).join("")}
+    </div>
+  `;
   settingsContent.innerHTML = `
     <div class="metric"><span>Default source</span><strong>Bybit</strong></div>
     <div class="metric"><span>Default chart count</span><strong>1</strong></div>
@@ -1777,13 +2050,26 @@ function renderSettingsPage() {
         <tbody>${Object.entries(config.sources || {}).map(([id, source]) => `
           <tr>
             <td>${escapeHtml(source.label || id)}</td>
-            <td>${escapeHtml((source.symbols || []).join(", "))}</td>
+            <td>${symbolChips(id, source)}</td>
             <td>${escapeHtml((source.timeframes || []).join(", "))}</td>
           </tr>
         `).join("")}</tbody>
       </table>
     </section>
   `;
+  settingsContent.querySelectorAll("[data-settings-symbol]").forEach((button) => {
+    button.addEventListener("click", () => {
+      showPage("charts");
+      history.pushState({}, "", "/charts");
+      const pane = panes[0];
+      if (!pane) return;
+      pane.sourceSelect.value = button.dataset.settingsSource || "bybit";
+      populateSymbolAndTimeframe(pane, { symbol: button.dataset.settingsSymbol });
+      syncChartsToolbarFromPane(pane);
+      startPane(pane);
+      saveState();
+    });
+  });
 }
 
 function formatIsoDate(value) {
@@ -1956,6 +2242,7 @@ function updateTicker(pane, price) {
   pane.tickerPrice.textContent = formatPrice(price);
   pane.ticker.classList.remove("up", "down", "neutral");
   pane.ticker.classList.add(direction);
+  renderWatchlist();
 
   window.clearTimeout(pane.flashTimer);
   pane.flashTimer = window.setTimeout(() => {

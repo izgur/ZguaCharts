@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260523-ui-details">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-compact-ui">
   </head>
   <body>
     <header class="topbar">
@@ -14,41 +14,41 @@
       </a>
       <nav class="app-nav" aria-label="Main navigation">
         <a href="/charts" data-route="charts">Charts</a>
+        <button id="paper-tab-button" class="paper-tab-button nav-button" type="button">Paper Simulation</button>
         <a href="/backtest" data-route="backtest">Backtest</a>
         <a href="/analysis" data-route="analysis">Analysis</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
-      <button id="paper-tab-button" class="paper-tab-button" type="button">Paper Simulation</button>
+      <label class="count-control header-count-control">
+        <span>Charts</span>
+        <select id="chart-count">
+          <option value="1">1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+          <option value="6">6</option>
+          <option value="8">8</option>
+        </select>
+      </label>
       <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
     </header>
 
     <main class="app-shell">
       <section id="charts-page" class="route-page charts-page" data-page="charts">
-        <div class="workspace-toolbar compact-toolbar">
-          <label class="count-control">
-            <span>Number of charts</span>
-            <select id="chart-count">
-              <option value="1">1</option>
-              <option value="2">2</option>
-              <option value="4">4</option>
-              <option value="6">6</option>
-              <option value="8">8</option>
-            </select>
-          </label>
-          <span class="toolbar-note">Each pane has its own source, symbol, timeframe, indicators, and backtest controls.</span>
-        </div>
-
         <div class="charts-workspace">
           <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>
           <aside class="right-sidebar">
-            <section>
-              <h2>Watchlist</h2>
-              <div class="sidebar-placeholder">Pinned markets and custom watchlists will live here.</div>
-            </section>
-            <section>
-              <h2>Active Signals</h2>
+            <details id="watchlist-section" class="sidebar-section" open>
+              <summary><span class="sidebar-title"><span class="star-icon">★</span> Watchlist</span></summary>
+              <div class="watchlist-actions">
+                <button id="watchlist-add-current" type="button">★ Add current</button>
+                <button id="watchlist-add-all" type="button">Add all</button>
+              </div>
+              <div id="watchlist-content" class="sidebar-placeholder">Loading watchlist...</div>
+            </details>
+            <details id="active-signals-section" class="sidebar-section" open>
+              <summary><span class="sidebar-title">Active Signals</span></summary>
               <div id="active-signals-list" class="sidebar-placeholder">Signals render from `/api/signals`; no frontend scoring.</div>
-            </section>
+            </details>
           </aside>
         </div>
 
@@ -204,6 +204,6 @@
       <div id="paper-panel-content" class="paper-panel-content"></div>
     </section>
 
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260523-ui-details" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-compact-ui" defer></script>
   </body>
 </html>

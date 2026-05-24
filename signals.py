@@ -40,6 +40,9 @@ def build_signal_payload(candles: list[dict]) -> dict:
         "label": label,
         "tone": tone_for_label(label),
         "buySuggestionPct": buy_suggestion_pct(latest_score),
+        "signalDirection": signal_direction(latest_score),
+        "longSignalPct": long_signal_pct(latest_score),
+        "shortSignalPct": short_signal_pct(latest_score),
         "components": components_for_row(latest_features),
         "details": details_for_row(latest_features),
         "warnings": warnings_for_row(latest_features),
@@ -53,6 +56,9 @@ def empty_payload() -> dict:
         "label": "NEUTRAL",
         "tone": "neutral",
         "buySuggestionPct": 0,
+        "signalDirection": "NEUTRAL",
+        "longSignalPct": 0,
+        "shortSignalPct": 0,
         "components": [],
         "details": [],
         "warnings": ["Not enough candles to score signals."],
@@ -293,6 +299,24 @@ def buy_suggestion_pct(score: int) -> int:
     The UI renders this as a signal-derived suggestion only. Real position
     sizing remains a separate risk-management decision.
     """
+    return long_signal_pct(score)
+
+
+def signal_direction(score: int) -> str:
+    if score > 25:
+        return "LONG"
+    if score < -25:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def long_signal_pct(score: int) -> int:
     if score <= 25:
         return 0
     return int(max(0, min(100, round(((score - 25) / 75) * 100))))
+
+
+def short_signal_pct(score: int) -> int:
+    if score >= -25:
+        return 0
+    return int(max(0, min(100, round(((-score - 25) / 75) * 100))))
