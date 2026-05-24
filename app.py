@@ -19,6 +19,7 @@ from strategy import DEFAULT_PRESET_ID, preset_options
 app = Flask(__name__)
 
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
+PAPER_CANDIDATE_PATH = Path(app.root_path) / "config" / "paper-candidate.json"
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
@@ -276,6 +277,7 @@ def strategy_ranking():
                         "averageBarsHeld": metrics["averageBarsHeld"],
                         "score": ranking_score(metrics, min_trades=min_trades),
                         "diagnostics": payload.get("diagnostics") or {},
+                        "params": (payload.get("diagnostics") or {}).get("params", {}),
                         "warnings": warnings,
                     }
                     rows.append(row)
@@ -341,10 +343,9 @@ def strategy_ranking():
 def paper_status():
     try:
         state_path = os.path.join(app.root_path, "data", "paper-state.json")
-        config_path = os.path.join(app.root_path, "config", "paper-candidate.json")
         journal_path = os.path.join(app.root_path, "reports", "paper-journal.jsonl")
         state = read_json_file(state_path, {})
-        candidate = read_json_file(config_path, {})
+        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
         events = read_jsonl_tail(journal_path, 30)
         return jsonify({
             "openPositions": state.get("openPositions", []),
@@ -360,7 +361,13 @@ def paper_status():
             "candidate": {
                 "enabled": candidate.get("enabled", False),
                 "strategy": candidate.get("strategy"),
+                "source": candidate.get("source"),
                 "regimeMode": candidate.get("regimeMode"),
+                "params": candidate.get("params", {}),
+                "activeSymbols": candidate_symbols_by_mode(candidate, "active"),
+                "watchSymbols": candidate_symbols_by_mode(candidate, "watch"),
+                "promotedAt": candidate.get("promotedAt"),
+                "promotedFromRanking": candidate.get("promotedFromRanking"),
                 "fillModel": candidate.get("fillModel"),
                 "makerFeePct": candidate.get("makerFeePct"),
                 "takerFeePct": candidate.get("takerFeePct"),
@@ -370,6 +377,46 @@ def paper_status():
         })
     except Exception as exc:
         return jsonify({"error": f"Could not load paper status: {exc}"}), 502
+
+
+@app.get("/api/candidate/current")
+def current_candidate():
+    try:
+        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        return jsonify(candidate_summary(candidate))
+    except Exception as exc:
+        return jsonify({"error": f"Could not load current candidate: {exc}"}), 502
+
+
+@app.post("/api/candidate/promote")
+def promote_candidate():
+    try:
+        payload = request.get_json(force=True) or {}
+        force = bool(payload.get("force")) or request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
+        ranking_snapshot = payload.get("rankingSnapshot") or {}
+        min_trades = int(payload.get("minTrades") or ranking_snapshot.get("minTrades") or 10)
+        promotion_error = validate_candidate_promotion(payload, ranking_snapshot, min_trades, force)
+        if promotion_error:
+            return jsonify({"error": promotion_error}), 400
+
+        current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        backup_path = backup_candidate_config(current)
+        promoted_symbol = str(payload.get("symbol") or "").strip()
+        promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
+        updated = merge_promoted_candidate(current, payload, ranking_snapshot, promoted_symbol, promoted_interval)
+        PAPER_CANDIDATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(PAPER_CANDIDATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(updated, handle, indent=2)
+            handle.write("\n")
+
+        return jsonify({
+            "ok": True,
+            "message": "Candidate promoted. Paper simulation remains disabled until explicitly enabled.",
+            "backupPath": str(backup_path.relative_to(app.root_path)),
+            "candidate": candidate_summary(updated),
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not promote candidate: {exc}"}), 502
 
 
 def read_json_file(path: str, fallback):
@@ -391,6 +438,110 @@ def read_jsonl_tail(path: str, limit: int):
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def candidate_symbols_by_mode(candidate: dict, mode: str) -> list[dict]:
+    return [
+        item for item in candidate.get("symbols", [])
+        if item.get("mode", "active") == mode
+    ]
+
+
+def candidate_summary(candidate: dict) -> dict:
+    return {
+        "enabled": candidate.get("enabled", False),
+        "strategy": candidate.get("strategy"),
+        "source": candidate.get("source"),
+        "regimeMode": candidate.get("regimeMode"),
+        "activeSymbols": candidate_symbols_by_mode(candidate, "active"),
+        "watchSymbols": candidate_symbols_by_mode(candidate, "watch"),
+        "params": candidate.get("params", {}),
+        "promotedAt": candidate.get("promotedAt"),
+        "promotedFromRanking": candidate.get("promotedFromRanking"),
+        "fillModel": candidate.get("fillModel"),
+        "makerFeePct": candidate.get("makerFeePct"),
+        "takerFeePct": candidate.get("takerFeePct"),
+        "slippageBps": candidate.get("slippageBps"),
+        "accountEquity": candidate.get("accountEquity"),
+        "riskPct": candidate.get("riskPct"),
+        "maxOpenTrades": candidate.get("maxOpenTrades"),
+        "maxNotionalPerTrade": candidate.get("maxNotionalPerTrade"),
+    }
+
+
+def validate_candidate_promotion(payload: dict, ranking_snapshot: dict, min_trades: int, force: bool) -> str | None:
+    if not payload.get("symbol") or not (payload.get("timeframe") or payload.get("interval")):
+        return "Promotion requires symbol and timeframe."
+    if not (payload.get("preset") or payload.get("strategy")):
+        return "Promotion requires preset or strategy."
+    if ranking_snapshot.get("valid") is False and not force:
+        return "Cannot promote an invalid ranking row without force=true."
+    trades = int(safe_float(ranking_snapshot.get("trades", 0)))
+    profit_factor = safe_float(ranking_snapshot.get("profitFactor", 0))
+    max_drawdown = safe_float(ranking_snapshot.get("maxDrawdown", 0))
+    if trades < min_trades:
+        return f"Cannot promote candidate with too few trades ({trades} < {min_trades})."
+    if profit_factor <= 1 and not force:
+        return f"Cannot promote candidate with profitFactor <= 1 ({profit_factor})."
+    if max_drawdown > 30 and not force:
+        return f"Cannot promote candidate with maxDrawdown > 30 ({max_drawdown})."
+    return None
+
+
+def backup_candidate_config(candidate: dict) -> Path:
+    backup_dir = Path(app.root_path) / "config" / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = backup_dir / f"paper-candidate-{timestamp}.json"
+    with open(backup_path, "w", encoding="utf-8") as handle:
+        json.dump(candidate, handle, indent=2)
+        handle.write("\n")
+    return backup_path
+
+
+def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dict, promoted_symbol: str, promoted_interval: str) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    preserved = dict(current)
+    existing_symbols = current.get("symbols", [])
+    watch_symbols = [
+        {**item, "mode": "watch"}
+        for item in existing_symbols
+        if item.get("mode") == "watch" and not (
+            item.get("symbol") == promoted_symbol and item.get("interval") == promoted_interval
+        )
+    ]
+    promoted_market = {"symbol": promoted_symbol, "interval": promoted_interval, "mode": "active"}
+    symbols = [promoted_market]
+    seen = {(promoted_symbol, promoted_interval, "active")}
+    for item in watch_symbols:
+        key = (item.get("symbol"), item.get("interval"), item.get("mode"))
+        if key not in seen:
+            symbols.append(item)
+            seen.add(key)
+
+    snapshot = {
+        "rank": ranking_snapshot.get("rank"),
+        "score": ranking_snapshot.get("score"),
+        "period": payload.get("period"),
+        "totalReturnPct": ranking_snapshot.get("totalReturnPct"),
+        "winRate": ranking_snapshot.get("winRate"),
+        "maxDrawdown": ranking_snapshot.get("maxDrawdown"),
+        "profitFactor": ranking_snapshot.get("profitFactor"),
+        "trades": ranking_snapshot.get("trades"),
+    }
+    # TODO: Add scheduled ranking runs, automatic candidate suggestions,
+    # a human approval queue, and automatic promotion only after paper validation.
+    preserved.update({
+        "enabled": False,
+        "source": payload.get("source", current.get("source", "bybit")),
+        "strategy": payload.get("strategy") or payload.get("preset") or current.get("strategy"),
+        "regimeMode": payload.get("regimeMode", current.get("regimeMode")),
+        "params": payload.get("params") if isinstance(payload.get("params"), dict) else current.get("params", {}),
+        "symbols": symbols,
+        "promotedAt": now,
+        "promotedFromRanking": snapshot,
+    })
+    return preserved
 
 
 def node_executable() -> str:

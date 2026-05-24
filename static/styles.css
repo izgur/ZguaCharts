@@ -1117,6 +1117,17 @@ button:hover {
   opacity: 0.58;
 }
 
+.small-action-button {
+  min-height: 22px;
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
+.small-action-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .status-pill.muted {
   color: #9aa6b2;
   border-color: rgba(154, 166, 178, 0.25);

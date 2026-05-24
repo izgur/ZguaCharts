@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-ranking-api">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-candidate-promote">
   </head>
   <body>
     <header class="topbar">
@@ -126,6 +126,7 @@
               <th>Profit factor</th>
               <th>Trades</th>
               <th>Score</th>
+              <th>Action</th>
             </tr>
           </thead>
           <tbody id="analysis-table-body"></tbody>
@@ -216,6 +217,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-ranking-api" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260524-candidate-promote" defer></script>
   </body>
 </html>

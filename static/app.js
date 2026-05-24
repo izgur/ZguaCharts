@@ -56,6 +56,7 @@ let chartsToolbarInitialized = false;
 let backtestInitialized = false;
 let analysisInitialized = false;
 let backtestPane = null;
+let lastStrategyRankingPayload = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
 let watchlistRefreshInFlight = false;
@@ -113,6 +114,18 @@ function hasElement(...elements) {
 
 async function apiGet(url) {
   const response = await fetch(url);
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
+  if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+  return payload;
+}
+
+async function apiPost(url, body) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
   if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
@@ -370,18 +383,30 @@ function renderPaperStatus(payload) {
   const trades = payload.closedTrades || [];
   const events = payload.lastSignals || [];
   const warnings = payload.warnings || [];
+  const candidate = payload.candidate || {};
+  const activeSymbols = candidate.activeSymbols || [];
+  const watchSymbols = candidate.watchSymbols || [];
   return `
     <div class="paper-warning">Simulated only. No real order execution, no exchange account connection, no API keys.</div>
     <div class="metric-grid">
-      <div class="metric"><span>Enabled</span><strong>${payload.candidate?.enabled ? "Yes" : "No"}</strong></div>
+      <div class="metric"><span>Enabled</span><strong>${candidate.enabled ? "Yes" : "No"}</strong></div>
       <div class="metric"><span>Equity</span><strong>${formatPrice(Number(payload.equity || 0))}</strong></div>
       <div class="metric"><span>Realized PnL</span><strong class="${payload.realizedPnL >= 0 ? "positive" : "negative"}">${formatSigned(payload.realizedPnL)}</strong></div>
       <div class="metric"><span>Unrealized PnL</span><strong class="${payload.unrealizedPnL >= 0 ? "positive" : "negative"}">${formatSigned(payload.unrealizedPnL)}</strong></div>
       <div class="metric"><span>Fees</span><strong>${formatPrice(Number(payload.totalFees || 0))}</strong></div>
       <div class="metric"><span>Slippage</span><strong>${formatPrice(Number(payload.totalSlippage || 0))}</strong></div>
-      <div class="metric"><span>Strategy</span><strong>${escapeHtml(payload.candidate?.strategy || "-")}</strong></div>
-      <div class="metric"><span>Fill</span><strong>${escapeHtml(payload.candidate?.fillModel || "-")}</strong></div>
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(candidate.strategy || "-")}</strong></div>
+      <div class="metric"><span>Fill</span><strong>${escapeHtml(candidate.fillModel || "-")}</strong></div>
     </div>
+    <h3 class="modal-section-title">Current Candidate</h3>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Source</th><td>${escapeHtml(candidate.source || "-")}</td><th>Promoted</th><td>${candidate.promotedAt ? escapeHtml(new Date(candidate.promotedAt).toLocaleString()) : "-"}</td></tr>
+        <tr><th>Active</th><td colspan="3">${activeSymbols.map((item) => `${escapeHtml(item.symbol)} ${escapeHtml(item.interval)}`).join(", ") || "-"}</td></tr>
+        <tr><th>Watch</th><td colspan="3">${watchSymbols.map((item) => `${escapeHtml(item.symbol)} ${escapeHtml(item.interval)}`).join(", ") || "-"}</td></tr>
+        <tr><th>Ranking</th><td colspan="3">${candidate.promotedFromRanking ? `Rank ${escapeHtml(candidate.promotedFromRanking.rank)} · Score ${escapeHtml(candidate.promotedFromRanking.score)} · PF ${escapeHtml(candidate.promotedFromRanking.profitFactor)} · Trades ${escapeHtml(candidate.promotedFromRanking.trades)}` : "-"}</td></tr>
+      </tbody>
+    </table>
     ${warnings.length ? `<ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <h3 class="modal-section-title">Open Positions</h3>
     <table class="trade-table">
@@ -2016,6 +2041,13 @@ function setupAnalysisControls() {
   populateAnalysisMarketFilters();
   sourceFilter.addEventListener("change", populateAnalysisMarketFilters);
   document.querySelector("#analysis-run-ranking")?.addEventListener("click", runStrategyRanking);
+  document.querySelector("#analysis-table-body")?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-promote-ranking]");
+    if (!button) return;
+    const index = Number(button.dataset.promoteRanking);
+    const row = lastStrategyRankingPayload?.rows?.[index];
+    if (row) promoteRankingCandidate(row);
+  });
 }
 
 function populateAnalysisMarketFilters() {
@@ -2042,7 +2074,7 @@ async function runStrategyRanking() {
   const cardsEl = document.querySelector("#analysis-cards");
   if (status) status.textContent = "Running backend strategy ranking...";
   if (cardsEl) cardsEl.innerHTML = "";
-  if (body) body.innerHTML = `<tr><td colspan="10">Loading ranking results...</td></tr>`;
+  if (body) body.innerHTML = `<tr><td colspan="11">Loading ranking results...</td></tr>`;
   const symbolSelect = document.querySelector("#analysis-symbol-filter");
   const timeframeSelect = document.querySelector("#analysis-timeframe-filter");
   const presetSelect = document.querySelector("#analysis-preset-filter");
@@ -2061,6 +2093,7 @@ async function runStrategyRanking() {
     const response = await fetch(`/api/strategy-ranking?${params}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Strategy ranking failed");
+    lastStrategyRankingPayload = payload;
     renderStrategyRanking(payload);
     if (status) {
       const summary = payload.summary || {};
@@ -2068,7 +2101,7 @@ async function runStrategyRanking() {
     }
   } catch (error) {
     if (status) status.textContent = error.message;
-    if (body) body.innerHTML = `<tr><td colspan="10">${escapeHtml(error.message)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="11">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -2092,7 +2125,7 @@ function renderStrategyRanking(payload) {
     `).join("");
   }
   if (body) {
-    body.innerHTML = rows.map((row) => `
+    body.innerHTML = rows.map((row, index) => `
       <tr class="${row.valid ? "" : "invalid-row"}">
         <td>${row.rank}</td>
         <td>${escapeHtml(row.strategy)}${row.valid ? "" : " <span class=\"status-pill muted\">invalid</span>"}</td>
@@ -2104,8 +2137,44 @@ function renderStrategyRanking(payload) {
         <td>${formatNumber(row.profitFactor)}</td>
         <td>${row.trades}</td>
         <td title="${escapeHtml((row.warnings || []).join("; "))}">${formatNumber(row.score)}</td>
+        <td><button type="button" class="small-action-button" data-promote-ranking="${index}" ${row.valid ? "" : "disabled"}>Promote</button></td>
       </tr>
-    `).join("") || `<tr><td colspan="10">No rows matched the filters.</td></tr>`;
+    `).join("") || `<tr><td colspan="11">No rows matched the filters.</td></tr>`;
+  }
+}
+
+async function promoteRankingCandidate(row) {
+  const status = document.querySelector("#analysis-status");
+  const minTrades = Number(lastStrategyRankingPayload?.requested?.minTrades || document.querySelector("#analysis-min-trades")?.value || 10);
+  const ok = window.confirm(`Promote ${row.strategy} on ${row.symbol} ${row.timeframe} as the paper candidate?\n\nPaper simulation will stay disabled until you explicitly enable it.`);
+  if (!ok) return;
+  const requestBody = {
+    source: lastStrategyRankingPayload?.source || document.querySelector("#analysis-source-filter")?.value || "bybit",
+    symbol: row.symbol,
+    timeframe: row.timeframe,
+    preset: row.preset,
+    strategy: row.strategy,
+    period: row.period || lastStrategyRankingPayload?.period,
+    params: row.params || {},
+    minTrades,
+    rankingSnapshot: {
+      valid: row.valid,
+      rank: row.rank,
+      score: row.score,
+      totalReturnPct: row.totalReturnPct,
+      winRate: row.winRate,
+      maxDrawdown: row.maxDrawdown,
+      profitFactor: row.profitFactor,
+      trades: row.trades,
+    },
+  };
+  try {
+    if (status) status.textContent = "Promoting candidate...";
+    const payload = await apiPost("/api/candidate/promote", requestBody);
+    if (status) status.textContent = `${payload.message} Candidate remains disabled.`;
+    if (!paperPanel?.hidden) openPaperPanel();
+  } catch (error) {
+    if (status) status.textContent = `Promotion failed: ${error.message}`;
   }
 }
 
