@@ -7,7 +7,7 @@ const enabled = args.enable === true;
 
 try {
   const result = paper.setPaperEnabled({
-    configPath: args.config || "config/paper-candidate.json",
+    configPath: args.config || "config/local/paper-candidate.json",
     statePath: args.state || "data/paper-state.json"
   }, enabled);
   process.stdout.write(JSON.stringify(result, null, 2));

@@ -503,10 +503,18 @@ regimeMode: looseBtcBull
 fillModel: next-open
 ```
 
-The candidate config lives at:
+Tracked config files are defaults only. Runtime changes are written to ignored local config files so normal UI usage does not dirty Git.
+
+Paper candidate defaults live at:
 
 ```text
-config/paper-candidate.json
+config/paper-candidate.default.json
+```
+
+The local runtime candidate config lives at:
+
+```text
+config/local/paper-candidate.json
 ```
 
 Paper simulation is disabled by default:
@@ -520,43 +528,43 @@ Paper simulation is disabled by default:
 Initialize baselines without importing historical trades:
 
 ```powershell
-npm run paper:init -- --config config/paper-candidate.json
+npm run paper:init -- --config config/local/paper-candidate.json
 ```
 
 Refresh latest Bybit candles and write freshness diagnostics:
 
 ```powershell
-npm run paper:refresh -- --config config/paper-candidate.json
+npm run paper:refresh -- --config config/local/paper-candidate.json
 ```
 
 Check current paper status:
 
 ```powershell
-npm run paper:status -- --config config/paper-candidate.json
+npm run paper:status -- --config config/local/paper-candidate.json
 ```
 
 Enable simulated paper processing after initialization:
 
 ```powershell
-npm run paper:enable -- --config config/paper-candidate.json
+npm run paper:enable -- --config config/local/paper-candidate.json
 ```
 
 Run one safe forward paper tick:
 
 ```powershell
-npm run paper:tick -- --config config/paper-candidate.json --refresh-first
+npm run paper:tick -- --config config/local/paper-candidate.json --refresh-first
 ```
 
 Disable paper simulation:
 
 ```powershell
-npm run paper:disable -- --config config/paper-candidate.json
+npm run paper:disable -- --config config/local/paper-candidate.json
 ```
 
 Dry-run mode previews processing without mutating state or appending journals:
 
 ```powershell
-npm run paper:tick -- --config config/paper-candidate.json --dry-run --refresh-first
+npm run paper:tick -- --config config/local/paper-candidate.json --dry-run --refresh-first
 ```
 
 Paper state and outputs:

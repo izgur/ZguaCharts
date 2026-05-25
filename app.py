@@ -30,9 +30,15 @@ from strategy import DEFAULT_PRESET_ID, preset_options
 app = Flask(__name__)
 
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
-PAPER_CANDIDATE_PATH = Path(app.root_path) / "config" / "paper-candidate.json"
+CONFIG_DIR = Path(app.root_path) / "config"
+LOCAL_CONFIG_DIR = CONFIG_DIR / "local"
+PAPER_CANDIDATE_DEFAULT_PATH = CONFIG_DIR / "paper-candidate.default.json"
+PAPER_CANDIDATE_LOCAL_PATH = LOCAL_CONFIG_DIR / "paper-candidate.json"
+PAPER_CANDIDATE_LEGACY_PATH = CONFIG_DIR / "paper-candidate.json"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
-LEARNING_CONFIG_PATH = Path(app.root_path) / "config" / "learning-runner.json"
+LEARNING_CONFIG_DEFAULT_PATH = CONFIG_DIR / "learning-runner.default.json"
+LEARNING_CONFIG_LOCAL_PATH = LOCAL_CONFIG_DIR / "learning-runner.json"
+LEARNING_CONFIG_LEGACY_PATH = CONFIG_DIR / "learning-runner.json"
 LEARNING_REPORTS_PATH = Path(app.root_path) / "data" / "learning-reports.json"
 LEARNING_DECISIONS_PATH = Path(app.root_path) / "data" / "learning-decisions.json"
 MAX_RESEARCH_RUNS = 200
@@ -384,7 +390,7 @@ def research_best_candidate():
 @app.post("/api/research/suggest-candidate")
 def research_suggest_candidate():
     candidate = best_saved_candidate(load_research_runs())
-    current = candidate_summary(read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    current = candidate_summary(load_paper_candidate_config())
     if not candidate:
         return jsonify({
             "action": "NO_VALID_CANDIDATE",
@@ -491,7 +497,7 @@ def learning_auto_promote_status():
     config = load_learning_config()
     latest = (load_learning_reports() or [None])[-1]
     audit = build_learning_quality_audit()
-    result = evaluate_auto_promotion(config, audit, latest, read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    result = evaluate_auto_promotion(config, audit, latest, load_paper_candidate_config())
     payload = {
         "autoPromote": bool(config.get("autoPromote", False)),
         "autoPromoteMode": config.get("autoPromoteMode", "candidate_only"),
@@ -724,17 +730,19 @@ def build_system_health(quick: bool = False, include_optimizer: bool = False) ->
         "paperState": generated_file_info(Path(app.root_path) / "data" / "paper-state.json"),
     }
 
-    for path, label, check_id in (
-        (PAPER_CANDIDATE_PATH, "Paper candidate config", "paper_candidate_config"),
-        (LEARNING_CONFIG_PATH, "Learning runner config", "learning_config"),
+    for path, label, check_id, required in (
+        (PAPER_CANDIDATE_DEFAULT_PATH, "Paper candidate default config", "paper_candidate_default_config", True),
+        (LEARNING_CONFIG_DEFAULT_PATH, "Learning runner default config", "learning_default_config", True),
+        (PAPER_CANDIDATE_LOCAL_PATH, "Paper candidate local runtime config", "paper_candidate_local_config", False),
+        (LEARNING_CONFIG_LOCAL_PATH, "Learning runner local runtime config", "learning_local_config", False),
     ):
         status, message, details = readable_json_file(path)
-        if not path.exists():
+        if required and not path.exists():
             status = "FAIL"
             message = "Required config file is missing."
         health_check_item(checks, check_id, label, status, message, details)
 
-    paper_candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    paper_candidate = load_paper_candidate_config()
     candidate_ok = bool(paper_candidate.get("strategy") and paper_candidate.get("source") and paper_candidate.get("symbols"))
     health_check_item(
         checks,
@@ -753,6 +761,15 @@ def build_system_health(quick: bool = False, include_optimizer: bool = False) ->
         "nextRunAt": learning_config_data.get("nextRunAt"),
         "autoPromote": learning_config_data.get("autoPromote"),
         "autoEnablePaper": learning_config_data.get("autoEnablePaper"),
+        "defaultConfig": generated_file_info(LEARNING_CONFIG_DEFAULT_PATH),
+        "localConfig": generated_file_info(LEARNING_CONFIG_LOCAL_PATH),
+        "localOverridesDefault": LEARNING_CONFIG_LOCAL_PATH.exists(),
+    })
+    health_check_item(checks, "runtime_config_split", "Runtime config split", "PASS", "Tracked defaults and ignored local runtime configs are separated.", {
+        "paperDefault": PAPER_CANDIDATE_DEFAULT_PATH.name,
+        "paperLocal": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
+        "learningDefault": LEARNING_CONFIG_DEFAULT_PATH.name,
+        "learningLocal": str(LEARNING_CONFIG_LOCAL_PATH.relative_to(app.root_path)),
     })
     auto_status = "WARN" if learning_config_data.get("autoPromote") else "PASS"
     health_check_item(checks, "auto_promotion", "Auto-promotion mode", auto_status, "Auto-promotion is candidate-only and paper auto-enable is blocked.", {
@@ -892,7 +909,7 @@ def paper_status():
         state_path = os.path.join(app.root_path, "data", "paper-state.json")
         journal_path = os.path.join(app.root_path, "reports", "paper-journal.jsonl")
         state = read_json_file(state_path, {})
-        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        candidate = load_paper_candidate_config()
         events = read_jsonl_tail(journal_path, 30)
         return jsonify({
             "openPositions": state.get("openPositions", []),
@@ -929,7 +946,7 @@ def paper_status():
 @app.get("/api/candidate/current")
 def current_candidate():
     try:
-        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        candidate = load_paper_candidate_config()
         return jsonify(candidate_summary(candidate))
     except Exception as exc:
         return jsonify({"error": f"Could not load current candidate: {exc}"}), 502
@@ -946,7 +963,7 @@ def candidate_health():
 @app.get("/api/candidate/validate")
 def validate_candidate():
     try:
-        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        candidate = load_paper_candidate_config()
         validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
         return jsonify({
             "candidate": candidate_summary(candidate),
@@ -961,7 +978,7 @@ def enable_paper_candidate():
     try:
         payload = request.get_json(silent=True) or {}
         force = bool(payload.get("force"))
-        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        candidate = load_paper_candidate_config()
         validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
         if validation["status"] != "PASS" and not force:
             return jsonify({
@@ -996,7 +1013,7 @@ def enable_paper_candidate():
 @app.post("/api/candidate/disable-paper")
 def disable_paper_candidate():
     try:
-        candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        candidate = load_paper_candidate_config()
         backup_path = backup_candidate_config(candidate)
         updated = dict(candidate)
         updated["enabled"] = False
@@ -1023,7 +1040,7 @@ def promote_candidate():
         if promotion_error:
             return jsonify({"error": promotion_error}), 400
 
-        current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+        current = load_paper_candidate_config()
         backup_path = backup_candidate_config(current)
         promoted_symbol = str(payload.get("symbol") or "").strip()
         promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
@@ -1047,6 +1064,38 @@ def read_json_file(path: str, fallback):
         return json.load(handle)
 
 
+def shallow_merge_config(defaults: dict, local: dict) -> dict:
+    merged = dict(defaults)
+    for key, value in (local or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            nested = dict(merged[key])
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_config_pair(default_path: Path, local_path: Path, legacy_path: Path | None = None, fallback: dict | None = None) -> dict:
+    defaults = read_json_file(str(default_path), fallback or {})
+    if local_path.exists():
+        return shallow_merge_config(defaults, read_json_file(str(local_path), {}))
+    if legacy_path and legacy_path.exists():
+        return shallow_merge_config(defaults, read_json_file(str(legacy_path), {}))
+    return defaults
+
+
+def ensure_local_config_from_existing(default_path: Path, local_path: Path, legacy_path: Path | None, fallback: dict | None = None) -> None:
+    if local_path.exists():
+        return
+    source = legacy_path if legacy_path and legacy_path.exists() else default_path
+    data = read_json_file(str(source), fallback or {})
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(local_path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2)
+        handle.write("\n")
+
+
 def read_jsonl_tail(path: str, limit: int):
     if not os.path.exists(path):
         return []
@@ -1059,6 +1108,15 @@ def read_jsonl_tail(path: str, limit: int):
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def load_paper_candidate_config() -> dict:
+    return load_config_pair(
+        PAPER_CANDIDATE_DEFAULT_PATH,
+        PAPER_CANDIDATE_LOCAL_PATH,
+        PAPER_CANDIDATE_LEGACY_PATH,
+        {},
+    )
 
 
 def run_strategy_ranking_payload(
@@ -1253,22 +1311,25 @@ def default_learning_config() -> dict:
 
 
 def load_learning_config() -> dict:
-    config = default_learning_config()
-    if LEARNING_CONFIG_PATH.exists():
-        try:
-            with open(LEARNING_CONFIG_PATH, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            if isinstance(data, dict):
-                config.update(data)
-        except Exception:
-            pass
+    config = load_config_pair(
+        LEARNING_CONFIG_DEFAULT_PATH,
+        LEARNING_CONFIG_LOCAL_PATH,
+        LEARNING_CONFIG_LEGACY_PATH,
+        default_learning_config(),
+    )
     config["autoEnablePaper"] = False
     return config
 
 
 def write_learning_config(config: dict) -> None:
-    LEARNING_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(LEARNING_CONFIG_PATH, "w", encoding="utf-8") as handle:
+    ensure_local_config_from_existing(
+        LEARNING_CONFIG_DEFAULT_PATH,
+        LEARNING_CONFIG_LOCAL_PATH,
+        LEARNING_CONFIG_LEGACY_PATH,
+        default_learning_config(),
+    )
+    LEARNING_CONFIG_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(LEARNING_CONFIG_LOCAL_PATH, "w", encoding="utf-8") as handle:
         json.dump(safe_learning_config(config), handle, indent=2)
         handle.write("\n")
 
@@ -1454,7 +1515,7 @@ def append_learning_decision(record: dict) -> str:
     decision.setdefault("id", f"decision-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}")
     decision.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
     decision.setdefault("promoted", False)
-    decision.setdefault("paperEnabledAfter", bool(read_json_file(str(PAPER_CANDIDATE_PATH), {}).get("enabled", False)))
+    decision.setdefault("paperEnabledAfter", bool(load_paper_candidate_config().get("enabled", False)))
     decision.setdefault("errors", [])
     decision.setdefault("warnings", [])
     decisions = load_learning_decisions()
@@ -1531,7 +1592,7 @@ def append_learning_decision_from_context(
     errors: list | None = None,
     warnings: list | None = None,
 ) -> str:
-    current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    current = load_paper_candidate_config()
     audit_summary = (audit or {}).get("summary", {})
     record = {
         "source": source,
@@ -1686,7 +1747,7 @@ def build_learning_quality_audit(window: int = 5, extra_report: dict | None = No
     if extra_report:
         reports = reports + [extra_report]
     research_runs = load_research_runs()
-    current_candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    current_candidate = load_paper_candidate_config()
     paper_health = build_candidate_health(candidate_health_rules({}))["health"]
     recent = reports[-window:]
     latest = reports[-1] if reports else None
@@ -1909,7 +1970,7 @@ def evaluate_auto_promotion(config: dict, audit: dict, latest_report: dict | Non
 def auto_promote_candidate_if_allowed(config: dict, learning_report: dict | None, decision_source: str = "learning_run") -> dict:
     attempted = bool(safe_learning_config(config).get("autoPromote"))
     audit = build_learning_quality_audit(extra_report=learning_report)
-    current = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    current = load_paper_candidate_config()
     evaluation = evaluate_auto_promotion(config, audit, learning_report, current)
     result = {
         "attempted": attempted,
@@ -2056,7 +2117,7 @@ def run_learning_cycle(config: dict) -> dict:
     report["candidateHealth"] = build_candidate_health(candidate_health_rules({}))["health"]
     report["bestSavedCandidate"] = best_saved_candidate(load_research_runs())
     report["replacementSuggestion"] = replacement_suggestion_from_health(report["candidateHealth"])
-    report["recommendation"] = learning_recommendation(report["candidateHealth"], report["bestSavedCandidate"], read_json_file(str(PAPER_CANDIDATE_PATH), {}))
+    report["recommendation"] = learning_recommendation(report["candidateHealth"], report["bestSavedCandidate"], load_paper_candidate_config())
     report["autoPromotion"] = auto_promote_candidate_if_allowed(config, report)
     if report["errors"] and (report["rankingRunIds"] or report["optimizationRunIds"]):
         report["status"] = "partial"
@@ -2354,8 +2415,14 @@ def backup_candidate_config(candidate: dict) -> Path:
 
 
 def write_candidate_config(candidate: dict) -> None:
-    PAPER_CANDIDATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(PAPER_CANDIDATE_PATH, "w", encoding="utf-8") as handle:
+    ensure_local_config_from_existing(
+        PAPER_CANDIDATE_DEFAULT_PATH,
+        PAPER_CANDIDATE_LOCAL_PATH,
+        PAPER_CANDIDATE_LEGACY_PATH,
+        {},
+    )
+    PAPER_CANDIDATE_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(PAPER_CANDIDATE_LOCAL_PATH, "w", encoding="utf-8") as handle:
         json.dump(candidate, handle, indent=2)
         handle.write("\n")
 
@@ -2558,7 +2625,7 @@ def candidate_health_rules(args) -> dict:
 
 
 def build_candidate_health(rules: dict) -> dict:
-    candidate = read_json_file(str(PAPER_CANDIDATE_PATH), {})
+    candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
     journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 500)
     expected = expected_metrics_from_candidate(candidate)

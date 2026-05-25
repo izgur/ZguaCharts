@@ -6,7 +6,7 @@ const args = argsUtil.parseArgs(process.argv.slice(2));
 
 try {
   const result = paper.getPaperStatus({
-    configPath: args.config || "config/paper-candidate.json",
+    configPath: args.config || "config/local/paper-candidate.json",
     statePath: args.state || "data/paper-state.json",
     reportDir: args.output || "reports"
   });

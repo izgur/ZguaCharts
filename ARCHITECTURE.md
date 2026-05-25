@@ -41,7 +41,7 @@ Responsibilities:
 - Own `/api/strategy-ranking`, including matrix execution, metric collection, ranking score calculation, validity flags, and ranking cards.
 - Own `/api/strategy-optimize`, including parameter search, train/test scoring, overfit warnings, and optimized candidate summaries.
 - Own persistent research memory through `/api/research/runs`, `/api/research/best-candidate`, and `/api/research/suggest-candidate`.
-- Own manual candidate promotion through `/api/candidate/promote`; browser actions may request promotion, but only the backend writes `config/paper-candidate.json` after explicit confirmation.
+- Own manual candidate promotion through `/api/candidate/promote`; browser actions may request promotion, but only the backend writes the ignored runtime config `config/local/paper-candidate.json` after explicit confirmation.
 - Own candidate validation and paper enablement gates through `/api/candidate/validate`, `/api/candidate/enable-paper`, and `/api/candidate/disable-paper`.
 - Own paper candidate health scoring and degradation detection through `/api/candidate/health`; the browser renders the returned status and expected-vs-paper metrics only.
 - Own replacement suggestions through `/api/research/suggest-replacement`; the browser can ask for a suggestion and manually promote it, but it must not auto-promote or disable paper simulation.
@@ -51,6 +51,24 @@ Responsibilities:
 - Own automatic learning decision logs through `/api/learning/decisions` and `/api/learning/decision-summary`; every learning recommendation, scheduled tick, eligibility check, rejection, and auto-promotion must be auditable from backend-owned records.
 - Own ops diagnostics through `/api/system/health` and `/api/system/health/quick`; health checks are read-only, never expose secrets, and must not mutate candidate config, paper state, research memory, or learning settings.
 - Own market-data maintenance through `/api/market/*`; Bybit symbol validation, cache inspection, and historical prefetch are backend-owned and must never run automatically on app startup.
+
+## Config Files
+
+Tracked config files are defaults/templates only:
+
+```text
+config/learning-runner.default.json
+config/paper-candidate.default.json
+```
+
+Runtime/user-modified config is ignored by Git:
+
+```text
+config/local/learning-runner.json
+config/local/paper-candidate.json
+```
+
+The backend loads defaults first, overlays local runtime config when present, and writes only to `config/local/`. Candidate promotion, paper enable/disable, learning config changes, scheduler updates, and auto-promotion must never mutate tracked default files. Backups live under ignored `config/backups/`.
 
 ## Core Strategy / Research Engine
 
@@ -97,9 +115,9 @@ Run scheduled learning locally with:
 python scripts/learning_tick.py
 ```
 
-On Windows Task Scheduler, run that command every 15 or 60 minutes. The script checks
-`config/learning-runner.json`, runs only when due, writes recommendation reports, and
-never promotes candidates or enables paper simulation. On Render/free hosting, repeated
+On Windows Task Scheduler, run that command every 15 or 60 minutes. The script reads
+`config/learning-runner.default.json` plus ignored `config/local/learning-runner.json`,
+runs only when due, writes recommendation reports, and never promotes candidates or enables paper simulation. On Render/free hosting, repeated
 execution needs an external cron/ping or a paid background worker.
 
 If the same trading formula appears in both frontend JavaScript and backend/core code, the frontend copy should be removed.

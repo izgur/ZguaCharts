@@ -13,5 +13,6 @@ reports/
 reports-smoke/
 reports-cli-smoke/
 config/backups/
+config/local/
 zguacharts-*.patch
 zguacharts-local-commits.txt

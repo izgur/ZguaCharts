@@ -7,11 +7,45 @@ const backtest = require("../backtest");
 
 const DEFAULT_STATE_PATH = path.join(process.cwd(), "data", "paper-state.json");
 const DEFAULT_REPORT_DIR = path.join(process.cwd(), "reports");
+const DEFAULT_CONFIG_PATH = path.join(process.cwd(), "config", "paper-candidate.default.json");
+const LOCAL_CONFIG_PATH = path.join(process.cwd(), "config", "local", "paper-candidate.json");
+
+function resolveConfigPath(configPath) {
+  return configPath || LOCAL_CONFIG_PATH;
+}
+
+function loadConfig(configPath) {
+  const resolvedPath = resolveConfigPath(configPath);
+  const defaults = readJson(DEFAULT_CONFIG_PATH, {});
+  if (!fs.existsSync(resolvedPath)) {
+    return Object.assign({}, defaults);
+  }
+  return Object.assign({}, defaults, readJson(resolvedPath, {}));
+}
+
+function ensureRuntimeConfig(configPath) {
+  const resolvedPath = resolveConfigPath(configPath);
+  if (!fs.existsSync(resolvedPath)) {
+    ensureDir(path.dirname(resolvedPath));
+    const defaults = readJson(DEFAULT_CONFIG_PATH, {});
+    fs.writeFileSync(resolvedPath, JSON.stringify(defaults, null, 2) + "\n");
+  }
+  return resolvedPath;
+}
+
+function readJson(file, fallback) {
+  try {
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
 
 function runPaperTick(options) {
   options = options || {};
-  const configPath = options.configPath || path.join(process.cwd(), "config", "paper-candidate.json");
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const configPath = resolveConfigPath(options.configPath);
+  const config = loadConfig(configPath);
   const statePath = options.statePath || DEFAULT_STATE_PATH;
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
   ensureDir(path.dirname(statePath));
@@ -60,8 +94,8 @@ function runPaperTick(options) {
 
 function initializePaper(options) {
   options = options || {};
-  const configPath = options.configPath || path.join(process.cwd(), "config", "paper-candidate.json");
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const configPath = resolveConfigPath(options.configPath);
+  const config = loadConfig(configPath);
   const statePath = options.statePath || DEFAULT_STATE_PATH;
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
   ensureDir(path.dirname(statePath));
@@ -107,8 +141,8 @@ function initializePaper(options) {
 
 function refreshPaperCandles(options) {
   options = options || {};
-  const configPath = options.configPath || path.join(process.cwd(), "config", "paper-candidate.json");
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const configPath = resolveConfigPath(options.configPath);
+  const config = loadConfig(configPath);
   const statePath = options.statePath || DEFAULT_STATE_PATH;
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
   const state = loadState(statePath, config);
@@ -142,9 +176,9 @@ function refreshPaperCandles(options) {
 
 function setPaperEnabled(options, enabled) {
   options = options || {};
-  const configPath = options.configPath || path.join(process.cwd(), "config", "paper-candidate.json");
+  const configPath = ensureRuntimeConfig(options.configPath);
   const statePath = options.statePath || DEFAULT_STATE_PATH;
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const config = loadConfig(configPath);
   const state = loadState(statePath, config);
   const missing = normalizeMarkets(config).filter((market) => !state.lastProcessedCandleTime[marketKey(market)]).map(marketKey);
   if (enabled && missing.length) {
@@ -159,10 +193,10 @@ function setPaperEnabled(options, enabled) {
 
 function getPaperStatus(options) {
   options = options || {};
-  const configPath = options.configPath || path.join(process.cwd(), "config", "paper-candidate.json");
+  const configPath = resolveConfigPath(options.configPath);
   const statePath = options.statePath || DEFAULT_STATE_PATH;
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const config = loadConfig(configPath);
   const state = loadState(statePath, config);
   const freshnessReport = path.join(reportDir, "paper-freshness.json");
   let freshness = state.freshness || {};
