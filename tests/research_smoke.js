@@ -67,6 +67,21 @@ assert.strictEqual(v2Grid.metadata.gridName, "V2 ATR trend");
 assert.ok(v2Grid.metadata.candidateCountTested <= 25, "optimizer grid must respect max combo limit");
 const fallbackGrid = optimizer.selectOptimizerGrid("AlwaysLongTest", null, 5);
 assert.strictEqual(fallbackGrid.metadata.gridName, "Default fallback");
+const qualityPolicy = optimizer.optimizerQualityPolicy();
+assert.strictEqual(qualityPolicy.minTestTrades, 10);
+const zeroQuality = optimizer.evaluateCandidateQuality({
+  train: { totalReturn: 0, maxDrawdown: 0, profitFactor: 0, trades: 0, sharpeRatio: 0 },
+  test: { totalReturn: 0, maxDrawdown: 0, profitFactor: 0, trades: 0, sharpeRatio: 0 },
+  zeroTradeDiagnostics: { summary: { likelyReason: "no_entry_signal" } }
+});
+assert.strictEqual(zeroQuality.qualityStatus, "FAIL");
+assert.ok(zeroQuality.rejectionReasons.some((reason) => reason.code === "zero_trades"));
+const passQuality = optimizer.evaluateCandidateQuality({
+  train: { totalReturn: 5, maxDrawdown: 3, profitFactor: 1.3, trades: 40, sharpeRatio: 1 },
+  test: { totalReturn: 3, maxDrawdown: 2, profitFactor: 1.2, trades: 12, sharpeRatio: 1 },
+  full: { totalReturn: 8, maxDrawdown: 4, profitFactor: 1.2, trades: 52, sharpeRatio: 1 }
+});
+assert.strictEqual(passQuality.qualityStatus, "PASS");
 
 const csv = reporting.toCsv([
   {

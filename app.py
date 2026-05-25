@@ -2446,6 +2446,27 @@ def run_learning_cycle(config: dict) -> dict:
                             "timeframe": timeframe,
                             "zeroTradeSummary": payload.get("zeroTradeSummary"),
                         })
+                    quality_summary = payload.get("qualitySummary") or {}
+                    if quality_summary:
+                        report["warnings"].append({
+                            "type": "optimizer_quality",
+                            "strategy": strategy,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "selectedStatus": quality_summary.get("selectedStatus"),
+                            "passCandidates": quality_summary.get("passCandidates"),
+                            "warnCandidates": quality_summary.get("warnCandidates"),
+                            "failCandidates": quality_summary.get("failCandidates"),
+                            "topRejectionReasons": quality_summary.get("topRejectionReasons", [])[:3],
+                        })
+                        if quality_summary.get("selectedStatus") == "NONE":
+                            report["warnings"].append({
+                                "type": "optimizer_no_acceptable_candidate",
+                                "strategy": strategy,
+                                "symbol": symbol,
+                                "timeframe": timeframe,
+                                "message": "Optimizer returned no PASS/WARN candidate after quality filtering.",
+                            })
                 except Exception as exc:
                     report["errors"].append({"stage": "optimization", "strategy": strategy, "symbol": symbol, "timeframe": timeframe, "error": str(exc)})
                     if "0 trades" in str(exc).lower() or "zero" in str(exc).lower():
@@ -2663,7 +2684,10 @@ def research_candidate_from_ranking_row(row: dict | None, payload: dict) -> dict
         "preset": row.get("preset"),
         "period": row.get("period", payload.get("period")),
         "params": row.get("params", {}),
-        "valid": row.get("valid", False),
+        "valid": row.get("valid", False) and row.get("qualityStatus", "PASS") != "FAIL",
+        "qualityStatus": row.get("qualityStatus"),
+        "rejectionReasons": row.get("rejectionReasons", []),
+        "qualityMetrics": row.get("qualityMetrics", {}),
         "rank": row.get("rank"),
         "score": row.get("score"),
         "totalReturnPct": row.get("totalReturnPct"),
@@ -2689,7 +2713,10 @@ def research_candidate_from_optimization_row(row: dict | None, payload: dict) ->
         "preset": payload.get("strategy"),
         "period": payload.get("period"),
         "params": row.get("params", {}),
-        "valid": row.get("valid", False),
+        "valid": row.get("valid", False) and row.get("qualityStatus", "PASS") != "FAIL",
+        "qualityStatus": row.get("qualityStatus"),
+        "rejectionReasons": row.get("rejectionReasons", []),
+        "qualityMetrics": row.get("qualityMetrics", {}),
         "rank": row.get("rank"),
         "score": row.get("score"),
         "totalReturnPct": test.get("totalReturn", full.get("totalReturn", 0)),
@@ -2711,6 +2738,8 @@ def best_saved_candidate(runs: list[dict]) -> dict | None:
     for run in runs:
         for candidate in ([run.get("bestCandidate")] + run.get("rows", []) + run.get("topCandidates", [])):
             if candidate and candidate.get("valid"):
+                if candidate.get("origin") == "optimization" and candidate.get("qualityStatus") not in (None, "PASS"):
+                    continue
                 item = dict(candidate)
                 item["researchRunId"] = run.get("id")
                 item["researchRunType"] = run.get("type")
@@ -3849,6 +3878,9 @@ def load_optimizer_grid_catalog() -> dict:
 def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: str, strategy: str, period: str, limit: int, max_combos: int, train_ratio: float, fee_pct: float, slippage_pct: float) -> dict:
     candidates = optimizer_candidates(raw)
     rows = [normalize_optimizer_candidate(row, index + 1) for index, row in enumerate(candidates[:20])]
+    rejected_rows = [normalize_optimizer_candidate(row, index + 1) for index, row in enumerate((raw.get("rejectedCandidates") or [])[:20])]
+    quality_summary = raw.get("qualitySummary") or (raw.get("summary") or {}).get("qualitySummary") or {}
+    optimized = raw.get("optimizedPerformance")
     return {
         "source": source,
         "strategy": NODE_STRATEGIES.get(strategy, strategy),
@@ -3866,13 +3898,20 @@ def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: 
         "summary": {
             "combinationsTested": optimizer_combinations_tested(raw),
             "validCandidates": raw.get("validCandidates", 0),
+            "qualitySummary": quality_summary,
+            "selectedStatus": quality_summary.get("selectedStatus"),
             "warnings": optimizer_warnings(raw),
         },
         "optimizerGrid": raw.get("optimizerGrid") or {},
+        "qualityPolicy": raw.get("qualityPolicy") or {},
+        "qualitySummary": quality_summary,
         "zeroTradeSummary": raw.get("zeroTradeSummary") or {},
         "allZeroTradeCandidates": bool(raw.get("allZeroTradeCandidates")),
         "warnings": optimizer_warnings(raw),
+        "optimizedPerformance": normalize_optimizer_candidate(optimized, 1) if isinstance(optimized, dict) else None,
+        "unseenTestPerformance": raw.get("unseenTestPerformance"),
         "topCandidates": rows,
+        "rejectedCandidates": rejected_rows,
         "rawSummary": raw.get("summary") or {key: raw.get(key) for key in ("robustnessAssessment", "bestTestResult", "combinationsTested")},
         "errors": [],
     }
@@ -3896,9 +3935,23 @@ def normalize_optimizer_candidate(row: dict, rank: int) -> dict:
     walk_forward = row.get("walkForward") or []
     score = optimizer_candidate_score(row)
     warnings = optimizer_candidate_warnings(row, train, test, full, walk_forward)
+    quality_status = row.get("qualityStatus") or ("PASS" if row.get("valid") else "FAIL")
+    rejection_reasons = row.get("rejectionReasons") or []
+    quality_warnings = row.get("qualityWarnings") or []
+    quality_warning_labels = [
+        item.get("label") or item.get("code") or str(item)
+        for item in quality_warnings
+    ]
+    if quality_warning_labels:
+        warnings = dedupe_list(warnings + [f"WARN: {label}" for label in quality_warning_labels])
     return {
         "rank": rank,
-        "valid": bool(row.get("valid")) and not any(warning.startswith("FAIL") for warning in warnings),
+        "valid": bool(row.get("isValid", row.get("valid"))) and quality_status != "FAIL" and not any(warning.startswith("FAIL") for warning in warnings),
+        "qualityStatus": quality_status,
+        "isValid": bool(row.get("isValid", row.get("valid"))) and quality_status != "FAIL",
+        "rejectionReasons": rejection_reasons,
+        "qualityMetrics": row.get("qualityMetrics") or {},
+        "scorePenalty": safe_float(row.get("scorePenalty")),
         "params": row.get("params", {}),
         "score": score,
         "train": train,
@@ -3936,10 +3989,20 @@ def optimizer_candidate_score(row: dict) -> float:
 
 def optimizer_candidate_warnings(row: dict, train: dict, test: dict, full: dict, walk_forward: list) -> list[str]:
     warnings = []
+    quality_status = row.get("qualityStatus")
+    rejection_reasons = row.get("rejectionReasons") or []
+    if quality_status == "FAIL" and rejection_reasons:
+        labels = [item.get("label") or item.get("code") or str(item) for item in rejection_reasons[:4]]
+        warnings.append("FAIL: " + ", ".join(labels))
+    elif quality_status == "WARN" and rejection_reasons:
+        labels = [item.get("label") or item.get("code") or str(item) for item in rejection_reasons[:4]]
+        warnings.append("WARN: " + ", ".join(labels))
     zero_diag = row.get("zeroTradeDiagnostics") or {}
     if zero_diag:
         likely = (zero_diag.get("summary") or {}).get("likelyReason")
         warnings.append(f"ZERO TRADE: {likely or 'candidate produced no train/test trades'}")
+    if quality_status:
+        return dedupe_list(warnings)
     if safe_float(test.get("trades")) < 20:
         warnings.append("FAIL: low test trade count")
     if safe_float(test.get("profitFactor")) <= 1:

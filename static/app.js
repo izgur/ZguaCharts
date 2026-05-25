@@ -3244,9 +3244,13 @@ async function runStrategyOptimization() {
       const readiness = payload.dataReadiness?.summary || {};
       const grid = payload.optimizerGrid || {};
       const zero = payload.zeroTradeSummary || {};
+      const quality = payload.qualitySummary || {};
       const fallback = grid.fallbackUsed ? " Fallback grid used." : "";
       const zeroText = payload.allZeroTradeCandidates ? ` All candidates had zero trades: ${zero.suggestedGridAction || "inspect diagnostics"}.` : "";
-      status.textContent = `Optimization complete using ${grid.gridName || "optimizer grid"}. Tested ${grid.candidateCountTested || JSON.stringify(summary.combinationsTested || 0)}/${grid.candidateCountPlanned || "?"} combos. ${summary.validCandidates || 0} valid candidates. Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.${fallback}${zeroText}`;
+      const qualityText = quality.totalCandidates !== undefined
+        ? ` Quality PASS/WARN/FAIL ${quality.passCandidates || 0}/${quality.warnCandidates || 0}/${quality.failCandidates || 0}; selected=${quality.selectedStatus || "n/a"}.`
+        : "";
+      status.textContent = `Optimization complete using ${grid.gridName || "optimizer grid"}. Tested ${grid.candidateCountTested || JSON.stringify(summary.combinationsTested || 0)}/${grid.candidateCountPlanned || "?"} combos. ${summary.validCandidates || 0} acceptable candidates.${qualityText} Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.${fallback}${zeroText}`;
     }
   } catch (error) {
     if (status) status.textContent = `Optimization failed: ${error.message}`;
@@ -3263,8 +3267,11 @@ async function runStrategyOptimization() {
 function renderStrategyOptimization(payload) {
   const body = document.querySelector("#optimization-table-body");
   const rows = payload.topCandidates || [];
+  const rejectedRows = payload.rejectedCandidates || [];
   if (!body) return;
   const zeroSummary = payload.zeroTradeSummary || {};
+  const qualitySummary = payload.qualitySummary || {};
+  const topQualityReason = qualitySummary.topRejectionReasons?.[0];
   const metaRows = `
     <tr class="diagnostic-row">
       <td colspan="8">
@@ -3272,23 +3279,53 @@ function renderStrategyOptimization(payload) {
         · planned ${payload.optimizerGrid?.candidateCountPlanned ?? "-"}
         · tested ${payload.optimizerGrid?.candidateCountTested ?? "-"}
         ${payload.optimizerGrid?.fallbackUsed ? " · fallback used" : ""}
+        ${qualitySummary.totalCandidates !== undefined ? ` · quality PASS/WARN/FAIL ${qualitySummary.passCandidates || 0}/${qualitySummary.warnCandidates || 0}/${qualitySummary.failCandidates || 0}` : ""}
+        ${qualitySummary.selectedStatus ? ` · selected ${escapeHtml(qualitySummary.selectedStatus)}` : ""}
+        ${topQualityReason ? ` · top rejection ${escapeHtml(topQualityReason.label || topQualityReason.reason)}` : ""}
         ${zeroSummary.zeroTradeCandidates ? ` · zero-trade candidates ${zeroSummary.zeroTradeCandidates}/${zeroSummary.totalCandidates}` : ""}
         ${zeroSummary.topReasons?.length ? ` · top reason ${escapeHtml(zeroSummary.topReasons[0].reason)}` : ""}
       </td>
     </tr>
   `;
-  body.innerHTML = metaRows + (rows.map((row, index) => `
-    <tr class="${row.valid ? "" : "invalid-row"}">
+  const candidateRows = rows.map((row, index) => {
+    const quality = row.qualityStatus || (row.valid ? "PASS" : "FAIL");
+    const reasons = optimizerReasonText(row);
+    return `
+    <tr class="${quality === "FAIL" ? "invalid-row" : ""}">
       <td>${row.rank}</td>
-      <td>${formatNumber(row.score)}</td>
+      <td>${formatNumber(row.score)} <span class="status-pill muted" title="${escapeHtml(reasons)}">${escapeHtml(quality)}</span></td>
       <td><code>${escapeHtml(JSON.stringify(row.params || {}))}</code></td>
       <td>${formatOptimizationMetric(row.train)}</td>
       <td>${formatOptimizationMetric(row.test)}</td>
       <td>${row.full && Object.keys(row.full).length ? formatOptimizationMetric(row.full) : "-"}</td>
-      <td title="${escapeHtml((row.warnings || []).join("; "))}">${escapeHtml(row.overfitWarning || (row.warnings || [])[0] || "-")}</td>
-      <td><button type="button" class="small-action-button" data-promote-optimization="${index}">Promote</button></td>
+      <td title="${escapeHtml(reasons)}">${escapeHtml(row.overfitWarning || (row.warnings || [])[0] || reasons || "-")}</td>
+      <td><button type="button" class="small-action-button" data-promote-optimization="${index}" ${quality === "FAIL" ? "disabled" : ""}>Promote</button></td>
     </tr>
-  `).join("") || `<tr><td colspan="8">No optimization candidates returned.</td></tr>`);
+  `;
+  }).join("");
+  const rejectedPreview = rejectedRows.length ? `
+    <tr class="diagnostic-row"><td colspan="8">Rejected candidates preview</td></tr>
+    ${rejectedRows.slice(0, 10).map((row) => `
+      <tr class="invalid-row">
+        <td>R${row.rank}</td>
+        <td>${formatNumber(row.score)} <span class="status-pill muted">FAIL</span></td>
+        <td><code>${escapeHtml(JSON.stringify(row.params || {}))}</code></td>
+        <td>${formatOptimizationMetric(row.train)}</td>
+        <td>${formatOptimizationMetric(row.test)}</td>
+        <td>${row.full && Object.keys(row.full).length ? formatOptimizationMetric(row.full) : "-"}</td>
+        <td colspan="2" title="${escapeHtml(optimizerReasonText(row))}">${escapeHtml(optimizerReasonText(row) || "Rejected by optimizer quality policy")}</td>
+      </tr>
+    `).join("")}
+  ` : "";
+  const empty = !candidateRows && !rejectedPreview
+    ? `<tr><td colspan="8">No optimization candidates returned.</td></tr>`
+    : (!candidateRows ? `<tr><td colspan="8">No acceptable optimizer candidate found.</td></tr>` : "");
+  body.innerHTML = metaRows + candidateRows + empty + rejectedPreview;
+}
+
+function optimizerReasonText(row) {
+  const reasons = (row.rejectionReasons || []).map((item) => item.label || item.code || String(item));
+  return [...reasons, ...(row.warnings || [])].filter(Boolean).join("; ");
 }
 
 function formatOptimizationMetric(metric) {

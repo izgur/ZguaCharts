@@ -5,6 +5,32 @@ const backtest = require("../backtest");
 const reporting = require("../reporting");
 const tradeAudit = require("../backtest/tradeAudit");
 
+const OPTIMIZER_QUALITY_POLICY = {
+  minTestTrades: 10,
+  minFullTrades: 20,
+  minProfitFactor: 1.05,
+  minTestReturnPct: 0,
+  maxDrawdownPct: 25,
+  maxTrainTestReturnGapPct: 25,
+  maxNegativeWalkForwardFoldRatio: 0.5
+};
+
+const REJECTION_LABELS = {
+  zero_trades: "Zero trades",
+  too_few_test_trades: "Too few test trades",
+  too_few_full_trades: "Too few full-period trades",
+  test_profit_factor_below_min: "Test profit factor below minimum",
+  full_profit_factor_below_min: "Full-period profit factor below minimum",
+  negative_test_return: "Negative test return",
+  high_drawdown: "High drawdown",
+  train_test_overfit_gap: "Train/test overfit gap",
+  unstable_walk_forward: "Unstable walk-forward",
+  missing_metrics: "Missing metrics",
+  invalid_candidate: "Invalid candidate",
+  zero_trade_diagnostics: "Zero-trade diagnostics available",
+  train_only_success_test_failure: "Train-only success but test failed"
+};
+
 function optimize(options) {
   options = options || {};
   var grid = selectOptimizerGrid(options.strategy, options.ranges, Number(options.maxCombos || 1000));
@@ -37,14 +63,19 @@ function optimize(options) {
         }
       }
     }
+    rows = rows.map(function (row) { return ensureCandidateQuality(row); });
     var zeroTradeSummary = aggregateZeroTradeSummary(rows);
-    var validRows = rows.filter(validCandidate);
-    var ranked = rankResults(validRows.length ? validRows : rows);
-    var summary = buildSummary(ranked, rows, validRows);
-    summary.walkForward = ranked[0] && !allZero
-      ? walkForward(candles, options, ranked[0].params, options.walkForwardFolds || 3)
+    var qualitySummary = buildQualitySummary(rows);
+    var acceptableRows = acceptableOptimizerRows(rows);
+    var ranked = rankResults(acceptableRows);
+    var rejectedRanked = rankResults(rows.filter(function (row) { return row.qualityStatus === "FAIL"; })).slice(0, 20);
+    var selected = ranked[0] || null;
+    var summary = buildSummary(ranked, rows, acceptableRows);
+    summary.walkForward = selected && !allZero
+      ? walkForward(candles, options, selected.params, options.walkForwardFolds || 3)
       : [];
-    summary.warnings = optimizerRunWarnings(grid.metadata, zeroTradeSummary, allZero);
+    summary.qualitySummary = qualitySummary;
+    summary.warnings = optimizerRunWarnings(grid.metadata, zeroTradeSummary, allZero, qualitySummary);
     if (options.outputDir) reporting.writeOptimizationReport(options.outputDir, ranked, summary, options.reportPrefix);
     return {
       symbol: options.symbol,
@@ -53,17 +84,20 @@ function optimize(options) {
       trainRatio: options.trainRatio || 0.7,
       combinations: combos.length,
       totalResults: rows.length,
-      validCandidates: allZero ? 0 : validRows.length,
-      optimizedPerformance: allZero ? null : (ranked[0] || null),
-      unseenTestPerformance: !allZero && ranked[0] ? ranked[0].test : null,
+      validCandidates: acceptableRows.length,
+      optimizedPerformance: selected,
+      unseenTestPerformance: selected ? selected.test : null,
       optimizerGrid: Object.assign({}, grid.metadata, {
         candidateCountTested: rows.length
       }),
+      qualityPolicy: optimizerQualityPolicy(),
+      qualitySummary: qualitySummary,
       zeroTradeSummary: zeroTradeSummary,
       allZeroTradeCandidates: allZero,
       warnings: summary.warnings,
       summary: summary,
-      results: ranked
+      results: ranked,
+      rejectedCandidates: rejectedRanked
     };
   });
 }
@@ -1045,7 +1079,7 @@ function buildOptimizationRow(options, params, train, test) {
   var zeroTradeDiagnostics = train.trades === 0 && test.trades === 0
     ? zeroTradeDiagnosticsForRow(train, test)
     : null;
-  return {
+  var row = {
     symbol: options.symbol,
     interval: options.interval,
     strategy: options.strategy,
@@ -1063,6 +1097,178 @@ function buildOptimizationRow(options, params, train, test) {
     valid: validCandidate({ train: trainMetrics, test: testMetrics }),
     zeroTradeDiagnostics: zeroTradeDiagnostics
   };
+  return ensureCandidateQuality(row);
+}
+
+function optimizerQualityPolicy() {
+  return Object.assign({}, OPTIMIZER_QUALITY_POLICY);
+}
+
+function ensureCandidateQuality(row) {
+  var quality = evaluateCandidateQuality(row, OPTIMIZER_QUALITY_POLICY);
+  row.qualityStatus = quality.qualityStatus;
+  row.isValid = quality.isValid;
+  row.valid = quality.isValid;
+  row.scorePenalty = quality.scorePenalty;
+  row.rejectionReasons = quality.rejectionReasons;
+  row.qualityWarnings = quality.warnings;
+  row.qualityMetrics = quality.qualityMetrics;
+  return row;
+}
+
+function evaluateCandidateQuality(row, policy) {
+  policy = Object.assign({}, OPTIMIZER_QUALITY_POLICY, policy || {});
+  var train = row.train || {};
+  var test = row.test || {};
+  var hasFull = row.full && Object.keys(row.full).length;
+  var full = hasFull ? row.full : Object.assign({}, test, {
+    trades: Number(train.trades || 0) + Number(test.trades || 0),
+    maxDrawdown: Math.max(Number(train.maxDrawdown || 0), Number(test.maxDrawdown || 0)),
+    totalReturn: Number(train.totalReturn || 0) + Number(test.totalReturn || 0)
+  });
+  var walkForwardRows = Array.isArray(row.walkForward) ? row.walkForward : [];
+  var metrics = {
+    trainTrades: numberOrNull(train.trades),
+    testTrades: numberOrNull(test.trades),
+    fullTrades: numberOrNull(full.trades),
+    trainReturnPct: numberOrNull(train.totalReturn),
+    testReturnPct: numberOrNull(test.totalReturn),
+    fullReturnPct: numberOrNull(full.totalReturn),
+    testProfitFactor: numberOrNull(test.profitFactor),
+    fullProfitFactor: numberOrNull(full.profitFactor),
+    testMaxDrawdownPct: numberOrNull(test.maxDrawdown),
+    fullMaxDrawdownPct: numberOrNull(full.maxDrawdown),
+    trainTestReturnGapPct: Math.abs(Number(train.totalReturn || 0) - Number(test.totalReturn || 0)),
+    negativeWalkForwardFoldRatio: negativeWalkForwardFoldRatio(walkForwardRows)
+  };
+  var hardReasons = [];
+  var warnings = [];
+
+  if (missingCoreMetrics(metrics)) hardReasons.push(reason("missing_metrics"));
+  if ((Number(metrics.trainTrades || 0) + Number(metrics.testTrades || 0) + Number(metrics.fullTrades || 0)) === 0) {
+    hardReasons.push(reason("zero_trades"));
+  }
+  if (row.zeroTradeDiagnostics) {
+    hardReasons.push(reason("zero_trade_diagnostics"));
+  }
+  if (Number(metrics.testTrades || 0) < policy.minTestTrades) {
+    hardReasons.push(reason("too_few_test_trades"));
+  }
+  if (Number(metrics.fullTrades || 0) < policy.minFullTrades) {
+    hardReasons.push(reason("too_few_full_trades"));
+  }
+  if (Number(metrics.testProfitFactor || 0) <= 1) {
+    hardReasons.push(reason("test_profit_factor_below_min"));
+  } else if (Number(metrics.testProfitFactor || 0) < policy.minProfitFactor) {
+    warnings.push(reason("test_profit_factor_below_min"));
+  }
+  if (Number(metrics.fullProfitFactor || 0) <= 1) {
+    hardReasons.push(reason("full_profit_factor_below_min"));
+  } else if (Number(metrics.fullProfitFactor || 0) < policy.minProfitFactor) {
+    warnings.push(reason("full_profit_factor_below_min"));
+  }
+  if (Number(metrics.testReturnPct || 0) < policy.minTestReturnPct) {
+    hardReasons.push(reason("negative_test_return"));
+  }
+  if (Math.max(Number(metrics.testMaxDrawdownPct || 0), Number(metrics.fullMaxDrawdownPct || 0)) > policy.maxDrawdownPct) {
+    hardReasons.push(reason("high_drawdown"));
+  }
+  if (metrics.trainTestReturnGapPct > policy.maxTrainTestReturnGapPct) {
+    hardReasons.push(reason("train_test_overfit_gap"));
+  }
+  if (Number(metrics.trainReturnPct || 0) > 0 && Number(metrics.testReturnPct || 0) <= 0) {
+    hardReasons.push(reason("train_only_success_test_failure"));
+  }
+  if (metrics.negativeWalkForwardFoldRatio !== null && metrics.negativeWalkForwardFoldRatio > policy.maxNegativeWalkForwardFoldRatio) {
+    hardReasons.push(reason("unstable_walk_forward"));
+  }
+  if (row.valid === false && !hardReasons.length) {
+    warnings.push(reason("invalid_candidate"));
+  }
+
+  hardReasons = uniqueReasons(hardReasons);
+  warnings = uniqueReasons(warnings.filter(function (item) {
+    return !hardReasons.some(function (reasonItem) { return reasonItem.code === item.code; });
+  }));
+  var status = hardReasons.length ? "FAIL" : (warnings.length ? "WARN" : "PASS");
+  return {
+    qualityStatus: status,
+    isValid: status !== "FAIL",
+    scorePenalty: status === "FAIL" ? 100 + hardReasons.length * 5 : warnings.length * 5,
+    rejectionReasons: hardReasons,
+    warnings: warnings,
+    qualityMetrics: metrics
+  };
+}
+
+function acceptableOptimizerRows(rows) {
+  var passRows = rows.filter(function (row) { return row.qualityStatus === "PASS"; });
+  if (passRows.length) return passRows;
+  return rows.filter(function (row) { return row.qualityStatus === "WARN"; });
+}
+
+function buildQualitySummary(rows) {
+  var counts = {};
+  rows.forEach(function (row) {
+    counts[row.qualityStatus || "FAIL"] = (counts[row.qualityStatus || "FAIL"] || 0) + 1;
+  });
+  var reasonCounts = {};
+  rows.forEach(function (row) {
+    (row.rejectionReasons || []).forEach(function (item) {
+      reasonCounts[item.code || String(item)] = (reasonCounts[item.code || String(item)] || 0) + 1;
+    });
+  });
+  var topReasons = Object.keys(reasonCounts).map(function (code) {
+    return { reason: code, label: REJECTION_LABELS[code] || code, count: reasonCounts[code] };
+  }).sort(function (a, b) { return b.count - a.count; }).slice(0, 8);
+  var selectedStatus = counts.PASS ? "PASS" : (counts.WARN ? "WARN" : "NONE");
+  var warnings = [];
+  if (selectedStatus === "NONE" && rows.length) warnings.push("No acceptable optimizer candidate found; every candidate failed the quality policy.");
+  if (counts.FAIL) warnings.push(counts.FAIL + " optimizer candidates failed quality filters.");
+  return {
+    totalCandidates: rows.length,
+    passCandidates: counts.PASS || 0,
+    warnCandidates: counts.WARN || 0,
+    failCandidates: counts.FAIL || 0,
+    selectedStatus: selectedStatus,
+    topRejectionReasons: topReasons,
+    warnings: warnings
+  };
+}
+
+function reason(code) {
+  return { code: code, label: REJECTION_LABELS[code] || code };
+}
+
+function uniqueReasons(items) {
+  var seen = {};
+  return items.filter(function (item) {
+    if (seen[item.code]) return false;
+    seen[item.code] = true;
+    return true;
+  });
+}
+
+function numberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  var numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function missingCoreMetrics(metrics) {
+  return metrics.testTrades === null ||
+    metrics.testProfitFactor === null ||
+    metrics.testReturnPct === null ||
+    metrics.testMaxDrawdownPct === null;
+}
+
+function negativeWalkForwardFoldRatio(walkForwardRows) {
+  if (!walkForwardRows.length) return null;
+  var negative = walkForwardRows.filter(function (fold) {
+    var test = fold.test || fold;
+    return Number(test.totalReturn || 0) < 0 || Number(test.profitFactor || 0) <= 1;
+  }).length;
+  return negative / walkForwardRows.length;
 }
 
 function metrics(result) {
@@ -1110,11 +1316,19 @@ function validCandidate(row) {
 
 function rankResults(rows) {
   return rows.sort(function (a, b) {
-    return (b.score - a.score) ||
+    return (qualitySortValue(b) - qualitySortValue(a)) ||
+      (b.score - a.score) ||
       (b.test.profitFactor - a.test.profitFactor) ||
       (b.test.totalReturn - a.test.totalReturn) ||
       (b.drawdownAdjustedReturn - a.drawdownAdjustedReturn);
   });
+}
+
+function qualitySortValue(row) {
+  if (row.qualityStatus === "PASS") return 3;
+  if (row.qualityStatus === "WARN") return 2;
+  if (row.qualityStatus === "FAIL") return 1;
+  return 0;
 }
 
 function buildSummary(rows, allRows, validRows) {
@@ -1218,12 +1432,14 @@ function suggestedGridAction(reason) {
   return "Run a single backtest diagnosis for this strategy and market before widening the grid.";
 }
 
-function optimizerRunWarnings(gridMetadata, zeroTradeSummary, allZero) {
+function optimizerRunWarnings(gridMetadata, zeroTradeSummary, allZero, qualitySummary) {
   var warnings = [];
   if (gridMetadata.sampled) warnings.push("Optimizer grid was deterministically sampled/truncated to stay within max-combos.");
   if (gridMetadata.fallbackUsed) warnings.push("Fallback diagnostic grid was used: " + (gridMetadata.fallbackReason || "initial grid was too restrictive."));
   if (allZero) warnings.push("Every tested optimizer candidate produced zero trades. Do not treat this as a successful optimization.");
   if (zeroTradeSummary && zeroTradeSummary.zeroTradeCandidates) warnings.push(zeroTradeSummary.suggestedGridAction);
+  if (qualitySummary && qualitySummary.selectedStatus === "NONE") warnings.push("No acceptable optimizer candidate found after quality filtering.");
+  if (qualitySummary && Array.isArray(qualitySummary.warnings)) warnings = warnings.concat(qualitySummary.warnings);
   return warnings.filter(Boolean);
 }
 
@@ -1255,6 +1471,8 @@ module.exports = {
   expandGrid: expandGrid,
   splitCandles: splitCandles,
   walkForward: walkForward,
+  optimizerQualityPolicy: optimizerQualityPolicy,
+  evaluateCandidateQuality: evaluateCandidateQuality,
   parseRanges: parseRanges,
   validCombo: validCombo,
   validCandidate: validCandidate,
