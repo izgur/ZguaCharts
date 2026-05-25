@@ -20,6 +20,7 @@ from data_source import (
     fetch_candles,
     fetch_historical_candles,
     inspect_all_bybit_cache,
+    parse_period_to_days,
     validate_bybit_symbol,
 )
 from indicators import available_indicators, build_indicator_payload
@@ -196,6 +197,7 @@ def backtest():
 
     try:
         payload = run_shared_backtest_engine(source, symbol, timeframe, period, preset, fee_pct, slippage_pct, limit, debug, allow_shorts)
+        payload = normalize_backtest_response(payload, source, symbol, timeframe, period, preset, fee_pct, slippage_pct)
         payload.setdefault("diagnostics", {})
         overlay_diag = overlay_diagnostics_from_payload(payload)
         payload["diagnostics"]["overlay_rendering"] = {
@@ -2895,6 +2897,126 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["diagnostics"].setdefault("warnings", [])
     payload["diagnostics"]["warnings"].extend(historical_diag.get("warnings", []))
     return payload
+
+
+def normalize_backtest_response(
+    payload: dict,
+    source: str,
+    symbol: str,
+    timeframe: str,
+    period: str,
+    preset: str,
+    fee_pct: float,
+    slippage_pct: float,
+) -> dict:
+    """Normalize diagnostics so UI rendering does not depend on engine variants."""
+    payload = dict(payload or {})
+    diagnostics = dict(payload.get("diagnostics") or {})
+    coverage = dict(diagnostics.get("historical_coverage") or payload.get("historical_coverage") or {})
+    candles_loaded = (
+        payload.get("candlesLoaded")
+        or payload.get("candles_loaded")
+        or diagnostics.get("candlesLoaded")
+        or diagnostics.get("number_of_candles_loaded")
+        or coverage.get("returned_candles")
+        or diagnostics.get("actual_returned_candles")
+        or 0
+    )
+    first_time = (
+        payload.get("firstCandleTime")
+        or payload.get("first_candle_time")
+        or diagnostics.get("firstCandleTime")
+        or diagnostics.get("first_candle_time")
+        or coverage.get("first_candle_time")
+    )
+    last_time = (
+        payload.get("lastCandleTime")
+        or payload.get("last_candle_time")
+        or diagnostics.get("lastCandleTime")
+        or diagnostics.get("last_candle_time")
+        or coverage.get("last_candle_time")
+    )
+    actual_days = diagnostics.get("actual_days_returned")
+    if actual_days is None:
+        actual_days = coverage.get("approximate_days_returned")
+    if actual_days is None and first_time and last_time:
+        try:
+            actual_days = round((int(last_time) - int(first_time)) / 86400, 2)
+        except (TypeError, ValueError):
+            actual_days = None
+
+    strategy = payload.get("strategy") or payload.get("preset") or preset
+    requested_period = coverage.get("requested_period") or diagnostics.get("requested_period") or period
+    fee_pct = safe_float(fee_pct, 0)
+    slippage_pct = safe_float(slippage_pct, 0)
+    warnings = list(diagnostics.get("warnings") or [])
+    requested_days = parse_period_to_days(requested_period)
+    if requested_days is not None and actual_days is not None:
+        if actual_days > requested_days * 1.25 or actual_days < requested_days * 0.75:
+            warnings.append(
+                f"Selected period was {requested_period}, but returned candles span approximately {actual_days}d. Check limit/period settings."
+            )
+
+    diagnostics.update({
+        "source": source,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "interval": timeframe,
+        "period": period,
+        "candlesLoaded": int(candles_loaded or 0),
+        "number_of_candles_loaded": int(candles_loaded or 0),
+        "firstCandleTime": first_time,
+        "lastCandleTime": last_time,
+        "first_candle_time": first_time,
+        "last_candle_time": last_time,
+        "actualDays": actual_days,
+        "actual_days_returned": actual_days,
+        "feePct": fee_pct,
+        "slippagePct": slippage_pct,
+        "fee_pct_per_side": fee_pct,
+        "slippage_pct_per_side": slippage_pct,
+        "preset": preset,
+        "strategy": strategy,
+        "historicalCoverage": coverage,
+        "historical_coverage": coverage,
+        "warnings": dedupe_list(warnings),
+    })
+    if first_time and not diagnostics.get("first_candle_date"):
+        diagnostics["first_candle_date"] = datetime.fromtimestamp(int(first_time), timezone.utc).isoformat()
+    if last_time and not diagnostics.get("last_candle_date"):
+        diagnostics["last_candle_date"] = datetime.fromtimestamp(int(last_time), timezone.utc).isoformat()
+
+    payload.update({
+        "source": source,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "period": period,
+        "preset": payload.get("preset") or strategy,
+        "preset_id": payload.get("preset_id") or preset,
+        "strategy": strategy,
+        "fee_pct": fee_pct,
+        "slippage_pct": slippage_pct,
+        "candlesLoaded": int(candles_loaded or 0),
+        "firstCandleTime": first_time,
+        "lastCandleTime": last_time,
+        "actualDays": actual_days,
+        "historicalCoverage": coverage,
+        "historical_coverage": coverage,
+        "diagnostics": diagnostics,
+    })
+    return payload
+
+
+def dedupe_list(items: list) -> list:
+    seen = set()
+    output = []
+    for item in items:
+        key = json.dumps(item, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
 
 
 def build_signal_timeframe_matrix(source: str, symbol: str, selected_timeframe: str, limit: int) -> list[dict]:

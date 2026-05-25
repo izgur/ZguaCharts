@@ -2021,6 +2021,13 @@ function closeBacktestModal() {
 }
 
 function renderBacktestResults(payload) {
+  const diagnostics = normalizedBacktestDiagnostics(payload);
+  const coverage = diagnostics.historicalCoverage || diagnostics.historical_coverage || {};
+  const overlayDiagnostics = diagnostics.overlay_rendering || payload.overlayDiagnostics || {};
+  const warningsList = [
+    ...(diagnostics.warnings || []),
+    ...coverageWarnings(payload, diagnostics, coverage)
+  ];
   const metrics = [
     ["Total return", `${formatSigned(payload.total_return_pct)}%`],
     ["Trades", payload.number_of_trades],
@@ -2032,53 +2039,55 @@ function renderBacktestResults(payload) {
     ["Avg bars held", payload.average_bars_held],
     ["Period", payload.period],
   ];
-  const diagnostics = payload.diagnostics || {};
-  const coverage = diagnostics.historical_coverage || {};
   const diagnosticMetrics = [
-    ["Preset", payload.preset],
-    ["First candle", formatIsoDate(diagnostics.first_candle_date)],
-    ["Last candle", formatIsoDate(diagnostics.last_candle_date)],
-    ["Candles loaded", diagnostics.number_of_candles_loaded],
+    ["Preset", diagnostics.preset],
+    ["Strategy", diagnostics.strategy],
+    ["Source", diagnostics.source],
+    ["Symbol", diagnostics.symbol],
+    ["First candle", formatBacktestTime(diagnostics.firstCandleTime || diagnostics.first_candle_time || diagnostics.first_candle_date)],
+    ["Last candle", formatBacktestTime(diagnostics.lastCandleTime || diagnostics.last_candle_time || diagnostics.last_candle_date)],
+    ["Candles loaded", diagnostics.candlesLoaded],
     ["Timeframe", diagnostics.timeframe],
-    ["Actual days", diagnostics.actual_days_returned],
+    ["Actual days", diagnostics.actualDays],
     ["Reliability", diagnostics.backtest_reliability],
     ["Warmup skipped", diagnostics.warmup_candles_skipped],
     ["Warmup %", `${diagnostics.warmup_pct ?? 0}%`],
     ["Average ATR %", diagnostics.average_atr_pct],
     ["Average volume", formatCompact(diagnostics.average_volume)],
     ["Trades/day", diagnostics.trades_per_day],
-    ["Fee/side", `${diagnostics.fee_pct_per_side ?? payload.fee_pct}%`],
-    ["Slippage/side", `${diagnostics.slippage_pct_per_side ?? payload.slippage_pct}%`],
+    ["Fee/side", `${formatNumber(diagnostics.feePct ?? diagnostics.fee_pct_per_side ?? payload.fee_pct ?? 0, 4)}%`],
+    ["Slippage/side", `${formatNumber(diagnostics.slippagePct ?? diagnostics.slippage_pct_per_side ?? payload.slippage_pct ?? 0, 4)}%`],
     ["Raw score", diagnostics.raw_latest_score],
     ["Smoothed score", diagnostics.smoothed_latest_score],
   ];
   const coverageMetrics = [
-    ["Requested", coverage.requested_period || payload.period],
-    ["Requested limit", coverage.requested_limit ?? "-"],
-    ["Required candles", coverage.period_required_candles ?? "-"],
-    ["Effective limit", coverage.effective_limit ?? "-"],
-    ["Provider cap", coverage.provider_max_candles ?? "-"],
-    ["Returned", coverage.returned_candles ?? diagnostics.actual_returned_candles ?? diagnostics.number_of_candles_loaded],
-    ["Coverage", coverage.approximate_days_returned !== undefined ? `~${coverage.approximate_days_returned}d` : "-"],
-    ["First candle", formatDateTime(coverage.first_candle_time || diagnostics.first_candle_time)],
-    ["Last candle", formatDateTime(coverage.last_candle_time || diagnostics.last_candle_time)],
+    ["Requested period", coverage.requested_period || diagnostics.period || payload.period],
+    ["Requested limit", coverage.requested_limit],
+    ["Required candles", coverage.period_required_candles],
+    ["Effective limit", coverage.effective_limit],
+    ["Provider cap", coverage.provider_max_candles],
+    ["Returned candles", coverage.returned_candles ?? diagnostics.actual_returned_candles ?? diagnostics.candlesLoaded],
+    ["Coverage days", coverage.approximate_days_returned !== undefined ? `~${coverage.approximate_days_returned}d` : undefined],
+    ["First candle", formatBacktestTime(coverage.first_candle_time || diagnostics.firstCandleTime)],
+    ["Last candle", formatBacktestTime(coverage.last_candle_time || diagnostics.lastCandleTime)],
     ["Full period", coverage.full_period_covered === undefined ? "-" : (coverage.full_period_covered ? "yes" : "no")],
   ];
-  const overlayDiagnostics = diagnostics.overlay_rendering || payload.overlayDiagnostics || {};
   const overlayMetrics = [
     ["Chart candles", overlayDiagnostics.chartCandlesCount],
-    ["Backtest candles", overlayDiagnostics.backtestCandlesCount],
-    ["First chart candle", formatDateTime(overlayDiagnostics.firstChartCandleTime)],
-    ["Last chart candle", formatDateTime(overlayDiagnostics.lastChartCandleTime)],
-    ["First overlay", formatDateTime(overlayDiagnostics.firstOverlayTime)],
-    ["Last overlay", formatDateTime(overlayDiagnostics.lastOverlayTime)],
+    ["Backtest candles", overlayDiagnostics.backtestCandlesCount ?? diagnostics.candlesLoaded],
+    ["First chart candle", formatBacktestTime(overlayDiagnostics.firstChartCandleTime)],
+    ["Last chart candle", formatBacktestTime(overlayDiagnostics.lastChartCandleTime)],
+    ["First backtest candle", formatBacktestTime(diagnostics.firstCandleTime)],
+    ["Last backtest candle", formatBacktestTime(diagnostics.lastCandleTime)],
+    ["First overlay", formatBacktestTime(overlayDiagnostics.firstOverlayTime)],
+    ["Last overlay", formatBacktestTime(overlayDiagnostics.lastOverlayTime)],
     ["Dropped bars", overlayDiagnostics.droppedBarsReason],
   ];
   const skipped = diagnostics.skipped_trade_reasons || {};
   const skippedRows = Object.entries(skipped).sort((a, b) => b[1] - a[1]).map(([reason, count]) => `
     <tr><td>${formatReason(reason)}</td><td>${count}</td></tr>
   `).join("");
-  const warnings = (diagnostics.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const warnings = Array.from(new Set(warningsList.filter(Boolean))).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
   const trades = normalizedTrades(payload);
   const rows = trades.map((trade) => `
     <tr>
@@ -2098,15 +2107,15 @@ function renderBacktestResults(payload) {
     </div>
     <h3 class="modal-section-title">Diagnostics</h3>
     <div class="metric-grid diagnostics-grid">
-      ${diagnosticMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? "-"}</strong></div>`).join("")}
+      ${diagnosticMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
     </div>
     <h3 class="modal-section-title">History Coverage</h3>
     <div class="metric-grid diagnostics-grid">
-      ${coverageMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? "-"}</strong></div>`).join("")}
+      ${coverageMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
     </div>
     <h3 class="modal-section-title">Data Diagnostics</h3>
     <div class="metric-grid diagnostics-grid">
-      ${overlayMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? "-"}</strong></div>`).join("")}
+      ${overlayMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
     </div>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
     <h3 class="modal-section-title">Skipped Entry Reasons</h3>
@@ -2189,6 +2198,78 @@ function renderOptimizationSummary(payload) {
       <tbody>${topRows}</tbody>
     </table>
   `;
+}
+
+function normalizedBacktestDiagnostics(payload) {
+  const diagnostics = { ...(payload.diagnostics || {}) };
+  const coverage = diagnostics.historicalCoverage || diagnostics.historical_coverage || payload.historicalCoverage || payload.historical_coverage || {};
+  const candlesLoaded = diagnostics.candlesLoaded
+    ?? diagnostics.number_of_candles_loaded
+    ?? payload.candlesLoaded
+    ?? coverage.returned_candles
+    ?? diagnostics.actual_returned_candles;
+  const firstCandleTime = diagnostics.firstCandleTime
+    ?? diagnostics.first_candle_time
+    ?? payload.firstCandleTime
+    ?? coverage.first_candle_time;
+  const lastCandleTime = diagnostics.lastCandleTime
+    ?? diagnostics.last_candle_time
+    ?? payload.lastCandleTime
+    ?? coverage.last_candle_time;
+  const actualDays = diagnostics.actualDays
+    ?? diagnostics.actual_days_returned
+    ?? payload.actualDays
+    ?? coverage.approximate_days_returned;
+  return {
+    ...diagnostics,
+    source: diagnostics.source || payload.source || "N/A",
+    symbol: diagnostics.symbol || payload.symbol || "N/A",
+    timeframe: diagnostics.timeframe || diagnostics.interval || payload.timeframe || "N/A",
+    period: diagnostics.period || payload.period || "N/A",
+    candlesLoaded,
+    number_of_candles_loaded: candlesLoaded,
+    firstCandleTime,
+    lastCandleTime,
+    actualDays,
+    feePct: diagnostics.feePct ?? diagnostics.fee_pct_per_side ?? payload.fee_pct ?? 0,
+    slippagePct: diagnostics.slippagePct ?? diagnostics.slippage_pct_per_side ?? payload.slippage_pct ?? 0,
+    preset: diagnostics.preset || payload.preset || payload.preset_id || "N/A",
+    strategy: diagnostics.strategy || payload.strategy || payload.preset || "N/A",
+    historicalCoverage: coverage,
+    historical_coverage: coverage
+  };
+}
+
+function coverageWarnings(payload, diagnostics, coverage) {
+  const warnings = [];
+  const selectedDays = parsePeriodDays(diagnostics.period || payload.period);
+  const actualDays = Number(diagnostics.actualDays ?? coverage.approximate_days_returned);
+  if (selectedDays && Number.isFinite(actualDays) && actualDays > 0) {
+    if (actualDays > selectedDays * 1.25 || actualDays < selectedDays * 0.75) {
+      warnings.push(`Selected period is ${diagnostics.period || payload.period}, but returned history spans about ${actualDays} days.`);
+    }
+  }
+  if (coverage.period_capped) warnings.push("Selected history was capped by the provider/cache candle limit.");
+  (coverage.warnings || []).forEach((warning) => warnings.push(warning));
+  return warnings;
+}
+
+function parsePeriodDays(period) {
+  const text = String(period || "").trim().toLowerCase();
+  if (!text || text === "max" || text === "all") return null;
+  const number = Number.parseFloat(text);
+  if (!Number.isFinite(number)) return null;
+  if (text.endsWith("w")) return number * 7;
+  if (text.endsWith("mo")) return number * 30;
+  if (text.endsWith("m")) return number * 30;
+  if (text.endsWith("y")) return number * 365;
+  return number;
+}
+
+function displayValue(value) {
+  if (value === undefined || value === null || value === "") return "N/A";
+  if (Number.isNaN(value)) return "N/A";
+  return escapeHtml(value);
 }
 
 function renderAnalysisPage() {
@@ -3318,6 +3399,16 @@ function renderSettingsPage() {
 function formatIsoDate(value) {
   if (!value) return "-";
   return new Date(value).toLocaleString();
+}
+
+function formatBacktestTime(value) {
+  if (!value) return "N/A";
+  if (typeof value === "number" || /^\d+$/.test(String(value))) {
+    return formatDateTime(Number(value));
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "N/A";
+  return date.toLocaleString();
 }
 
 function renderDataDiagnostics(pane) {
