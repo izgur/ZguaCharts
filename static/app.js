@@ -2216,11 +2216,15 @@ function renderOpsPage() {
     opsInitialized = true;
   }
   loadSystemHealth(true);
+  loadMarketCacheStatus();
 }
 
 function setupOpsControls() {
   document.querySelector("#ops-refresh-full")?.addEventListener("click", () => loadSystemHealth(false));
   document.querySelector("#ops-refresh-quick")?.addEventListener("click", () => loadSystemHealth(true));
+  document.querySelector("#cache-validate-symbols")?.addEventListener("click", validateBybitSymbols);
+  document.querySelector("#cache-refresh-status")?.addEventListener("click", loadMarketCacheStatus);
+  document.querySelector("#cache-prefetch-selected")?.addEventListener("click", prefetchMarketCache);
 }
 
 async function loadSystemHealth(quick = true) {
@@ -2266,6 +2270,147 @@ function renderSystemHealth(payload, quick) {
     </tr>
   `).join("") || `<tr><td colspan="4">No checks returned.</td></tr>`;
   details.innerHTML = renderOpsDetails(checks);
+}
+
+function cacheParams() {
+  return {
+    symbols: document.querySelector("#cache-symbols")?.value || "BTCUSDT,ETHUSDT,SOLUSDT",
+    timeframes: document.querySelector("#cache-timeframes")?.value || "15m,1h,4h",
+    period: document.querySelector("#cache-period")?.value || "max",
+    limit: document.querySelector("#cache-limit")?.value || "50000",
+  };
+}
+
+async function validateBybitSymbols() {
+  const host = document.querySelector("#cache-symbol-validation");
+  const status = document.querySelector("#cache-status");
+  const params = cacheParams();
+  if (status) status.textContent = "Validating Bybit symbols...";
+  try {
+    const payload = await apiGet(`/api/market/bybit/symbols?${new URLSearchParams({ symbols: params.symbols })}`);
+    if (host) host.innerHTML = renderBybitValidation(payload);
+    if (status) status.textContent = `Validation complete. Invalid: ${(payload.invalidSymbols || []).length}.`;
+  } catch (error) {
+    if (status) status.textContent = `Symbol validation failed: ${error.message}`;
+  }
+}
+
+async function loadMarketCacheStatus() {
+  const status = document.querySelector("#cache-status");
+  const summary = document.querySelector("#cache-summary");
+  const body = document.querySelector("#cache-rows-body");
+  const params = cacheParams();
+  if (!summary || !body) return;
+  if (status) status.textContent = "Loading market cache status...";
+  try {
+    const payload = await apiGet(`/api/market/cache/status?${new URLSearchParams({ source: "bybit", symbols: params.symbols, timeframes: params.timeframes })}`);
+    renderMarketCacheStatus(payload);
+    if (status) status.textContent = "Market cache status loaded.";
+  } catch (error) {
+    if (status) status.textContent = `Cache status failed: ${error.message}`;
+    body.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+async function prefetchMarketCache() {
+  const status = document.querySelector("#cache-status");
+  const params = cacheParams();
+  if (status) status.textContent = "Prefetching selected history. This can take a while...";
+  try {
+    const payload = await apiPost("/api/market/cache/prefetch", {
+      source: "bybit",
+      symbols: csvStringValues(params.symbols),
+      timeframes: csvStringValues(params.timeframes),
+      period: params.period,
+      limit: Number(params.limit || 50000),
+      force: false,
+    });
+    renderPrefetchResult(payload);
+    await loadMarketCacheStatus();
+    if (status) status.textContent = `Prefetch complete. OK: ${payload.summary?.ok || 0}, errors: ${payload.summary?.errors || 0}.`;
+  } catch (error) {
+    if (status) status.textContent = `Prefetch failed: ${error.message}`;
+  }
+}
+
+function csvStringValues(value) {
+  return String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function renderBybitValidation(payload) {
+  const aliases = payload.suggestedAliases || {};
+  return `
+    <h3 class="modal-section-title">Bybit Symbol Validation</h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Configured</span><strong>${(payload.configuredSymbols || []).length}</strong></div>
+      <div class="metric"><span>Valid</span><strong class="positive">${(payload.validSymbols || []).length}</strong></div>
+      <div class="metric"><span>Invalid</span><strong class="${(payload.invalidSymbols || []).length ? "negative" : "positive"}">${(payload.invalidSymbols || []).length}</strong></div>
+      <div class="metric"><span>Aliases</span><strong>${Object.keys(aliases).length}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Invalid</th><td>${escapeHtml((payload.invalidSymbols || []).join(", ") || "-")}</td></tr>
+        <tr><th>Aliases</th><td>${escapeHtml(Object.entries(aliases).map(([from, to]) => `${from} -> ${to}`).join(", ") || "-")}</td></tr>
+      </tbody>
+    </table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+function renderMarketCacheStatus(payload) {
+  const summary = document.querySelector("#cache-summary");
+  const body = document.querySelector("#cache-rows-body");
+  if (!summary || !body) return;
+  const item = payload.summary || {};
+  summary.innerHTML = `
+    <div class="metric"><span>Symbols</span><strong>${item.symbols || 0}</strong></div>
+    <div class="metric"><span>Timeframes</span><strong>${item.timeframes || 0}</strong></div>
+    <div class="metric"><span>Cached candles</span><strong>${formatCompact(item.totalCachedCandles || 0)}</strong></div>
+    <div class="metric"><span>Missing</span><strong>${item.missingPairs || 0}</strong></div>
+    <div class="metric"><span>Partial</span><strong>${item.partialPairs || 0}</strong></div>
+    <div class="metric"><span>Stale</span><strong>${item.stalePairs || 0}</strong></div>
+  `;
+  body.innerHTML = (payload.rows || []).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.symbol || "-")}</td>
+      <td>${escapeHtml(row.timeframe || "-")}</td>
+      <td class="${row.status === "OK" ? "positive" : row.status === "MISSING" ? "negative" : "neutral"}">${escapeHtml(row.status || "-")}</td>
+      <td>${row.cachedCandles || 0}</td>
+      <td>${formatNumber(row.approximateDays)}</td>
+      <td>${formatDateTime(row.firstCandleTime)}</td>
+      <td>${formatDateTime(row.lastCandleTime)}</td>
+      <td>${escapeHtml((row.warnings || []).join("; "))}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="8">No cache rows returned.</td></tr>`;
+}
+
+function renderPrefetchResult(payload) {
+  const host = document.querySelector("#cache-symbol-validation");
+  if (!host) return;
+  const rows = (payload.results || []).slice(0, 20).map((item) => `
+    <tr>
+      <td>${escapeHtml(item.symbol || "-")}</td>
+      <td>${escapeHtml(item.timeframe || "-")}</td>
+      <td class="${item.status === "OK" ? "positive" : "negative"}">${escapeHtml(item.status || "-")}</td>
+      <td>${item.candles || 0}</td>
+      <td>${escapeHtml(item.error || (item.warnings || []).join("; ") || "-")}</td>
+    </tr>
+  `).join("");
+  host.innerHTML = `
+    <h3 class="modal-section-title">Prefetch Result</h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Pairs</span><strong>${payload.summary?.pairsRequested || 0}</strong></div>
+      <div class="metric"><span>OK</span><strong class="positive">${payload.summary?.ok || 0}</strong></div>
+      <div class="metric"><span>Errors</span><strong class="${payload.summary?.errors ? "negative" : "positive"}">${payload.summary?.errors || 0}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Symbol</th><th>Timeframe</th><th>Status</th><th>Candles</th><th>Message</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="5">No prefetch rows returned.</td></tr>`}</tbody>
+    </table>
+  `;
 }
 
 function healthTone(status) {

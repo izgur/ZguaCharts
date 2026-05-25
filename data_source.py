@@ -14,6 +14,7 @@ import yfinance as yf
 
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_INSTRUMENTS_URL = "https://api.bybit.com/v5/market/instruments-info"
 BYBIT_REQUEST_LIMIT = 1000
 BYBIT_MAX_REQUESTS_IN_FLIGHT = 2
 BYBIT_MIN_REQUEST_DELAY_SECONDS = 0.18
@@ -38,6 +39,11 @@ VISIBLE_CHART_LIMITS = {
 
 _bybit_cache = {}
 _bybit_cache_lock = threading.Lock()
+_bybit_instruments_cache = {}
+_bybit_instruments_cache_time = 0.0
+BYBIT_SYMBOL_ALIASES = {
+    "PEPEUSDT": "1000PEPEUSDT",
+}
 
 
 class BybitRateLimiter:
@@ -92,6 +98,16 @@ def safe_int(value) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def safe_symbol_list(symbols: list[str] | str | None, fallback: list[str]) -> list[str]:
+    if isinstance(symbols, str):
+        items = [item.strip().upper() for item in symbols.split(",") if item.strip()]
+    elif isinstance(symbols, list):
+        items = [str(item).strip().upper() for item in symbols if str(item).strip()]
+    else:
+        items = []
+    return items or fallback
 
 DATA_SOURCE_CONFIG = {
     "sources": {
@@ -210,6 +226,92 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
     }
 
 
+def fetch_bybit_instruments(category: str = "linear") -> list[dict]:
+    global _bybit_instruments_cache_time
+    category = category or "linear"
+    now = time.time()
+    cached = _bybit_instruments_cache.get(category)
+    if cached is not None and now - _bybit_instruments_cache_time < 3600:
+        return cached
+
+    rows = []
+    cursor = None
+    for _page in range(20):
+        params = {"category": category, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        response = None
+        _bybit_rate_limiter.acquire()
+        try:
+            response = requests.get(BYBIT_INSTRUMENTS_URL, params=params, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+        finally:
+            _bybit_rate_limiter.release(response)
+        if payload.get("retCode") != 0:
+            raise ValueError(payload.get("retMsg", "Bybit instruments request failed"))
+        result = payload.get("result", {})
+        rows.extend(result.get("list", []) or [])
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+    _bybit_instruments_cache[category] = rows
+    _bybit_instruments_cache_time = now
+    return rows
+
+
+def get_valid_bybit_symbols(category: str = "linear") -> list[str]:
+    symbols = []
+    for item in fetch_bybit_instruments(category):
+        symbol = str(item.get("symbol") or "").upper()
+        status = str(item.get("status") or "").lower()
+        if symbol and status in {"trading", ""}:
+            symbols.append(symbol)
+    return sorted(set(symbols))
+
+
+def validate_bybit_symbol(symbol: str, valid_symbols: set[str] | None = None) -> dict:
+    requested = str(symbol or "").strip().upper()
+    valid = valid_symbols if valid_symbols is not None else set(get_valid_bybit_symbols())
+    alias = BYBIT_SYMBOL_ALIASES.get(requested)
+    if requested in valid:
+        return {"symbol": requested, "valid": True, "alias": None, "message": "Symbol is valid."}
+    if alias and alias in valid:
+        return {"symbol": requested, "valid": False, "alias": alias, "message": f"{requested} is not listed; use {alias}."}
+    return {"symbol": requested, "valid": False, "alias": alias if alias else None, "message": "Symbol is not listed by Bybit linear instruments."}
+
+
+def bybit_symbol_validation_payload(symbols: list[str] | None = None) -> dict:
+    configured = symbols or DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"]
+    warnings = []
+    try:
+        valid_symbols = set(get_valid_bybit_symbols())
+    except Exception as exc:
+        aliases = {symbol: BYBIT_SYMBOL_ALIASES[symbol] for symbol in configured if symbol in BYBIT_SYMBOL_ALIASES}
+        return {
+            "configuredSymbols": configured,
+            "validSymbols": [],
+            "invalidSymbols": [],
+            "suggestedAliases": aliases,
+            "warnings": [f"Could not fetch Bybit instruments: {exc}"],
+        }
+    validations = [validate_bybit_symbol(symbol, valid_symbols) for symbol in configured]
+    valid_configured = [item["symbol"] for item in validations if item["valid"]]
+    invalid = [item["symbol"] for item in validations if not item["valid"]]
+    aliases = {item["symbol"]: item["alias"] for item in validations if item.get("alias") and not item["valid"]}
+    if aliases:
+        current = DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"]
+        DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"] = [aliases.get(symbol, symbol) for symbol in current]
+        warnings.append("Configured Bybit symbols were updated in memory where confirmed aliases exist.")
+    return {
+        "configuredSymbols": configured,
+        "validSymbols": valid_configured,
+        "invalidSymbols": invalid,
+        "suggestedAliases": aliases,
+        "warnings": warnings,
+    }
+
+
 def parse_period_to_days(period: str | None) -> float | None:
     if not period:
         return None
@@ -325,6 +427,63 @@ def bybit_visible_chart_cap(visible_charts: int | None) -> int:
 def clear_bybit_cache() -> None:
     with _bybit_cache_lock:
         _bybit_cache.clear()
+
+
+def inspect_bybit_cache(symbol: str, timeframe: str, partial_threshold: int = 1000) -> dict:
+    symbol = str(symbol or "").upper()
+    cached = load_bybit_disk_cache(symbol, timeframe)
+    with _bybit_cache_lock:
+        memory_cached = list(_bybit_cache.get((symbol, timeframe), []))
+    if len(memory_cached) > len(cached):
+        cached = memory_cached
+    warnings = []
+    cache_file = bybit_disk_cache_path(symbol, timeframe)
+    stale_details = {}
+    stale = bybit_cache_is_stale(cached, timeframe, stale_details)
+    count = len(cached)
+    if count == 0:
+        status = "MISSING"
+        warnings.append("No cached candles found.")
+    elif stale:
+        status = "STALE"
+        warnings.append("Cached latest candle is stale.")
+    elif count < partial_threshold:
+        status = "PARTIAL"
+        warnings.append(f"Cached candles below partial threshold {partial_threshold}.")
+    else:
+        status = "OK"
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "cachedCandles": count,
+        "approximateDays": approximate_days_for_candles(count, timeframe),
+        "firstCandleTime": int(cached[0]["time"]) if cached else None,
+        "lastCandleTime": int(cached[-1]["time"]) if cached else None,
+        "cacheFile": cache_file.name,
+        "status": status,
+        "warnings": warnings,
+        "stale": stale,
+        "latestCachedCandleAgeSeconds": stale_details.get("latest_cached_candle_age_seconds"),
+        "staleThresholdSeconds": stale_details.get("stale_threshold_seconds"),
+    }
+
+
+def inspect_all_bybit_cache(symbols: list[str] | None = None, timeframes: list[str] | None = None) -> dict:
+    symbols = safe_symbol_list(symbols, DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"])
+    timeframes = timeframes or ["15m", "1h", "4h"]
+    rows = [inspect_bybit_cache(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
+    return {
+        "source": "bybit",
+        "summary": {
+            "symbols": len(symbols),
+            "timeframes": len(timeframes),
+            "totalCachedCandles": sum(row["cachedCandles"] for row in rows),
+            "missingPairs": sum(1 for row in rows if row["status"] == "MISSING"),
+            "partialPairs": sum(1 for row in rows if row["status"] == "PARTIAL"),
+            "stalePairs": sum(1 for row in rows if row["status"] == "STALE"),
+        },
+        "rows": rows,
+    }
 
 
 def fetch_bybit_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:

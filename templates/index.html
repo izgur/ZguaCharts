@@ -316,6 +316,46 @@
           </thead>
           <tbody id="ops-checks-body"></tbody>
         </table>
+        <div class="page-heading compact-heading">
+          <div>
+            <h2>Market Data Cache</h2>
+            <p>Recommended for research: prefetch 15m, 1h, 4h first. Avoid 1m for long backtests because 50,000 candles is only about 35 days.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label><span>Symbols</span><input id="cache-symbols" value="BTCUSDT,ETHUSDT,SOLUSDT"></label>
+          <label><span>Timeframes</span><input id="cache-timeframes" value="15m,1h,4h"></label>
+          <label><span>Period</span><input id="cache-period" value="max"></label>
+          <label><span>Limit</span><select id="cache-limit">
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="9000">9000</option>
+            <option value="20000">20000</option>
+            <option value="35000">35000</option>
+            <option value="50000" selected>50000</option>
+          </select></label>
+          <button id="cache-validate-symbols" type="button">Validate Bybit Symbols</button>
+          <button id="cache-refresh-status" type="button">Refresh Cache Status</button>
+          <button id="cache-prefetch-selected" type="button">Prefetch Selected</button>
+        </div>
+        <div id="cache-status" class="pane-status">Market cache tools are idle.</div>
+        <div id="cache-summary" class="metric-grid"></div>
+        <div id="cache-symbol-validation" class="paper-validation-result"></div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Timeframe</th>
+              <th>Status</th>
+              <th>Candles</th>
+              <th>Days</th>
+              <th>First</th>
+              <th>Last</th>
+              <th>Warnings</th>
+            </tr>
+          </thead>
+          <tbody id="cache-rows-body"></tbody>
+        </table>
       </section>
 
       <section id="settings-page" class="route-page settings-page" data-page="settings" hidden>

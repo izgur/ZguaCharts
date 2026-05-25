@@ -50,6 +50,7 @@ Responsibilities:
 - Own automatic learning v1 decisions. Auto-promotion may only write a paper candidate config with `enabled=false`; paper simulation enablement remains manual, auto-enable paper is intentionally blocked, and real trading is not implemented.
 - Own automatic learning decision logs through `/api/learning/decisions` and `/api/learning/decision-summary`; every learning recommendation, scheduled tick, eligibility check, rejection, and auto-promotion must be auditable from backend-owned records.
 - Own ops diagnostics through `/api/system/health` and `/api/system/health/quick`; health checks are read-only, never expose secrets, and must not mutate candidate config, paper state, research memory, or learning settings.
+- Own market-data maintenance through `/api/market/*`; Bybit symbol validation, cache inspection, and historical prefetch are backend-owned and must never run automatically on app startup.
 
 ## Core Strategy / Research Engine
 
@@ -85,6 +86,7 @@ When adding a feature:
 - New auto-promotion rule or eligibility check: backend/core only, and it must not enable paper simulation or place trades.
 - New automatic-learning decision record or audit summary: backend/core only; frontend may render the records but must not invent reasons, scores, checks, or outcomes.
 - New operational diagnostic or health status: backend/core only; frontend may render PASS/WARN/FAIL checks and details returned by the API.
+- New market-data validation, cache-status, or prefetch rule: backend/core only; frontend may trigger explicit actions and render returned status.
 - New UI view: frontend may call APIs and render returned payloads only.
 
 ## Scheduled Learning

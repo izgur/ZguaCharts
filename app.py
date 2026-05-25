@@ -13,7 +13,15 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
-from data_source import DATA_SOURCE_CONFIG, fetch_candles, fetch_historical_candles
+from data_source import (
+    BYBIT_MAX_CACHE_CANDLES,
+    DATA_SOURCE_CONFIG,
+    bybit_symbol_validation_payload,
+    fetch_candles,
+    fetch_historical_candles,
+    inspect_all_bybit_cache,
+    validate_bybit_symbol,
+)
 from indicators import available_indicators, build_indicator_payload
 from signals import build_signal_payload
 from strategy import DEFAULT_PRESET_ID, preset_options
@@ -218,6 +226,98 @@ def optimize():
     except Exception as exc:
         return jsonify({"error": f"Could not run optimizer: {exc}"}), 502
     return jsonify(payload)
+
+
+@app.get("/api/market/bybit/symbols")
+def market_bybit_symbols():
+    symbols_arg = request.args.get("symbols")
+    symbols = parse_csv_arg(symbols_arg, DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"]) if symbols_arg else None
+    return jsonify(bybit_symbol_validation_payload(symbols))
+
+
+@app.get("/api/market/cache/status")
+def market_cache_status():
+    source = request.args.get("source", "bybit")
+    if source != "bybit":
+        return jsonify({"error": "Only Bybit cache inspection is supported for now."}), 400
+    symbols = parse_csv_arg(request.args.get("symbols"), DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"])
+    timeframes = parse_csv_arg(request.args.get("timeframes"), ["15m", "1h", "4h"])
+    return jsonify(inspect_all_bybit_cache(symbols, timeframes))
+
+
+@app.post("/api/market/cache/prefetch")
+def market_cache_prefetch():
+    payload = request.get_json(silent=True) or {}
+    source = payload.get("source", "bybit")
+    if source != "bybit":
+        return jsonify({"error": "Only Bybit prefetch is supported for now."}), 400
+    symbols = parse_csv_arg(payload.get("symbols"), ["BTCUSDT", "ETHUSDT"])
+    timeframes = parse_csv_arg(payload.get("timeframes"), ["1h"])
+    period = payload.get("period", "max")
+    limit = min(int(payload.get("limit", BYBIT_MAX_CACHE_CANDLES)), BYBIT_MAX_CACHE_CANDLES)
+    force = bool(payload.get("force", False))
+    pair_count = len(symbols) * len(timeframes)
+    if pair_count > 20 and not force:
+        return jsonify({"error": f"Prefetch request has {pair_count} pairs; max is 20 unless force=true."}), 400
+
+    validation = bybit_symbol_validation_payload(symbols)
+    aliases = validation.get("suggestedAliases", {})
+    validation_unavailable = bool(validation.get("warnings")) and not validation.get("validSymbols") and not validation.get("invalidSymbols")
+    results = []
+    for symbol in symbols:
+        if validation_unavailable:
+            validation_item = {"symbol": symbol, "valid": True, "alias": aliases.get(symbol), "message": "Bybit validation unavailable; attempting fetch directly."}
+        else:
+            try:
+                validation_item = validate_bybit_symbol(symbol)
+            except Exception as exc:
+                validation_item = {"symbol": symbol, "valid": False, "alias": aliases.get(symbol), "message": f"Could not validate symbol: {exc}"}
+        if not validation_item.get("valid") and not validation_item.get("alias"):
+            for timeframe in timeframes:
+                results.append({
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "status": "ERROR",
+                    "error": validation_item.get("message", "Invalid Bybit symbol."),
+                    "warnings": [],
+                })
+            continue
+        fetch_symbol = validation_item.get("alias") or symbol
+        for timeframe in timeframes:
+            try:
+                historical = fetch_historical_candles("bybit", fetch_symbol, timeframe, period=period, limit=limit)
+                diagnostics = historical.get("diagnostics", {})
+                results.append({
+                    "symbol": symbol,
+                    "resolvedSymbol": fetch_symbol,
+                    "timeframe": timeframe,
+                    "status": "OK",
+                    "candles": len(historical.get("candles", [])),
+                    "diagnostics": diagnostics,
+                    "warnings": (["Bybit symbol validation was unavailable; fetched directly."] if validation_unavailable else []) + diagnostics.get("warnings", []),
+                })
+            except Exception as exc:
+                results.append({
+                    "symbol": symbol,
+                    "resolvedSymbol": fetch_symbol,
+                    "timeframe": timeframe,
+                    "status": "ERROR",
+                    "error": str(exc),
+                    "warnings": [],
+                })
+    return jsonify({
+        "source": "bybit",
+        "period": period,
+        "limit": limit,
+        "validation": validation,
+        "summary": {
+            "pairsRequested": pair_count,
+            "ok": sum(1 for item in results if item["status"] == "OK"),
+            "errors": sum(1 for item in results if item["status"] == "ERROR"),
+            "aliases": aliases,
+        },
+        "results": results,
+    })
 
 
 @app.get("/api/strategy-optimize")
@@ -3092,7 +3192,10 @@ def optimizer_warnings(raw: dict) -> list[str]:
 def parse_csv_arg(value: str | None, fallback: list[str]) -> list[str]:
     if not value:
         return fallback
-    items = [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = [item.strip() for item in str(value).split(",") if item.strip()]
     return items or fallback
 
 
