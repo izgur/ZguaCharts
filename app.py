@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -35,11 +36,9 @@ CONFIG_DIR = Path(app.root_path) / "config"
 LOCAL_CONFIG_DIR = CONFIG_DIR / "local"
 PAPER_CANDIDATE_DEFAULT_PATH = CONFIG_DIR / "paper-candidate.default.json"
 PAPER_CANDIDATE_LOCAL_PATH = LOCAL_CONFIG_DIR / "paper-candidate.json"
-PAPER_CANDIDATE_LEGACY_PATH = CONFIG_DIR / "paper-candidate.json"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
 LEARNING_CONFIG_DEFAULT_PATH = CONFIG_DIR / "learning-runner.default.json"
 LEARNING_CONFIG_LOCAL_PATH = LOCAL_CONFIG_DIR / "learning-runner.json"
-LEARNING_CONFIG_LEGACY_PATH = CONFIG_DIR / "learning-runner.json"
 LEARNING_REPORTS_PATH = Path(app.root_path) / "data" / "learning-reports.json"
 LEARNING_DECISIONS_PATH = Path(app.root_path) / "data" / "learning-decisions.json"
 MAX_RESEARCH_RUNS = 200
@@ -98,6 +97,33 @@ def config():
     ]
     payload["default_strategy_preset"] = DEFAULT_PRESET_ID
     return jsonify(payload)
+
+
+@app.post("/api/config/bootstrap-local")
+def bootstrap_local_config():
+    payload = request.get_json(silent=True) or {}
+    force = bool(payload.get("force")) or request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
+    jobs = [
+        ("paper-candidate", PAPER_CANDIDATE_DEFAULT_PATH, PAPER_CANDIDATE_LOCAL_PATH, {}),
+        ("learning-runner", LEARNING_CONFIG_DEFAULT_PATH, LEARNING_CONFIG_LOCAL_PATH, default_learning_config()),
+    ]
+    results = []
+    for name, default_path, local_path, fallback in jobs:
+        try:
+            if not default_path.exists():
+                results.append({"name": name, "status": "failed", "reason": "default config missing", "path": str(default_path.relative_to(app.root_path))})
+                continue
+            if local_path.exists() and not force:
+                results.append({"name": name, "status": "skipped", "reason": "local config already exists", "path": str(local_path.relative_to(app.root_path))})
+                continue
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(local_path, "w", encoding="utf-8") as handle:
+                json.dump(read_json_file(str(default_path), fallback), handle, indent=2)
+                handle.write("\n")
+            results.append({"name": name, "status": "written" if force else "created", "path": str(local_path.relative_to(app.root_path))})
+        except Exception as exc:
+            results.append({"name": name, "status": "failed", "reason": str(exc), "path": str(local_path.relative_to(app.root_path))})
+    return jsonify({"ok": not any(item["status"] == "failed" for item in results), "force": force, "results": results})
 
 
 @app.get("/api/candles")
@@ -180,40 +206,158 @@ def signals():
 
 @app.get("/api/backtest")
 def backtest():
-    source = request.args.get("source", "bybit")
-    symbol = request.args.get("symbol", "BTCUSDT")
-    timeframe = request.args.get("timeframe", "15m")
-    period = request.args.get("period", "60d")
-    preset = request.args.get("preset", DEFAULT_PRESET_ID)
-    fee_pct = float(request.args.get("fee_pct", "0"))
-    slippage_pct = float(request.args.get("slippage_pct", "0"))
-    limit_arg = request.args.get("limit", "5000")
-    limit = None if str(limit_arg).lower() == "auto" else int(limit_arg)
-    debug = request.args.get("debug", "false").lower() == "true"
-    allow_shorts = request.args.get("allowShorts", "false").lower() == "true"
-    chart_candles_count = int(request.args.get("chart_candles_count", "0") or "0")
-    first_chart_candle_time = request.args.get("first_chart_candle_time")
-    last_chart_candle_time = request.args.get("last_chart_candle_time")
-
+    stage = "argument parsing"
+    context = {}
     try:
-        payload = run_shared_backtest_engine(source, symbol, timeframe, period, preset, fee_pct, slippage_pct, limit, debug, allow_shorts)
-        payload = normalize_backtest_response(payload, source, symbol, timeframe, period, preset, fee_pct, slippage_pct)
+        args = parse_backtest_request_args(request.args)
+        context = args
+        stage = "node backtest execution"
+        payload = run_shared_backtest_engine(
+            args["source"],
+            args["symbol"],
+            args["timeframe"],
+            args["period"],
+            args["preset"],
+            args["fee_pct"],
+            args["slippage_pct"],
+            args["limit"],
+            args["debug"],
+            args["allow_shorts"],
+        )
+        stage = "diagnostics normalization"
+        payload = normalize_backtest_response(
+            payload,
+            args["source"],
+            args["symbol"],
+            args["timeframe"],
+            args["period"],
+            args["preset"],
+            args["fee_pct"],
+            args["slippage_pct"],
+        )
         payload.setdefault("diagnostics", {})
+        payload["diagnostics"]["requestedLimitRaw"] = args["limit_arg"]
         overlay_diag = overlay_diagnostics_from_payload(payload)
         payload["diagnostics"]["overlay_rendering"] = {
             **overlay_diag,
-            "chartCandlesCount": chart_candles_count or overlay_diag.get("chartCandlesCount"),
+            "chartCandlesCount": args["chart_candles_count"] or overlay_diag.get("chartCandlesCount"),
             "backtestCandlesCount": overlay_diag.get("backtestCandlesCount"),
-            "firstChartCandleTime": int(first_chart_candle_time) if first_chart_candle_time else overlay_diag.get("firstChartCandleTime"),
-            "lastChartCandleTime": int(last_chart_candle_time) if last_chart_candle_time else overlay_diag.get("lastChartCandleTime"),
+            "firstChartCandleTime": safe_int_arg(args["first_chart_candle_time"], overlay_diag.get("firstChartCandleTime")),
+            "lastChartCandleTime": safe_int_arg(args["last_chart_candle_time"], overlay_diag.get("lastChartCandleTime")),
         }
+        stage = "backtest history recording"
         record_backtest_history(payload)
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return jsonify(backtest_error_payload(exc, stage, context)), 400
     except Exception as exc:
-        return jsonify({"error": f"Could not run backtest: {exc}"}), 502
+        return jsonify(backtest_error_payload(exc, stage, context)), 502
 
     return jsonify(payload)
+
+
+@app.get("/api/backtest/debug")
+def backtest_debug():
+    stages = []
+    context = {}
+    try:
+        args = parse_backtest_request_args(request.args, force_debug=True)
+        context = args
+        stages.append({"stage": "parsed args", "ok": True, "args": public_backtest_args(args)})
+        candles_payload = fetch_historical_candles(args["source"], args["symbol"], args["timeframe"], period=args["period"], limit=args["limit"])
+        candles = candles_payload.get("candles", [])
+        stages.append({
+            "stage": "candle fetch",
+            "ok": True,
+            "candleCount": len(candles),
+            "firstCandleTime": candles[0].get("time") if candles else None,
+            "lastCandleTime": candles[-1].get("time") if candles else None,
+            "effectiveHistoricalLimit": candles_payload.get("limit"),
+            "diagnostics": candles_payload.get("diagnostics", {}),
+        })
+        payload = run_shared_backtest_engine(
+            args["source"],
+            args["symbol"],
+            args["timeframe"],
+            args["period"],
+            args["preset"],
+            args["fee_pct"],
+            args["slippage_pct"],
+            args["limit"],
+            True,
+            args["allow_shorts"],
+        )
+        payload = normalize_backtest_response(payload, args["source"], args["symbol"], args["timeframe"], args["period"], args["preset"], args["fee_pct"], args["slippage_pct"])
+        stages.append({
+            "stage": "node command/final payload",
+            "ok": True,
+            "diagnosticsKeys": sorted((payload.get("diagnostics") or {}).keys()),
+            "finalPayloadKeys": sorted(payload.keys()),
+            "trades": payload.get("number_of_trades") or payload.get("trades"),
+        })
+        return jsonify({"ok": True, "stages": stages})
+    except Exception as exc:
+        stages.append({"stage": "error", "ok": False, "error": str(exc)})
+        return jsonify({**backtest_error_payload(exc, "debug", context, include_traceback=True), "stages": stages}), 502
+
+
+def parse_backtest_request_args(args, force_debug: bool = False) -> dict:
+    limit_arg = args.get("limit", "5000")
+    limit = None if str(limit_arg).strip().lower() == "auto" else int(limit_arg)
+    return {
+        "source": args.get("source", "bybit"),
+        "symbol": args.get("symbol", "BTCUSDT"),
+        "timeframe": args.get("timeframe", "15m"),
+        "period": args.get("period", "60d"),
+        "preset": args.get("preset", DEFAULT_PRESET_ID),
+        "fee_pct": float(args.get("fee_pct", "0") or 0),
+        "slippage_pct": float(args.get("slippage_pct", "0") or 0),
+        "limit_arg": limit_arg,
+        "limit": limit,
+        "debug": force_debug or args.get("debug", "false").lower() == "true",
+        "allow_shorts": args.get("allowShorts", "false").lower() == "true",
+        "chart_candles_count": int(args.get("chart_candles_count", "0") or "0"),
+        "first_chart_candle_time": args.get("first_chart_candle_time"),
+        "last_chart_candle_time": args.get("last_chart_candle_time"),
+    }
+
+
+def public_backtest_args(args: dict) -> dict:
+    return {
+        "source": args.get("source"),
+        "symbol": args.get("symbol"),
+        "timeframe": args.get("timeframe"),
+        "period": args.get("period"),
+        "preset": args.get("preset"),
+        "feePct": args.get("fee_pct"),
+        "slippagePct": args.get("slippage_pct"),
+        "limitArg": args.get("limit_arg"),
+        "parsedLimit": args.get("limit"),
+        "allowShorts": args.get("allow_shorts"),
+    }
+
+
+def safe_int_arg(value, fallback=None):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def backtest_error_payload(exc: Exception, stage: str, context: dict | None = None, include_traceback: bool = False) -> dict:
+    context = context or {}
+    payload = {
+        "error": f"Could not run backtest: {exc}",
+        "stage": stage,
+        "source": context.get("source"),
+        "symbol": context.get("symbol"),
+        "timeframe": context.get("timeframe"),
+        "period": context.get("period"),
+        "limitArg": context.get("limit_arg"),
+    }
+    debug_requested = bool(context.get("debug")) or request.args.get("debug", "false").lower() == "true"
+    if include_traceback or debug_requested:
+        payload["tracebackTail"] = "\n".join(traceback.format_exc().splitlines()[-8:])
+    return payload
 
 
 @app.get("/api/optimize")
@@ -724,6 +868,15 @@ def build_system_health(quick: bool = False, include_optimizer: bool = False) ->
         "version": sys.version.split()[0],
     })
     health_check_item(checks, "flask", "Flask app", "PASS", "Flask application object is loaded.", {"appName": app.name})
+    health_check_item(checks, "config_paths", "Config paths", "PASS", "Default/local config paths resolved.", {
+        "appRoot": app.root_path,
+        "configDir": str(CONFIG_DIR),
+        "localConfigDir": str(LOCAL_CONFIG_DIR),
+        "paperCandidateDefault": str(PAPER_CANDIDATE_DEFAULT_PATH.relative_to(app.root_path)),
+        "paperCandidateLocal": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
+        "learningDefault": str(LEARNING_CONFIG_DEFAULT_PATH.relative_to(app.root_path)),
+        "learningLocal": str(LEARNING_CONFIG_LOCAL_PATH.relative_to(app.root_path)),
+    })
 
     generated_files = {
         "researchRuns": generated_file_info(RESEARCH_RUNS_PATH),
@@ -1078,24 +1231,26 @@ def shallow_merge_config(defaults: dict, local: dict) -> dict:
     return merged
 
 
-def load_config_pair(default_path: Path, local_path: Path, legacy_path: Path | None = None, fallback: dict | None = None) -> dict:
+def load_config_pair(default_path: Path, local_path: Path, fallback: dict | None = None) -> dict:
     defaults = read_json_file(str(default_path), fallback or {})
     if local_path.exists():
         return shallow_merge_config(defaults, read_json_file(str(local_path), {}))
-    if legacy_path and legacy_path.exists():
-        return shallow_merge_config(defaults, read_json_file(str(legacy_path), {}))
     return defaults
 
 
-def ensure_local_config_from_existing(default_path: Path, local_path: Path, legacy_path: Path | None, fallback: dict | None = None) -> None:
+def merged_config(default_path: Path, local_path: Path, fallback: dict | None = None) -> dict:
+    return load_config_pair(default_path, local_path, fallback)
+
+
+def ensure_local_config_from_default(default_path: Path, local_path: Path, fallback: dict | None = None) -> bool:
     if local_path.exists():
-        return
-    source = legacy_path if legacy_path and legacy_path.exists() else default_path
-    data = read_json_file(str(source), fallback or {})
+        return False
+    data = read_json_file(str(default_path), fallback or {})
     local_path.parent.mkdir(parents=True, exist_ok=True)
     with open(local_path, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
+    return True
 
 
 def read_jsonl_tail(path: str, limit: int):
@@ -1116,7 +1271,6 @@ def load_paper_candidate_config() -> dict:
     return load_config_pair(
         PAPER_CANDIDATE_DEFAULT_PATH,
         PAPER_CANDIDATE_LOCAL_PATH,
-        PAPER_CANDIDATE_LEGACY_PATH,
         {},
     )
 
@@ -1316,7 +1470,6 @@ def load_learning_config() -> dict:
     config = load_config_pair(
         LEARNING_CONFIG_DEFAULT_PATH,
         LEARNING_CONFIG_LOCAL_PATH,
-        LEARNING_CONFIG_LEGACY_PATH,
         default_learning_config(),
     )
     config["autoEnablePaper"] = False
@@ -1324,10 +1477,9 @@ def load_learning_config() -> dict:
 
 
 def write_learning_config(config: dict) -> None:
-    ensure_local_config_from_existing(
+    ensure_local_config_from_default(
         LEARNING_CONFIG_DEFAULT_PATH,
         LEARNING_CONFIG_LOCAL_PATH,
-        LEARNING_CONFIG_LEGACY_PATH,
         default_learning_config(),
     )
     LEARNING_CONFIG_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2417,16 +2569,19 @@ def backup_candidate_config(candidate: dict) -> Path:
 
 
 def write_candidate_config(candidate: dict) -> None:
-    ensure_local_config_from_existing(
+    ensure_local_config_from_default(
         PAPER_CANDIDATE_DEFAULT_PATH,
         PAPER_CANDIDATE_LOCAL_PATH,
-        PAPER_CANDIDATE_LEGACY_PATH,
         {},
     )
     PAPER_CANDIDATE_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(PAPER_CANDIDATE_LOCAL_PATH, "w", encoding="utf-8") as handle:
         json.dump(candidate, handle, indent=2)
         handle.write("\n")
+
+
+def write_paper_candidate_config(candidate: dict) -> None:
+    write_candidate_config(candidate)
 
 
 def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dict, promoted_symbol: str, promoted_interval: str) -> dict:

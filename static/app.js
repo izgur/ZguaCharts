@@ -1629,9 +1629,7 @@ async function runLabBacktest() {
       first_chart_candle_time: String(backtestPane.candles[0]?.time || ""),
       last_chart_candle_time: String(backtestPane.candles[backtestPane.candles.length - 1]?.time || ""),
     });
-    const response = await fetch(`/api/backtest?${params}`);
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Backtest failed");
+    const payload = await apiGet(`/api/backtest?${params}`);
     backtestPane.backtestMarkers = markersFromBacktestPayload(payload);
     renderBacktestOverlays(backtestPane, payload);
     backtestPane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
@@ -1666,9 +1664,7 @@ async function runBacktest(pane, presetId) {
       last_chart_candle_time: String(pane.candles[pane.candles.length - 1]?.time || ""),
       ...settings,
     });
-    const response = await fetch(`/api/backtest?${params}`);
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Backtest failed");
+    const payload = await apiGet(`/api/backtest?${params}`);
 
     pane.backtestMarkers = markersFromBacktestPayload(payload);
     renderBacktestOverlays(pane, payload);
@@ -1761,9 +1757,11 @@ async function testPresets(pane) {
       period: "60d",
       ...settings,
     });
-    const response = await fetch(`/api/backtest?${params}`);
-    const payload = await response.json();
-    if (response.ok) rows.push(payload);
+    try {
+      rows.push(await apiGet(`/api/backtest?${params}`));
+    } catch (error) {
+      rows.push({ preset: preset.label || preset.id, total_return_pct: 0, number_of_trades: 0, win_rate: 0, max_drawdown: 0, profit_factor: 0, average_bars_held: 0, error: error.message });
+    }
   }
 
   resultsEl.innerHTML = renderPresetComparison(rows);
