@@ -239,6 +239,15 @@ def backtest():
         )
         payload.setdefault("diagnostics", {})
         payload["diagnostics"]["requestedLimitRaw"] = args["limit_arg"]
+        if int(safe_float(payload.get("number_of_trades", payload.get("trades", 0)))) == 0:
+            readiness = research_data_readiness(args["source"], [args["symbol"]], [args["timeframe"]], args["period"], args["limit_arg"])
+            payload["tradeGenerationDiagnostics"] = build_trade_generation_diagnostics(
+                payload,
+                readiness.get("rows", [{}])[0],
+                args["allow_shorts"],
+            )
+            payload.setdefault("warnings", [])
+            payload["warnings"] = dedupe_list(payload["warnings"] + [payload["tradeGenerationDiagnostics"]["summary"]["likelyReason"]])
         overlay_diag = overlay_diagnostics_from_payload(payload)
         payload["diagnostics"]["overlay_rendering"] = {
             **overlay_diag,
@@ -300,6 +309,49 @@ def backtest_debug():
     except Exception as exc:
         stages.append({"stage": "error", "ok": False, "error": str(exc)})
         return jsonify({**backtest_error_payload(exc, "debug", context, include_traceback=True), "stages": stages}), 502
+
+
+@app.get("/api/backtest/diagnose")
+def backtest_diagnose():
+    context = {}
+    try:
+        args = parse_backtest_request_args(request.args, force_debug=True)
+        context = args
+        return jsonify(run_backtest_diagnosis_payload(
+            args["source"],
+            args["symbol"],
+            args["timeframe"],
+            args["period"],
+            args["preset"],
+            args["fee_pct"],
+            args["slippage_pct"],
+            args["limit_arg"],
+            args["allow_shorts"],
+        ))
+    except ValueError as exc:
+        return jsonify(backtest_error_payload(exc, "diagnose argument parsing", context)), 400
+    except Exception as exc:
+        return jsonify(backtest_error_payload(exc, "diagnose backtest execution", context, include_traceback=True)), 502
+
+
+def run_backtest_diagnosis_payload(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit_arg, allow_shorts: bool) -> dict:
+    limit = None if str(limit_arg).strip().lower() == "auto" else int(limit_arg)
+    payload = run_shared_backtest_engine(source, symbol, timeframe, period, preset, fee_pct, slippage_pct, limit, True, allow_shorts)
+    payload = normalize_backtest_response(payload, source, symbol, timeframe, period, preset, fee_pct, slippage_pct)
+    readiness = research_data_readiness(source, [symbol], [timeframe], period, limit_arg)
+    diagnostic = build_trade_generation_diagnostics(payload, readiness.get("rows", [{}])[0], allow_shorts)
+    return {
+        "ok": True,
+        "summary": diagnostic["summary"],
+        "dataReadiness": readiness,
+        "historicalCoverage": payload.get("historicalCoverage") or {},
+        "strategy": diagnostic["strategy"],
+        "diagnostics": diagnostic["diagnostics"],
+        "reasonCounters": diagnostic["reasonCounters"],
+        "suggestedActions": diagnostic["suggestedActions"],
+        "warnings": diagnostic["warnings"],
+        "tradeGenerationDiagnostics": diagnostic,
+    }
 
 
 def parse_backtest_request_args(args, force_debug: bool = False) -> dict:
@@ -525,6 +577,13 @@ def strategy_optimize():
         payload.setdefault("requested", {})["limitRaw"] = limit_arg
         return jsonify(payload)
     except Exception as exc:
+        zero_trade_diagnostics = None
+        if "0 trades" in str(exc).lower() or "zero" in str(exc).lower():
+            try:
+                diagnostic_payload = run_backtest_diagnosis_payload(source, symbol, timeframe, period, strategy, fee_pct, slippage_pct, limit_arg, False)
+                zero_trade_diagnostics = diagnostic_payload.get("tradeGenerationDiagnostics")
+            except Exception as diag_exc:
+                zero_trade_diagnostics = {"error": f"Could not collect zero-trade diagnostics: {diag_exc}"}
         return jsonify({
             "error": f"Could not run strategy optimizer: {exc}",
             "source": source,
@@ -536,6 +595,7 @@ def strategy_optimize():
             "dataReadiness": readiness,
             "partialData": not readiness.get("summary", {}).get("allReady", False),
             "warnings": readiness_warnings(readiness),
+            "zeroTradeDiagnostics": zero_trade_diagnostics,
         }), 502
 
 
@@ -1360,10 +1420,13 @@ def run_strategy_ranking_payload(
                     metrics = ranking_metrics_from_backtest(payload)
                     valid = metrics["trades"] >= min_trades
                     warnings = list(payload.get("warnings") or [])
+                    zero_trade_diagnostics = None
                     if readiness_row.get("status") != "READY":
                         warnings.append(f"Data readiness is {readiness_row.get('status', 'UNKNOWN')}: {readiness_row.get('recommendedAction', '')}")
                     if metrics["trades"] == 0:
+                        zero_trade_diagnostics = build_trade_generation_diagnostics(payload, readiness_row, allow_shorts)
                         warnings.append("zero-trade result")
+                        warnings.append(zero_trade_diagnostics["summary"]["likelyReason"])
                     if metrics["trades"] < min_trades:
                         warnings.append(f"trades below min_trades ({metrics['trades']} < {min_trades})")
                     rows.append({
@@ -1384,6 +1447,7 @@ def run_strategy_ranking_payload(
                         "diagnostics": payload.get("diagnostics") or {},
                         "dataReadiness": readiness_row,
                         "partialData": readiness_row.get("status") != "READY",
+                        "tradeGenerationDiagnostics": zero_trade_diagnostics,
                         "effectiveLimit": (payload.get("historicalCoverage") or payload.get("historical_coverage") or {}).get("effective_limit"),
                         "returnedCoverageDays": (payload.get("historicalCoverage") or payload.get("historical_coverage") or {}).get("approximate_days_returned"),
                         "params": (payload.get("diagnostics") or {}).get("params", {}),
@@ -2316,6 +2380,20 @@ def run_learning_cycle(config: dict) -> dict:
         if ranking_payload.get("researchRunId"):
             report["rankingRunIds"].append(ranking_payload["researchRunId"])
         report["warnings"].extend(ranking_payload.get("errors") or [])
+        zero_rows = [row for row in ranking_payload.get("rows", []) if int(safe_float(row.get("trades"))) == 0]
+        if zero_rows:
+            sample = zero_rows[0]
+            diag = sample.get("tradeGenerationDiagnostics") or {}
+            report["warnings"].append({
+                "type": "zero_trade_ranking_rows",
+                "count": len(zero_rows),
+                "sample": {
+                    "strategy": sample.get("strategy"),
+                    "symbol": sample.get("symbol"),
+                    "timeframe": sample.get("timeframe"),
+                    "likelyReason": (diag.get("summary") or {}).get("likelyReason") or "No trades generated.",
+                },
+            })
     except Exception as exc:
         report["errors"].append({"stage": "ranking", "error": str(exc)})
 
@@ -2343,6 +2421,36 @@ def run_learning_cycle(config: dict) -> dict:
                         report["optimizationRunIds"].append(payload["researchRunId"])
                 except Exception as exc:
                     report["errors"].append({"stage": "optimization", "strategy": strategy, "symbol": symbol, "timeframe": timeframe, "error": str(exc)})
+                    if "0 trades" in str(exc).lower() or "zero" in str(exc).lower():
+                        try:
+                            diag_payload = run_backtest_diagnosis_payload(
+                                config["source"],
+                                symbol,
+                                timeframe,
+                                config["period"],
+                                strategy,
+                                config["feePct"],
+                                config["slippagePct"],
+                                config["optimizationLimit"],
+                                config["allowShorts"],
+                            )
+                            report["warnings"].append({
+                                "type": "zero_trade_optimization",
+                                "strategy": strategy,
+                                "symbol": symbol,
+                                "timeframe": timeframe,
+                                "likelyReason": diag_payload.get("summary", {}).get("likelyReason"),
+                                "confidence": diag_payload.get("summary", {}).get("confidence"),
+                            })
+                        except Exception as diag_exc:
+                            report["warnings"].append({
+                                "type": "zero_trade_optimization",
+                                "strategy": strategy,
+                                "symbol": symbol,
+                                "timeframe": timeframe,
+                                "likelyReason": f"Optimizer produced zero trades; diagnostics failed: {diag_exc}",
+                                "confidence": "LOW",
+                            })
 
     if optimization_runs == 0:
         report["warnings"].append("No optimization strategies were configured.")
@@ -3255,6 +3363,216 @@ def dedupe_list(items: list) -> list:
         seen.add(key)
         output.append(item)
     return output
+
+
+ZERO_TRADE_REASON_KEYS = (
+    "insufficient_candles",
+    "warmup_not_met",
+    "no_entry_signal",
+    "regime_filter_blocked",
+    "trend_filter_blocked",
+    "volatility_filter_blocked",
+    "risk_filter_blocked",
+    "short_mode_disabled",
+    "invalid_indicator_values",
+    "no_exit_signal",
+    "unknown",
+)
+
+
+def build_trade_generation_diagnostics(payload: dict, readiness_row: dict | None = None, allow_shorts: bool = False) -> dict:
+    diagnostics = payload.get("diagnostics") or {}
+    debug = diagnostics.get("debug") if isinstance(diagnostics.get("debug"), dict) else {}
+    readiness_row = readiness_row or {}
+    trades = int(safe_float(payload.get("number_of_trades", payload.get("trades", 0))))
+    candles = int(safe_float(diagnostics.get("candlesLoaded", payload.get("candlesLoaded", 0))))
+    warmup = int(safe_float(
+        diagnostics.get("warmupCandles")
+        or diagnostics.get("warmup_candles_skipped")
+        or diagnostics.get("warmup")
+        or estimate_warmup_candles(candles, diagnostics.get("strategy"))
+    ))
+    blocker_counts = dict(diagnostics.get("blockerCounts") or debug.get("blockerCounts") or {})
+    skip_reasons = dict(diagnostics.get("skipReasons") or debug.get("skipReasons") or {})
+    counters = {key: 0 for key in ZERO_TRADE_REASON_KEYS}
+
+    if candles <= 0:
+        counters["insufficient_candles"] += 1
+    elif candles < max(50, warmup):
+        counters["insufficient_candles"] += max(1, candles)
+    if warmup and candles <= warmup:
+        counters["warmup_not_met"] += max(1, warmup - candles + 1)
+
+    for reason, count in {**blocker_counts, **skip_reasons}.items():
+        canonical = canonical_zero_trade_reason(reason)
+        counters[canonical] = counters.get(canonical, 0) + int(safe_float(count, 1))
+
+    entry_count = int(safe_float(
+        diagnostics.get("entrySignalsCount")
+        or debug.get("entrySignalsCount")
+        or diagnostics.get("longEntriesAccepted")
+        or 0
+    ))
+    exit_count = int(safe_float(diagnostics.get("exitSignalsCount") or debug.get("exitSignalsCount") or 0))
+    if trades == 0 and entry_count == 0 and not any(counters[key] for key in ("insufficient_candles", "warmup_not_met")):
+        counters["no_entry_signal"] += max(1, candles - warmup if candles else 1)
+    if trades == 0 and entry_count > 0 and exit_count == 0:
+        counters["no_exit_signal"] += 1
+    short_mode = bool((diagnostics.get("params") or {}).get("shortMode") or (debug.get("paramsUsed") or {}).get("shortMode"))
+    if not allow_shorts and not short_mode:
+        counters["short_mode_disabled"] += 1
+    if readiness_row.get("status") in {"MISSING", "PARTIAL", "CAPPED", "ERROR"}:
+        counters["insufficient_candles"] += 1
+    if readiness_row.get("status") == "STALE":
+        counters["unknown"] += 1
+
+    likely_reason, confidence = likely_zero_trade_reason(counters, diagnostics, readiness_row, trades)
+    suggested = zero_trade_suggestions(counters, readiness_row, diagnostics, allow_shorts)
+    warnings = []
+    if readiness_row.get("status") and readiness_row.get("status") != "READY":
+        warnings.append(f"Data readiness is {readiness_row.get('status')}: {readiness_row.get('recommendedAction')}")
+    warnings.extend(payload.get("warnings") or [])
+
+    return {
+        "summary": {
+            "trades": trades,
+            "likelyReason": likely_reason,
+            "confidence": confidence,
+        },
+        "strategy": {
+            "name": diagnostics.get("strategy") or payload.get("strategy") or payload.get("preset"),
+            "preset": diagnostics.get("preset") or payload.get("preset_id") or payload.get("preset"),
+            "params": diagnostics.get("params") or debug.get("paramsUsed") or {},
+            "allowShorts": allow_shorts,
+            "shortMode": short_mode,
+            "mapping": {
+                "requestedPreset": payload.get("preset_id"),
+                "engineStrategy": payload.get("strategy") or diagnostics.get("strategy"),
+            },
+        },
+        "diagnostics": {
+            "candlesLoaded": candles,
+            "warmupCandles": warmup,
+            "usableCandlesAfterWarmup": max(0, candles - warmup),
+            "longEntriesConsidered": int(safe_float(diagnostics.get("candlesEvaluated") or debug.get("candlesEvaluated") or max(0, candles - warmup))),
+            "longEntriesAccepted": entry_count,
+            "shortEntriesConsidered": 0,
+            "shortEntriesAccepted": 0,
+            "exitsConsidered": exit_count,
+            "exitsAccepted": int(safe_float(diagnostics.get("exitSignalsAccepted") or 0)),
+            "regimeFilter": extract_filter_counts(blocker_counts, "regime"),
+            "indicatorInvalidCounts": extract_indicator_invalid_counts(diagnostics, debug),
+            "primaryBlocker": diagnostics.get("primaryBlocker") or primary_counter_label(counters),
+            "engineSkipReasons": skip_reasons,
+            "engineBlockerCounts": blocker_counts,
+            "firstSignalsPreview": diagnostics.get("firstSignalsPreview") or debug.get("firstSignalsPreview") or [],
+            "lastSignalsPreview": diagnostics.get("lastSignalsPreview") or debug.get("lastSignalsPreview") or [],
+        },
+        "reasonCounters": counters,
+        "suggestedActions": suggested,
+        "warnings": dedupe_list(warnings),
+    }
+
+
+def estimate_warmup_candles(candles: int, strategy: str | None = None) -> int:
+    if strategy == "AlwaysLongTest":
+        return 0
+    return min(250, max(50, math.floor(candles * 0.2))) if candles else 250
+
+
+def canonical_zero_trade_reason(reason: str) -> str:
+    text = str(reason or "").lower()
+    if any(token in text for token in ("warmup", "confirmation")):
+        return "warmup_not_met"
+    if any(token in text for token in ("regime", "btc")):
+        return "regime_filter_blocked"
+    if any(token in text for token in ("ema", "trend", "donchian", "breakout", "pullback", "reclaim", "rsi")):
+        return "trend_filter_blocked"
+    if any(token in text for token in ("atr", "adx", "volatility", "squeeze", "range")):
+        return "volatility_filter_blocked"
+    if any(token in text for token in ("risk", "stop", "notional", "volume", "cooldown", "position")):
+        return "risk_filter_blocked"
+    if any(token in text for token in ("nan", "invalid", "missing indicator")):
+        return "invalid_indicator_values"
+    if "short" in text:
+        return "short_mode_disabled"
+    if any(token in text for token in ("entry", "signal", "false")):
+        return "no_entry_signal"
+    if "exit" in text:
+        return "no_exit_signal"
+    return "unknown"
+
+
+def likely_zero_trade_reason(counters: dict, diagnostics: dict, readiness_row: dict, trades: int) -> tuple[str, str]:
+    if trades > 0:
+        return "Trades were generated; zero-trade diagnostics are informational only.", "HIGH"
+    if readiness_row.get("status") in {"MISSING", "ERROR"}:
+        return f"Historical data is {readiness_row.get('status')}; strategy could not be evaluated reliably.", "HIGH"
+    ordered = sorted(counters.items(), key=lambda item: item[1], reverse=True)
+    top_key, top_value = ordered[0] if ordered else ("unknown", 0)
+    if top_value <= 0:
+        primary = diagnostics.get("primaryBlocker")
+        if primary:
+            return f"Primary engine blocker: {primary}.", "MEDIUM"
+        return "No entries were generated, but the strategy did not expose enough internal counters to identify the exact blocker.", "LOW"
+    label = format_backend_reason(top_key)
+    if top_key == "no_entry_signal" and diagnostics.get("primaryBlocker"):
+        return f"No entry signal accepted. Primary engine blocker: {diagnostics.get('primaryBlocker')}.", "MEDIUM"
+    return f"{label} appears to be the dominant blocker ({top_value}).", "MEDIUM" if top_key != "unknown" else "LOW"
+
+
+def zero_trade_suggestions(counters: dict, readiness_row: dict, diagnostics: dict, allow_shorts: bool) -> list[str]:
+    suggestions = []
+    if readiness_row.get("status") in {"MISSING", "PARTIAL", "CAPPED"}:
+        suggestions.append("Prefetch or request more historical candles before trusting the result.")
+    if counters.get("insufficient_candles") or counters.get("warmup_not_met"):
+        suggestions.append("Use a longer period or Auto/50000 candle limit so indicators have enough warmup history.")
+    if counters.get("regime_filter_blocked"):
+        suggestions.append("Check regime filter settings and compare the BTC 4h regime against the selected symbol/timeframe.")
+    if counters.get("trend_filter_blocked"):
+        suggestions.append("Try a less restrictive preset or inspect trend/breakout thresholds.")
+    if counters.get("volatility_filter_blocked"):
+        suggestions.append("Check ATR/ADX/volatility thresholds for the selected market.")
+    if counters.get("risk_filter_blocked"):
+        suggestions.append("Review risk, volume, cooldown, and max-position filters.")
+    if counters.get("short_mode_disabled") and not allow_shorts:
+        suggestions.append("Enable shorts only if the strategy defines and you intentionally want short rules.")
+    if not suggestions:
+        suggestions.extend([
+            "Run with a known test strategy such as AlwaysLongTest to verify the engine.",
+            "Run the backtest with debug=true and inspect signal previews.",
+        ])
+    suggestions.append("Check strategy mapping to confirm the requested preset maps to the intended Node strategy.")
+    return dedupe_list(suggestions)
+
+
+def extract_filter_counts(counts: dict, token: str) -> dict:
+    passed = sum(int(safe_float(value)) for key, value in counts.items() if token in str(key).lower() and "pass" in str(key).lower())
+    failed = sum(int(safe_float(value)) for key, value in counts.items() if token in str(key).lower() and "fail" in str(key).lower())
+    blocked = sum(int(safe_float(value)) for key, value in counts.items() if token in str(key).lower() and "block" in str(key).lower())
+    return {"passed": passed, "failed": failed, "blocked": blocked}
+
+
+def extract_indicator_invalid_counts(diagnostics: dict, debug: dict) -> dict:
+    invalid = diagnostics.get("indicatorInvalidCounts") or debug.get("indicatorInvalidCounts") or {}
+    if invalid:
+        return invalid
+    ready = safe_float(diagnostics.get("indicatorsReadyCount") or debug.get("indicatorsReadyCount"), 0)
+    candles = safe_float(diagnostics.get("candlesLoaded") or debug.get("candlesLoaded"), 0)
+    if candles and ready <= 0:
+        return {"unknownIndicators": int(candles)}
+    return {}
+
+
+def primary_counter_label(counters: dict) -> str | None:
+    ordered = sorted(counters.items(), key=lambda item: item[1], reverse=True)
+    if not ordered or ordered[0][1] <= 0:
+        return None
+    return f"{ordered[0][0]} ({ordered[0][1]})"
+
+
+def format_backend_reason(reason: str) -> str:
+    return str(reason or "unknown").replace("_", " ").capitalize()
 
 
 def build_signal_timeframe_matrix(source: str, symbol: str, selected_timeframe: str, limit: int) -> list[dict]:

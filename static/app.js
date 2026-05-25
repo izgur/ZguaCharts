@@ -175,6 +175,11 @@ async function boot() {
   });
 
   document.addEventListener("click", (event) => {
+    const diagnoseButton = event.target?.closest?.("[data-diagnose-backtest]");
+    if (diagnoseButton) {
+      runBacktestDiagnosis(diagnoseButton);
+      return;
+    }
     const infoButton = event.target?.closest?.(".indicator-info-button");
     const syncButton = event.target?.closest?.(".indicator-sync-button");
     if (infoButton || syncButton) {
@@ -1680,6 +1685,20 @@ async function runBacktest(pane, presetId) {
   }
 }
 
+async function runBacktestDiagnosis(button) {
+  const target = button.closest(".zero-trade-panel")?.querySelector(".zero-trade-diagnostics");
+  if (target) target.innerHTML = `<p class="pane-status">Running backend diagnosis...</p>`;
+  button.disabled = true;
+  try {
+    const payload = await apiGet(`/api/backtest/diagnose?${button.dataset.diagnoseBacktest || ""}`);
+    if (target) target.innerHTML = renderTradeGenerationDiagnostics(payload.tradeGenerationDiagnostics || payload);
+  } catch (error) {
+    if (target) target.innerHTML = `<p class="pane-status">Diagnosis failed: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function renderBacktestOverlays(pane, payload) {
   clearBacktestOverlaySeries(pane);
   (payload.overlays || []).forEach((overlay) => {
@@ -2087,6 +2106,7 @@ function renderBacktestResults(payload) {
   `).join("");
   const warnings = Array.from(new Set(warningsList.filter(Boolean))).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
   const trades = normalizedTrades(payload);
+  const zeroTradePanel = trades.length === 0 ? renderZeroTradePanel(payload) : "";
   const rows = trades.map((trade) => `
     <tr>
       <td>${formatDateTime(trade.entry_time)}</td>
@@ -2120,6 +2140,7 @@ function renderBacktestResults(payload) {
     <table class="trade-table skipped-table">
       <tbody>${skippedRows || `<tr><td>No skipped score>=70 candles.</td><td>0</td></tr>`}</tbody>
     </table>
+    ${zeroTradePanel}
     <h3 class="modal-section-title">Trades</h3>
     <table class="trade-table">
       <thead>
@@ -2135,6 +2156,59 @@ function renderBacktestResults(payload) {
       </thead>
       <tbody>${rows || `<tr><td colspan="7">No trades for this period.</td></tr>`}</tbody>
     </table>
+  `;
+}
+
+function renderZeroTradePanel(payload) {
+  const diagnostics = normalizedBacktestDiagnostics(payload);
+  const tradeDiag = payload.tradeGenerationDiagnostics;
+  const params = new URLSearchParams({
+    source: payload.source || diagnostics.source || "bybit",
+    symbol: payload.symbol || diagnostics.symbol || "BTCUSDT",
+    timeframe: payload.timeframe || diagnostics.timeframe || "1h",
+    period: payload.period || diagnostics.period || "365d",
+    preset: payload.preset_id || diagnostics.preset || payload.preset || "conservative_trend",
+    limit: diagnostics.requestedLimitRaw || diagnostics.requestedLimit || "auto",
+    fee_pct: payload.fee_pct ?? diagnostics.feePct ?? "0",
+    slippage_pct: payload.slippage_pct ?? diagnostics.slippagePct ?? "0",
+    allowShorts: diagnostics.allowShorts || "false",
+    debug: "true",
+  });
+  return `
+    <section class="zero-trade-panel">
+      <h3 class="modal-section-title">Why no trades?</h3>
+      <p class="modal-note">Backend-owned trade-generation diagnostics. Strategy formulas are not calculated in the browser.</p>
+      ${tradeDiag ? renderTradeGenerationDiagnostics(tradeDiag) : `<p class="pane-status">No detailed diagnosis is attached yet.</p>`}
+      <button type="button" class="small-action-button" data-diagnose-backtest="${escapeHtml(params.toString())}">Diagnose Backtest</button>
+      <div class="zero-trade-diagnostics"></div>
+    </section>
+  `;
+}
+
+function renderTradeGenerationDiagnostics(payload) {
+  const summary = payload.summary || {};
+  const diagnostics = payload.diagnostics || {};
+  const counters = payload.reasonCounters || {};
+  const strategy = payload.strategy || {};
+  const counterRows = Object.entries(counters)
+    .sort((a, b) => Number(b[1]) - Number(a[1]))
+    .map(([reason, count]) => `<tr><td>${escapeHtml(formatReason(reason))}</td><td>${count}</td></tr>`)
+    .join("");
+  const actions = (payload.suggestedActions || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  return `
+    <div class="metric-grid diagnostics-grid">
+      <div class="metric"><span>Likely reason</span><strong>${escapeHtml(summary.likelyReason || "-")}</strong></div>
+      <div class="metric"><span>Confidence</span><strong>${escapeHtml(summary.confidence || "LOW")}</strong></div>
+      <div class="metric"><span>Candles</span><strong>${displayValue(diagnostics.candlesLoaded)}</strong></div>
+      <div class="metric"><span>Usable candles</span><strong>${displayValue(diagnostics.usableCandlesAfterWarmup)}</strong></div>
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(strategy.name || "-")}</strong></div>
+      <div class="metric"><span>Primary blocker</span><strong>${escapeHtml(diagnostics.primaryBlocker || "-")}</strong></div>
+    </div>
+    <table class="trade-table skipped-table">
+      <thead><tr><th>Reason counter</th><th>Count</th></tr></thead>
+      <tbody>${counterRows || `<tr><td>No counters returned.</td><td>0</td></tr>`}</tbody>
+    </table>
+    ${actions ? `<h3 class="modal-section-title">Suggested Actions</h3><ul class="backtest-warnings">${actions}</ul>` : ""}
   `;
 }
 
@@ -3159,7 +3233,9 @@ async function runStrategyOptimization() {
     slippage_pct: document.querySelector("#analysis-slippage-filter")?.value || "0",
   });
   try {
-    const payload = await apiGet(`/api/strategy-optimize?${params}`);
+    const response = await fetch(`/api/strategy-optimize?${params}`);
+    const payload = await response.json();
+    if (!response.ok) throw Object.assign(new Error(payload.error || "Strategy optimization failed"), { payload });
     lastOptimizationPayload = payload;
     renderStrategyOptimization(payload);
     loadResearchRuns();
@@ -3170,7 +3246,13 @@ async function runStrategyOptimization() {
     }
   } catch (error) {
     if (status) status.textContent = `Optimization failed: ${error.message}`;
-    if (body) body.innerHTML = `<tr><td colspan="8">${escapeHtml(error.message)}</td></tr>`;
+    if (body) {
+      const diagnostic = error.payload?.zeroTradeDiagnostics;
+      body.innerHTML = `
+        <tr><td colspan="8">${escapeHtml(error.message)}</td></tr>
+        ${diagnostic ? `<tr><td colspan="8">${renderTradeGenerationDiagnostics(diagnostic)}</td></tr>` : ""}
+      `;
+    }
   }
 }
 
