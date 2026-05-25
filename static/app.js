@@ -2296,6 +2296,7 @@ function renderOpsPage() {
   }
   loadSystemHealth(true);
   loadMarketCacheStatus();
+  loadResearchDataReadiness();
 }
 
 function setupOpsControls() {
@@ -2304,6 +2305,7 @@ function setupOpsControls() {
   document.querySelector("#cache-validate-symbols")?.addEventListener("click", validateBybitSymbols);
   document.querySelector("#cache-refresh-status")?.addEventListener("click", loadMarketCacheStatus);
   document.querySelector("#cache-prefetch-selected")?.addEventListener("click", prefetchMarketCache);
+  document.querySelector("#readiness-check")?.addEventListener("click", loadResearchDataReadiness);
 }
 
 async function loadSystemHealth(quick = true) {
@@ -2357,6 +2359,15 @@ function cacheParams() {
     timeframes: document.querySelector("#cache-timeframes")?.value || "15m,1h,4h",
     period: document.querySelector("#cache-period")?.value || "max",
     limit: document.querySelector("#cache-limit")?.value || "50000",
+  };
+}
+
+function readinessParams() {
+  return {
+    symbols: document.querySelector("#readiness-symbols")?.value || "BTCUSDT,ETHUSDT,SOLUSDT",
+    timeframes: document.querySelector("#readiness-timeframes")?.value || "15m,1h,4h",
+    period: document.querySelector("#readiness-period")?.value || "365d",
+    limit: document.querySelector("#readiness-limit")?.value || "auto",
   };
 }
 
@@ -2464,6 +2475,58 @@ function renderMarketCacheStatus(payload) {
       <td>${escapeHtml((row.warnings || []).join("; "))}</td>
     </tr>
   `).join("") || `<tr><td colspan="8">No cache rows returned.</td></tr>`;
+}
+
+async function loadResearchDataReadiness() {
+  const status = document.querySelector("#readiness-status");
+  const summary = document.querySelector("#readiness-summary");
+  const body = document.querySelector("#readiness-rows-body");
+  const params = readinessParams();
+  if (!summary || !body) return;
+  if (status) status.textContent = "Checking research data readiness...";
+  try {
+    const payload = await apiGet(`/api/research/data-readiness?${new URLSearchParams({ source: "bybit", ...params })}`);
+    renderResearchDataReadiness(payload);
+    if (status) status.textContent = "Research data readiness loaded.";
+  } catch (error) {
+    if (status) status.textContent = `Readiness check failed: ${error.message}`;
+    body.innerHTML = `<tr><td colspan="10">${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function renderResearchDataReadiness(payload) {
+  const summary = document.querySelector("#readiness-summary");
+  const body = document.querySelector("#readiness-rows-body");
+  if (!summary || !body) return;
+  const item = payload.summary || {};
+  summary.innerHTML = `
+    <div class="metric"><span>Ready</span><strong class="positive">${item.readyPairs || 0}</strong></div>
+    <div class="metric"><span>Partial</span><strong class="neutral">${item.partialPairs || 0}</strong></div>
+    <div class="metric"><span>Missing</span><strong class="${item.missingPairs ? "negative" : "positive"}">${item.missingPairs || 0}</strong></div>
+    <div class="metric"><span>Stale</span><strong class="neutral">${item.stalePairs || 0}</strong></div>
+    <div class="metric"><span>Capped</span><strong class="neutral">${item.cappedPairs || 0}</strong></div>
+    <div class="metric"><span>Errors</span><strong class="${item.errorPairs ? "negative" : "positive"}">${item.errorPairs || 0}</strong></div>
+  `;
+  body.innerHTML = (payload.rows || []).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.symbol || "-")}</td>
+      <td>${escapeHtml(row.timeframe || "-")}</td>
+      <td class="${readinessTone(row.status)}">${escapeHtml(row.status || "-")}</td>
+      <td>${row.cachedCandles || 0}</td>
+      <td>${row.requiredCandles ?? "N/A"}</td>
+      <td>${formatNumber(row.approximateDays || 0)}</td>
+      <td>${formatDateTime(row.firstCandleTime)}</td>
+      <td>${formatDateTime(row.lastCandleTime)}</td>
+      <td>${escapeHtml((row.warnings || []).join("; "))}</td>
+      <td>${escapeHtml(row.recommendedAction || "-")}</td>
+    </tr>
+  `).join("") || `<tr><td colspan="10">No readiness rows returned.</td></tr>`;
+}
+
+function readinessTone(status) {
+  if (status === "READY") return "positive";
+  if (status === "MISSING" || status === "ERROR") return "negative";
+  return "neutral";
 }
 
 function renderPrefetchResult(payload) {
@@ -2972,7 +3035,7 @@ async function runStrategyRanking() {
   const cardsEl = document.querySelector("#analysis-cards");
   if (status) status.textContent = "Running backend strategy ranking...";
   if (cardsEl) cardsEl.innerHTML = "";
-  if (body) body.innerHTML = `<tr><td colspan="11">Loading ranking results...</td></tr>`;
+  if (body) body.innerHTML = `<tr><td colspan="12">Loading ranking results...</td></tr>`;
   const symbolSelect = document.querySelector("#analysis-symbol-filter");
   const timeframeSelect = document.querySelector("#analysis-timeframe-filter");
   const presetSelect = document.querySelector("#analysis-preset-filter");
@@ -2983,7 +3046,7 @@ async function runStrategyRanking() {
     presets: selectedOptionValues(presetSelect).join(","),
     period: document.querySelector("#analysis-period-filter")?.value || "365d",
     min_trades: document.querySelector("#analysis-min-trades")?.value || "0",
-    limit: document.querySelector("#analysis-limit-filter")?.value || "3000",
+    limit: document.querySelector("#analysis-limit-filter")?.value || "auto",
     fee_pct: document.querySelector("#analysis-fee-filter")?.value || "0",
     slippage_pct: document.querySelector("#analysis-slippage-filter")?.value || "0",
   });
@@ -3000,7 +3063,7 @@ async function runStrategyRanking() {
     }
   } catch (error) {
     if (status) status.textContent = error.message;
-    if (body) body.innerHTML = `<tr><td colspan="11">${escapeHtml(error.message)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="12">${escapeHtml(error.message)}</td></tr>`;
   }
 }
 
@@ -3036,9 +3099,10 @@ function renderStrategyRanking(payload) {
         <td>${formatNumber(row.profitFactor)}</td>
         <td>${row.trades}</td>
         <td title="${escapeHtml((row.warnings || []).join("; "))}">${formatNumber(row.score)}</td>
+        <td title="${escapeHtml((row.dataReadiness?.warnings || []).join("; "))}">${escapeHtml(row.dataReadiness?.status || (row.partialData ? "PARTIAL" : "READY"))}</td>
         <td><button type="button" class="small-action-button" data-promote-ranking="${index}" ${row.valid ? "" : "disabled"}>Promote</button></td>
       </tr>
-    `).join("") || `<tr><td colspan="11">No rows matched the filters.</td></tr>`;
+    `).join("") || `<tr><td colspan="12">No rows matched the filters.</td></tr>`;
   }
 }
 
@@ -3088,7 +3152,7 @@ async function runStrategyOptimization() {
     timeframe: document.querySelector("#opt-timeframe-filter")?.value || "1h",
     strategy: document.querySelector("#opt-strategy-filter")?.value || "regime_filtered_trend",
     period: document.querySelector("#opt-period-filter")?.value || "365d",
-    limit: document.querySelector("#opt-limit-filter")?.value || "9000",
+    limit: document.querySelector("#opt-limit-filter")?.value || "auto",
     max_combos: document.querySelector("#opt-max-combos-filter")?.value || "500",
     train_ratio: document.querySelector("#opt-train-ratio-filter")?.value || "0.7",
     fee_pct: document.querySelector("#analysis-fee-filter")?.value || "0",
@@ -3101,7 +3165,8 @@ async function runStrategyOptimization() {
     loadResearchRuns();
     if (status) {
       const summary = payload.summary || {};
-      status.textContent = `Optimization complete. Tested ${JSON.stringify(summary.combinationsTested || 0)} combos. ${summary.validCandidates || 0} valid candidates.`;
+      const readiness = payload.dataReadiness?.summary || {};
+      status.textContent = `Optimization complete. Tested ${JSON.stringify(summary.combinationsTested || 0)} combos. ${summary.validCandidates || 0} valid candidates. Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.`;
     }
   } catch (error) {
     if (status) status.textContent = `Optimization failed: ${error.message}`;

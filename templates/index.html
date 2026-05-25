@@ -116,7 +116,15 @@
           <label><span>Presets</span><select id="analysis-preset-filter" multiple></select></label>
           <label><span>Period</span><input id="analysis-period-filter" value="365d"></label>
           <label><span>Min trades</span><input id="analysis-min-trades" type="number" value="50"></label>
-          <label><span>Candle limit</span><input id="analysis-limit-filter" type="number" min="100" max="20000" value="3000"></label>
+          <label><span>Candle limit</span><select id="analysis-limit-filter">
+            <option value="auto" selected>Auto</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="9000">9000</option>
+            <option value="20000">20000</option>
+            <option value="35000">35000</option>
+            <option value="50000">50000</option>
+          </select></label>
           <label><span>Fee % / side</span><input id="analysis-fee-filter" type="number" min="0" step="0.01" value="0"></label>
           <label><span>Slippage % / side</span><input id="analysis-slippage-filter" type="number" min="0" step="0.01" value="0"></label>
           <button id="analysis-run-ranking" type="button">Run Ranking</button>
@@ -136,6 +144,7 @@
               <th>Profit factor</th>
               <th>Trades</th>
               <th>Score</th>
+              <th>Data</th>
               <th>Action</th>
             </tr>
           </thead>
@@ -152,7 +161,15 @@
           <label><span>Symbol</span><select id="opt-symbol-filter"></select></label>
           <label><span>Timeframe</span><select id="opt-timeframe-filter"></select></label>
           <label><span>Period</span><input id="opt-period-filter" value="365d"></label>
-          <label><span>Candle limit</span><input id="opt-limit-filter" type="number" min="100" max="20000" value="9000"></label>
+          <label><span>Candle limit</span><select id="opt-limit-filter">
+            <option value="auto" selected>Auto</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="9000">9000</option>
+            <option value="20000">20000</option>
+            <option value="35000">35000</option>
+            <option value="50000">50000</option>
+          </select></label>
           <label><span>Max combos</span><input id="opt-max-combos-filter" type="number" min="1" max="5000" value="500"></label>
           <label><span>Train ratio</span><input id="opt-train-ratio-filter" type="number" min="0.5" max="0.9" step="0.05" value="0.7"></label>
           <button id="analysis-run-optimization" type="button">Run Optimization</button>
@@ -355,6 +372,46 @@
             </tr>
           </thead>
           <tbody id="cache-rows-body"></tbody>
+        </table>
+        <div class="page-heading compact-heading">
+          <div>
+            <h2>Research Data Readiness</h2>
+            <p>Read-only coverage check before ranking, optimization, validation, or learning. This never prefetches automatically.</p>
+          </div>
+        </div>
+        <div class="analysis-filters">
+          <label><span>Symbols</span><input id="readiness-symbols" value="BTCUSDT,ETHUSDT,SOLUSDT"></label>
+          <label><span>Timeframes</span><input id="readiness-timeframes" value="15m,1h,4h"></label>
+          <label><span>Period</span><input id="readiness-period" value="365d"></label>
+          <label><span>Limit</span><select id="readiness-limit">
+            <option value="auto" selected>Auto</option>
+            <option value="1000">1000</option>
+            <option value="5000">5000</option>
+            <option value="9000">9000</option>
+            <option value="20000">20000</option>
+            <option value="35000">35000</option>
+            <option value="50000">50000</option>
+          </select></label>
+          <button id="readiness-check" type="button">Check Readiness</button>
+        </div>
+        <div id="readiness-status" class="pane-status">Research readiness check is idle.</div>
+        <div id="readiness-summary" class="metric-grid"></div>
+        <table class="trade-table analysis-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Timeframe</th>
+              <th>Status</th>
+              <th>Cached</th>
+              <th>Required</th>
+              <th>Days</th>
+              <th>First</th>
+              <th>Last</th>
+              <th>Warnings</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="readiness-rows-body"></tbody>
         </table>
       </section>
 

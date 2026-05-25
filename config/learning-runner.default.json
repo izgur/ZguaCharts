@@ -31,8 +31,8 @@
     "regime_filtered_trend"
   ],
   "period": "365d",
-  "rankingLimit": 5000,
-  "optimizationLimit": 9000,
+  "rankingLimit": "auto",
+  "optimizationLimit": "auto",
   "maxRankingRuns": 20,
   "maxOptimizationCombos": 300,
   "minTrades": 20,

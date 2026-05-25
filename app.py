@@ -22,6 +22,8 @@ from data_source import (
     fetch_historical_candles,
     inspect_all_bybit_cache,
     parse_period_to_days,
+    historical_limit_for_period,
+    research_data_readiness,
     validate_bybit_symbol,
 )
 from indicators import available_indicators, build_indicator_payload
@@ -321,6 +323,14 @@ def parse_backtest_request_args(args, force_debug: bool = False) -> dict:
     }
 
 
+def research_limit_for(source: str, timeframe: str, period: str, limit_arg, require_number: bool = False):
+    if str(limit_arg).strip().lower() == "auto":
+        if require_number:
+            return historical_limit_for_period(period, timeframe, None) if source == "bybit" else 5000
+        return None
+    return int(limit_arg)
+
+
 def public_backtest_args(args: dict) -> dict:
     return {
         "source": args.get("source"),
@@ -395,6 +405,16 @@ def market_cache_status():
     symbols = parse_csv_arg(request.args.get("symbols"), DATA_SOURCE_CONFIG["sources"]["bybit"]["symbols"])
     timeframes = parse_csv_arg(request.args.get("timeframes"), ["15m", "1h", "4h"])
     return jsonify(inspect_all_bybit_cache(symbols, timeframes))
+
+
+@app.get("/api/research/data-readiness")
+def research_data_readiness_endpoint():
+    source = request.args.get("source", "bybit")
+    symbols = parse_csv_arg(request.args.get("symbols"), ["BTCUSDT"])
+    timeframes = parse_csv_arg(request.args.get("timeframes"), ["1h"])
+    period = request.args.get("period", "365d")
+    limit = request.args.get("limit", "auto")
+    return jsonify(research_data_readiness(source, symbols, timeframes, period, limit))
 
 
 @app.post("/api/market/cache/prefetch")
@@ -479,15 +499,17 @@ def strategy_optimize():
     timeframe = request.args.get("timeframe", "1h")
     strategy = request.args.get("strategy") or request.args.get("preset") or "RegimeFilteredTrendStrategy"
     period = request.args.get("period", "365d")
-    limit = int(request.args.get("limit", "9000"))
+    limit_arg = request.args.get("limit", "auto")
+    limit = research_limit_for(source, timeframe, period, limit_arg, require_number=True)
     max_combos = int(request.args.get("max_combos", "500"))
     train_ratio = float(request.args.get("train_ratio", "0.7"))
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
     save_run = request.args.get("save", "true").lower() not in {"0", "false", "no", "off"}
+    readiness = research_data_readiness(source, [symbol], [timeframe], period, limit_arg)
 
     try:
-        return jsonify(run_strategy_optimization_payload(
+        payload = run_strategy_optimization_payload(
             source,
             symbol,
             timeframe,
@@ -499,9 +521,22 @@ def strategy_optimize():
             fee_pct,
             slippage_pct,
             save_run=save_run,
-        ))
+        )
+        payload.setdefault("requested", {})["limitRaw"] = limit_arg
+        return jsonify(payload)
     except Exception as exc:
-        return jsonify({"error": f"Could not run strategy optimizer: {exc}"}), 502
+        return jsonify({
+            "error": f"Could not run strategy optimizer: {exc}",
+            "source": source,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "period": period,
+            "limit": limit,
+            "limitRaw": limit_arg,
+            "dataReadiness": readiness,
+            "partialData": not readiness.get("summary", {}).get("allReady", False),
+            "warnings": readiness_warnings(readiness),
+        }), 502
 
 
 @app.get("/api/research/runs")
@@ -1022,7 +1057,8 @@ def strategy_ranking():
     period = request.args.get("period", "365d")
     default_presets = [item["id"] for item in preset_options()] + ["regime_filtered_trend"]
     presets = parse_csv_arg(request.args.get("presets"), default_presets)
-    limit = int(request.args.get("limit", "5000"))
+    limit_arg = request.args.get("limit", "auto")
+    limit = research_limit_for(source, timeframes[0] if timeframes else "1h", period, limit_arg)
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
     min_trades = int(request.args.get("min_trades", "10"))
@@ -1037,6 +1073,7 @@ def strategy_ranking():
             presets,
             period,
             limit,
+            limit_arg,
             fee_pct,
             slippage_pct,
             min_trades,
@@ -1052,6 +1089,7 @@ def strategy_ranking():
                 "timeframes": timeframes,
                 "presets": presets,
                 "limit": limit,
+                "limitRaw": limit_arg,
                 "minTrades": min_trades,
                 "maxRuns": max_runs,
             },
@@ -1281,7 +1319,8 @@ def run_strategy_ranking_payload(
     timeframes: list[str],
     presets: list[str],
     period: str,
-    limit: int,
+    limit,
+    limit_raw,
     fee_pct: float,
     slippage_pct: float,
     min_trades: int,
@@ -1298,11 +1337,14 @@ def run_strategy_ranking_payload(
 
     rows = []
     errors = []
+    readiness = research_data_readiness(source, symbols, timeframes, period, limit_raw)
+    readiness_by_pair = {(row["symbol"], row["timeframe"]): row for row in readiness.get("rows", [])}
     # TODO: Move this synchronous matrix run to a background job/cache when the
     # requested symbol/timeframe/preset matrix becomes too slow for one request.
     for symbol in symbols:
         for timeframe in timeframes:
             for preset in presets:
+                readiness_row = readiness_by_pair.get((symbol, timeframe), {})
                 try:
                     payload = run_shared_backtest_engine(
                         source,
@@ -1318,6 +1360,8 @@ def run_strategy_ranking_payload(
                     metrics = ranking_metrics_from_backtest(payload)
                     valid = metrics["trades"] >= min_trades
                     warnings = list(payload.get("warnings") or [])
+                    if readiness_row.get("status") != "READY":
+                        warnings.append(f"Data readiness is {readiness_row.get('status', 'UNKNOWN')}: {readiness_row.get('recommendedAction', '')}")
                     if metrics["trades"] == 0:
                         warnings.append("zero-trade result")
                     if metrics["trades"] < min_trades:
@@ -1338,6 +1382,10 @@ def run_strategy_ranking_payload(
                         "averageBarsHeld": metrics["averageBarsHeld"],
                         "score": ranking_score(metrics, min_trades=min_trades),
                         "diagnostics": payload.get("diagnostics") or {},
+                        "dataReadiness": readiness_row,
+                        "partialData": readiness_row.get("status") != "READY",
+                        "effectiveLimit": (payload.get("historicalCoverage") or payload.get("historical_coverage") or {}).get("effective_limit"),
+                        "returnedCoverageDays": (payload.get("historicalCoverage") or payload.get("historical_coverage") or {}).get("approximate_days_returned"),
                         "params": (payload.get("diagnostics") or {}).get("params", {}),
                         "warnings": warnings,
                     })
@@ -1359,6 +1407,8 @@ def run_strategy_ranking_payload(
                         "averageBarsHeld": 0,
                         "score": -999,
                         "diagnostics": {},
+                        "dataReadiness": readiness_row,
+                        "partialData": True,
                         "warnings": [str(exc)],
                     })
 
@@ -1375,6 +1425,7 @@ def run_strategy_ranking_payload(
             "timeframes": timeframes,
             "presets": presets,
             "limit": limit,
+            "limitRaw": limit_raw,
             "minTrades": min_trades,
             "maxRuns": max_runs,
             "allowShorts": allow_shorts,
@@ -1386,7 +1437,10 @@ def run_strategy_ranking_payload(
             "runsCompleted": len(rows) - len(errors),
             "validCandidates": len([row for row in rows if row.get("valid")]),
             "errors": len(errors),
+            "partialDataRows": len([row for row in rows if row.get("partialData")]),
         },
+        "dataReadiness": readiness,
+        "warnings": readiness_warnings(readiness),
         "cards": ranking_cards(rows),
         "rows": rows,
         "errors": errors,
@@ -1409,11 +1463,24 @@ def run_strategy_optimization_payload(
     slippage_pct: float,
     save_run: bool = True,
 ) -> dict:
+    readiness = research_data_readiness(source, [symbol], [timeframe], period, limit)
     raw = run_strategy_optimizer_engine(source, symbol, timeframe, period, strategy, limit, max_combos, train_ratio, fee_pct, slippage_pct)
     payload = normalize_optimizer_payload(raw, source, symbol, timeframe, strategy, period, limit, max_combos, train_ratio, fee_pct, slippage_pct)
+    payload["dataReadiness"] = readiness
+    payload["partialData"] = not readiness.get("summary", {}).get("allReady", False)
+    payload.setdefault("warnings", [])
+    payload["warnings"].extend(readiness_warnings(readiness))
     if save_run:
         payload["researchRunId"] = append_research_run(research_record_from_optimization(payload))
     return payload
+
+
+def readiness_warnings(readiness: dict) -> list[str]:
+    warnings = []
+    for row in readiness.get("rows", []):
+        if row.get("status") != "READY":
+            warnings.append(f"{row.get('symbol')} {row.get('timeframe')} data readiness {row.get('status')}: {row.get('recommendedAction')}")
+    return warnings
 
 
 def default_learning_config() -> dict:
@@ -1439,8 +1506,8 @@ def default_learning_config() -> dict:
         "rankingPresets": ["conservative_trend", "regime_filtered_trend", "pullback_trend"],
         "optimizationStrategies": ["regime_filtered_trend"],
         "period": "365d",
-        "rankingLimit": 5000,
-        "optimizationLimit": 9000,
+        "rankingLimit": "auto",
+        "optimizationLimit": "auto",
         "maxRankingRuns": 20,
         "maxOptimizationCombos": 300,
         "minTrades": 20,
@@ -1510,7 +1577,10 @@ def safe_learning_config(config: dict) -> dict:
     base["autoPromoteMode"] = "candidate_only"
     base["autoPromoteRules"] = safe_auto_promote_rules(base.get("autoPromoteRules", {}))
     base["autoEnablePaper"] = False
-    for key in ("rankingLimit", "optimizationLimit", "maxRankingRuns", "maxOptimizationCombos", "minTrades"):
+    for key in ("rankingLimit", "optimizationLimit"):
+        value = base.get(key, default_learning_config()[key])
+        base[key] = "auto" if str(value).strip().lower() == "auto" else int(safe_float(value, 5000))
+    for key in ("maxRankingRuns", "maxOptimizationCombos", "minTrades"):
         base[key] = int(safe_float(base.get(key), default_learning_config()[key]))
     for key in ("feePct", "slippagePct"):
         base[key] = safe_float(base.get(key), default_learning_config()[key])
@@ -1911,6 +1981,9 @@ def build_learning_quality_audit(window: int = 5, extra_report: dict | None = No
     best_candidate = best_saved_candidate(research_runs)
     robustness_score = learning_robustness_score(stability, trend, paper_health, best_candidate, len(reports))
     warnings = learning_audit_warnings(reports, stability, trend, paper_health, best_candidate)
+    latest_readiness = (latest or {}).get("dataReadiness")
+    if latest_readiness and not latest_readiness.get("summary", {}).get("allReady", False):
+        warnings.append("Latest learning report used partial/stale/capped research data.")
     status, recommendation = learning_audit_status(robustness_score, warnings, stability, paper_health, best_candidate, len(reports))
     return {
         "status": status,
@@ -1928,6 +2001,7 @@ def build_learning_quality_audit(window: int = 5, extra_report: dict | None = No
         "candidateStability": stability,
         "scoreTrend": trend,
         "paperHealth": paper_health,
+        "dataReadiness": latest_readiness,
         "trustRules": learning_trust_rules(),
         "warnings": warnings,
         "recommendation": recommendation,
@@ -2219,14 +2293,18 @@ def run_learning_cycle(config: dict) -> dict:
         "warnings": [],
         "errors": [],
     }
+    report["dataReadiness"] = research_data_readiness(config["source"], config["symbols"], config["timeframes"], config["period"], config["rankingLimit"])
+    report["warnings"].extend(readiness_warnings(report["dataReadiness"]))
 
     try:
+        ranking_limit = research_limit_for(config["source"], config["timeframes"][0] if config["timeframes"] else "1h", config["period"], config["rankingLimit"])
         ranking_payload = run_strategy_ranking_payload(
             config["source"],
             config["symbols"],
             config["timeframes"],
             config["rankingPresets"],
             config["period"],
+            ranking_limit,
             config["rankingLimit"],
             config["feePct"],
             config["slippagePct"],
@@ -2247,13 +2325,14 @@ def run_learning_cycle(config: dict) -> dict:
             for timeframe in config["timeframes"]:
                 optimization_runs += 1
                 try:
+                    optimization_limit = research_limit_for(config["source"], timeframe, config["period"], config["optimizationLimit"], require_number=True)
                     payload = run_strategy_optimization_payload(
                         config["source"],
                         symbol,
                         timeframe,
                         config["period"],
                         strategy,
-                        config["optimizationLimit"],
+                        optimization_limit,
                         config["maxOptimizationCombos"],
                         0.7,
                         config["feePct"],
@@ -2391,6 +2470,8 @@ def research_record_from_ranking(payload: dict) -> dict:
         "presets": payload.get("requested", {}).get("presets", []),
         "period": payload.get("period"),
         "limit": payload.get("requested", {}).get("limit"),
+        "dataReadiness": payload.get("dataReadiness"),
+        "partialData": bool(payload.get("summary", {}).get("partialDataRows")),
         "fee_pct": payload.get("requested", {}).get("feePct"),
         "slippage_pct": payload.get("requested", {}).get("slippagePct"),
         "summary": payload.get("summary", {}),
@@ -2414,6 +2495,8 @@ def research_record_from_optimization(payload: dict) -> dict:
         "presets": [payload.get("strategy")],
         "period": payload.get("period"),
         "limit": payload.get("requested", {}).get("limit"),
+        "dataReadiness": payload.get("dataReadiness"),
+        "partialData": payload.get("partialData"),
         "fee_pct": payload.get("requested", {}).get("feePct"),
         "slippage_pct": payload.get("requested", {}).get("slippagePct"),
         "train_ratio": payload.get("requested", {}).get("trainRatio"),

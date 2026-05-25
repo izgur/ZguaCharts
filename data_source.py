@@ -486,6 +486,147 @@ def inspect_all_bybit_cache(symbols: list[str] | None = None, timeframes: list[s
     }
 
 
+def research_data_readiness(source: str, symbols: list[str], timeframes: list[str], period: str, limit: int | str | None = "auto") -> dict:
+    """Read-only readiness check for research/backtest jobs.
+
+    This intentionally inspects local/cache state only. It does not prefetch or
+    refresh candles; callers should use the explicit cache prefetch endpoint for
+    that workflow.
+    """
+    source = source or "bybit"
+    rows = []
+    for symbol in symbols:
+        for timeframe in timeframes:
+            try:
+                rows.append(research_data_readiness_pair(source, symbol, timeframe, period, limit))
+            except Exception as exc:
+                rows.append({
+                    "source": source,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "period": period,
+                    "status": "ERROR",
+                    "requiredCandles": None,
+                    "cachedCandles": 0,
+                    "returnedCandles": None,
+                    "approximateDays": 0,
+                    "requestedDays": parse_period_to_days(period),
+                    "firstCandleTime": None,
+                    "lastCandleTime": None,
+                    "fullPeriodCovered": False,
+                    "stale": None,
+                    "warnings": [str(exc)],
+                    "recommendedAction": "Fix data source/timeframe configuration before research.",
+                })
+    summary = {
+        "totalPairs": len(rows),
+        "readyPairs": sum(1 for row in rows if row["status"] == "READY"),
+        "partialPairs": sum(1 for row in rows if row["status"] == "PARTIAL"),
+        "missingPairs": sum(1 for row in rows if row["status"] == "MISSING"),
+        "stalePairs": sum(1 for row in rows if row["status"] == "STALE"),
+        "cappedPairs": sum(1 for row in rows if row["status"] == "CAPPED"),
+        "errorPairs": sum(1 for row in rows if row["status"] == "ERROR"),
+    }
+    summary["allReady"] = summary["readyPairs"] == summary["totalPairs"] and summary["totalPairs"] > 0
+    return {
+        "source": source,
+        "period": period,
+        "limit": limit,
+        "summary": summary,
+        "rows": rows,
+    }
+
+
+def research_data_readiness_pair(source: str, symbol: str, timeframe: str, period: str, limit: int | str | None = "auto") -> dict:
+    required = candles_needed_for_period(period, timeframe)
+    requested_days = parse_period_to_days(period)
+    provider_cap = BYBIT_MAX_CACHE_CANDLES if source == "bybit" else None
+    effective_limit = historical_limit_for_period(period, timeframe, None if str(limit).lower() == "auto" else limit) if source == "bybit" else safe_int(limit)
+    warnings = []
+    recommended = "Ready for research."
+    cached_candles = 0
+    approximate_days = 0
+    first_time = None
+    last_time = None
+    stale = None
+
+    if source == "bybit":
+        cache = inspect_bybit_cache(symbol, timeframe, partial_threshold=min(required or 1000, 1000))
+        cached_candles = int(cache.get("cachedCandles") or 0)
+        approximate_days = cache.get("approximateDays") or 0
+        first_time = cache.get("firstCandleTime")
+        last_time = cache.get("lastCandleTime")
+        stale = bool(cache.get("stale"))
+        warnings.extend(cache.get("warnings") or [])
+    else:
+        status = "ERROR"
+        warnings.append(f"Readiness cache inspection is currently implemented for Bybit only, not {source}.")
+        recommended = "Use Bybit or add cache inspection for this source."
+        return {
+            "source": source,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "period": period,
+            "requestedLimit": limit,
+            "effectiveLimit": effective_limit,
+            "providerMaxCandles": provider_cap,
+            "requiredCandles": required,
+            "cachedCandles": cached_candles,
+            "returnedCandles": None,
+            "approximateDays": approximate_days,
+            "requestedDays": requested_days,
+            "firstCandleTime": first_time,
+            "lastCandleTime": last_time,
+            "fullPeriodCovered": False,
+            "stale": stale,
+            "status": status,
+            "warnings": warnings,
+            "recommendedAction": recommended,
+        }
+
+    target = min(required or effective_limit or 0, provider_cap or required or effective_limit or 0)
+    full_period = bool(required and cached_candles >= min(required, provider_cap or required))
+    capped = bool(required and provider_cap and required > provider_cap)
+    if capped:
+        warnings.append(f"Requested {period} on {timeframe} requires {required} candles, capped at {provider_cap}.")
+    if cached_candles <= 0:
+        status = "MISSING"
+        recommended = "Prefetch this symbol/timeframe before ranking or optimization."
+    elif capped:
+        status = "CAPPED"
+        recommended = "Use a higher timeframe or shorter period; provider/cache cap prevents full coverage."
+    elif cached_candles < target:
+        status = "PARTIAL"
+        recommended = "Prefetch more history before trusting research results."
+    elif stale:
+        status = "STALE"
+        recommended = "Refresh latest candles before forward-sensitive research."
+    else:
+        status = "READY"
+
+    return {
+        "source": source,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "period": period,
+        "requestedLimit": limit,
+        "effectiveLimit": effective_limit,
+        "providerMaxCandles": provider_cap,
+        "requiredCandles": required,
+        "cachedCandles": cached_candles,
+        "returnedCandles": None,
+        "approximateDays": approximate_days,
+        "requestedDays": requested_days,
+        "firstCandleTime": first_time,
+        "lastCandleTime": last_time,
+        "fullPeriodCovered": full_period,
+        "stale": stale,
+        "status": status,
+        "warnings": warnings,
+        "recommendedAction": recommended,
+    }
+
+
 def fetch_bybit_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
     candles, _diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, limit)
     return candles
