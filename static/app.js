@@ -3242,7 +3242,11 @@ async function runStrategyOptimization() {
     if (status) {
       const summary = payload.summary || {};
       const readiness = payload.dataReadiness?.summary || {};
-      status.textContent = `Optimization complete. Tested ${JSON.stringify(summary.combinationsTested || 0)} combos. ${summary.validCandidates || 0} valid candidates. Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.`;
+      const grid = payload.optimizerGrid || {};
+      const zero = payload.zeroTradeSummary || {};
+      const fallback = grid.fallbackUsed ? " Fallback grid used." : "";
+      const zeroText = payload.allZeroTradeCandidates ? ` All candidates had zero trades: ${zero.suggestedGridAction || "inspect diagnostics"}.` : "";
+      status.textContent = `Optimization complete using ${grid.gridName || "optimizer grid"}. Tested ${grid.candidateCountTested || JSON.stringify(summary.combinationsTested || 0)}/${grid.candidateCountPlanned || "?"} combos. ${summary.validCandidates || 0} valid candidates. Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.${fallback}${zeroText}`;
     }
   } catch (error) {
     if (status) status.textContent = `Optimization failed: ${error.message}`;
@@ -3260,7 +3264,20 @@ function renderStrategyOptimization(payload) {
   const body = document.querySelector("#optimization-table-body");
   const rows = payload.topCandidates || [];
   if (!body) return;
-  body.innerHTML = rows.map((row, index) => `
+  const zeroSummary = payload.zeroTradeSummary || {};
+  const metaRows = `
+    <tr class="diagnostic-row">
+      <td colspan="8">
+        Grid: <strong>${escapeHtml(payload.optimizerGrid?.gridName || "-")}</strong>
+        · planned ${payload.optimizerGrid?.candidateCountPlanned ?? "-"}
+        · tested ${payload.optimizerGrid?.candidateCountTested ?? "-"}
+        ${payload.optimizerGrid?.fallbackUsed ? " · fallback used" : ""}
+        ${zeroSummary.zeroTradeCandidates ? ` · zero-trade candidates ${zeroSummary.zeroTradeCandidates}/${zeroSummary.totalCandidates}` : ""}
+        ${zeroSummary.topReasons?.length ? ` · top reason ${escapeHtml(zeroSummary.topReasons[0].reason)}` : ""}
+      </td>
+    </tr>
+  `;
+  body.innerHTML = metaRows + (rows.map((row, index) => `
     <tr class="${row.valid ? "" : "invalid-row"}">
       <td>${row.rank}</td>
       <td>${formatNumber(row.score)}</td>
@@ -3271,7 +3288,7 @@ function renderStrategyOptimization(payload) {
       <td title="${escapeHtml((row.warnings || []).join("; "))}">${escapeHtml(row.overfitWarning || (row.warnings || [])[0] || "-")}</td>
       <td><button type="button" class="small-action-button" data-promote-optimization="${index}">Promote</button></td>
     </tr>
-  `).join("") || `<tr><td colspan="8">No optimization candidates returned.</td></tr>`;
+  `).join("") || `<tr><td colspan="8">No optimization candidates returned.</td></tr>`);
 }
 
 function formatOptimizationMetric(metric) {

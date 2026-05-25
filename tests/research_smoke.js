@@ -60,6 +60,13 @@ assert.ok(looseAudit.ok, "ConservativeTrendLoose lifecycle audit must pass: " + 
 
 const combos = optimizer.expandGrid({ emaFast: [10, 20], emaSlow: [50], rsiMin: [45, 50] });
 assert.strictEqual(combos.length, 4);
+const grids = optimizer.availableOptimizerGrids();
+assert.ok(grids.some((grid) => grid.gridName === "V2 ATR trend"), "optimizer should expose strategy-specific grids");
+const v2Grid = optimizer.selectOptimizerGrid("SimpleAtrTrendV2", null, 25);
+assert.strictEqual(v2Grid.metadata.gridName, "V2 ATR trend");
+assert.ok(v2Grid.metadata.candidateCountTested <= 25, "optimizer grid must respect max combo limit");
+const fallbackGrid = optimizer.selectOptimizerGrid("AlwaysLongTest", null, 5);
+assert.strictEqual(fallbackGrid.metadata.gridName, "Default fallback");
 
 const csv = reporting.toCsv([
   {

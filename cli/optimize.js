@@ -13,7 +13,7 @@ const options = {
   strategy: args.strategy || "ConservativeTrend",
   limit: Number(args.limit || 5000),
   trainRatio: Number(args.trainRatio || 0.7),
-  ranges: optimizer.parseRanges(args.ranges),
+  ranges: args.ranges ? optimizer.parseRanges(args.ranges) : null,
   outputDir: outputDir,
   reportPrefix: args["report-prefix"] || args.reportPrefix || "",
   maxCombos: Number(args["max-combos"] || args.maxCombos || 1000),

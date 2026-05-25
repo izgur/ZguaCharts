@@ -599,6 +599,14 @@ def strategy_optimize():
         }), 502
 
 
+@app.get("/api/strategy-optimizer/grids")
+def strategy_optimizer_grids():
+    try:
+        return jsonify(load_optimizer_grid_catalog())
+    except Exception as exc:
+        return jsonify({"error": f"Could not load optimizer grids: {exc}", "grids": []}), 502
+
+
 @app.get("/api/research/runs")
 def research_runs():
     limit = int(request.args.get("limit", "50"))
@@ -2419,6 +2427,25 @@ def run_learning_cycle(config: dict) -> dict:
                     )
                     if payload.get("researchRunId"):
                         report["optimizationRunIds"].append(payload["researchRunId"])
+                    grid_meta = payload.get("optimizerGrid") or {}
+                    if grid_meta:
+                        report["warnings"].append({
+                            "type": "optimizer_grid",
+                            "strategy": strategy,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "gridName": grid_meta.get("gridName"),
+                            "candidateCountTested": grid_meta.get("candidateCountTested"),
+                            "fallbackUsed": grid_meta.get("fallbackUsed"),
+                        })
+                    if payload.get("allZeroTradeCandidates"):
+                        report["warnings"].append({
+                            "type": "zero_trade_optimizer_result",
+                            "strategy": strategy,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "zeroTradeSummary": payload.get("zeroTradeSummary"),
+                        })
                 except Exception as exc:
                     report["errors"].append({"stage": "optimization", "strategy": strategy, "symbol": symbol, "timeframe": timeframe, "error": str(exc)})
                     if "0 trades" in str(exc).lower() or "zero" in str(exc).lower():
@@ -2605,6 +2632,9 @@ def research_record_from_optimization(payload: dict) -> dict:
         "limit": payload.get("requested", {}).get("limit"),
         "dataReadiness": payload.get("dataReadiness"),
         "partialData": payload.get("partialData"),
+        "optimizerGrid": payload.get("optimizerGrid"),
+        "zeroTradeSummary": payload.get("zeroTradeSummary"),
+        "allZeroTradeCandidates": payload.get("allZeroTradeCandidates"),
         "fee_pct": payload.get("requested", {}).get("feePct"),
         "slippage_pct": payload.get("requested", {}).get("slippagePct"),
         "train_ratio": payload.get("requested", {}).get("trainRatio"),
@@ -3802,6 +3832,20 @@ def run_strategy_optimizer_engine(source: str, symbol: str, timeframe: str, peri
     return json.loads(completed.stdout)
 
 
+def load_optimizer_grid_catalog() -> dict:
+    script = "const optimizer=require('./core/optimizer'); process.stdout.write(JSON.stringify({grids: optimizer.availableOptimizerGrids()}));"
+    completed = subprocess.run(
+        [node_executable(), "-e", script],
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Could not inspect optimizer grids")
+    return json.loads(completed.stdout)
+
+
 def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: str, strategy: str, period: str, limit: int, max_combos: int, train_ratio: float, fee_pct: float, slippage_pct: float) -> dict:
     candidates = optimizer_candidates(raw)
     rows = [normalize_optimizer_candidate(row, index + 1) for index, row in enumerate(candidates[:20])]
@@ -3824,6 +3868,10 @@ def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: 
             "validCandidates": raw.get("validCandidates", 0),
             "warnings": optimizer_warnings(raw),
         },
+        "optimizerGrid": raw.get("optimizerGrid") or {},
+        "zeroTradeSummary": raw.get("zeroTradeSummary") or {},
+        "allZeroTradeCandidates": bool(raw.get("allZeroTradeCandidates")),
+        "warnings": optimizer_warnings(raw),
         "topCandidates": rows,
         "rawSummary": raw.get("summary") or {key: raw.get(key) for key in ("robustnessAssessment", "bestTestResult", "combinationsTested")},
         "errors": [],
@@ -3858,6 +3906,7 @@ def normalize_optimizer_candidate(row: dict, rank: int) -> dict:
         "full": full,
         "walkForward": walk_forward,
         "warnings": warnings,
+        "zeroTradeDiagnostics": row.get("zeroTradeDiagnostics"),
         "overfitWarning": train_test_overfit_warning(train, test),
     }
 
@@ -3887,6 +3936,10 @@ def optimizer_candidate_score(row: dict) -> float:
 
 def optimizer_candidate_warnings(row: dict, train: dict, test: dict, full: dict, walk_forward: list) -> list[str]:
     warnings = []
+    zero_diag = row.get("zeroTradeDiagnostics") or {}
+    if zero_diag:
+        likely = (zero_diag.get("summary") or {}).get("likelyReason")
+        warnings.append(f"ZERO TRADE: {likely or 'candidate produced no train/test trades'}")
     if safe_float(test.get("trades")) < 20:
         warnings.append("FAIL: low test trade count")
     if safe_float(test.get("profitFactor")) <= 1:
@@ -3926,12 +3979,18 @@ def optimizer_combinations_tested(raw: dict):
 def optimizer_warnings(raw: dict) -> list[str]:
     warnings = []
     summary = raw.get("summary") or {}
+    for value in raw.get("warnings") or []:
+        if value:
+            warnings.append(value)
+    for value in summary.get("warnings") or []:
+        if value:
+            warnings.append(value)
     for value in (raw.get("warning"), summary.get("warning"), raw.get("robustnessAssessment"), summary.get("robustnessAssessment")):
         if value:
             warnings.append(value)
     # TODO: Add scheduled optimization runs, automatic candidate suggestions,
     # human approval queues, auto-promotion after validation, and paper-performance monitoring.
-    return warnings
+    return dedupe_list(warnings)
 
 
 def parse_csv_arg(value: str | None, fallback: list[str]) -> list[str]:
