@@ -1403,8 +1403,12 @@ function syncIndicatorTimeRanges(pane) {
   }
 }
 
+function backtestLimitOptions(selected = "auto") {
+  const values = ["auto", "1000", "5000", "9000", "20000", "35000", "50000"];
+  return values.map((value) => `<option value="${value}" ${String(selected) === value ? "selected" : ""}>${value === "auto" ? "Auto" : value}</option>`).join("");
+}
+
 function openBacktestControls(pane) {
-  const currentLimit = Math.max(pane.candles.length || 5000, 5000);
   const options = (config.strategy_presets || [])
     .map((preset) => `<option value="${preset.id}" ${preset.id === pane.presetSelect.value ? "selected" : ""}>${preset.label}</option>`)
     .join("");
@@ -1416,7 +1420,7 @@ function openBacktestControls(pane) {
       </label>
       <label>
         <span>Limit</span>
-        <input id="modal-limit-input" type="number" min="100" max="20000" value="${currentLimit}">
+        <select id="modal-limit-input">${backtestLimitOptions("auto")}</select>
       </label>
       <label>
         <span>Fee % / side</span>
@@ -1458,7 +1462,7 @@ function openBacktestControls(pane) {
 function backtestSettings(presetId) {
   return {
     preset: presetId,
-    limit: document.querySelector("#modal-limit-input")?.value || "5000",
+    limit: document.querySelector("#modal-limit-input")?.value || "auto",
     fee_pct: document.querySelector("#modal-fee-input")?.value || "0",
     slippage_pct: document.querySelector("#modal-slippage-input")?.value || "0",
     allowShorts: document.querySelector("#modal-allow-shorts")?.checked ? "true" : "false",
@@ -1596,7 +1600,7 @@ function labBacktestSettings() {
   return {
     preset: document.querySelector("#lab-preset-select")?.value || config.default_strategy_preset,
     period: document.querySelector("#lab-period-input")?.value || "60d",
-    limit: document.querySelector("#lab-limit-input")?.value || "5000",
+    limit: document.querySelector("#lab-limit-input")?.value || "auto",
     fee_pct: document.querySelector("#lab-fee-input")?.value || "0",
     slippage_pct: document.querySelector("#lab-slippage-input")?.value || "0",
     allowShorts: document.querySelector("#lab-allow-shorts")?.checked ? "true" : "false",
@@ -2029,6 +2033,7 @@ function renderBacktestResults(payload) {
     ["Period", payload.period],
   ];
   const diagnostics = payload.diagnostics || {};
+  const coverage = diagnostics.historical_coverage || {};
   const diagnosticMetrics = [
     ["Preset", payload.preset],
     ["First candle", formatIsoDate(diagnostics.first_candle_date)],
@@ -2046,6 +2051,18 @@ function renderBacktestResults(payload) {
     ["Slippage/side", `${diagnostics.slippage_pct_per_side ?? payload.slippage_pct}%`],
     ["Raw score", diagnostics.raw_latest_score],
     ["Smoothed score", diagnostics.smoothed_latest_score],
+  ];
+  const coverageMetrics = [
+    ["Requested", coverage.requested_period || payload.period],
+    ["Requested limit", coverage.requested_limit ?? "-"],
+    ["Required candles", coverage.period_required_candles ?? "-"],
+    ["Effective limit", coverage.effective_limit ?? "-"],
+    ["Provider cap", coverage.provider_max_candles ?? "-"],
+    ["Returned", coverage.returned_candles ?? diagnostics.actual_returned_candles ?? diagnostics.number_of_candles_loaded],
+    ["Coverage", coverage.approximate_days_returned !== undefined ? `~${coverage.approximate_days_returned}d` : "-"],
+    ["First candle", formatDateTime(coverage.first_candle_time || diagnostics.first_candle_time)],
+    ["Last candle", formatDateTime(coverage.last_candle_time || diagnostics.last_candle_time)],
+    ["Full period", coverage.full_period_covered === undefined ? "-" : (coverage.full_period_covered ? "yes" : "no")],
   ];
   const overlayDiagnostics = diagnostics.overlay_rendering || payload.overlayDiagnostics || {};
   const overlayMetrics = [
@@ -2082,6 +2099,10 @@ function renderBacktestResults(payload) {
     <h3 class="modal-section-title">Diagnostics</h3>
     <div class="metric-grid diagnostics-grid">
       ${diagnosticMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? "-"}</strong></div>`).join("")}
+    </div>
+    <h3 class="modal-section-title">History Coverage</h3>
+    <div class="metric-grid diagnostics-grid">
+      ${coverageMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? "-"}</strong></div>`).join("")}
     </div>
     <h3 class="modal-section-title">Data Diagnostics</h3>
     <div class="metric-grid diagnostics-grid">

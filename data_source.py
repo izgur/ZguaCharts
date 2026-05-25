@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+import math
 from pathlib import Path
 import threading
 import time
@@ -17,6 +18,7 @@ BYBIT_REQUEST_LIMIT = 1000
 BYBIT_MAX_REQUESTS_IN_FLIGHT = 2
 BYBIT_MIN_REQUEST_DELAY_SECONDS = 0.18
 BYBIT_MAX_CACHE_CANDLES = 50000
+BYBIT_HISTORICAL_DEFAULT_MAX_CANDLES = 50000
 BYBIT_CACHE_STALE_MULTIPLIER = 3
 HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 BYBIT_DISK_CACHE_DIR = Path(__file__).resolve().parent / ".research-cache"
@@ -166,7 +168,7 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, vi
     }
 
 
-def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: str = "60d", limit: int = 5000) -> dict:
+def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: str = "60d", limit: int | None = 5000) -> dict:
     """Historical candle entry point for analytics such as backtests.
 
     Broker adapters should still return plain OHLCV dictionaries. yfinance can
@@ -175,9 +177,26 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
     if source == "yfinance":
         effective_period = yfinance_backtest_period(timeframe)
         candles = fetch_yfinance_candles_for_period(symbol, timeframe, effective_period)
+        diagnostics = historical_diagnostics(period, timeframe, limit, len(candles), len(candles), len(candles), candles)
+    elif source == "bybit":
+        effective_period = period
+        effective_limit = historical_limit_for_period(period, timeframe, limit)
+        candles, bybit_diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, effective_limit)
+        diagnostics = historical_diagnostics(
+            period,
+            timeframe,
+            limit,
+            candles_needed_for_period(period, timeframe),
+            effective_limit,
+            BYBIT_MAX_CACHE_CANDLES,
+            candles,
+        )
+        diagnostics.update({"bybit": bybit_diagnostics})
     else:
         effective_period = period
-        candles = fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)["candles"]
+        effective_limit = int(limit or 5000)
+        candles = fetch_candles(source, symbol, timeframe, limit=effective_limit, visible_charts=1)["candles"]
+        diagnostics = historical_diagnostics(period, timeframe, limit, effective_limit, effective_limit, effective_limit, candles)
 
     return {
         "source": source,
@@ -185,8 +204,110 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
         "timeframe": timeframe,
         "period": period,
         "effective_period": effective_period,
-        "limit": limit,
+        "limit": diagnostics["effective_limit"],
+        "diagnostics": diagnostics,
         "candles": candles,
+    }
+
+
+def parse_period_to_days(period: str | None) -> float | None:
+    if not period:
+        return None
+    text = str(period).strip().lower()
+    if text in {"max", "all"}:
+        return None
+    try:
+        if text.endswith("d"):
+            return float(text[:-1])
+        if text.endswith("w"):
+            return float(text[:-1]) * 7
+        if text.endswith("mo"):
+            return float(text[:-2]) * 30
+        if text.endswith("m"):
+            return float(text[:-1]) * 30
+        if text.endswith("y"):
+            return float(text[:-1]) * 365
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def timeframe_to_minutes(timeframe: str) -> float:
+    text = str(timeframe).strip().lower()
+    if text.endswith("m"):
+        return float(text[:-1])
+    if text.endswith("h"):
+        return float(text[:-1]) * 60
+    if text.endswith("d"):
+        return float(text[:-1]) * 1440
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def candles_needed_for_period(period: str | None, timeframe: str) -> int | None:
+    days = parse_period_to_days(period)
+    if days is None:
+        return None
+    minutes = timeframe_to_minutes(timeframe)
+    return max(1, int(math.ceil((days * 1440) / minutes)))
+
+
+def approximate_days_for_candles(candle_count: int, timeframe: str) -> float:
+    minutes = timeframe_to_minutes(timeframe)
+    return round((max(0, int(candle_count)) * minutes) / 1440, 2)
+
+
+def historical_limit_for_period(period: str | None, timeframe: str, requested_limit: int | str | None = None) -> int:
+    required = candles_needed_for_period(period, timeframe)
+    requested = safe_int(requested_limit)
+    if requested is None:
+        requested = BYBIT_HISTORICAL_DEFAULT_MAX_CANDLES if required is None else required
+    target = max(requested, required or 0, BYBIT_HISTORICAL_DEFAULT_MAX_CANDLES if required is None else 50)
+    return min(target, BYBIT_MAX_CACHE_CANDLES)
+
+
+def historical_diagnostics(
+    period: str,
+    timeframe: str,
+    requested_limit,
+    required_candles: int | None,
+    effective_limit: int,
+    provider_max: int,
+    candles: list[dict],
+) -> dict:
+    returned = len(candles)
+    requested_days = parse_period_to_days(period)
+    approx_days = approximate_days_for_candles(returned, timeframe)
+    first_time = int(candles[0]["time"]) if candles else None
+    last_time = int(candles[-1]["time"]) if candles else None
+    warnings = []
+    full_period_covered = True
+    if required_candles is not None:
+        full_period_covered = returned >= min(required_candles, provider_max)
+        if required_candles > provider_max:
+            full_period_covered = False
+            warnings.append(
+                f"Requested {period} on {timeframe} requires {required_candles} candles, capped at {provider_max}."
+            )
+        elif returned < required_candles:
+            full_period_covered = False
+            warnings.append(
+                f"Requested {period} on {timeframe} requires {required_candles} candles, but source returned {returned}."
+            )
+    if requested_days is not None and approx_days + 0.01 < requested_days and required_candles is not None:
+        warnings.append(f"Approximate returned coverage is {approx_days}d versus requested {requested_days:g}d.")
+    return {
+        "requested_period": period,
+        "requested_limit": requested_limit,
+        "period_required_candles": required_candles,
+        "effective_limit": effective_limit,
+        "provider_max_candles": provider_max,
+        "returned_candles": returned,
+        "approximate_days_returned": approx_days,
+        "first_candle_time": first_time,
+        "last_candle_time": last_time,
+        "full_period_covered": full_period_covered,
+        "period_capped": bool(required_candles and required_candles > provider_max),
+        "warnings": warnings,
     }
 
 

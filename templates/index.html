@@ -78,7 +78,15 @@
             <label><span>Period</span><input id="lab-period-input" value="60d"></label>
             <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.01" value="0"></label>
             <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.01" value="0"></label>
-            <label><span>Candle limit</span><input id="lab-limit-input" type="number" min="100" max="20000" value="5000"></label>
+            <label><span>Candle limit</span><select id="lab-limit-input">
+              <option value="auto">Auto</option>
+              <option value="1000">1000</option>
+              <option value="5000">5000</option>
+              <option value="9000">9000</option>
+              <option value="20000">20000</option>
+              <option value="35000">35000</option>
+              <option value="50000">50000</option>
+            </select></label>
             <label class="allow-short-toggle">
               <input id="lab-allow-shorts" type="checkbox">
               <span>Allow shorts when strategy supports them</span>

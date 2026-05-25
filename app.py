@@ -172,7 +172,8 @@ def backtest():
     preset = request.args.get("preset", DEFAULT_PRESET_ID)
     fee_pct = float(request.args.get("fee_pct", "0"))
     slippage_pct = float(request.args.get("slippage_pct", "0"))
-    limit = int(request.args.get("limit", "5000"))
+    limit_arg = request.args.get("limit", "5000")
+    limit = None if str(limit_arg).lower() == "auto" else int(limit_arg)
     debug = request.args.get("debug", "false").lower() == "true"
     allow_shorts = request.args.get("allowShorts", "false").lower() == "true"
     chart_candles_count = int(request.args.get("chart_candles_count", "0") or "0")
@@ -2666,7 +2667,7 @@ def node_executable() -> str:
     return fallback or "node"
 
 
-def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None) -> dict:
+def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
     Python keeps responsibility for broker adapters that already work here
@@ -2674,6 +2675,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     the UI, CLI optimizer, and future workers all share one backtest engine.
     """
     candles_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
+    effective_limit = int(candles_payload.get("limit") or limit or len(candles_payload["candles"]) or 0)
     params = {
         **(strategy_params or {}),
         "feePct": fee_pct,
@@ -2687,7 +2689,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "timeframe": timeframe,
         "strategy": NODE_STRATEGIES.get(preset, preset),
         "preset": NODE_STRATEGIES.get(preset, preset),
-        "limit": limit,
+        "limit": effective_limit,
         "params": params,
         "debug": debug,
         "candles": candles_payload["candles"],
@@ -2709,9 +2711,22 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["period"] = period
     payload["presets"] = preset_options()
     payload.setdefault("diagnostics", {})
-    payload["diagnostics"]["requested_period"] = period
+    historical_diag = candles_payload.get("diagnostics", {})
+    payload["diagnostics"]["requested_period"] = historical_diag.get("requested_period", period)
     payload["diagnostics"]["effective_period"] = candles_payload.get("effective_period", period)
-    payload["diagnostics"]["api_candles"] = candle_diagnostics(candles_payload["candles"], requested_limit=limit)
+    payload["diagnostics"]["historical_coverage"] = historical_diag
+    payload["diagnostics"]["api_candles"] = candle_diagnostics(candles_payload["candles"], requested_limit=effective_limit)
+    payload["diagnostics"]["actual_returned_candles"] = historical_diag.get("returned_candles", len(candles_payload["candles"]))
+    payload["diagnostics"]["actual_days_returned"] = historical_diag.get("approximate_days_returned", payload["diagnostics"].get("actual_days_returned"))
+    payload["diagnostics"]["first_candle_time"] = historical_diag.get("first_candle_time", payload.get("firstCandleTime"))
+    payload["diagnostics"]["last_candle_time"] = historical_diag.get("last_candle_time", payload.get("lastCandleTime"))
+    if payload["diagnostics"].get("first_candle_time"):
+        payload["diagnostics"]["first_candle_date"] = datetime.fromtimestamp(int(payload["diagnostics"]["first_candle_time"]), timezone.utc).isoformat()
+    if payload["diagnostics"].get("last_candle_time"):
+        payload["diagnostics"]["last_candle_date"] = datetime.fromtimestamp(int(payload["diagnostics"]["last_candle_time"]), timezone.utc).isoformat()
+    payload["diagnostics"]["period_capped"] = historical_diag.get("period_capped", False)
+    payload["diagnostics"].setdefault("warnings", [])
+    payload["diagnostics"]["warnings"].extend(historical_diag.get("warnings", []))
     return payload
 
 
