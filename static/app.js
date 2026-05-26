@@ -2358,6 +2358,7 @@ function renderLearningPage() {
     learningInitialized = true;
   }
   loadLearningConfig();
+  loadLearningAuditSummary();
   loadLearningAudit();
   loadLearningDecisions();
   loadLearningReports();
@@ -2673,6 +2674,7 @@ function setupLearningControls() {
   document.querySelector("#learning-run-button")?.addEventListener("click", runLearningCycle);
   document.querySelector("#learning-save-config")?.addEventListener("click", saveLearningConfig);
   document.querySelector("#learning-tick-button")?.addEventListener("click", runLearningTick);
+  document.querySelector("#learning-audit-summary-button")?.addEventListener("click", loadLearningAuditSummary);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
   document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
@@ -2733,6 +2735,7 @@ async function runLearningTick() {
     if (payload.report) {
       lastLearningReport = payload.report;
       renderLearningReport(payload.report);
+      loadLearningAuditSummary();
       loadLearningAudit();
       loadLearningDecisions();
       loadLearningReports();
@@ -2794,6 +2797,7 @@ async function runLearningCycle() {
     const report = await apiPost("/api/learning/run", body);
     lastLearningReport = report;
     renderLearningReport(report);
+    loadLearningAuditSummary();
     loadLearningAudit();
     loadLearningDecisions();
     loadLearningReports();
@@ -2886,6 +2890,59 @@ async function loadLearningAudit() {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Learning audit could not load: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadLearningAuditSummary() {
+  const host = document.querySelector("#learning-audit-summary");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading audit summary...</p>`;
+    const payload = await apiGet("/api/learning/audit-summary");
+    host.innerHTML = renderLearningAuditSummary(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Audit summary could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderLearningAuditSummary(payload) {
+  const latest = payload.latestLearningReport || {};
+  const opt = payload.optimizerQuality || {};
+  const zero = payload.zeroTrade || {};
+  const readiness = payload.readiness || {};
+  const next = payload.nextAction || {};
+  const best = payload.bestSavedCandidate || {};
+  const current = payload.currentPaperCandidate || {};
+  const commands = (next.commands || []).map((command) => `<code>${escapeHtml(command)}</code>`).join("<br>");
+  const rejectionRows = (opt.topRejectionReasons || []).slice(0, 5).map((item) => `
+    <tr><td>${escapeHtml(item.label || item.reason || "-")}</td><td>${item.count || 0}</td></tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Audit Summary <span class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "Check"}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Learning</span><strong>${escapeHtml(latest.status || "none")}</strong></div>
+      <div class="metric"><span>Optimizer</span><strong>${escapeHtml(opt.latestSelectedStatus || "UNKNOWN")}</strong></div>
+      <div class="metric"><span>PASS/WARN/FAIL</span><strong>${opt.passCandidates || 0}/${opt.warnCandidates || 0}/${opt.failCandidates || 0}</strong></div>
+      <div class="metric"><span>Zero-trade</span><strong>${zero.hasZeroTradeProblem ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${current.enabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Best saved candidate</th><td>${best.strategy ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol || "")} ${escapeHtml(best.timeframe || "")} · PF ${formatNumber(best.profitFactor)} · T ${best.trades || 0}` : "-"}</td></tr>
+        <tr><th>Current paper candidate</th><td>${current.strategy ? `${escapeHtml(current.strategy)} ${escapeHtml((current.activeSymbols || [])[0]?.symbol || "")}` : "-"}</td></tr>
+        <tr><th>Safe for manual review</th><td class="${readiness.safeForManualReview ? "positive" : "neutral"}">${readiness.safeForManualReview ? "yes" : "no"}</td></tr>
+        <tr><th>Suggested commands</th><td>${commands || "-"}</td></tr>
+      </tbody>
+    </table>
+    <h3 class="modal-section-title">Top Rejection Reasons</h3>
+    <table class="trade-table">
+      <thead><tr><th>Reason</th><th>Count</th></tr></thead>
+      <tbody>${rejectionRows || `<tr><td colspan="2">No optimizer rejection reasons available.</td></tr>`}</tbody>
+    </table>
+    ${(zero.suggestedActions || []).length ? `<ul class="backtest-warnings">${zero.suggestedActions.map((action) => `<li>${escapeHtml(action)}</li>`).join("")}</ul>` : ""}
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
 }
 
 function renderLearningAudit(payload) {

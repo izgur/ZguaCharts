@@ -741,6 +741,14 @@ def learning_audit():
         return jsonify({"error": f"Could not build learning audit: {exc}"}), 502
 
 
+@app.get("/api/learning/audit-summary")
+def learning_audit_summary():
+    try:
+        return jsonify(build_learning_audit_summary())
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Could not build learning audit summary: {exc}"}), 502
+
+
 @app.get("/api/learning/auto-promote/status")
 def learning_auto_promote_status():
     config = load_learning_config()
@@ -2078,6 +2086,196 @@ def build_learning_quality_audit(window: int = 5, extra_report: dict | None = No
         "warnings": warnings,
         "recommendation": recommendation,
     }
+
+
+def build_learning_audit_summary() -> dict:
+    reports = load_learning_reports()
+    research_runs = load_research_runs()
+    current_candidate = load_paper_candidate_config()
+    candidate_health_payload = build_candidate_health(candidate_health_rules({}))
+    candidate_health = candidate_health_payload.get("health", {})
+    latest_learning = reports[-1] if reports else None
+    latest_ranking = latest_research_run_by_type(research_runs, "ranking")
+    latest_optimization = latest_research_run_by_type(research_runs, "optimization")
+    best_candidate = best_saved_candidate(research_runs)
+    optimizer_quality = optimizer_quality_from_run(latest_optimization)
+    zero_trade = zero_trade_summary_from_run(latest_optimization)
+    readiness = learning_audit_readiness(reports, best_candidate, current_candidate, candidate_health, optimizer_quality)
+    next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate)
+    warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness)
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "latestLearningReport": compact_learning_report(latest_learning),
+        "latestRankingRun": compact_research_run(latest_ranking),
+        "latestOptimizationRun": compact_research_run(latest_optimization),
+        "bestSavedCandidate": compact_candidate(best_candidate),
+        "currentPaperCandidate": candidate_summary(current_candidate),
+        "candidateHealth": candidate_health,
+        "optimizerQuality": optimizer_quality,
+        "zeroTrade": zero_trade,
+        "readiness": readiness,
+        "nextAction": next_action,
+        "warnings": warnings,
+    }
+
+
+def latest_research_run_by_type(runs: list[dict], run_type: str) -> dict | None:
+    return next((run for run in reversed(runs) if run.get("type") == run_type), None)
+
+
+def compact_learning_report(report: dict | None) -> dict | None:
+    if not report:
+        return None
+    return {
+        "id": report.get("id"),
+        "createdAt": report.get("createdAt"),
+        "status": report.get("status"),
+        "rankingRunIds": report.get("rankingRunIds", []),
+        "optimizationRunIds": report.get("optimizationRunIds", []),
+        "recommendation": report.get("recommendation"),
+        "errors": report.get("errors", []),
+        "warningsCount": len(report.get("warnings") or []),
+    }
+
+
+def compact_research_run(run: dict | None) -> dict | None:
+    if not run:
+        return None
+    return {
+        "id": run.get("id"),
+        "createdAt": run.get("createdAt"),
+        "type": run.get("type"),
+        "status": run.get("status"),
+        "source": run.get("source"),
+        "symbols": run.get("symbols", []),
+        "timeframes": run.get("timeframes", []),
+        "strategies": run.get("strategies", []),
+        "period": run.get("period"),
+        "summary": run.get("summary", {}),
+        "bestCandidate": compact_candidate(run.get("bestCandidate")),
+        "optimizerGrid": run.get("optimizerGrid"),
+        "zeroTradeSummary": run.get("zeroTradeSummary"),
+        "allZeroTradeCandidates": run.get("allZeroTradeCandidates"),
+        "errors": run.get("errors", []),
+    }
+
+
+def compact_candidate(candidate: dict | None) -> dict | None:
+    if not candidate:
+        return None
+    return {
+        "source": candidate.get("source"),
+        "symbol": candidate.get("symbol"),
+        "timeframe": candidate.get("timeframe"),
+        "strategy": candidate.get("strategy") or candidate.get("preset"),
+        "preset": candidate.get("preset"),
+        "period": candidate.get("period"),
+        "params": candidate.get("params", {}),
+        "valid": candidate.get("valid"),
+        "qualityStatus": candidate.get("qualityStatus"),
+        "rank": candidate.get("rank"),
+        "score": candidate.get("score"),
+        "totalReturnPct": candidate.get("totalReturnPct"),
+        "winRate": candidate.get("winRate"),
+        "maxDrawdown": candidate.get("maxDrawdown"),
+        "profitFactor": candidate.get("profitFactor"),
+        "trades": candidate.get("trades"),
+        "origin": candidate.get("origin"),
+        "warnings": candidate.get("warnings", []),
+        "rejectionReasons": candidate.get("rejectionReasons", []),
+    }
+
+
+def optimizer_quality_from_run(run: dict | None) -> dict:
+    summary = (run or {}).get("summary") or {}
+    quality = (run or {}).get("qualitySummary") or summary.get("qualitySummary") or {}
+    return {
+        "latestSelectedStatus": quality.get("selectedStatus") or "UNKNOWN",
+        "passCandidates": int(safe_float(quality.get("passCandidates", 0))),
+        "warnCandidates": int(safe_float(quality.get("warnCandidates", 0))),
+        "failCandidates": int(safe_float(quality.get("failCandidates", 0))),
+        "totalCandidates": int(safe_float(quality.get("totalCandidates", 0))),
+        "topRejectionReasons": quality.get("topRejectionReasons", []),
+        "warnings": quality.get("warnings", []),
+    }
+
+
+def zero_trade_summary_from_run(run: dict | None) -> dict:
+    zero = (run or {}).get("zeroTradeSummary") or {}
+    top_reasons = zero.get("topReasons", [])
+    has_problem = bool((run or {}).get("allZeroTradeCandidates")) or safe_float(zero.get("zeroTradeCandidates")) > 0
+    return {
+        "hasZeroTradeProblem": has_problem,
+        "zeroTradeCandidates": int(safe_float(zero.get("zeroTradeCandidates", 0))),
+        "totalCandidates": int(safe_float(zero.get("totalCandidates", 0))),
+        "topReasons": top_reasons,
+        "suggestedActions": zero_trade_suggested_actions(zero, top_reasons),
+    }
+
+
+def zero_trade_suggested_actions(zero: dict, top_reasons: list[dict]) -> list[str]:
+    actions = []
+    reason = (top_reasons[0] or {}).get("reason") if top_reasons else None
+    if reason in {"zero_trades", "no_entry_signal", "trend_filter_blocked", "regime_filter_blocked"}:
+        actions.append("Inspect rejection reasons before widening grids.")
+        actions.append("Try a longer period or higher timeframe before trusting zero-trade scans.")
+    if reason in {"warmup_not_met", "too_few_test_trades"}:
+        actions.append("Use Auto/50000 candle limits or a longer period.")
+    if zero.get("suggestedGridAction"):
+        actions.append(zero["suggestedGridAction"])
+    if not actions and zero:
+        actions.append("Run /api/backtest/diagnose on the strategy and market before changing formulas.")
+    return dedupe_list(actions)
+
+
+def learning_audit_readiness(reports: list[dict], best_candidate: dict | None, current_candidate: dict, health: dict, optimizer_quality: dict) -> dict:
+    has_pass = optimizer_quality.get("latestSelectedStatus") == "PASS" or safe_float(optimizer_quality.get("passCandidates")) > 0
+    return {
+        "enoughLearningReports": len(reports) >= learning_trust_rules()["minReports"],
+        "hasValidCandidate": bool(best_candidate),
+        "hasPassOptimizerCandidate": bool(has_pass),
+        "paperEnabled": bool(current_candidate.get("enabled", False)),
+        "safeForManualReview": bool(best_candidate and (has_pass or best_candidate.get("origin") == "ranking") and health.get("status") != "FAILED"),
+    }
+
+
+def learning_audit_next_action(latest_learning: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict, health: dict, best_candidate: dict | None) -> dict:
+    commands = ["python run_server.py"]
+    if not latest_learning:
+        return {"action": "RUN_LEARNING", "reason": "No learning reports exist yet.", "commands": commands + ["POST /api/learning/run"]}
+    if latest_learning.get("status") == "failed":
+        return {"action": "INSPECT_REJECTIONS", "reason": "Latest learning report failed; inspect errors before rerunning.", "commands": commands + ["GET /api/learning/reports"]}
+    if readiness.get("paperEnabled") and health.get("status") == "UNKNOWN":
+        return {"action": "WAIT_FOR_PAPER_DATA", "reason": "Paper simulation is enabled but there are not enough closed paper trades for health scoring.", "commands": ["npm run paper:tick -- --config config/local/paper-candidate.json --refresh-first"]}
+    if health.get("status") == "HEALTHY":
+        return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is aligned with expectations.", "commands": []}
+    if optimizer_quality.get("latestSelectedStatus") == "NONE":
+        reasons = {item.get("reason") for item in optimizer_quality.get("topRejectionReasons", [])}
+        if reasons & {"zero_trades", "too_few_test_trades", "too_few_full_trades", "zero_trade_diagnostics"} or zero_trade.get("hasZeroTradeProblem"):
+            return {"action": "TUNE_GRIDS", "reason": "Latest optimizer produced no acceptable candidates and failures are dominated by trade generation or trade-count issues.", "commands": ["GET /api/backtest/diagnose?source=bybit&symbol=BTCUSDT&timeframe=1h&period=365d&limit=auto"]}
+        return {"action": "TUNE_QUALITY_POLICY", "reason": "Latest optimizer produced no acceptable candidates; inspect quality thresholds and rejection reasons manually.", "commands": ["GET /api/strategy-optimize?source=bybit&symbol=BTCUSDT&timeframe=1h&period=365d&limit=auto&max_combos=20"]}
+    if readiness.get("safeForManualReview") and best_candidate:
+        return {"action": "MANUAL_PROMOTE_REVIEW", "reason": "A backend-valid saved candidate is available for manual review. Paper remains disabled until explicitly enabled.", "commands": ["GET /api/research/best-candidate", "GET /api/candidate/validate"]}
+    if not best_candidate:
+        return {"action": "RUN_LEARNING", "reason": "No valid saved candidate is available yet.", "commands": commands + ["POST /api/learning/run"]}
+    return {"action": "NO_ACTION", "reason": "No safe manual action is required right now.", "commands": []}
+
+
+def learning_audit_summary_warnings(latest_learning: dict | None, latest_optimization: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict) -> list[str]:
+    warnings = []
+    if latest_learning and latest_learning.get("errors"):
+        warnings.append("Latest learning report contains errors.")
+    if not latest_optimization:
+        warnings.append("No optimization research run is saved yet.")
+    if optimizer_quality.get("latestSelectedStatus") == "NONE":
+        warnings.append("Latest optimizer run has no acceptable PASS/WARN candidate.")
+    if zero_trade.get("hasZeroTradeProblem"):
+        warnings.append("Zero-trade or low-trade optimizer candidates were detected.")
+    if not readiness.get("safeForManualReview"):
+        warnings.append("No candidate is currently marked safe for manual promotion review.")
+    warnings.append("Audit summary is advisory only; it never promotes candidates, enables paper simulation, or trades.")
+    return dedupe_list(warnings)
 
 
 def learning_trust_rules() -> dict:

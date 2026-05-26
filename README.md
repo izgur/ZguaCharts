@@ -42,10 +42,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -m py_compile app.py data_source.py indicators.py signals.py strategy.py
-python app.py
+python run_server.py
 ```
 
-On Windows, you can also start a persistent local Flask process with:
+On Windows, you can also use the optional helper:
 
 ```powershell
 .\start-local.ps1
@@ -70,7 +70,7 @@ python --version
 node --version
 python -m py_compile app.py data_source.py indicators.py signals.py strategy.py
 python -c "import app; print('import ok')"
-python app.py
+python run_server.py
 ```
 
 Then open `http://127.0.0.1:5000/healthz`. It should return:
