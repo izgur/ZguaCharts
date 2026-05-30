@@ -3147,8 +3147,8 @@ function populateOptimizationControls() {
   const symbolSelect = document.querySelector("#opt-symbol-filter");
   const timeframeSelect = document.querySelector("#opt-timeframe-filter");
   if (!hasElement(strategySelect, symbolSelect, timeframeSelect)) return;
-  strategySelect.innerHTML = (config.strategy_presets || [])
-    .map((preset) => `<option value="${preset.id}" ${preset.id === "regime_filtered_trend" ? "selected" : ""}>${preset.label}</option>`)
+  strategySelect.innerHTML = (config.optimizer_strategy_presets || config.strategy_presets || [])
+    .map((preset) => `<option value="${preset.id}" ${preset.id === "SimpleAtrTrendV2" ? "selected" : ""}>${preset.label}</option>`)
     .join("");
   symbolSelect.innerHTML = (sourceConfig.symbols || [])
     .map((symbol) => `<option value="${symbol}" ${symbol === "BTCUSDT" ? "selected" : ""}>${symbol}</option>`)

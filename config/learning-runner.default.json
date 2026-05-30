@@ -29,8 +29,11 @@
   ],
   "optimizationStrategies": [
     "SimpleAtrTrendV2",
-    "PullbackReclaimV2",
-    "regime_filtered_trend"
+    "ConservativeTrendLoose",
+    "MeanReversion",
+    "MomentumScalping",
+    "PullbackTrend",
+    "ConservativeTrend"
   ],
   "period": "365d",
   "rankingLimit": "auto",

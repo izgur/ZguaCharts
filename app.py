@@ -50,13 +50,39 @@ MAX_LEARNING_DECISIONS = 300
 
 NODE_STRATEGIES = {
     "conservative_trend": "ConservativeTrend",
+    "ConservativeTrend": "ConservativeTrend",
+    "ConservativeTrendLoose": "ConservativeTrendLoose",
     "regime_filtered_trend": "RegimeFilteredTrendStrategy",
     "RegimeFilteredTrendStrategy": "RegimeFilteredTrendStrategy",
     "momentum_scalping": "MomentumScalping",
+    "MomentumScalping": "MomentumScalping",
     "mean_reversion": "MeanReversion",
+    "MeanReversion": "MeanReversion",
     "pullback_trend": "PullbackTrend",
+    "PullbackTrend": "PullbackTrend",
+    "SimpleAtrTrendV2": "SimpleAtrTrendV2",
+    "PullbackReclaimV2": "PullbackReclaimV2",
     "original": "ConservativeTrend",
 }
+
+LEARNING_FORMULA_REVIEW_STRATEGIES = {
+    "RegimeFilteredTrendStrategy",
+    "regime_filtered_trend",
+    "PullbackReclaimV2",
+    "EmaBounceV2",
+    "BreakoutRetestV2",
+    "RangeExpansionV2",
+    "RelativeStrengthV2",
+}
+
+LEARNING_OPTIMIZER_STRATEGY_OPTIONS = [
+    {"id": "SimpleAtrTrendV2", "label": "Simple ATR Trend V2", "role": "Primary"},
+    {"id": "ConservativeTrendLoose", "label": "Conservative Trend Loose", "role": "Baseline"},
+    {"id": "MeanReversion", "label": "Mean Reversion", "role": "Baseline"},
+    {"id": "MomentumScalping", "label": "Momentum Scalping", "role": "Baseline"},
+    {"id": "PullbackTrend", "label": "Pullback Trend", "role": "Baseline"},
+    {"id": "ConservativeTrend", "label": "Conservative Trend", "role": "Baseline"},
+]
 
 
 @app.get("/")
@@ -97,6 +123,7 @@ def config():
             "intended_timeframes": "1h with BTCUSDT 4h regime filter",
         }
     ]
+    payload["optimizer_strategy_presets"] = LEARNING_OPTIMIZER_STRATEGY_OPTIONS
     payload["default_strategy_preset"] = DEFAULT_PRESET_ID
     return jsonify(payload)
 
@@ -1584,7 +1611,14 @@ def default_learning_config() -> dict:
         "symbols": ["BTCUSDT", "ETHUSDT"],
         "timeframes": ["1h"],
         "rankingPresets": ["conservative_trend", "regime_filtered_trend", "pullback_trend"],
-        "optimizationStrategies": ["regime_filtered_trend"],
+        "optimizationStrategies": [
+            "SimpleAtrTrendV2",
+            "ConservativeTrendLoose",
+            "MeanReversion",
+            "MomentumScalping",
+            "PullbackTrend",
+            "ConservativeTrend",
+        ],
         "period": "365d",
         "rankingLimit": "auto",
         "optimizationLimit": "auto",
@@ -2566,6 +2600,16 @@ def run_learning_cycle(config: dict) -> dict:
         "warnings": [],
         "errors": [],
     }
+    formula_review_strategies = [
+        strategy for strategy in config.get("optimizationStrategies", [])
+        if strategy in LEARNING_FORMULA_REVIEW_STRATEGIES or NODE_STRATEGIES.get(strategy) in LEARNING_FORMULA_REVIEW_STRATEGIES
+    ]
+    if formula_review_strategies:
+        report["warnings"].append({
+            "type": "learning_strategy_formula_review",
+            "strategies": formula_review_strategies,
+            "message": "Recent diagnostics found these strategy families generated zero trades on ready BTC/ETH 1h/4h data; review formulas or default regime behavior before re-adding them to learning.",
+        })
     report["dataReadiness"] = research_data_readiness(config["source"], config["symbols"], config["timeframes"], config["period"], config["rankingLimit"])
     report["warnings"].extend(readiness_warnings(report["dataReadiness"]))
 
