@@ -2099,6 +2099,7 @@ def build_learning_audit_summary() -> dict:
     latest_optimization = latest_research_run_by_type(research_runs, "optimization")
     best_candidate = best_saved_candidate(research_runs)
     optimizer_quality = optimizer_quality_from_run(latest_optimization)
+    grid_audit = (latest_optimization or {}).get("gridAudit") or {}
     zero_trade = zero_trade_summary_from_run(latest_optimization)
     readiness = learning_audit_readiness(reports, best_candidate, current_candidate, candidate_health, optimizer_quality)
     next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate)
@@ -2113,6 +2114,7 @@ def build_learning_audit_summary() -> dict:
         "currentPaperCandidate": candidate_summary(current_candidate),
         "candidateHealth": candidate_health,
         "optimizerQuality": optimizer_quality,
+        "gridAudit": grid_audit,
         "zeroTrade": zero_trade,
         "readiness": readiness,
         "nextAction": next_action,
@@ -2155,6 +2157,7 @@ def compact_research_run(run: dict | None) -> dict | None:
         "summary": run.get("summary", {}),
         "bestCandidate": compact_candidate(run.get("bestCandidate")),
         "optimizerGrid": run.get("optimizerGrid"),
+        "gridAudit": run.get("gridAudit"),
         "zeroTradeSummary": run.get("zeroTradeSummary"),
         "allZeroTradeCandidates": run.get("allZeroTradeCandidates"),
         "errors": run.get("errors", []),
@@ -2626,6 +2629,7 @@ def run_learning_cycle(config: dict) -> dict:
                     if payload.get("researchRunId"):
                         report["optimizationRunIds"].append(payload["researchRunId"])
                     grid_meta = payload.get("optimizerGrid") or {}
+                    grid_audit = payload.get("gridAudit") or {}
                     if grid_meta:
                         report["warnings"].append({
                             "type": "optimizer_grid",
@@ -2635,6 +2639,16 @@ def run_learning_cycle(config: dict) -> dict:
                             "gridName": grid_meta.get("gridName"),
                             "candidateCountTested": grid_meta.get("candidateCountTested"),
                             "fallbackUsed": grid_meta.get("fallbackUsed"),
+                        })
+                    if grid_audit:
+                        report["warnings"].append({
+                            "type": "optimizer_grid_audit",
+                            "strategy": strategy,
+                            "symbol": symbol,
+                            "timeframe": timeframe,
+                            "diagnosis": grid_audit.get("diagnosis"),
+                            "dominantReasons": grid_audit.get("dominantReasons", [])[:3],
+                            "suggestedChanges": grid_audit.get("suggestedChanges", [])[:3],
                         })
                     if payload.get("allZeroTradeCandidates"):
                         report["warnings"].append({
@@ -2852,6 +2866,7 @@ def research_record_from_optimization(payload: dict) -> dict:
         "dataReadiness": payload.get("dataReadiness"),
         "partialData": payload.get("partialData"),
         "optimizerGrid": payload.get("optimizerGrid"),
+        "gridAudit": payload.get("gridAudit"),
         "zeroTradeSummary": payload.get("zeroTradeSummary"),
         "allZeroTradeCandidates": payload.get("allZeroTradeCandidates"),
         "fee_pct": payload.get("requested", {}).get("feePct"),
@@ -4060,7 +4075,7 @@ def run_strategy_optimizer_engine(source: str, symbol: str, timeframe: str, peri
 
 
 def load_optimizer_grid_catalog() -> dict:
-    script = "const optimizer=require('./core/optimizer'); process.stdout.write(JSON.stringify({grids: optimizer.availableOptimizerGrids()}));"
+    script = "const optimizer=require('./core/optimizer'); process.stdout.write(JSON.stringify(optimizer.optimizerGridMetadataCatalog()));"
     completed = subprocess.run(
         [node_executable(), "-e", script],
         text=True,
@@ -4103,6 +4118,7 @@ def normalize_optimizer_payload(raw: dict, source: str, symbol: str, timeframe: 
         "optimizerGrid": raw.get("optimizerGrid") or {},
         "qualityPolicy": raw.get("qualityPolicy") or {},
         "qualitySummary": quality_summary,
+        "gridAudit": raw.get("gridAudit") or (raw.get("summary") or {}).get("gridAudit") or {},
         "zeroTradeSummary": raw.get("zeroTradeSummary") or {},
         "allZeroTradeCandidates": bool(raw.get("allZeroTradeCandidates")),
         "warnings": optimizer_warnings(raw),

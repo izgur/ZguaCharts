@@ -2907,6 +2907,7 @@ async function loadLearningAuditSummary() {
 function renderLearningAuditSummary(payload) {
   const latest = payload.latestLearningReport || {};
   const opt = payload.optimizerQuality || {};
+  const gridAudit = payload.gridAudit || {};
   const zero = payload.zeroTrade || {};
   const readiness = payload.readiness || {};
   const next = payload.nextAction || {};
@@ -2921,6 +2922,7 @@ function renderLearningAuditSummary(payload) {
     <div class="metric-grid">
       <div class="metric"><span>Learning</span><strong>${escapeHtml(latest.status || "none")}</strong></div>
       <div class="metric"><span>Optimizer</span><strong>${escapeHtml(opt.latestSelectedStatus || "UNKNOWN")}</strong></div>
+      <div class="metric"><span>Grid audit</span><strong>${escapeHtml(gridAudit.diagnosis || "UNKNOWN")}</strong></div>
       <div class="metric"><span>PASS/WARN/FAIL</span><strong>${opt.passCandidates || 0}/${opt.warnCandidates || 0}/${opt.failCandidates || 0}</strong></div>
       <div class="metric"><span>Zero-trade</span><strong>${zero.hasZeroTradeProblem ? "yes" : "no"}</strong></div>
       <div class="metric"><span>Paper</span><strong>${current.enabled ? "enabled" : "disabled"}</strong></div>
@@ -3300,6 +3302,7 @@ async function runStrategyOptimization() {
       const summary = payload.summary || {};
       const readiness = payload.dataReadiness?.summary || {};
       const grid = payload.optimizerGrid || {};
+      const gridAudit = payload.gridAudit || {};
       const zero = payload.zeroTradeSummary || {};
       const quality = payload.qualitySummary || {};
       const fallback = grid.fallbackUsed ? " Fallback grid used." : "";
@@ -3307,7 +3310,8 @@ async function runStrategyOptimization() {
       const qualityText = quality.totalCandidates !== undefined
         ? ` Quality PASS/WARN/FAIL ${quality.passCandidates || 0}/${quality.warnCandidates || 0}/${quality.failCandidates || 0}; selected=${quality.selectedStatus || "n/a"}.`
         : "";
-      status.textContent = `Optimization complete using ${grid.gridName || "optimizer grid"}. Tested ${grid.candidateCountTested || JSON.stringify(summary.combinationsTested || 0)}/${grid.candidateCountPlanned || "?"} combos. ${summary.validCandidates || 0} acceptable candidates.${qualityText} Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.${fallback}${zeroText}`;
+      const gridAuditText = gridAudit.diagnosis ? ` Grid audit: ${gridAudit.diagnosis}.` : "";
+      status.textContent = `Optimization complete using ${grid.gridName || "optimizer grid"}. Tested ${grid.candidateCountTested || JSON.stringify(summary.combinationsTested || 0)}/${grid.candidateCountPlanned || "?"} combos. ${summary.validCandidates || 0} acceptable candidates.${qualityText} Data ready ${readiness.readyPairs || 0}/${readiness.totalPairs || 0}; partial=${payload.partialData ? "yes" : "no"}.${fallback}${zeroText}${gridAuditText}`;
     }
   } catch (error) {
     if (status) status.textContent = `Optimization failed: ${error.message}`;
@@ -3328,6 +3332,7 @@ function renderStrategyOptimization(payload) {
   if (!body) return;
   const zeroSummary = payload.zeroTradeSummary || {};
   const qualitySummary = payload.qualitySummary || {};
+  const gridAudit = payload.gridAudit || {};
   const topQualityReason = qualitySummary.topRejectionReasons?.[0];
   const metaRows = `
     <tr class="diagnostic-row">
@@ -3344,6 +3349,11 @@ function renderStrategyOptimization(payload) {
       </td>
     </tr>
   `;
+  const gridAuditRow = gridAudit.diagnosis ? `
+    <tr class="diagnostic-row">
+      <td colspan="8">Grid audit: <strong>${escapeHtml(gridAudit.diagnosis)}</strong>${(gridAudit.suggestedChanges || []).length ? ` · ${escapeHtml(gridAudit.suggestedChanges[0])}` : ""}</td>
+    </tr>
+  ` : "";
   const candidateRows = rows.map((row, index) => {
     const quality = row.qualityStatus || (row.valid ? "PASS" : "FAIL");
     const reasons = optimizerReasonText(row);
@@ -3377,7 +3387,7 @@ function renderStrategyOptimization(payload) {
   const empty = !candidateRows && !rejectedPreview
     ? `<tr><td colspan="8">No optimization candidates returned.</td></tr>`
     : (!candidateRows ? `<tr><td colspan="8">No acceptable optimizer candidate found.</td></tr>` : "");
-  body.innerHTML = metaRows + candidateRows + empty + rejectedPreview;
+  body.innerHTML = metaRows + gridAuditRow + candidateRows + empty + rejectedPreview;
 }
 
 function optimizerReasonText(row) {

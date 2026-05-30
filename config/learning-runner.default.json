@@ -28,6 +28,8 @@
     "pullback_trend"
   ],
   "optimizationStrategies": [
+    "SimpleAtrTrendV2",
+    "PullbackReclaimV2",
     "regime_filtered_trend"
   ],
   "period": "365d",

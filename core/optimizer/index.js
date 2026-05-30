@@ -45,27 +45,24 @@ function optimize(options) {
   }).then(function (candles) {
     var split = splitCandles(candles, options.trainRatio || 0.7);
     var rows = evaluateOptimizerCombos(combos, candles, options);
-    var allZero = rows.length && rows.every(function (row) { return row.train.trades === 0 && row.test.trades === 0; });
-    var fallbackGrid = null;
-    if (allZero && !grid.metadata.fallbackUsed) {
-      fallbackGrid = selectOptimizerGrid(options.strategy, null, Math.min(Number(options.maxCombos || 1000), 60), true, "Initial grid produced zero trades for every candidate.");
+    rows = rows.map(function (row) { return ensureCandidateQuality(row); });
+    var allZero = allRowsZeroTrade(rows);
+    var qualitySummary = buildQualitySummary(rows);
+    var fallbackReason = tradeDiscoveryFallbackReason(rows, allZero, qualitySummary);
+    if (fallbackReason && !grid.metadata.fallbackUsed) {
+      var fallbackGrid = selectOptimizerGrid(options.strategy, null, Math.min(Number(options.maxCombos || 1000), 60), true, fallbackReason);
       if (fallbackGrid.combos.length) {
-        var fallbackRows = evaluateOptimizerCombos(fallbackGrid.combos, candles, options);
-        if (fallbackRows.some(function (row) { return row.train.trades > 0 || row.test.trades > 0; })) {
-          rows = fallbackRows;
-          grid = fallbackGrid;
-          allZero = false;
-        } else {
-          rows = fallbackRows.length ? fallbackRows : rows;
-          grid.metadata.fallbackUsed = true;
-          grid.metadata.fallbackReason = "Initial and fallback grids both produced zero trades.";
-          allZero = true;
-        }
+        var fallbackRows = evaluateOptimizerCombos(fallbackGrid.combos, candles, options).map(function (row) { return ensureCandidateQuality(row); });
+        rows = fallbackRows.length ? fallbackRows : rows;
+        grid = fallbackGrid;
+        combos = fallbackGrid.combos;
+        allZero = allRowsZeroTrade(rows);
+        if (allZero) grid.metadata.fallbackReason = "Initial and fallback grids both produced zero trades.";
       }
     }
-    rows = rows.map(function (row) { return ensureCandidateQuality(row); });
     var zeroTradeSummary = aggregateZeroTradeSummary(rows);
-    var qualitySummary = buildQualitySummary(rows);
+    qualitySummary = buildQualitySummary(rows);
+    var gridAudit = buildGridAudit(options.strategy, options.interval, grid.metadata, rows, zeroTradeSummary, qualitySummary);
     var acceptableRows = acceptableOptimizerRows(rows);
     var ranked = rankResults(acceptableRows);
     var rejectedRanked = rankResults(rows.filter(function (row) { return row.qualityStatus === "FAIL"; })).slice(0, 20);
@@ -75,6 +72,7 @@ function optimize(options) {
       ? walkForward(candles, options, selected.params, options.walkForwardFolds || 3)
       : [];
     summary.qualitySummary = qualitySummary;
+    summary.gridAudit = gridAudit;
     summary.warnings = optimizerRunWarnings(grid.metadata, zeroTradeSummary, allZero, qualitySummary);
     if (options.outputDir) reporting.writeOptimizationReport(options.outputDir, ranked, summary, options.reportPrefix);
     return {
@@ -92,6 +90,7 @@ function optimize(options) {
       }),
       qualityPolicy: optimizerQualityPolicy(),
       qualitySummary: qualitySummary,
+      gridAudit: gridAudit,
       zeroTradeSummary: zeroTradeSummary,
       allZeroTradeCandidates: allZero,
       warnings: summary.warnings,
@@ -666,17 +665,17 @@ function optimizerGridCatalog() {
     gridName: "Trend-following",
     humanName: "Trend-following",
     params: {
-      emaFast: [9, 12, 20],
+      emaFast: [8, 12, 20],
       emaMomentumSlow: [21],
       emaTrendFast: [50],
-      emaSlow: [100, 150, 200],
-      rsiMin: [38, 45, 50],
-      rsiMax: [65, 70, 78],
+      emaSlow: [80, 100, 150, 200],
+      rsiMin: [35, 38, 45, 50],
+      rsiMax: [65, 70, 78, 82],
       stopAtr: [2, 2.5, 3],
       takeProfitAtr: [3, 4],
       trailingAtr: [1.5, 2, 2.5],
-      minHoldBars: [2, 4, 8],
-      cooldownBars: [0, 3, 6],
+      minHoldBars: [0, 2, 4, 8],
+      cooldownBars: [0, 2, 3, 6],
       requireVolume: [false],
       requireBreakout: [false, true]
     },
@@ -692,13 +691,13 @@ function optimizerGridCatalog() {
       regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend"],
       useRsiFilter: [true, false],
       atrMultiplier: [1.8, 2.3, 2.8, 3.3],
-      emaFast: [10, 20, 30],
-      emaSlow: [50, 80, 110],
-      emaTrend: [100, 150, 200],
-      rsiMin: [40, 45, 48],
-      rsiMax: [68, 72, 76],
-      cooldownBars: [0, 3, 6],
-      minHoldBars: [1, 3, 6],
+      emaFast: [8, 10, 20, 30],
+      emaSlow: [40, 50, 80, 110],
+      emaTrend: [80, 100, 150, 200],
+      rsiMin: [35, 40, 45, 48],
+      rsiMax: [68, 72, 76, 82],
+      cooldownBars: [0, 2, 3, 6],
+      minHoldBars: [0, 1, 3, 6],
       volumeFilter: [false]
     },
     maxCombinations: 500,
@@ -710,15 +709,15 @@ function optimizerGridCatalog() {
     gridName: "Breakout/retest",
     humanName: "Breakout/retest",
     params: {
-      regimeMode: ["looseBtcBull", "symbolTrend"],
-      donchianEntry: [20, 55, 100],
-      donchianExit: [10, 20, 55],
-      adxThreshold: [0, 14, 18, 22],
-      atrMultiplier: [2, 2.5, 3],
-      emaTrendLength: [100, 150, 200],
-      retestLookback: [5, 8, 12],
-      retestAtr: [0.5, 0.8, 1.2],
-      volumeFilter: [false, true],
+      regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend"],
+      donchianEntry: [10, 20, 55],
+      donchianExit: [5, 10, 20],
+      adxThreshold: [0, 10, 14, 18],
+      atrMultiplier: [1.8, 2.3, 2.8, 3.3],
+      emaTrendLength: [50, 100, 150, 200],
+      retestLookback: [3, 5, 8, 12],
+      retestAtr: [0.5, 0.8, 1.2, 1.6],
+      volumeFilter: [false],
       shortMode: [false]
     },
     maxCombinations: 500,
@@ -749,16 +748,16 @@ function optimizerGridCatalog() {
     humanName: "Pullback/reclaim",
     params: {
       regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend"],
-      rsiPullbackLevel: [38, 42, 45, 48],
-      rsiReclaimLevel: [48, 50, 53],
-      rsiMin: [35, 38, 42],
-      rsiMax: [55, 60, 65],
-      atrMultiplier: [2, 2.5, 3],
+      rsiPullbackLevel: [35, 38, 42, 45, 48],
+      rsiReclaimLevel: [45, 48, 50, 53],
+      rsiMin: [32, 35, 38, 42],
+      rsiMax: [55, 60, 65, 70],
+      atrMultiplier: [1.8, 2.3, 2.8, 3.3],
       stopAtr: [1.8, 2, 2.5],
       takeProfitAtr: [2.5, 3, 4],
       trailingAtr: [1.5, 2, 2.5],
-      cooldownBars: [0, 3, 6],
-      minHoldBars: [2, 4, 6],
+      cooldownBars: [0, 2, 3, 6],
+      minHoldBars: [0, 1, 3, 6],
       volumeFilter: [false]
     },
     maxCombinations: 500,
@@ -829,13 +828,13 @@ function optimizerGridCatalog() {
       strategyKey: "volatility_squeeze",
       gridName: "Volatility squeeze breakout",
       params: {
-        regimeMode: ["looseBtcBull", "symbolTrend"],
+        regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend"],
         squeezeLookback: [50, 80, 100],
-        squeezePercentile: [0.2, 0.35, 0.5],
+        squeezePercentile: [0.2, 0.35, 0.5, 0.65],
         rangeLookback: [10, 20, 40],
         rangeSma: [10, 20],
-        closeHighPct: [0.6, 0.7, 0.8],
-        adxThreshold: [0, 14, 18],
+        closeHighPct: [0.55, 0.65, 0.75, 0.85],
+        adxThreshold: [0, 10, 14, 18],
         atrMultiplier: [2, 2.5, 3],
         volumeFilter: [false]
       }
@@ -845,12 +844,12 @@ function optimizerGridCatalog() {
       strategyKey: "range_expansion_v2",
       gridName: "Range expansion V2",
       params: {
-        regimeMode: ["looseBtcBull", "symbolTrend", "noRegime"],
-        squeezeLookback: [50, 80, 120],
-        squeezePercentile: [0.2, 0.35, 0.5],
+        regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend", "noRegime"],
+        squeezeLookback: [40, 60, 80, 120],
+        squeezePercentile: [0.2, 0.35, 0.5, 0.65],
         rangeLookback: [10, 20, 40],
         rangeSma: [10, 20, 30],
-        closeHighPct: [0.55, 0.7, 0.85],
+        closeHighPct: [0.5, 0.6, 0.7, 0.85],
         atrMultiplier: [2, 2.5, 3],
         volumeFilter: [false]
       }
@@ -859,11 +858,11 @@ function optimizerGridCatalog() {
       strategyKey: "relative_strength_v2",
       gridName: "Relative strength V2",
       params: {
-        regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend"],
-        rsLookback: [12, 24, 48],
-        rsThreshold: [-0.01, 0, 0.01],
-        rsiMin: [42, 48, 52],
-        rsiMax: [68, 74, 80],
+        regimeMode: ["looseBtcBull", "symbolTrend", "symbolFastTrend", "noRegime"],
+        rsLookback: [8, 12, 24, 48],
+        rsThreshold: [-0.02, -0.01, 0, 0.01],
+        rsiMin: [38, 42, 48, 52],
+        rsiMax: [68, 74, 80, 84],
         atrMultiplier: [2, 2.5, 3],
         volumeFilter: [false]
       }
@@ -878,6 +877,28 @@ function availableOptimizerGrids() {
     var grid = catalog[key];
     return gridMetadata(grid, grid.params, 0, 0, false, null, false);
   });
+}
+
+function optimizerGridMetadataCatalog() {
+  var catalog = optimizerGridCatalog();
+  var grids = availableOptimizerGrids();
+  var fallbackStrategies = [
+    "RegimeFilteredTrendStrategy",
+    "SimpleAtrTrendV2",
+    "ConservativeTrendLoose",
+    "PullbackReclaimV2",
+    "EmaBounceV2",
+    "BreakoutRetestV2",
+    "RangeExpansionV2",
+    "RelativeStrengthV2"
+  ];
+  var fallbackGrids = fallbackStrategies.map(function (strategy) {
+    var grid = fallbackGridForStrategy(strategy, catalog);
+    var metadata = gridMetadata(grid, grid.params, 0, 0, false, true, "Trade-discovery fallback metadata preview.");
+    metadata.strategy = strategy;
+    return metadata;
+  });
+  return { grids: grids, tradeDiscoveryFallbacks: fallbackGrids };
 }
 
 function selectOptimizerGrid(strategy, explicitRanges, maxCombos, fallbackMode, fallbackReason) {
@@ -910,32 +931,58 @@ function selectOptimizerGrid(strategy, explicitRanges, maxCombos, fallbackMode, 
 function fallbackGridForStrategy(strategy, catalog) {
   if (String(strategy || "").indexOf("V2") !== -1) {
     return {
-      strategyKey: "diagnostic_v2_fallback",
-      gridName: "Diagnostic V2 fallback",
-      humanName: "Diagnostic V2 fallback",
+      strategyKey: "trade_discovery_v2_fallback",
+      gridName: "Trade-discovery V2 fallback",
+      humanName: "Trade-discovery V2 fallback",
+      fallbackType: "TRADE_DISCOVERY",
       params: {
         regimeMode: ["symbolTrend", "symbolFastTrend", "noRegime"],
         useRsiFilter: [false, true],
-        atrMultiplier: [2, 3],
-        emaFast: [20],
-        emaSlow: [50, 100],
-        emaTrend: [100, 200],
+        atrMultiplier: [1.8, 2.5, 3.3],
+        emaFast: [10, 20],
+        emaSlow: [40, 50, 100],
+        emaTrend: [80, 100, 200],
         rsiMin: [35, 45],
-        rsiMax: [70, 80],
+        rsiMax: [72, 82],
         cooldownBars: [0],
-        minHoldBars: [1],
+        minHoldBars: [0, 1],
         volumeFilter: [false]
       },
       maxCombinations: 60,
-      notes: ["Diagnostic fallback keeps existing formulas but relaxes filters and tests noRegime only for diagnosis."],
+      notes: ["Trade-discovery fallback keeps existing formulas but relaxes existing filters. noRegime is diagnostic only."],
+      warning: "Fallback grid is for diagnosing trade generation, not immediate promotion.",
       riskLevel: "diagnostic"
     };
   }
   if (String(strategy || "").toLowerCase().indexOf("mean") !== -1) return catalog.MeanReversion;
+  if (["RegimeFilteredTrendStrategy", "RegimeDonchian20", "RegimeDonchianCloseConfirm", "TrendBreakoutRetest", "BreakoutRetestV2"].indexOf(String(strategy || "")) !== -1) {
+    return {
+      strategyKey: "trade_discovery_breakout_fallback",
+      gridName: "Trade-discovery breakout fallback",
+      humanName: "Trade-discovery breakout fallback",
+      fallbackType: "TRADE_DISCOVERY",
+      params: {
+        donchianEntry: [5, 10, 20],
+        donchianExit: [3, 5, 10],
+        adxThreshold: [0, 8, 12],
+        atrMultiplier: [1.8, 2.5, 3.3],
+        emaTrendLength: [20, 50, 100],
+        retestLookback: [3, 5, 8],
+        retestAtr: [0.8, 1.2, 1.8],
+        volumeFilter: [false],
+        shortMode: [false]
+      },
+      maxCombinations: 60,
+      notes: ["Trade-discovery fallback for breakout/regime strategies uses shorter existing Donchian/EMA thresholds and disables optional volume filtering."],
+      warning: "Fallback grid is for diagnosing trade generation, not immediate promotion.",
+      riskLevel: "diagnostic"
+    };
+  }
   return {
-    strategyKey: "diagnostic_fallback",
-    gridName: "Diagnostic fallback",
-    humanName: "Diagnostic fallback",
+    strategyKey: "trade_discovery_fallback",
+    gridName: "Trade-discovery fallback",
+    humanName: "Trade-discovery fallback",
+    fallbackType: "TRADE_DISCOVERY",
     params: {
       emaFast: [9, 20],
       emaMomentumSlow: [21],
@@ -952,7 +999,8 @@ function fallbackGridForStrategy(strategy, catalog) {
       requireBreakout: [false]
     },
     maxCombinations: 60,
-    notes: ["Small diagnostic fallback with wider thresholds. It does not force trades or change formulas."],
+    notes: ["Small trade-discovery fallback with wider existing thresholds. It does not force trades or change formulas."],
+    warning: "Fallback grid is for diagnosing trade generation, not immediate promotion.",
     riskLevel: "diagnostic"
   };
 }
@@ -969,6 +1017,8 @@ function gridMetadata(grid, ranges, planned, tested, sampled, fallbackUsed, fall
     maxCombinations: grid.maxCombinations,
     fallbackUsed: fallbackUsed === true,
     fallbackReason: fallbackReason || null,
+    fallbackType: grid.fallbackType || null,
+    warning: grid.warning || null,
     sampled: sampled === true,
     notes: grid.notes || [],
     riskLevel: grid.riskLevel || "unknown"
@@ -1236,6 +1286,95 @@ function buildQualitySummary(rows) {
   };
 }
 
+function buildGridAudit(strategy, interval, gridMetadata, rows, zeroTradeSummary, qualitySummary) {
+  var tooFewTest = countReason(rows, "too_few_test_trades");
+  var tooFewFull = countReason(rows, "too_few_full_trades");
+  var dominant = (qualitySummary.topRejectionReasons || []).slice(0, 5);
+  var dominantCodes = dominant.map(function (item) { return item.reason; });
+  var diagnosis = "UNKNOWN";
+  if (!rows.length) {
+    diagnosis = "UNKNOWN";
+  } else if (zeroTradeSummary.zeroTradeCandidates === rows.length || dominantCodes.indexOf("zero_trades") !== -1) {
+    diagnosis = "TOO_RESTRICTIVE";
+  } else if (dominantCodes.indexOf("too_few_test_trades") !== -1 || dominantCodes.indexOf("too_few_full_trades") !== -1) {
+    diagnosis = isLowTimeframe(interval) ? "TIMEFRAME_TOO_LOW" : "PERIOD_TOO_SHORT";
+  } else if (dominantCodes.indexOf("test_profit_factor_below_min") !== -1 || dominantCodes.indexOf("full_profit_factor_below_min") !== -1 || dominantCodes.indexOf("high_drawdown") !== -1) {
+    diagnosis = "QUALITY_FAILING";
+  }
+  var suggested = [];
+  if (diagnosis === "TOO_RESTRICTIVE") {
+    suggested.push("Use the trade-discovery fallback grid to verify trade generation before broader optimization.");
+    suggested.push("Prefer looser existing regime/trend filters and shorter Donchian/EMA values before changing strategy formulas.");
+  } else if (diagnosis === "PERIOD_TOO_SHORT") {
+    suggested.push("Use Auto/50000 candle limits or higher timeframes so train/test windows contain enough trades.");
+  } else if (diagnosis === "TIMEFRAME_TOO_LOW") {
+    suggested.push("Use a higher timeframe or aggregate more candles before widening the grid.");
+  } else if (diagnosis === "QUALITY_FAILING") {
+    suggested.push("Inspect candidate metrics before changing the quality policy; weak PF/drawdown failures may indicate strategy edge, not grid breadth.");
+  }
+  if (gridMetadata.fallbackUsed && gridMetadata.fallbackType === "TRADE_DISCOVERY") {
+    suggested.push("Trade-discovery fallback is diagnostic only and should not be promoted directly without normal validation.");
+  }
+  return {
+    strategy: strategy,
+    gridName: gridMetadata.gridName,
+    plannedCandidates: gridMetadata.candidateCountPlanned || 0,
+    testedCandidates: rows.length,
+    zeroTradeCandidates: zeroTradeSummary.zeroTradeCandidates || 0,
+    tooFewTestTradesCandidates: tooFewTest,
+    tooFewFullTradesCandidates: tooFewFull,
+    passCandidates: qualitySummary.passCandidates || 0,
+    warnCandidates: qualitySummary.warnCandidates || 0,
+    failCandidates: qualitySummary.failCandidates || 0,
+    dominantReasons: dominant,
+    diagnosis: diagnosis,
+    appearsTooRestrictive: diagnosis === "TOO_RESTRICTIVE",
+    periodOrTimeframeMayBeTooShort: diagnosis === "PERIOD_TOO_SHORT",
+    suggestedChanges: dedupeValues(suggested)
+  };
+}
+
+function allRowsZeroTrade(rows) {
+  return rows.length && rows.every(function (row) {
+    return Number((row.train || {}).trades || 0) === 0 && Number((row.test || {}).trades || 0) === 0;
+  });
+}
+
+function tradeDiscoveryFallbackReason(rows, allZero, qualitySummary) {
+  if (!rows.length) return null;
+  if (allZero) return "Initial grid produced zero trades for every candidate.";
+  if ((qualitySummary || {}).selectedStatus !== "NONE") return null;
+  var everyCandidateTooFew = rows.every(function (row) {
+    return hasReason(row, "too_few_test_trades") || hasReason(row, "too_few_full_trades") || hasReason(row, "zero_trades");
+  });
+  return everyCandidateTooFew ? "Initial grid produced too few trades for every candidate." : null;
+}
+
+function hasReason(row, code) {
+  return (row.rejectionReasons || []).some(function (item) { return item.code === code; });
+}
+
+function countReason(rows, code) {
+  return rows.filter(function (row) {
+    return hasReason(row, code);
+  }).length;
+}
+
+function dedupeValues(values) {
+  var seen = {};
+  return (values || []).filter(function (value) {
+    var key = JSON.stringify(value);
+    if (seen[key]) return false;
+    seen[key] = true;
+    return true;
+  });
+}
+
+function isLowTimeframe(interval) {
+  var value = String(interval || "").toLowerCase();
+  return ["1m", "3m", "5m", "15m"].indexOf(value) !== -1;
+}
+
 function reason(code) {
   return { code: code, label: REJECTION_LABELS[code] || code };
 }
@@ -1435,7 +1574,8 @@ function suggestedGridAction(reason) {
 function optimizerRunWarnings(gridMetadata, zeroTradeSummary, allZero, qualitySummary) {
   var warnings = [];
   if (gridMetadata.sampled) warnings.push("Optimizer grid was deterministically sampled/truncated to stay within max-combos.");
-  if (gridMetadata.fallbackUsed) warnings.push("Fallback diagnostic grid was used: " + (gridMetadata.fallbackReason || "initial grid was too restrictive."));
+  if (gridMetadata.fallbackUsed) warnings.push("Trade-discovery fallback grid was used: " + (gridMetadata.fallbackReason || "initial grid was too restrictive."));
+  if (gridMetadata.fallbackType === "TRADE_DISCOVERY") warnings.push(gridMetadata.warning || "Fallback grid is for diagnosing trade generation, not immediate promotion.");
   if (allZero) warnings.push("Every tested optimizer candidate produced zero trades. Do not treat this as a successful optimization.");
   if (zeroTradeSummary && zeroTradeSummary.zeroTradeCandidates) warnings.push(zeroTradeSummary.suggestedGridAction);
   if (qualitySummary && qualitySummary.selectedStatus === "NONE") warnings.push("No acceptable optimizer candidate found after quality filtering.");
@@ -1466,6 +1606,7 @@ module.exports = {
   optimizeRegimeStaged: optimizeRegimeStaged,
   optimizerGridCatalog: optimizerGridCatalog,
   availableOptimizerGrids: availableOptimizerGrids,
+  optimizerGridMetadataCatalog: optimizerGridMetadataCatalog,
   selectOptimizerGrid: selectOptimizerGrid,
   defaultRanges: defaultRanges,
   expandGrid: expandGrid,
