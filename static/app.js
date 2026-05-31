@@ -2678,6 +2678,7 @@ function setupLearningControls() {
   document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
+  document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
   document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
@@ -3108,6 +3109,68 @@ function renderCandidateStability(payload) {
     </table>
     ${(validation.robustnessFlags || []).length ? `<p class="modal-note"><strong>Flags:</strong> ${validation.robustnessFlags.map(escapeHtml).join(", ")}</p>` : ""}
     ${(validation.warnings || []).length ? `<ul class="backtest-warnings">${validation.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function loadLearningEvidence() {
+  const host = document.querySelector("#learning-evidence-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading learning evidence...</p>`;
+    const payload = await apiGet("/api/learning/evidence");
+    host.innerHTML = renderLearningEvidence(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Learning evidence could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderLearningEvidence(payload) {
+  const candidate = payload.latestRecommendedCandidate || {};
+  const repeat = payload.repeatability || {};
+  const readiness = repeat.readiness || {};
+  const metric = repeat.metricStability || {};
+  const churn = repeat.churn || {};
+  const next = payload.nextAction || {};
+  const stability = payload.candidateStability || {};
+  const tone = readiness.status === "READY_FOR_CONFIG_REVIEW" ? "positive" : readiness.status === "BLOCKED" ? "negative" : "neutral";
+  const appearanceRows = (repeat.recentAppearances || []).slice(-8).reverse().map((item) => `
+    <tr>
+      <td>${escapeHtml(formatLearningTime(item.createdAt))}</td>
+      <td>${item.matches ? "yes" : "no"}</td>
+      <td>${escapeHtml(item.strategy || "-")} ${escapeHtml(item.symbol || "")} ${escapeHtml(item.timeframe || "")}</td>
+      <td>${formatMaybeNumber(item.profitFactor)}</td>
+      <td>${formatMaybeNumber(item.returnPct)}%</td>
+      <td>${item.trades ?? "-"}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Learning Evidence <span class="${tone}">${escapeHtml(readiness.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Repeat</span><strong>${repeat.repeatCount || 0}/${repeat.requiredRepeatCount || 0}</strong></div>
+      <div class="metric"><span>Reports</span><strong>${repeat.reportsConsidered || 0}</strong></div>
+      <div class="metric"><span>Churn</span><strong>${formatMaybeNumber(churn.churnRatio)}</strong></div>
+      <div class="metric"><span>Missing</span><strong>${readiness.missingReports || 0}</strong></div>
+      <div class="metric"><span>Stability</span><strong>${escapeHtml(stability.status || "not run")}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><code>${escapeHtml(repeat.candidateKey || "-")}</code></p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || readiness.reason || "")}</p>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>PF spread</th><td>${formatMaybeNumber(metric.profitFactorMin)} - ${formatMaybeNumber(metric.profitFactorMax)} (${formatMaybeNumber(metric.profitFactorSpread)})</td></tr>
+        <tr><th>Return spread</th><td>${formatMaybeNumber(metric.returnMin)}% - ${formatMaybeNumber(metric.returnMax)}% (${formatMaybeNumber(metric.returnSpread)}%)</td></tr>
+        <tr><th>Max drawdown</th><td>${formatMaybeNumber(metric.drawdownMax)}%</td></tr>
+        <tr><th>Trades min</th><td>${metric.tradesMin ?? "-"}</td></tr>
+        <tr><th>Unique candidates</th><td>${churn.uniqueCandidates ?? "-"} / ${churn.totalRecommendations ?? "-"}</td></tr>
+      </tbody>
+    </table>
+    <h3 class="modal-section-title">Recent Appearances</h3>
+    <table class="trade-table">
+      <thead><tr><th>Report</th><th>Match</th><th>Candidate</th><th>PF</th><th>Return</th><th>Trades</th></tr></thead>
+      <tbody>${appearanceRows || `<tr><td colspan="6">No recommendation appearances available.</td></tr>`}</tbody>
+    </table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
   `;
 }
 

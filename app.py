@@ -776,6 +776,15 @@ def learning_audit_summary():
         return jsonify({"ok": False, "error": f"Could not build learning audit summary: {exc}"}), 502
 
 
+@app.get("/api/learning/evidence")
+def learning_evidence():
+    try:
+        include_stability = request.args.get("stability", "true").lower() not in {"0", "false", "no", "off"}
+        return jsonify(build_learning_evidence(include_stability=include_stability))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Could not build learning evidence: {exc}"}), 502
+
+
 @app.get("/api/learning/auto-promote/status")
 def learning_auto_promote_status():
     config = load_learning_config()
@@ -2173,7 +2182,8 @@ def build_learning_audit_summary() -> dict:
     zero_trade = zero_trade_summary_from_run(latest_optimization)
     readiness = learning_audit_readiness(reports, best_candidate, current_candidate, candidate_health, optimizer_quality)
     comparison = candidate_comparison(latest_recommendation_candidate, current_candidate)
-    next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate, latest_recommendation_candidate)
+    evidence = build_learning_evidence(include_stability=False, reports=reports, latest_report=latest_learning, audit_status=None)
+    next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate, latest_recommendation_candidate, evidence)
     warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness, best_candidate, latest_recommendation_candidate)
     return {
         "ok": True,
@@ -2187,6 +2197,7 @@ def build_learning_audit_summary() -> dict:
         "bestSavedCandidate": compact_candidate(best_candidate),
         "currentPaperCandidate": candidate_summary(current_candidate),
         "candidateComparison": comparison,
+        "evidenceSummary": evidence.get("repeatability"),
         "candidateHealth": candidate_health,
         "optimizerQuality": optimizer_quality,
         "gridAudit": grid_audit,
@@ -2875,6 +2886,202 @@ def build_candidate_stability_report(args) -> dict:
     }
 
 
+def normalized_candidate_key(candidate: dict | None) -> str | None:
+    if not candidate:
+        return None
+    strategy = candidate.get("strategy") or candidate.get("preset")
+    symbol = candidate_primary_symbol(candidate)
+    timeframe = candidate_primary_timeframe(candidate)
+    if not strategy or not symbol or not timeframe:
+        return None
+    params = candidate.get("params") or {}
+    params_key = json.dumps(params, sort_keys=True, separators=(",", ":"), default=str)
+    return "|".join([str(strategy), str(symbol), str(timeframe), params_key])
+
+
+def candidate_metric_value(candidate: dict | None, metric: str) -> float:
+    candidate = candidate or {}
+    quality = candidate.get("qualityMetrics") or {}
+    aliases = {
+        "profitFactor": ("profitFactor", "testProfitFactor", "fullProfitFactor"),
+        "return": ("totalReturnPct", "testReturnPct", "fullReturnPct"),
+        "drawdown": ("maxDrawdown", "testMaxDrawdownPct", "fullMaxDrawdownPct"),
+        "trades": ("trades", "testTrades", "fullTrades"),
+    }
+    for key in aliases.get(metric, (metric,)):
+        if candidate.get(key) is not None:
+            return safe_float(candidate.get(key))
+        if quality.get(key) is not None:
+            return safe_float(quality.get(key))
+    if metric == "return":
+        return candidate_metric(candidate, "test", "totalReturn", ("totalReturnPct",))
+    if metric == "trades":
+        return candidate_metric(candidate, "test", "trades", ("trades",))
+    return 0.0
+
+
+def candidate_appearance_from_report(report: dict, candidate: dict, target_key: str | None = None) -> dict:
+    key = normalized_candidate_key(candidate)
+    return {
+        "reportId": report.get("id"),
+        "createdAt": report.get("createdAt"),
+        "candidateKey": key,
+        "matches": bool(target_key and key == target_key),
+        "strategy": candidate.get("strategy") or candidate.get("preset"),
+        "symbol": candidate_primary_symbol(candidate),
+        "timeframe": candidate_primary_timeframe(candidate),
+        "qualityStatus": candidate.get("qualityStatus"),
+        "score": candidate.get("score"),
+        "profitFactor": candidate_metric_value(candidate, "profitFactor"),
+        "returnPct": candidate_metric_value(candidate, "return"),
+        "drawdownPct": candidate_metric_value(candidate, "drawdown"),
+        "trades": int(candidate_metric_value(candidate, "trades")),
+    }
+
+
+def metric_stability(appearances: list[dict]) -> dict:
+    def values(key: str) -> list[float]:
+        return [safe_float(item.get(key)) for item in appearances if item.get(key) is not None]
+
+    pf = values("profitFactor")
+    returns = values("returnPct")
+    drawdowns = values("drawdownPct")
+    trades = values("trades")
+    return {
+        "profitFactorMin": min(pf) if pf else 0,
+        "profitFactorMax": max(pf) if pf else 0,
+        "profitFactorSpread": round(max(pf) - min(pf), 6) if pf else 0,
+        "returnMin": min(returns) if returns else 0,
+        "returnMax": max(returns) if returns else 0,
+        "returnSpread": round(max(returns) - min(returns), 6) if returns else 0,
+        "drawdownMax": max(drawdowns) if drawdowns else 0,
+        "tradesMin": int(min(trades)) if trades else 0,
+    }
+
+
+def close_report_warning(appearances: list[dict]) -> str | None:
+    times = [parse_learning_time(item.get("createdAt")) for item in appearances if item.get("createdAt")]
+    times = [item for item in times if item]
+    if len(times) < 2:
+        return None
+    times = sorted(times)
+    min_gap_hours = min((later - earlier).total_seconds() / 3600 for earlier, later in zip(times, times[1:]))
+    if min_gap_hours < 6:
+        return "Repeated learning reports are close together; this may not represent independent market evidence."
+    return None
+
+
+def close_learning_report_warning(reports: list[dict]) -> str | None:
+    appearances = [{"createdAt": report.get("createdAt")} for report in reports if report.get("createdAt")]
+    warning = close_report_warning(appearances)
+    if warning:
+        return "Recent learning reports are close together; this may not represent independent market evidence."
+    return None
+
+
+def learning_evidence_readiness(reports_considered: int, repeat_count: int, required_repeat_count: int, churn_ratio: float, candidate: dict | None, stability_summary: dict | None, warnings: list[str]) -> dict:
+    missing_reports = max(0, 3 - reports_considered, required_repeat_count - repeat_count)
+    if not candidate:
+        return {"status": "BLOCKED", "missingReports": 3, "reason": "No latest recommendation candidate is available."}
+    if candidate.get("qualityStatus") == "FAIL" or candidate_has_robustness_blockers(candidate):
+        return {"status": "BLOCKED", "missingReports": missing_reports, "reason": "Candidate has quality or robustness blockers."}
+    stability_status = (stability_summary or {}).get("status")
+    if stability_status == "FAIL":
+        return {"status": "BLOCKED", "missingReports": missing_reports, "reason": "Candidate stability validation failed."}
+    if reports_considered < 3:
+        return {"status": "COLLECTING", "missingReports": missing_reports, "reason": "Need at least 3 learning reports before readiness review."}
+    if repeat_count < required_repeat_count:
+        return {"status": "WATCH", "missingReports": missing_reports, "reason": f"Need candidate repeated {required_repeat_count} times; current repeat count is {repeat_count}."}
+    if churn_ratio > 0.6:
+        return {"status": "WATCH", "missingReports": 0, "reason": f"Recommendation churn is too high ({round(churn_ratio, 4)} > 0.6)."}
+    if stability_status in (None, "PASS", "UNKNOWN"):
+        return {"status": "READY_FOR_CONFIG_REVIEW", "missingReports": 0, "reason": "Repeatability and stability evidence support config-only manual review."}
+    return {"status": "WATCH", "missingReports": 0, "reason": "Candidate has stability warnings; observe more before config-only review."}
+
+
+def build_learning_evidence(include_stability: bool = True, reports: list[dict] | None = None, latest_report: dict | None = None, audit_status: str | None = None) -> dict:
+    reports = reports if reports is not None else load_learning_reports()
+    latest_report = latest_report if latest_report is not None else (reports[-1] if reports else None)
+    candidate = latest_learning_recommendation_candidate(latest_report)
+    candidate_key = normalized_candidate_key(candidate)
+    considered = reports[-10:]
+    appearances = []
+    recommendation_keys = []
+    for report in considered:
+        rec_candidate = latest_learning_recommendation_candidate(report)
+        key = normalized_candidate_key(rec_candidate)
+        if key:
+            recommendation_keys.append(key)
+        if rec_candidate:
+            appearances.append(candidate_appearance_from_report(report, rec_candidate, candidate_key))
+    matching = [item for item in appearances if item.get("matches")]
+    counts = {}
+    for key in recommendation_keys:
+        counts[key] = counts.get(key, 0) + 1
+    total_recommendations = len(recommendation_keys)
+    unique_candidates = len(counts)
+    churn_ratio = (unique_candidates - 1) / max(1, total_recommendations - 1) if total_recommendations > 1 else 0
+    warnings = []
+    for warning in (close_learning_report_warning(considered), close_report_warning(matching)):
+        if warning:
+            warnings.append(warning)
+    stability = None
+    if include_stability and candidate:
+        stability_payload = build_candidate_stability_report({"compareCurrent": "true"})
+        stability = {
+            "status": (stability_payload.get("validation") or {}).get("status"),
+            "summary": (stability_payload.get("validation") or {}).get("summary"),
+            "aggregate": (stability_payload.get("validation") or {}).get("aggregate", {}),
+            "robustnessFlags": (stability_payload.get("validation") or {}).get("robustnessFlags", []),
+            "nextAction": stability_payload.get("nextAction", {}),
+        }
+    required_repeat_count = 3
+    readiness = learning_evidence_readiness(
+        len(considered),
+        len(matching),
+        required_repeat_count,
+        churn_ratio,
+        candidate,
+        stability,
+        warnings,
+    )
+    next_action = {"action": "OBSERVE_MORE", "reason": readiness.get("reason")}
+    if readiness["status"] == "COLLECTING":
+        next_action = {"action": "RUN_MORE_LEARNING", "reason": readiness["reason"]}
+    elif readiness["status"] == "READY_FOR_CONFIG_REVIEW":
+        next_action = {"action": "REVIEW_CONFIG_ONLY_PROMOTION", "reason": "Evidence supports config-only manual promotion review. Paper remains disabled."}
+    elif readiness["status"] == "BLOCKED":
+        next_action = {"action": "BLOCKED", "reason": readiness["reason"]}
+    repeatability = {
+        "candidateKey": candidate_key,
+        "strategy": (candidate or {}).get("strategy") or (candidate or {}).get("preset"),
+        "symbol": candidate_primary_symbol(candidate),
+        "timeframe": candidate_primary_timeframe(candidate),
+        "reportsConsidered": len(considered),
+        "repeatCount": len(matching),
+        "requiredRepeatCount": required_repeat_count,
+        "recentAppearances": appearances,
+        "metricStability": metric_stability(matching),
+        "churn": {
+            "uniqueCandidates": unique_candidates,
+            "totalRecommendations": total_recommendations,
+            "churnRatio": round(churn_ratio, 4),
+        },
+        "readiness": readiness,
+        "warnings": warnings,
+    }
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "latestRecommendedCandidate": compact_candidate(candidate),
+        "repeatability": repeatability,
+        "candidateStability": stability,
+        "learningAuditStatus": audit_status if audit_status is not None else build_learning_quality_audit().get("status"),
+        "nextAction": next_action,
+        "warnings": warnings,
+    }
+
+
 def optimizer_quality_from_run(run: dict | None) -> dict:
     summary = (run or {}).get("summary") or {}
     quality = (run or {}).get("qualitySummary") or summary.get("qualitySummary") or {}
@@ -3011,6 +3218,7 @@ def learning_audit_next_action(
     health: dict,
     best_candidate: dict | None,
     latest_recommendation_candidate: dict | None = None,
+    evidence: dict | None = None,
 ) -> dict:
     commands = ["python run_server.py"]
     if not latest_learning:
@@ -3021,6 +3229,19 @@ def learning_audit_next_action(
         return {"action": "WAIT_FOR_PAPER_DATA", "reason": "Paper simulation is enabled but there are not enough closed paper trades for health scoring.", "commands": ["npm run paper:tick -- --config config/local/paper-candidate.json --refresh-first"]}
     if health.get("status") == "HEALTHY":
         return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is aligned with expectations.", "commands": []}
+    evidence_readiness = ((evidence or {}).get("repeatability") or {}).get("readiness") or {}
+    if evidence_readiness.get("status") == "READY_FOR_CONFIG_REVIEW":
+        return {
+            "action": "REVIEW_CONFIG_ONLY_PROMOTION",
+            "reason": "Learning evidence is repeatable enough for config-only manual promotion review. Paper remains disabled.",
+            "commands": ["GET /api/learning/evidence", "GET /api/candidate/review", "GET /api/candidate/promote-preview"],
+        }
+    if evidence_readiness.get("status") in {"COLLECTING", "WATCH"}:
+        return {
+            "action": "OBSERVE_MORE",
+            "reason": evidence_readiness.get("reason") or "More learning evidence is needed before config-only manual review.",
+            "commands": ["GET /api/learning/evidence", "POST /api/learning/run"],
+        }
     if candidate_passes_quality(latest_recommendation_candidate):
         return {
             "action": "REVIEW_CANDIDATE",
