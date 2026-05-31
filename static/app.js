@@ -2911,13 +2911,17 @@ function renderLearningAuditSummary(payload) {
   const zero = payload.zeroTrade || {};
   const readiness = payload.readiness || {};
   const next = payload.nextAction || {};
+  const recommended = payload.latestLearningRecommendationCandidate || {};
+  const latestOptimizer = payload.latestOptimizerRun || payload.latestOptimizationRun || {};
   const best = payload.bestSavedCandidate || {};
   const current = payload.currentPaperCandidate || {};
+  const comparison = payload.candidateComparison || {};
   const commands = (next.commands || []).map((command) => `<code>${escapeHtml(command)}</code>`).join("<br>");
   const rejectionRows = (opt.topRejectionReasons || []).slice(0, 5).map((item) => `
     <tr><td>${escapeHtml(item.label || item.reason || "-")}</td><td>${item.count || 0}</td></tr>
   `).join("");
-  const bestRobustnessRows = renderCandidateRobustnessRows(best);
+  const recommendedRobustnessRows = renderCandidateRobustnessRows(recommended);
+  const comparisonNotes = (comparison.notes || []).map(escapeHtml).join("; ");
   return `
     <h3 class="modal-section-title">Audit Summary <span class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "Check"}</span></h3>
     <div class="metric-grid">
@@ -2932,10 +2936,15 @@ function renderLearningAuditSummary(payload) {
     <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
     <table class="trade-table">
       <tbody>
+        <tr><th>Latest recommended candidate</th><td>${recommended.strategy ? `${escapeHtml(recommended.strategy)} ${escapeHtml(recommended.symbol || "")} ${escapeHtml(recommended.timeframe || "")} - ${escapeHtml(recommended.qualityStatus || "-")} - PF ${formatNumber(recommended.profitFactor)} - T ${recommended.trades || 0}` : "-"}</td></tr>
+        ${recommendedRobustnessRows}
         <tr><th>Best saved candidate</th><td>${best.strategy ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol || "")} ${escapeHtml(best.timeframe || "")} - PF ${formatNumber(best.profitFactor)} - T ${best.trades || 0}` : "-"}</td></tr>
-        ${bestRobustnessRows}
         <tr><th>Current paper candidate</th><td>${current.strategy ? `${escapeHtml(current.strategy)} ${escapeHtml((current.activeSymbols || [])[0]?.symbol || "")}` : "-"}</td></tr>
+        <tr><th>Latest optimizer run</th><td>${latestOptimizer.id ? `${escapeHtml((latestOptimizer.strategies || [])[0] || "-")} ${escapeHtml((latestOptimizer.symbols || [])[0] || "")} ${escapeHtml((latestOptimizer.timeframes || [])[0] || "")} - ${escapeHtml(latestOptimizer.latestSelectedStatus || opt.latestSelectedStatus || "UNKNOWN")}` : "-"}</td></tr>
+        <tr><th>Candidate comparison</th><td>${comparison.recommendedStrategy ? `${escapeHtml(comparison.recommendedStrategy || "-")} ${escapeHtml(comparison.recommendedSymbol || "")} ${escapeHtml(comparison.recommendedTimeframe || "")} vs ${escapeHtml(comparison.currentPaperStrategy || "-")} ${escapeHtml(comparison.currentPaperSymbol || "")} - same ${comparison.sameAsCurrentPaper ? "yes" : "no"} - better ${comparison.recommendedBetterThanCurrent === null || comparison.recommendedBetterThanCurrent === undefined ? "unknown" : comparison.recommendedBetterThanCurrent ? "yes" : "no"}` : "-"}</td></tr>
+        ${comparisonNotes ? `<tr><th>Comparison notes</th><td>${comparisonNotes}</td></tr>` : ""}
         <tr><th>Safe for manual review</th><td class="${readiness.safeForManualReview ? "positive" : "neutral"}">${readiness.safeForManualReview ? "yes" : "no"}</td></tr>
+        <tr><th>Manual inspection candidate</th><td class="${payload.latestLearningRecommendationUsableForManualInspection ? "positive" : "neutral"}">${payload.latestLearningRecommendationUsableForManualInspection ? "yes" : "no"}</td></tr>
         <tr><th>Suggested commands</th><td>${commands || "-"}</td></tr>
       </tbody>
     </table>

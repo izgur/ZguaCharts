@@ -2131,21 +2131,27 @@ def build_learning_audit_summary() -> dict:
     latest_learning = reports[-1] if reports else None
     latest_ranking = latest_research_run_by_type(research_runs, "ranking")
     latest_optimization = latest_research_run_by_type(research_runs, "optimization")
+    latest_recommendation_candidate = latest_learning_recommendation_candidate(latest_learning)
     best_candidate = best_saved_candidate(research_runs)
     optimizer_quality = optimizer_quality_from_run(latest_optimization)
     grid_audit = (latest_optimization or {}).get("gridAudit") or {}
     zero_trade = zero_trade_summary_from_run(latest_optimization)
     readiness = learning_audit_readiness(reports, best_candidate, current_candidate, candidate_health, optimizer_quality)
-    next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate)
-    warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness, best_candidate)
+    comparison = candidate_comparison(latest_recommendation_candidate, current_candidate)
+    next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate, latest_recommendation_candidate)
+    warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness, best_candidate, latest_recommendation_candidate)
     return {
         "ok": True,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "latestLearningReport": compact_learning_report(latest_learning),
         "latestRankingRun": compact_research_run(latest_ranking),
         "latestOptimizationRun": compact_research_run(latest_optimization),
+        "latestOptimizerRun": compact_latest_optimizer_run(latest_optimization, optimizer_quality),
+        "latestLearningRecommendationCandidate": compact_candidate(latest_recommendation_candidate),
+        "latestLearningRecommendationUsableForManualInspection": candidate_passes_quality(latest_recommendation_candidate),
         "bestSavedCandidate": compact_candidate(best_candidate),
         "currentPaperCandidate": candidate_summary(current_candidate),
+        "candidateComparison": comparison,
         "candidateHealth": candidate_health,
         "optimizerQuality": optimizer_quality,
         "gridAudit": grid_audit,
@@ -2198,6 +2204,19 @@ def compact_research_run(run: dict | None) -> dict | None:
     }
 
 
+def compact_latest_optimizer_run(run: dict | None, optimizer_quality: dict) -> dict | None:
+    compact = compact_research_run(run)
+    if not compact:
+        return None
+    compact["latestSelectedStatus"] = optimizer_quality.get("latestSelectedStatus")
+    compact["passCandidates"] = optimizer_quality.get("passCandidates")
+    compact["warnCandidates"] = optimizer_quality.get("warnCandidates")
+    compact["failCandidates"] = optimizer_quality.get("failCandidates")
+    compact["totalCandidates"] = optimizer_quality.get("totalCandidates")
+    compact["topRejectionReasons"] = optimizer_quality.get("topRejectionReasons", [])
+    return compact
+
+
 def compact_candidate(candidate: dict | None) -> dict | None:
     if not candidate:
         return None
@@ -2225,6 +2244,98 @@ def compact_candidate(candidate: dict | None) -> dict | None:
         "origin": candidate.get("origin"),
         "warnings": candidate.get("warnings", []),
         "rejectionReasons": candidate.get("rejectionReasons", []),
+    }
+
+
+def latest_learning_recommendation_candidate(report: dict | None) -> dict | None:
+    if not report:
+        return None
+    recommendation = report.get("recommendation") or {}
+    candidate = recommendation.get("candidate") or report.get("bestSavedCandidate")
+    return candidate if isinstance(candidate, dict) else None
+
+
+def candidate_passes_quality(candidate: dict | None) -> bool:
+    if not candidate:
+        return False
+    quality_status = candidate.get("qualityStatus")
+    if not quality_status and candidate.get("origin") == "ranking" and candidate.get("valid"):
+        quality_status = "PASS"
+    if quality_status != "PASS":
+        return False
+    return bool(candidate.get("valid", True)) and not candidate_has_robustness_blockers(candidate)
+
+
+def candidate_primary_symbol(candidate: dict | None) -> str | None:
+    if not candidate:
+        return None
+    if candidate.get("symbol"):
+        return str(candidate.get("symbol"))
+    active = candidate.get("activeSymbols") or []
+    if active and isinstance(active[0], dict):
+        return str(active[0].get("symbol") or "") or None
+    symbols = candidate.get("symbols") or []
+    if symbols and isinstance(symbols[0], dict):
+        return str(symbols[0].get("symbol") or "") or None
+    return None
+
+
+def candidate_primary_timeframe(candidate: dict | None) -> str | None:
+    if not candidate:
+        return None
+    if candidate.get("timeframe"):
+        return str(candidate.get("timeframe"))
+    if candidate.get("interval"):
+        return str(candidate.get("interval"))
+    active = candidate.get("activeSymbols") or []
+    if active and isinstance(active[0], dict):
+        return str(active[0].get("interval") or active[0].get("timeframe") or "") or None
+    symbols = candidate.get("symbols") or []
+    if symbols and isinstance(symbols[0], dict):
+        return str(symbols[0].get("interval") or symbols[0].get("timeframe") or "") or None
+    return None
+
+
+def candidate_comparison(recommended: dict | None, current: dict | None) -> dict:
+    current_summary = candidate_summary(current or {})
+    recommended_strategy = (recommended or {}).get("strategy") or (recommended or {}).get("preset")
+    current_strategy = current_summary.get("strategy")
+    recommended_symbol = candidate_primary_symbol(recommended)
+    current_symbol = candidate_primary_symbol(current_summary)
+    recommended_timeframe = candidate_primary_timeframe(recommended)
+    current_timeframe = candidate_primary_timeframe(current_summary)
+    same_as_current = bool(
+        recommended_strategy and
+        recommended_strategy == current_strategy and
+        recommended_symbol == current_symbol and
+        recommended_timeframe == current_timeframe
+    )
+    recommended_score = safe_float((recommended or {}).get("score"), None)
+    current_score = current_candidate_score(current_summary)
+    better = None
+    if recommended_score is not None and current_score is not None:
+        better = recommended_score > current_score
+    notes = []
+    if not recommended:
+        notes.append("No latest learning recommendation candidate is available.")
+    elif candidate_has_robustness_blockers(recommended):
+        notes.append("Latest recommendation candidate has robustness blockers.")
+    elif candidate_passes_quality(recommended):
+        notes.append("Latest learning recommendation candidate passed optimizer quality checks.")
+    if same_as_current:
+        notes.append("Latest recommendation matches the current paper candidate family and primary market.")
+    elif recommended and current_strategy:
+        notes.append("Latest recommendation differs from the current paper candidate.")
+    return {
+        "recommendedStrategy": recommended_strategy,
+        "recommendedSymbol": recommended_symbol,
+        "recommendedTimeframe": recommended_timeframe,
+        "currentPaperStrategy": current_strategy,
+        "currentPaperSymbol": current_symbol,
+        "currentPaperTimeframe": current_timeframe,
+        "sameAsCurrentPaper": same_as_current,
+        "recommendedBetterThanCurrent": better,
+        "notes": notes,
     }
 
 
@@ -2356,7 +2467,15 @@ def learning_audit_readiness(reports: list[dict], best_candidate: dict | None, c
     }
 
 
-def learning_audit_next_action(latest_learning: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict, health: dict, best_candidate: dict | None) -> dict:
+def learning_audit_next_action(
+    latest_learning: dict | None,
+    optimizer_quality: dict,
+    zero_trade: dict,
+    readiness: dict,
+    health: dict,
+    best_candidate: dict | None,
+    latest_recommendation_candidate: dict | None = None,
+) -> dict:
     commands = ["python run_server.py"]
     if not latest_learning:
         return {"action": "RUN_LEARNING", "reason": "No learning reports exist yet.", "commands": commands + ["POST /api/learning/run"]}
@@ -2366,6 +2485,18 @@ def learning_audit_next_action(latest_learning: dict | None, optimizer_quality: 
         return {"action": "WAIT_FOR_PAPER_DATA", "reason": "Paper simulation is enabled but there are not enough closed paper trades for health scoring.", "commands": ["npm run paper:tick -- --config config/local/paper-candidate.json --refresh-first"]}
     if health.get("status") == "HEALTHY":
         return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is aligned with expectations.", "commands": []}
+    if candidate_passes_quality(latest_recommendation_candidate):
+        return {
+            "action": "REVIEW_CANDIDATE",
+            "reason": "Latest learning report contains a PASS recommendation candidate. Review it manually before tuning global optimizer policy; paper remains disabled.",
+            "commands": ["GET /api/learning/audit", "GET /api/research/best-candidate", "GET /api/candidate/validate"],
+        }
+    if latest_recommendation_candidate and candidate_has_robustness_blockers(latest_recommendation_candidate):
+        return {
+            "action": "TUNE_QUALITY_POLICY",
+            "reason": "Latest learning recommendation candidate has robustness blockers; inspect quality reasons before manual review.",
+            "commands": ["GET /api/learning/audit", "GET /api/strategy-optimize?source=bybit&symbol=BTCUSDT&timeframe=1h&period=365d&limit=auto&max_combos=20"],
+        }
     if optimizer_quality.get("latestSelectedStatus") == "NONE":
         reasons = {item.get("reason") for item in optimizer_quality.get("topRejectionReasons", [])}
         if reasons & {"zero_trades", "too_few_test_trades", "too_few_full_trades", "zero_trade_diagnostics"} or zero_trade.get("hasZeroTradeProblem"):
@@ -2378,14 +2509,25 @@ def learning_audit_next_action(latest_learning: dict | None, optimizer_quality: 
     return {"action": "NO_ACTION", "reason": "No safe manual action is required right now.", "commands": []}
 
 
-def learning_audit_summary_warnings(latest_learning: dict | None, latest_optimization: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict, best_candidate: dict | None = None) -> list[str]:
+def learning_audit_summary_warnings(
+    latest_learning: dict | None,
+    latest_optimization: dict | None,
+    optimizer_quality: dict,
+    zero_trade: dict,
+    readiness: dict,
+    best_candidate: dict | None = None,
+    latest_recommendation_candidate: dict | None = None,
+) -> list[str]:
     warnings = []
     if latest_learning and latest_learning.get("errors"):
         warnings.append("Latest learning report contains errors.")
     if not latest_optimization:
         warnings.append("No optimization research run is saved yet.")
     if optimizer_quality.get("latestSelectedStatus") == "NONE":
-        warnings.append("Latest optimizer run has no acceptable PASS/WARN candidate.")
+        if candidate_passes_quality(latest_recommendation_candidate):
+            warnings.append("Latest optimizer run failed, but latest learning report contains a PASS recommendation candidate. Review the recommended candidate before tuning global policy.")
+        else:
+            warnings.append("Latest optimizer run has no acceptable PASS/WARN candidate.")
     if zero_trade.get("hasZeroTradeProblem"):
         warnings.append("Zero-trade or low-trade optimizer candidates were detected.")
     if not readiness.get("safeForManualReview"):
