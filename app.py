@@ -2185,6 +2185,7 @@ def build_learning_audit_summary() -> dict:
     evidence = build_learning_evidence(include_stability=False, reports=reports, latest_report=latest_learning, audit_status=None)
     next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate, latest_recommendation_candidate, evidence)
     warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness, best_candidate, latest_recommendation_candidate)
+    warnings = dedupe_list(warnings + (evidence.get("warnings") or []))
     return {
         "ok": True,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -2899,6 +2900,17 @@ def normalized_candidate_key(candidate: dict | None) -> str | None:
     return "|".join([str(strategy), str(symbol), str(timeframe), params_key])
 
 
+def family_candidate_key(candidate: dict | None) -> str | None:
+    if not candidate:
+        return None
+    strategy = candidate.get("strategy") or candidate.get("preset")
+    symbol = candidate_primary_symbol(candidate)
+    timeframe = candidate_primary_timeframe(candidate)
+    if not strategy or not symbol or not timeframe:
+        return None
+    return "|".join([str(strategy), str(symbol), str(timeframe)])
+
+
 def candidate_metric_value(candidate: dict | None, metric: str) -> float:
     candidate = candidate or {}
     quality = candidate.get("qualityMetrics") or {}
@@ -2920,16 +2932,22 @@ def candidate_metric_value(candidate: dict | None, metric: str) -> float:
     return 0.0
 
 
-def candidate_appearance_from_report(report: dict, candidate: dict, target_key: str | None = None) -> dict:
+def candidate_appearance_from_report(report: dict, candidate: dict, target_key: str | None = None, target_family_key: str | None = None) -> dict:
     key = normalized_candidate_key(candidate)
+    family_key = family_candidate_key(candidate)
     return {
         "reportId": report.get("id"),
         "createdAt": report.get("createdAt"),
         "candidateKey": key,
+        "exactCandidateKey": key,
+        "familyCandidateKey": family_key,
         "matches": bool(target_key and key == target_key),
+        "exactMatches": bool(target_key and key == target_key),
+        "familyMatches": bool(target_family_key and family_key == target_family_key),
         "strategy": candidate.get("strategy") or candidate.get("preset"),
         "symbol": candidate_primary_symbol(candidate),
         "timeframe": candidate_primary_timeframe(candidate),
+        "params": candidate.get("params") or {},
         "qualityStatus": candidate.get("qualityStatus"),
         "score": candidate.get("score"),
         "profitFactor": candidate_metric_value(candidate, "profitFactor"),
@@ -2959,6 +2977,56 @@ def metric_stability(appearances: list[dict]) -> dict:
     }
 
 
+def param_drift_summary(appearances: list[dict]) -> dict:
+    family = [item for item in appearances if item.get("familyMatches")]
+    if len(family) < 2:
+        return {
+            "familyReportsCompared": len(family),
+            "changedParamCount": 0,
+            "stableParamCount": 0,
+            "changedParams": [],
+            "stableParams": [],
+            "driftStatus": "UNKNOWN",
+            "summary": "Need at least two family-matching reports to measure parameter drift.",
+        }
+    param_sets = [item.get("params") or {} for item in family]
+    keys = sorted(set().union(*[set(params.keys()) for params in param_sets]))
+    changed = []
+    stable = []
+    for key in keys:
+        values = [params.get(key) for params in param_sets]
+        unique_values = []
+        for value in values:
+            if value not in unique_values:
+                unique_values.append(value)
+        if len(unique_values) > 1:
+            changed.append({"param": key, "values": unique_values})
+        else:
+            stable.append({"param": key, "value": unique_values[0] if unique_values else None})
+    core_params = {"atrMultiplier", "emaFast", "emaSlow", "emaTrend", "rsiMin", "rsiMax", "cooldownBars", "minHoldBars", "regimeMode", "volumeFilter"}
+    changed_core = len([item for item in changed if item["param"] in core_params])
+    total = max(1, len(keys))
+    changed_ratio = len(changed) / total
+    if changed_core == 0 or changed_ratio <= 0.25:
+        drift_status = "LOW"
+        summary = "Same family repeats with mostly stable parameters."
+    elif changed_core <= 2 or changed_ratio <= 0.5:
+        drift_status = "MEDIUM"
+        summary = "Same family repeats with some parameter drift."
+    else:
+        drift_status = "HIGH"
+        summary = "Same family repeats, but parameters are still drifting."
+    return {
+        "familyReportsCompared": len(family),
+        "changedParamCount": len(changed),
+        "stableParamCount": len(stable),
+        "changedParams": changed,
+        "stableParams": stable,
+        "driftStatus": drift_status,
+        "summary": summary,
+    }
+
+
 def close_report_warning(appearances: list[dict]) -> str | None:
     times = [parse_learning_time(item.get("createdAt")) for item in appearances if item.get("createdAt")]
     times = [item for item in times if item]
@@ -2979,8 +3047,21 @@ def close_learning_report_warning(reports: list[dict]) -> str | None:
     return None
 
 
-def learning_evidence_readiness(reports_considered: int, repeat_count: int, required_repeat_count: int, churn_ratio: float, candidate: dict | None, stability_summary: dict | None, warnings: list[str]) -> dict:
-    missing_reports = max(0, 3 - reports_considered, required_repeat_count - repeat_count)
+def learning_evidence_readiness(
+    reports_considered: int,
+    exact_repeat_count: int,
+    required_exact_repeat_count: int,
+    family_repeat_count: int,
+    required_family_repeat_count: int,
+    churn_ratio: float,
+    candidate: dict | None,
+    stability_summary: dict | None,
+    param_drift: dict,
+    warnings: list[str],
+) -> dict:
+    missing_exact = max(0, required_exact_repeat_count - exact_repeat_count)
+    missing_family = max(0, required_family_repeat_count - family_repeat_count)
+    missing_reports = max(0, 3 - reports_considered, missing_exact)
     if not candidate:
         return {"status": "BLOCKED", "missingReports": 3, "reason": "No latest recommendation candidate is available."}
     if candidate.get("qualityStatus") == "FAIL" or candidate_has_robustness_blockers(candidate):
@@ -2990,12 +3071,19 @@ def learning_evidence_readiness(reports_considered: int, repeat_count: int, requ
         return {"status": "BLOCKED", "missingReports": missing_reports, "reason": "Candidate stability validation failed."}
     if reports_considered < 3:
         return {"status": "COLLECTING", "missingReports": missing_reports, "reason": "Need at least 3 learning reports before readiness review."}
-    if repeat_count < required_repeat_count:
-        return {"status": "WATCH", "missingReports": missing_reports, "reason": f"Need candidate repeated {required_repeat_count} times; current repeat count is {repeat_count}."}
     if churn_ratio > 0.6:
         return {"status": "WATCH", "missingReports": 0, "reason": f"Recommendation churn is too high ({round(churn_ratio, 4)} > 0.6)."}
-    if stability_status in (None, "PASS", "UNKNOWN"):
+    if exact_repeat_count >= required_exact_repeat_count and stability_status in (None, "PASS", "UNKNOWN"):
         return {"status": "READY_FOR_CONFIG_REVIEW", "missingReports": 0, "reason": "Repeatability and stability evidence support config-only manual review."}
+    drift_status = (param_drift or {}).get("driftStatus", "UNKNOWN")
+    if family_repeat_count >= required_family_repeat_count and stability_status in (None, "PASS", "UNKNOWN") and drift_status in {"LOW", "MEDIUM"}:
+        return {"status": "FAMILY_STABLE", "missingReports": 0, "missingExactReports": missing_exact, "missingFamilyReports": 0, "reason": "Strategy/symbol/timeframe family is repeating with acceptable parameter drift."}
+    if family_repeat_count >= 2 and exact_repeat_count < required_exact_repeat_count:
+        if drift_status == "HIGH":
+            return {"status": "WATCH_PARAM_DRIFT", "missingReports": missing_exact, "missingExactReports": missing_exact, "missingFamilyReports": missing_family, "reason": "Candidate family is repeating, but optimizer parameters are drifting too much."}
+        return {"status": "WATCH", "missingReports": missing_exact, "missingExactReports": missing_exact, "missingFamilyReports": missing_family, "reason": f"Candidate family is repeating ({family_repeat_count}/{required_family_repeat_count}), but exact parameters need more stability ({exact_repeat_count}/{required_exact_repeat_count})."}
+    if exact_repeat_count < required_exact_repeat_count:
+        return {"status": "WATCH", "missingReports": missing_reports, "missingExactReports": missing_exact, "missingFamilyReports": missing_family, "reason": f"Need exact candidate repeated {required_exact_repeat_count} times; current exact repeat count is {exact_repeat_count}."}
     return {"status": "WATCH", "missingReports": 0, "reason": "Candidate has stability warnings; observe more before config-only review."}
 
 
@@ -3004,20 +3092,29 @@ def build_learning_evidence(include_stability: bool = True, reports: list[dict] 
     latest_report = latest_report if latest_report is not None else (reports[-1] if reports else None)
     candidate = latest_learning_recommendation_candidate(latest_report)
     candidate_key = normalized_candidate_key(candidate)
+    family_key = family_candidate_key(candidate)
     considered = reports[-10:]
     appearances = []
     recommendation_keys = []
+    family_keys = []
     for report in considered:
         rec_candidate = latest_learning_recommendation_candidate(report)
         key = normalized_candidate_key(rec_candidate)
+        fam_key = family_candidate_key(rec_candidate)
         if key:
             recommendation_keys.append(key)
+        if fam_key:
+            family_keys.append(fam_key)
         if rec_candidate:
-            appearances.append(candidate_appearance_from_report(report, rec_candidate, candidate_key))
+            appearances.append(candidate_appearance_from_report(report, rec_candidate, candidate_key, family_key))
     matching = [item for item in appearances if item.get("matches")]
+    family_matching = [item for item in appearances if item.get("familyMatches")]
     counts = {}
     for key in recommendation_keys:
         counts[key] = counts.get(key, 0) + 1
+    family_counts = {}
+    for key in family_keys:
+        family_counts[key] = family_counts.get(key, 0) + 1
     total_recommendations = len(recommendation_keys)
     unique_candidates = len(counts)
     churn_ratio = (unique_candidates - 1) / max(1, total_recommendations - 1) if total_recommendations > 1 else 0
@@ -3025,6 +3122,9 @@ def build_learning_evidence(include_stability: bool = True, reports: list[dict] 
     for warning in (close_learning_report_warning(considered), close_report_warning(matching)):
         if warning:
             warnings.append(warning)
+    param_drift = param_drift_summary(appearances)
+    if len(family_matching) > len(matching):
+        warnings.append(f"{family_key or 'Latest candidate family'} is repeating as a family, but exact optimizer parameters differ.")
     stability = None
     if include_stability and candidate:
         stability_payload = build_candidate_stability_report({"compareCurrent": "true"})
@@ -3036,34 +3136,49 @@ def build_learning_evidence(include_stability: bool = True, reports: list[dict] 
             "nextAction": stability_payload.get("nextAction", {}),
         }
     required_repeat_count = 3
+    required_family_repeat_count = 3
     readiness = learning_evidence_readiness(
         len(considered),
         len(matching),
         required_repeat_count,
+        len(family_matching),
+        required_family_repeat_count,
         churn_ratio,
         candidate,
         stability,
+        param_drift,
         warnings,
     )
     next_action = {"action": "OBSERVE_MORE", "reason": readiness.get("reason")}
     if readiness["status"] == "COLLECTING":
         next_action = {"action": "RUN_MORE_LEARNING", "reason": readiness["reason"]}
-    elif readiness["status"] == "READY_FOR_CONFIG_REVIEW":
+    elif readiness["status"] in {"READY_FOR_CONFIG_REVIEW", "FAMILY_STABLE"}:
         next_action = {"action": "REVIEW_CONFIG_ONLY_PROMOTION", "reason": "Evidence supports config-only manual promotion review. Paper remains disabled."}
     elif readiness["status"] == "BLOCKED":
         next_action = {"action": "BLOCKED", "reason": readiness["reason"]}
+    elif len(family_matching) >= 2 and len(matching) < required_repeat_count:
+        next_action = {"action": "OBSERVE_PARAM_STABILITY", "reason": readiness["reason"]}
     repeatability = {
         "candidateKey": candidate_key,
+        "exactCandidateKey": candidate_key,
+        "familyCandidateKey": family_key,
         "strategy": (candidate or {}).get("strategy") or (candidate or {}).get("preset"),
         "symbol": candidate_primary_symbol(candidate),
         "timeframe": candidate_primary_timeframe(candidate),
         "reportsConsidered": len(considered),
         "repeatCount": len(matching),
+        "exactRepeatCount": len(matching),
+        "familyRepeatCount": len(family_matching),
         "requiredRepeatCount": required_repeat_count,
+        "requiredExactRepeatCount": required_repeat_count,
+        "requiredFamilyRepeatCount": required_family_repeat_count,
         "recentAppearances": appearances,
         "metricStability": metric_stability(matching),
+        "familyMetricStability": metric_stability(family_matching),
+        "paramDrift": param_drift,
         "churn": {
             "uniqueCandidates": unique_candidates,
+            "uniqueFamilies": len(family_counts),
             "totalRecommendations": total_recommendations,
             "churnRatio": round(churn_ratio, 4),
         },

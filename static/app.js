@@ -3129,14 +3129,18 @@ function renderLearningEvidence(payload) {
   const repeat = payload.repeatability || {};
   const readiness = repeat.readiness || {};
   const metric = repeat.metricStability || {};
+  const familyMetric = repeat.familyMetricStability || {};
+  const drift = repeat.paramDrift || {};
   const churn = repeat.churn || {};
   const next = payload.nextAction || {};
   const stability = payload.candidateStability || {};
-  const tone = readiness.status === "READY_FOR_CONFIG_REVIEW" ? "positive" : readiness.status === "BLOCKED" ? "negative" : "neutral";
+  const tone = ["READY_FOR_CONFIG_REVIEW", "FAMILY_STABLE"].includes(readiness.status) ? "positive" : readiness.status === "BLOCKED" ? "negative" : "neutral";
+  const changedParams = (drift.changedParams || []).slice(0, 10).map((item) => `${escapeHtml(item.param)}: ${escapeHtml((item.values || []).map((value) => String(value)).join(" -> "))}`).join("<br>");
+  const stableParams = (drift.stableParams || []).slice(0, 10).map((item) => `${escapeHtml(item.param)}: ${escapeHtml(String(item.value))}`).join("<br>");
   const appearanceRows = (repeat.recentAppearances || []).slice(-8).reverse().map((item) => `
     <tr>
       <td>${escapeHtml(formatLearningTime(item.createdAt))}</td>
-      <td>${item.matches ? "yes" : "no"}</td>
+      <td>${item.exactMatches || item.matches ? "exact" : item.familyMatches ? "family" : "no"}</td>
       <td>${escapeHtml(item.strategy || "-")} ${escapeHtml(item.symbol || "")} ${escapeHtml(item.timeframe || "")}</td>
       <td>${formatMaybeNumber(item.profitFactor)}</td>
       <td>${formatMaybeNumber(item.returnPct)}%</td>
@@ -3147,23 +3151,34 @@ function renderLearningEvidence(payload) {
     <h3 class="modal-section-title">Learning Evidence <span class="${tone}">${escapeHtml(readiness.status || "UNKNOWN")}</span></h3>
     <div class="metric-grid">
       <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</strong></div>
-      <div class="metric"><span>Repeat</span><strong>${repeat.repeatCount || 0}/${repeat.requiredRepeatCount || 0}</strong></div>
+      <div class="metric"><span>Exact repeat</span><strong>${repeat.exactRepeatCount ?? repeat.repeatCount ?? 0}/${repeat.requiredExactRepeatCount ?? repeat.requiredRepeatCount ?? 0}</strong></div>
+      <div class="metric"><span>Family repeat</span><strong>${repeat.familyRepeatCount ?? 0}/${repeat.requiredFamilyRepeatCount ?? 0}</strong></div>
       <div class="metric"><span>Reports</span><strong>${repeat.reportsConsidered || 0}</strong></div>
       <div class="metric"><span>Churn</span><strong>${formatMaybeNumber(churn.churnRatio)}</strong></div>
       <div class="metric"><span>Missing</span><strong>${readiness.missingReports || 0}</strong></div>
       <div class="metric"><span>Stability</span><strong>${escapeHtml(stability.status || "not run")}</strong></div>
+      <div class="metric"><span>Param drift</span><strong>${escapeHtml(drift.driftStatus || "UNKNOWN")}</strong></div>
       <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
     </div>
-    <p class="modal-note"><code>${escapeHtml(repeat.candidateKey || "-")}</code></p>
+    <p class="modal-note">Exact <code>${escapeHtml(repeat.exactCandidateKey || repeat.candidateKey || "-")}</code></p>
+    <p class="modal-note">Family <code>${escapeHtml(repeat.familyCandidateKey || "-")}</code></p>
     <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || readiness.reason || "")}</p>
     <table class="trade-table">
       <tbody>
         <tr><th>PF spread</th><td>${formatMaybeNumber(metric.profitFactorMin)} - ${formatMaybeNumber(metric.profitFactorMax)} (${formatMaybeNumber(metric.profitFactorSpread)})</td></tr>
         <tr><th>Return spread</th><td>${formatMaybeNumber(metric.returnMin)}% - ${formatMaybeNumber(metric.returnMax)}% (${formatMaybeNumber(metric.returnSpread)}%)</td></tr>
+        <tr><th>Family PF spread</th><td>${formatMaybeNumber(familyMetric.profitFactorMin)} - ${formatMaybeNumber(familyMetric.profitFactorMax)} (${formatMaybeNumber(familyMetric.profitFactorSpread)})</td></tr>
+        <tr><th>Family return spread</th><td>${formatMaybeNumber(familyMetric.returnMin)}% - ${formatMaybeNumber(familyMetric.returnMax)}% (${formatMaybeNumber(familyMetric.returnSpread)}%)</td></tr>
         <tr><th>Max drawdown</th><td>${formatMaybeNumber(metric.drawdownMax)}%</td></tr>
         <tr><th>Trades min</th><td>${metric.tradesMin ?? "-"}</td></tr>
-        <tr><th>Unique candidates</th><td>${churn.uniqueCandidates ?? "-"} / ${churn.totalRecommendations ?? "-"}</td></tr>
+        <tr><th>Unique candidates</th><td>${churn.uniqueCandidates ?? "-"} exact / ${churn.uniqueFamilies ?? "-"} family / ${churn.totalRecommendations ?? "-"} total</td></tr>
+        <tr><th>Drift summary</th><td>${escapeHtml(drift.summary || "-")}</td></tr>
       </tbody>
+    </table>
+    <h3 class="modal-section-title">Parameter Drift</h3>
+    <table class="trade-table">
+      <thead><tr><th>Changed Params</th><th>Stable Params</th></tr></thead>
+      <tbody><tr><td>${changedParams || "-"}</td><td>${stableParams || "-"}</td></tr></tbody>
     </table>
     <h3 class="modal-section-title">Recent Appearances</h3>
     <table class="trade-table">
