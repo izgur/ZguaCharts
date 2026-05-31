@@ -78,10 +78,20 @@ assert.strictEqual(zeroQuality.qualityStatus, "FAIL");
 assert.ok(zeroQuality.rejectionReasons.some((reason) => reason.code === "zero_trades"));
 const passQuality = optimizer.evaluateCandidateQuality({
   train: { totalReturn: 5, maxDrawdown: 3, profitFactor: 1.3, trades: 40, sharpeRatio: 1 },
-  test: { totalReturn: 3, maxDrawdown: 2, profitFactor: 1.2, trades: 12, sharpeRatio: 1 },
-  full: { totalReturn: 8, maxDrawdown: 4, profitFactor: 1.2, trades: 52, sharpeRatio: 1 }
+  test: { totalReturn: 3, maxDrawdown: 2, profitFactor: 1.2, trades: 13, sharpeRatio: 1 },
+  full: { totalReturn: 8, maxDrawdown: 4, profitFactor: 1.2, trades: 53, sharpeRatio: 1 }
 });
 assert.strictEqual(passQuality.qualityStatus, "PASS");
+const weakQuality = optimizer.evaluateCandidateQuality({
+  train: { totalReturn: -14.2474, maxDrawdown: 6, profitFactor: 0.8, trades: 28, sharpeRatio: -0.5 },
+  test: { totalReturn: 8.0155, maxDrawdown: 3, profitFactor: 3.6311, trades: 11, sharpeRatio: 1 },
+  full: { totalReturn: -6.2319, maxDrawdown: 8, profitFactor: 1.2, trades: 39, sharpeRatio: 0.1 }
+});
+assert.strictEqual(weakQuality.qualityStatus, "FAIL");
+assert.ok(weakQuality.rejectionReasons.some((reason) => reason.code === "negative_full_return"));
+assert.ok(weakQuality.rejectionReasons.some((reason) => reason.code === "strongly_negative_train_return"));
+assert.ok(weakQuality.warnings.some((reason) => reason.code === "train_test_direction_mismatch"));
+assert.ok(weakQuality.warnings.some((reason) => reason.code === "low_test_trade_evidence"));
 
 const csv = reporting.toCsv([
   {

@@ -10,6 +10,8 @@ const OPTIMIZER_QUALITY_POLICY = {
   minFullTrades: 20,
   minProfitFactor: 1.05,
   minTestReturnPct: 0,
+  strongNegativeTrainReturnPct: -5,
+  lowTestTradeEvidenceBuffer: 2,
   maxDrawdownPct: 25,
   maxTrainTestReturnGapPct: 25,
   maxNegativeWalkForwardFoldRatio: 0.5
@@ -25,6 +27,10 @@ const REJECTION_LABELS = {
   high_drawdown: "High drawdown",
   train_test_overfit_gap: "Train/test overfit gap",
   unstable_walk_forward: "Unstable walk-forward",
+  negative_full_return: "Negative full-period return",
+  train_test_direction_mismatch: "Train/test direction mismatch",
+  strongly_negative_train_return: "Strongly negative train return",
+  low_test_trade_evidence: "Low test-trade evidence",
   missing_metrics: "Missing metrics",
   invalid_candidate: "Invalid candidate",
   zero_trade_diagnostics: "Zero-trade diagnostics available",
@@ -1220,6 +1226,21 @@ function evaluateCandidateQuality(row, policy) {
   if (Number(metrics.testReturnPct || 0) < policy.minTestReturnPct) {
     hardReasons.push(reason("negative_test_return"));
   }
+  if (Number(metrics.fullReturnPct || 0) < 0) {
+    hardReasons.push(reason("negative_full_return"));
+  }
+  if (Number(metrics.trainReturnPct || 0) < 0 && Number(metrics.testReturnPct || 0) > 0) {
+    warnings.push(reason("train_test_direction_mismatch"));
+  }
+  if (Number(metrics.trainReturnPct || 0) < policy.strongNegativeTrainReturnPct && Number(metrics.testReturnPct || 0) > 0) {
+    hardReasons.push(reason("strongly_negative_train_return"));
+  }
+  if (
+    Number(metrics.testTrades || 0) >= policy.minTestTrades &&
+    Number(metrics.testTrades || 0) <= policy.minTestTrades + policy.lowTestTradeEvidenceBuffer
+  ) {
+    warnings.push(reason("low_test_trade_evidence"));
+  }
   if (Math.max(Number(metrics.testMaxDrawdownPct || 0), Number(metrics.fullMaxDrawdownPct || 0)) > policy.maxDrawdownPct) {
     hardReasons.push(reason("high_drawdown"));
   }
@@ -1298,7 +1319,13 @@ function buildGridAudit(strategy, interval, gridMetadata, rows, zeroTradeSummary
     diagnosis = "TOO_RESTRICTIVE";
   } else if (dominantCodes.indexOf("too_few_test_trades") !== -1 || dominantCodes.indexOf("too_few_full_trades") !== -1) {
     diagnosis = isLowTimeframe(interval) ? "TIMEFRAME_TOO_LOW" : "PERIOD_TOO_SHORT";
-  } else if (dominantCodes.indexOf("test_profit_factor_below_min") !== -1 || dominantCodes.indexOf("full_profit_factor_below_min") !== -1 || dominantCodes.indexOf("high_drawdown") !== -1) {
+  } else if (
+    dominantCodes.indexOf("test_profit_factor_below_min") !== -1 ||
+    dominantCodes.indexOf("full_profit_factor_below_min") !== -1 ||
+    dominantCodes.indexOf("high_drawdown") !== -1 ||
+    dominantCodes.indexOf("negative_full_return") !== -1 ||
+    dominantCodes.indexOf("strongly_negative_train_return") !== -1
+  ) {
     diagnosis = "QUALITY_FAILING";
   }
   var suggested = [];

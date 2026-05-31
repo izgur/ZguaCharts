@@ -2137,7 +2137,7 @@ def build_learning_audit_summary() -> dict:
     zero_trade = zero_trade_summary_from_run(latest_optimization)
     readiness = learning_audit_readiness(reports, best_candidate, current_candidate, candidate_health, optimizer_quality)
     next_action = learning_audit_next_action(latest_learning, optimizer_quality, zero_trade, readiness, candidate_health, best_candidate)
-    warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness)
+    warnings = learning_audit_summary_warnings(latest_learning, latest_optimization, optimizer_quality, zero_trade, readiness, best_candidate)
     return {
         "ok": True,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -2218,6 +2218,10 @@ def compact_candidate(candidate: dict | None) -> dict | None:
         "maxDrawdown": candidate.get("maxDrawdown"),
         "profitFactor": candidate.get("profitFactor"),
         "trades": candidate.get("trades"),
+        "train": candidate.get("train", {}),
+        "test": candidate.get("test", {}),
+        "full": candidate.get("full", {}),
+        "qualityMetrics": candidate.get("qualityMetrics", {}),
         "origin": candidate.get("origin"),
         "warnings": candidate.get("warnings", []),
         "rejectionReasons": candidate.get("rejectionReasons", []),
@@ -2266,14 +2270,89 @@ def zero_trade_suggested_actions(zero: dict, top_reasons: list[dict]) -> list[st
     return dedupe_list(actions)
 
 
+def candidate_metric(candidate: dict | None, section: str, key: str, fallback_keys: tuple[str, ...] = ()) -> float:
+    candidate = candidate or {}
+    quality = candidate.get("qualityMetrics") or {}
+    quality_keys = {
+        "totalReturn": f"{section}ReturnPct",
+        "trades": f"{section}Trades",
+        "maxDrawdown": f"{section}MaxDrawdownPct",
+        "profitFactor": f"{section}ProfitFactor",
+    }
+    for quality_key in (quality_keys.get(key), f"{section}{key[0].upper()}{key[1:]}"):
+        if quality_key and quality.get(quality_key) is not None:
+            return safe_float(quality.get(quality_key))
+    bucket = candidate.get(section) if isinstance(candidate.get(section), dict) else {}
+    if bucket.get(key) is not None:
+        return safe_float(bucket.get(key))
+    for fallback in fallback_keys:
+        if candidate.get(fallback) is not None:
+            return safe_float(candidate.get(fallback))
+    return 0.0
+
+
+def candidate_reason_codes(candidate: dict | None) -> set[str]:
+    codes = set()
+    for item in (candidate or {}).get("rejectionReasons") or []:
+        if isinstance(item, dict):
+            codes.add(str(item.get("code") or item.get("reason") or ""))
+        elif item:
+            codes.add(str(item))
+    warnings_text = " ".join((candidate or {}).get("warnings") or []).lower()
+    if "negative full-period return" in warnings_text:
+        codes.add("negative_full_return")
+    if "train/test direction mismatch" in warnings_text:
+        codes.add("train_test_direction_mismatch")
+    if "strongly negative train return" in warnings_text:
+        codes.add("strongly_negative_train_return")
+    if "low test-trade evidence" in warnings_text:
+        codes.add("low_test_trade_evidence")
+    return {code for code in codes if code}
+
+
+def candidate_robustness_warnings(candidate: dict | None) -> list[str]:
+    if not candidate:
+        return []
+    warnings = []
+    codes = candidate_reason_codes(candidate)
+    train_return = candidate_metric(candidate, "train", "totalReturn")
+    test_return = candidate_metric(candidate, "test", "totalReturn", ("totalReturnPct",))
+    full_return = candidate_metric(candidate, "full", "totalReturn")
+    test_trades = candidate_metric(candidate, "test", "trades", ("trades",))
+    min_test_trades = 10
+    if full_return < 0 or "negative_full_return" in codes:
+        warnings.append(f"Best candidate has negative full-period return ({round(full_return, 4)}%).")
+    if (train_return < 0 and test_return > 0) or "train_test_direction_mismatch" in codes:
+        warnings.append(f"Best candidate has train/test direction mismatch (train {round(train_return, 4)}%, test {round(test_return, 4)}%).")
+    if (train_return < -5 and test_return > 0) or "strongly_negative_train_return" in codes:
+        warnings.append(f"Best candidate has strongly negative train return ({round(train_return, 4)}%).")
+    if (min_test_trades <= test_trades <= min_test_trades + 2) or "low_test_trade_evidence" in codes:
+        warnings.append(f"Best candidate has low test-trade evidence ({int(test_trades)} test trades).")
+    return dedupe_list(warnings)
+
+
+def candidate_has_robustness_blockers(candidate: dict | None) -> bool:
+    if not candidate:
+        return False
+    codes = candidate_reason_codes(candidate)
+    blocking_codes = {"negative_full_return", "strongly_negative_train_return"}
+    if codes & blocking_codes:
+        return True
+    train_return = candidate_metric(candidate, "train", "totalReturn")
+    test_return = candidate_metric(candidate, "test", "totalReturn", ("totalReturnPct",))
+    full_return = candidate_metric(candidate, "full", "totalReturn")
+    return full_return < 0 or (train_return < -5 and test_return > 0)
+
+
 def learning_audit_readiness(reports: list[dict], best_candidate: dict | None, current_candidate: dict, health: dict, optimizer_quality: dict) -> dict:
     has_pass = optimizer_quality.get("latestSelectedStatus") == "PASS" or safe_float(optimizer_quality.get("passCandidates")) > 0
+    candidate_blocked = candidate_has_robustness_blockers(best_candidate)
     return {
         "enoughLearningReports": len(reports) >= learning_trust_rules()["minReports"],
         "hasValidCandidate": bool(best_candidate),
         "hasPassOptimizerCandidate": bool(has_pass),
         "paperEnabled": bool(current_candidate.get("enabled", False)),
-        "safeForManualReview": bool(best_candidate and (has_pass or best_candidate.get("origin") == "ranking") and health.get("status") != "FAILED"),
+        "safeForManualReview": bool(best_candidate and not candidate_blocked and (has_pass or best_candidate.get("origin") == "ranking") and health.get("status") != "FAILED"),
     }
 
 
@@ -2299,7 +2378,7 @@ def learning_audit_next_action(latest_learning: dict | None, optimizer_quality: 
     return {"action": "NO_ACTION", "reason": "No safe manual action is required right now.", "commands": []}
 
 
-def learning_audit_summary_warnings(latest_learning: dict | None, latest_optimization: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict) -> list[str]:
+def learning_audit_summary_warnings(latest_learning: dict | None, latest_optimization: dict | None, optimizer_quality: dict, zero_trade: dict, readiness: dict, best_candidate: dict | None = None) -> list[str]:
     warnings = []
     if latest_learning and latest_learning.get("errors"):
         warnings.append("Latest learning report contains errors.")
@@ -2311,6 +2390,7 @@ def learning_audit_summary_warnings(latest_learning: dict | None, latest_optimiz
         warnings.append("Zero-trade or low-trade optimizer candidates were detected.")
     if not readiness.get("safeForManualReview"):
         warnings.append("No candidate is currently marked safe for manual promotion review.")
+    warnings.extend(candidate_robustness_warnings(best_candidate))
     warnings.append("Audit summary is advisory only; it never promotes candidates, enables paper simulation, or trades.")
     return dedupe_list(warnings)
 
@@ -2413,6 +2493,8 @@ def learning_robustness_score(stability: dict, trend: dict, paper_health: dict, 
         score -= 20
     if "zero-trade" in warnings:
         score -= 20
+    if candidate_has_robustness_blockers(candidate):
+        score -= 35
     if trend.get("direction") == "improving":
         score += 8
     elif trend.get("direction") == "degrading":
@@ -2445,6 +2527,7 @@ def learning_audit_warnings(reports: list[dict], stability: dict, trend: dict, p
         warnings.append(f"Best candidate profit factor is below threshold ({candidate.get('profitFactor')} < {rules['minProfitFactor']}).")
     if safe_float(candidate.get("maxDrawdown")) > rules["maxDrawdown"]:
         warnings.append(f"Best candidate drawdown is above threshold ({candidate.get('maxDrawdown')} > {rules['maxDrawdown']}).")
+    warnings.extend(candidate_robustness_warnings(candidate))
     if paper_health.get("status") == "FAILED":
         warnings.append("Paper health is FAILED.")
     candidate_warnings = " ".join(candidate.get("warnings", []) or []).lower()
@@ -2809,17 +2892,20 @@ def learning_recommendation(health: dict, best_candidate: dict | None, current_c
     has_current = bool(current_candidate.get("strategy") and (current_candidate.get("promotedAt") or expected_metrics_from_candidate(current_candidate).get("source")))
     if not best_candidate:
         return {"action": "NO_VALID_CANDIDATE", "reason": "No valid saved candidate exists.", "candidate": None}
+    manual_only = "Candidate is available for manual inspection only; audit status must be READY before promotion."
+    if candidate_has_robustness_blockers(best_candidate):
+        manual_only = "Candidate has robustness warnings and is available for research inspection only; audit status blocks promotion."
     if not has_current:
-        return {"action": "PROMOTE_CANDIDATE", "reason": "No promoted candidate with an expected baseline exists; manual promotion is available.", "candidate": best_candidate}
+        return {"action": "PROMOTE_CANDIDATE", "reason": f"No promoted candidate with an expected baseline exists. {manual_only}", "candidate": best_candidate}
     current_score = current_candidate_score(candidate_summary(current_candidate))
     best_score = safe_float(best_candidate.get("score"))
     if health_status == "HEALTHY":
         if current_score is not None and best_score > current_score * 1.2:
-            return {"action": "PROMOTE_CANDIDATE", "reason": "Current health is healthy, but saved candidate score is significantly better. Manual review required.", "candidate": best_candidate}
+            return {"action": "PROMOTE_CANDIDATE", "reason": f"Current health is healthy, but saved candidate score is significantly better. {manual_only}", "candidate": best_candidate}
         return {"action": "KEEP_CURRENT", "reason": "Current paper candidate health is aligned with expectations.", "candidate": None}
     if health_status == "UNKNOWN":
         return {"action": "WAIT_FOR_MORE_PAPER_DATA", "reason": "Candidate health is unknown; wait for more paper trades before replacement unless manually chosen.", "candidate": None}
-    return {"action": "PROMOTE_CANDIDATE", "reason": f"Current health is {health_status}; a valid saved candidate is available for manual review.", "candidate": best_candidate}
+    return {"action": "PROMOTE_CANDIDATE", "reason": f"Current health is {health_status}; a saved candidate is available. {manual_only}", "candidate": best_candidate}
 
 
 def load_research_runs() -> list[dict]:
@@ -2996,6 +3082,8 @@ def best_saved_candidate(runs: list[dict]) -> dict | None:
         for candidate in ([run.get("bestCandidate")] + run.get("rows", []) + run.get("topCandidates", [])):
             if candidate and candidate.get("valid"):
                 if candidate.get("origin") == "optimization" and candidate.get("qualityStatus") not in (None, "PASS"):
+                    continue
+                if candidate.get("origin") == "optimization" and candidate_has_robustness_blockers(candidate):
                     continue
                 item = dict(candidate)
                 item["researchRunId"] = run.get("id")

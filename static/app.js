@@ -2917,6 +2917,7 @@ function renderLearningAuditSummary(payload) {
   const rejectionRows = (opt.topRejectionReasons || []).slice(0, 5).map((item) => `
     <tr><td>${escapeHtml(item.label || item.reason || "-")}</td><td>${item.count || 0}</td></tr>
   `).join("");
+  const bestRobustnessRows = renderCandidateRobustnessRows(best);
   return `
     <h3 class="modal-section-title">Audit Summary <span class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "Check"}</span></h3>
     <div class="metric-grid">
@@ -2931,7 +2932,8 @@ function renderLearningAuditSummary(payload) {
     <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
     <table class="trade-table">
       <tbody>
-        <tr><th>Best saved candidate</th><td>${best.strategy ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol || "")} ${escapeHtml(best.timeframe || "")} · PF ${formatNumber(best.profitFactor)} · T ${best.trades || 0}` : "-"}</td></tr>
+        <tr><th>Best saved candidate</th><td>${best.strategy ? `${escapeHtml(best.strategy)} ${escapeHtml(best.symbol || "")} ${escapeHtml(best.timeframe || "")} - PF ${formatNumber(best.profitFactor)} - T ${best.trades || 0}` : "-"}</td></tr>
+        ${bestRobustnessRows}
         <tr><th>Current paper candidate</th><td>${current.strategy ? `${escapeHtml(current.strategy)} ${escapeHtml((current.activeSymbols || [])[0]?.symbol || "")}` : "-"}</td></tr>
         <tr><th>Safe for manual review</th><td class="${readiness.safeForManualReview ? "positive" : "neutral"}">${readiness.safeForManualReview ? "yes" : "no"}</td></tr>
         <tr><th>Suggested commands</th><td>${commands || "-"}</td></tr>
@@ -2947,11 +2949,75 @@ function renderLearningAuditSummary(payload) {
   `;
 }
 
+function candidateMetric(candidate, section, key, fallbackKeys = []) {
+  const quality = candidate?.qualityMetrics || {};
+  const qualityAliases = {
+    totalReturn: `${section}ReturnPct`,
+    trades: `${section}Trades`,
+    maxDrawdown: `${section}MaxDrawdownPct`,
+    profitFactor: `${section}ProfitFactor`,
+  };
+  const qualityKeys = [qualityAliases[key], `${section}${key.charAt(0).toUpperCase()}${key.slice(1)}`].filter(Boolean);
+  for (const qualityKey of qualityKeys) {
+    if (quality[qualityKey] !== undefined && quality[qualityKey] !== null) return quality[qualityKey];
+  }
+  const bucket = candidate?.[section] || {};
+  if (bucket[key] !== undefined && bucket[key] !== null) return bucket[key];
+  for (const fallback of fallbackKeys) {
+    if (candidate?.[fallback] !== undefined && candidate?.[fallback] !== null) return candidate[fallback];
+  }
+  return null;
+}
+
+function candidateReasonLabels(candidate) {
+  const reasons = (candidate?.rejectionReasons || []).map((item) => item.label || item.code || item.reason || String(item));
+  const warnings = candidate?.warnings || [];
+  return [...reasons, ...warnings].filter(Boolean);
+}
+
+function candidateRobustnessFlags(candidate) {
+  const trainReturn = Number(candidateMetric(candidate, "train", "totalReturn") || 0);
+  const testReturn = Number(candidateMetric(candidate, "test", "totalReturn", ["totalReturnPct"]) || 0);
+  const fullReturn = Number(candidateMetric(candidate, "full", "totalReturn") || 0);
+  const testTrades = Number(candidateMetric(candidate, "test", "trades", ["trades"]) || 0);
+  const labels = candidateReasonLabels(candidate).join(" ").toLowerCase();
+  const flags = [];
+  if (fullReturn < 0 || labels.includes("negative full-period return")) flags.push("Negative full-period return");
+  if ((trainReturn < 0 && testReturn > 0) || labels.includes("train/test direction mismatch")) flags.push("Train/test mismatch");
+  if ((testTrades >= 10 && testTrades <= 12) || labels.includes("low test-trade evidence")) flags.push("Low test-trade evidence");
+  return flags;
+}
+
+function formatMaybeNumber(value) {
+  return value === null || value === undefined || value === "" ? "-" : formatNumber(value);
+}
+
+function renderCandidateRobustnessRows(candidate) {
+  if (!candidate || !candidate.strategy) return "";
+  const trainReturn = candidateMetric(candidate, "train", "totalReturn");
+  const testReturn = candidateMetric(candidate, "test", "totalReturn", ["totalReturnPct"]);
+  const fullReturn = candidateMetric(candidate, "full", "totalReturn");
+  const trainTestGap = candidate?.qualityMetrics?.trainTestReturnGapPct;
+  const fullTrades = candidateMetric(candidate, "full", "trades");
+  const testTrades = candidateMetric(candidate, "test", "trades", ["trades"]);
+  const flags = candidateRobustnessFlags(candidate);
+  const reasons = candidateReasonLabels(candidate);
+  return `
+    <tr><th>Quality</th><td>${escapeHtml(candidate.qualityStatus || "-")}</td></tr>
+    <tr><th>Returns</th><td>Train ${formatMaybeNumber(trainReturn)}% / Test ${formatMaybeNumber(testReturn)}% / Full ${formatMaybeNumber(fullReturn)}%</td></tr>
+    <tr><th>Trades</th><td>Test ${testTrades ?? "-"} / Full ${fullTrades ?? "-"}</td></tr>
+    <tr><th>Train/test gap</th><td>${formatMaybeNumber(trainTestGap)}%</td></tr>
+    ${flags.length ? `<tr><th>Robustness flags</th><td class="negative">${flags.map(escapeHtml).join("; ")}</td></tr>` : ""}
+    ${reasons.length ? `<tr><th>Reasons</th><td>${reasons.map(escapeHtml).join("; ")}</td></tr>` : ""}
+  `;
+}
+
 function renderLearningAudit(payload) {
   const stability = payload.candidateStability || {};
   const trend = payload.scoreTrend || {};
   const summary = payload.summary || {};
   const rec = payload.recommendation || {};
+  const best = summary.bestSavedCandidate || {};
   const statusTone = payload.status === "NOT_READY" ? "negative" : payload.status === "WATCH" ? "neutral" : "positive";
   return `
     <h3 class="modal-section-title">Audit <span class="${statusTone}">${escapeHtml(payload.status || "-")}</span></h3>
@@ -2971,6 +3037,7 @@ function renderLearningAudit(payload) {
         <tr><th>Top candidate key</th><td><code>${escapeHtml(stability.topCandidateKey || "-")}</code></td></tr>
         <tr><th>Latest score</th><td>${trend.latestScore === null || trend.latestScore === undefined ? "-" : formatNumber(trend.latestScore)}</td></tr>
         <tr><th>Paper health</th><td>${escapeHtml(payload.paperHealth?.status || "UNKNOWN")}</td></tr>
+        ${renderCandidateRobustnessRows(best)}
       </tbody>
     </table>
     ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
