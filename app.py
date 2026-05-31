@@ -1269,6 +1269,30 @@ def validate_candidate():
         return jsonify({"error": f"Could not validate candidate: {exc}"}), 502
 
 
+@app.get("/api/candidate/review")
+def candidate_review():
+    try:
+        return jsonify(build_candidate_review())
+    except Exception as exc:
+        return jsonify({"error": f"Could not build candidate review: {exc}"}), 502
+
+
+@app.post("/api/candidate/promote-preview")
+def promote_candidate_preview():
+    try:
+        payload = request.get_json(silent=True) or {}
+        candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
+        promotion_payload = payload if payload.get("symbol") else promotion_payload_from_candidate(candidate or latest_learning_recommendation_candidate(latest_learning_report()))
+        if not promotion_payload:
+            return jsonify({"error": "No candidate is available for promotion preview."}), 404
+        preview = build_candidate_promotion_preview(promotion_payload, dry_run=True)
+        if not preview.get("ok"):
+            return jsonify(preview), 400
+        return jsonify(public_promotion_preview(preview))
+    except Exception as exc:
+        return jsonify({"error": f"Could not preview candidate promotion: {exc}"}), 502
+
+
 @app.post("/api/candidate/enable-paper")
 def enable_paper_candidate():
     try:
@@ -1329,18 +1353,19 @@ def disable_paper_candidate():
 def promote_candidate():
     try:
         payload = request.get_json(force=True) or {}
+        dry_run = request.args.get("dryRun", "false").lower() in {"1", "true", "yes", "on"}
+        if dry_run and not payload.get("symbol"):
+            payload = promotion_payload_from_candidate(latest_learning_recommendation_candidate(latest_learning_report())) or payload
         force = bool(payload.get("force")) or request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
-        ranking_snapshot = payload.get("rankingSnapshot") or {}
-        min_trades = int(payload.get("minTrades") or ranking_snapshot.get("minTrades") or 10)
-        promotion_error = validate_candidate_promotion(payload, ranking_snapshot, min_trades, force)
-        if promotion_error:
-            return jsonify({"error": promotion_error}), 400
+        preview = build_candidate_promotion_preview(payload, dry_run=dry_run, force=force)
+        if not preview.get("ok"):
+            return jsonify(preview), 400
+        if dry_run:
+            return jsonify(public_promotion_preview(preview))
 
-        current = load_paper_candidate_config()
+        current = preview["currentPaperCandidateRaw"]
         backup_path = backup_candidate_config(current)
-        promoted_symbol = str(payload.get("symbol") or "").strip()
-        promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
-        updated = merge_promoted_candidate(current, payload, ranking_snapshot, promoted_symbol, promoted_interval)
+        updated = preview["candidateConfigPreview"]
         write_candidate_config(updated)
 
         return jsonify({
@@ -1348,6 +1373,8 @@ def promote_candidate():
             "message": "Candidate promoted. Paper simulation remains disabled until explicitly enabled.",
             "backupPath": str(backup_path.relative_to(app.root_path)),
             "candidate": candidate_summary(updated),
+            "changedFields": preview.get("changedFields", []),
+            "warnings": preview.get("warnings", []),
         })
     except Exception as exc:
         return jsonify({"error": f"Could not promote candidate: {exc}"}), 502
@@ -2166,6 +2193,11 @@ def latest_research_run_by_type(runs: list[dict], run_type: str) -> dict | None:
     return next((run for run in reversed(runs) if run.get("type") == run_type), None)
 
 
+def latest_learning_report() -> dict | None:
+    reports = load_learning_reports()
+    return reports[-1] if reports else None
+
+
 def compact_learning_report(report: dict | None) -> dict | None:
     if not report:
         return None
@@ -2336,6 +2368,242 @@ def candidate_comparison(recommended: dict | None, current: dict | None) -> dict
         "sameAsCurrentPaper": same_as_current,
         "recommendedBetterThanCurrent": better,
         "notes": notes,
+    }
+
+
+def candidate_review_comparison(recommended: dict | None, current: dict | None, preview_config: dict | None = None) -> dict:
+    current_summary = candidate_summary(current or {})
+    base = candidate_comparison(recommended, current or {})
+    same_strategy = bool(base.get("recommendedStrategy") and base.get("recommendedStrategy") == base.get("currentPaperStrategy"))
+    same_symbol = bool(base.get("recommendedSymbol") and base.get("recommendedSymbol") == base.get("currentPaperSymbol"))
+    same_timeframe = bool(base.get("recommendedTimeframe") and base.get("recommendedTimeframe") == base.get("currentPaperTimeframe"))
+    param_diffs = dict_diffs((current or {}).get("params") or {}, (recommended or {}).get("params") or {})
+    risk_diffs = risk_diffs_for_candidate(current or {}, preview_config or {})
+    expected_diffs = expected_metric_diffs(expected_metrics_from_candidate(current or {}), expected_metrics_from_candidate(preview_config or {}))
+    summary_bits = []
+    if not recommended:
+        summary_bits.append("No recommended candidate is available.")
+    elif same_strategy and same_symbol and same_timeframe and not param_diffs:
+        summary_bits.append("Recommended candidate matches the current paper candidate configuration.")
+    else:
+        changes = []
+        if not same_strategy:
+            changes.append("strategy")
+        if not same_symbol:
+            changes.append("symbol")
+        if not same_timeframe:
+            changes.append("timeframe")
+        if param_diffs:
+            changes.append("parameters")
+        summary_bits.append(f"Config-only promotion would update {', '.join(changes) or 'candidate metadata'}.")
+    if current_summary.get("enabled"):
+        summary_bits.append("Current paper simulation is enabled; review carefully before replacing the config.")
+    else:
+        summary_bits.append("Paper is disabled and would remain disabled.")
+    return {
+        "sameStrategy": same_strategy,
+        "sameSymbol": same_symbol,
+        "sameTimeframe": same_timeframe,
+        "paramDiffs": param_diffs,
+        "riskDiffs": risk_diffs,
+        "expectedMetricDiffs": expected_diffs,
+        "summary": " ".join(summary_bits),
+        **base,
+    }
+
+
+def dict_diffs(before: dict, after: dict) -> list[dict]:
+    keys = sorted(set((before or {}).keys()) | set((after or {}).keys()))
+    return [
+        {"field": key, "current": (before or {}).get(key), "recommended": (after or {}).get(key)}
+        for key in keys
+        if (before or {}).get(key) != (after or {}).get(key)
+    ]
+
+
+def risk_diffs_for_candidate(current: dict, preview: dict) -> list[dict]:
+    fields = ["fillModel", "makerFeePct", "takerFeePct", "slippageBps", "accountEquity", "riskPct", "maxOpenTrades", "maxNotionalPerTrade"]
+    return [
+        {"field": field, "current": current.get(field), "preview": preview.get(field)}
+        for field in fields
+        if current.get(field) != preview.get(field)
+    ]
+
+
+def expected_metric_diffs(current_expected: dict, preview_expected: dict) -> list[dict]:
+    fields = ["totalReturnPct", "winRate", "maxDrawdown", "profitFactor", "trades"]
+    return [
+        {"field": field, "current": current_expected.get(field), "preview": preview_expected.get(field)}
+        for field in fields
+        if current_expected.get(field) != preview_expected.get(field)
+    ]
+
+
+def promotion_payload_from_candidate(candidate: dict | None) -> dict | None:
+    if not candidate:
+        return None
+    ranking_snapshot = {
+        "valid": candidate.get("valid", True),
+        "rank": candidate.get("rank"),
+        "score": candidate.get("score"),
+        "period": candidate.get("period"),
+        "totalReturnPct": candidate.get("totalReturnPct"),
+        "winRate": candidate.get("winRate"),
+        "maxDrawdown": candidate.get("maxDrawdown"),
+        "profitFactor": candidate.get("profitFactor"),
+        "trades": candidate.get("trades"),
+        "qualityStatus": candidate.get("qualityStatus"),
+        "qualityMetrics": candidate.get("qualityMetrics", {}),
+    }
+    optimization_snapshot = None
+    ranking_origin_snapshot = None
+    if candidate.get("origin") == "optimization":
+        optimization_snapshot = {
+            "researchRunId": candidate.get("researchRunId"),
+            "score": candidate.get("score"),
+            "train": candidate.get("train"),
+            "test": candidate.get("test"),
+            "full": candidate.get("full"),
+            "qualityStatus": candidate.get("qualityStatus"),
+            "qualityMetrics": candidate.get("qualityMetrics", {}),
+            "warnings": candidate.get("warnings"),
+            "rejectionReasons": candidate.get("rejectionReasons", []),
+        }
+    else:
+        ranking_origin_snapshot = {
+            "researchRunId": candidate.get("researchRunId"),
+            "score": candidate.get("score"),
+            "warnings": candidate.get("warnings"),
+        }
+    return {
+        "source": candidate.get("source") or "bybit",
+        "symbol": candidate.get("symbol"),
+        "timeframe": candidate.get("timeframe"),
+        "preset": candidate.get("preset") or candidate.get("strategy"),
+        "strategy": candidate.get("strategy"),
+        "period": candidate.get("period"),
+        "params": candidate.get("params", {}),
+        "qualityStatus": candidate.get("qualityStatus"),
+        "rankingSnapshot": ranking_snapshot,
+        "optimizationSnapshot": optimization_snapshot,
+        "rankingOriginSnapshot": ranking_origin_snapshot,
+    }
+
+
+def promotion_quality_status(payload: dict, ranking_snapshot: dict) -> str | None:
+    for source in (payload, ranking_snapshot, payload.get("optimizationSnapshot") or {}):
+        if isinstance(source, dict) and source.get("qualityStatus"):
+            return source.get("qualityStatus")
+    return None
+
+
+def promotion_warnings(current: dict, updated: dict, payload: dict, candidate: dict | None = None) -> list[str]:
+    warnings = ["Promotion preview is config-only. Paper remains disabled and no trades will be placed."]
+    if current.get("enabled"):
+        warnings.append("Current paper simulation is enabled; promotion would replace the candidate config and disable paper.")
+    if candidate_has_robustness_blockers(candidate or payload):
+        warnings.extend(candidate_robustness_warnings(candidate or payload))
+    if updated.get("enabled"):
+        warnings.append("Preview unexpectedly has paper enabled; promotion is blocked.")
+    return dedupe_list(warnings)
+
+
+def changed_field_rows(before: dict, after: dict) -> list[dict]:
+    fields = ["enabled", "source", "strategy", "regimeMode", "params", "symbols", "promotedAt", "promotedFromRanking", "promotedFromOptimization"]
+    return [
+        {"field": field, "current": before.get(field), "preview": after.get(field)}
+        for field in fields
+        if before.get(field) != after.get(field)
+    ]
+
+
+def public_promotion_preview(preview: dict) -> dict:
+    public = dict(preview)
+    public.pop("currentPaperCandidateRaw", None)
+    return public
+
+
+def build_candidate_promotion_preview(payload: dict, dry_run: bool = True, force: bool = False) -> dict:
+    payload = payload or {}
+    ranking_snapshot = payload.get("rankingSnapshot") or {}
+    min_trades = int(payload.get("minTrades") or ranking_snapshot.get("minTrades") or 10)
+    quality_status = promotion_quality_status(payload, ranking_snapshot)
+    if quality_status == "FAIL":
+        return {"ok": False, "error": "Cannot promote a FAIL quality candidate.", "warnings": ["FAIL candidates are blocked from config promotion."]}
+    promotion_error = validate_candidate_promotion(payload, ranking_snapshot, min_trades, force)
+    if promotion_error:
+        return {"ok": False, "error": promotion_error}
+    current = load_paper_candidate_config()
+    promoted_symbol = str(payload.get("symbol") or "").strip()
+    promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
+    updated = merge_promoted_candidate(current, payload, ranking_snapshot, promoted_symbol, promoted_interval)
+    warnings = promotion_warnings(current, updated, payload)
+    if updated.get("enabled"):
+        return {"ok": False, "error": "Promotion preview would enable paper; blocked.", "warnings": warnings}
+    preview = {
+        "ok": True,
+        "dryRun": bool(dry_run),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "candidateConfigPreview": updated,
+        "currentPaperCandidate": candidate_summary(current),
+        "currentPaperCandidateRaw": current,
+        "changedFields": changed_field_rows(current, updated),
+        "expectedBaselineMetrics": expected_metrics_from_candidate(updated),
+        "warnings": warnings,
+        "paperRemainsDisabled": not bool(updated.get("enabled")),
+        "message": "Dry run only; no config was written." if dry_run else "Promotion preview is ready.",
+    }
+    return preview
+
+
+def build_candidate_review() -> dict:
+    latest = latest_learning_report()
+    audit = build_learning_quality_audit()
+    recommended = latest_learning_recommendation_candidate(latest)
+    best = best_saved_candidate(load_research_runs())
+    current = load_paper_candidate_config()
+    promotion_payload = promotion_payload_from_candidate(recommended)
+    preview = build_candidate_promotion_preview(promotion_payload, dry_run=True) if promotion_payload else {"ok": False}
+    preview_config = preview.get("candidateConfigPreview") if preview.get("ok") else None
+    quality_pass = candidate_passes_quality(recommended)
+    candidate_exists = bool(recommended)
+    paper_enabled = bool(current.get("enabled", False))
+    warnings = []
+    if not candidate_exists:
+        next_action = {"action": "NO_CANDIDATE", "reason": "No latest learning recommendation candidate is available."}
+    elif (recommended or {}).get("qualityStatus") == "FAIL" or candidate_has_robustness_blockers(recommended):
+        next_action = {"action": "BLOCKED", "reason": "Latest learning recommendation candidate is blocked by quality or robustness checks."}
+        warnings.extend(candidate_robustness_warnings(recommended))
+    elif quality_pass:
+        next_action = {"action": "REVIEW_AND_OPTIONALLY_PROMOTE_CONFIG_ONLY", "reason": "Candidate can be previewed for manual config-only promotion. Paper remains disabled."}
+    else:
+        next_action = {"action": "OBSERVE_MORE", "reason": "Latest learning candidate is not a clean PASS candidate yet."}
+    if paper_enabled:
+        warnings.append("Paper is currently enabled; a manual promotion would replace the paper candidate config and keep paper disabled.")
+    else:
+        warnings.append("Paper is disabled. Config-only promotion preview keeps paper disabled.")
+    if preview.get("warnings"):
+        warnings.extend(preview.get("warnings", []))
+    comparison = candidate_review_comparison(recommended, current, preview_config)
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "recommendedCandidate": compact_candidate(recommended),
+        "bestSavedCandidate": compact_candidate(best),
+        "currentPaperCandidate": candidate_summary(current),
+        "comparison": comparison,
+        "readiness": {
+            "candidateExists": candidate_exists,
+            "candidateQualityPass": quality_pass,
+            "auditStatus": audit.get("status"),
+            "safeForManualReview": build_learning_audit_summary().get("readiness", {}).get("safeForManualReview", False),
+            "paperEnabled": paper_enabled,
+            "canPromoteConfigOnly": bool(candidate_exists and quality_pass and preview.get("ok")),
+            "canEnablePaper": False,
+        },
+        "promotionPreview": public_promotion_preview(preview) if preview.get("ok") else None,
+        "warnings": dedupe_list(warnings),
+        "nextAction": next_action,
     }
 
 

@@ -2675,6 +2675,8 @@ function setupLearningControls() {
   document.querySelector("#learning-save-config")?.addEventListener("click", saveLearningConfig);
   document.querySelector("#learning-tick-button")?.addEventListener("click", runLearningTick);
   document.querySelector("#learning-audit-summary-button")?.addEventListener("click", loadLearningAuditSummary);
+  document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
+  document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
   document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
@@ -2958,6 +2960,97 @@ function renderLearningAuditSummary(payload) {
   `;
 }
 
+async function loadCandidateReview() {
+  const host = document.querySelector("#candidate-review-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading candidate review...</p>`;
+    const payload = await apiGet("/api/candidate/review");
+    host.innerHTML = renderCandidateReview(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate review could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function previewCandidatePromotion() {
+  const host = document.querySelector("#candidate-review-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Building config-only promotion preview...</p>`;
+    const payload = await apiPost("/api/candidate/promote-preview", {});
+    host.innerHTML = renderPromotionPreview(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Promotion preview failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderDiffRows(rows, emptyText) {
+  return (rows || []).map((item) => `
+    <tr><td>${escapeHtml(item.field || "-")}</td><td>${escapeHtml(formatDiffValue(item.current))}</td><td>${escapeHtml(formatDiffValue(item.recommended ?? item.preview))}</td></tr>
+  `).join("") || `<tr><td colspan="3">${escapeHtml(emptyText)}</td></tr>`;
+}
+
+function formatDiffValue(value) {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "object") return compactJson(value);
+  return String(value);
+}
+
+function renderCandidateReview(payload) {
+  const rec = payload.recommendedCandidate || {};
+  const current = payload.currentPaperCandidate || {};
+  const comparison = payload.comparison || {};
+  const readiness = payload.readiness || {};
+  const next = payload.nextAction || {};
+  const active = (current.activeSymbols || [])[0] || {};
+  return `
+    <h3 class="modal-section-title">Candidate Review <span class="${readiness.canPromoteConfigOnly ? "positive" : "neutral"}">${escapeHtml(next.action || "-")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Recommended</span><strong>${rec.strategy ? `${escapeHtml(rec.strategy)} ${escapeHtml(rec.symbol || "")} ${escapeHtml(rec.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Current</span><strong>${current.strategy ? `${escapeHtml(current.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Audit</span><strong>${escapeHtml(readiness.auditStatus || "-")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${readiness.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Config-only</span><strong>${readiness.canPromoteConfigOnly ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Enable paper</span><strong>${readiness.canEnablePaper ? "yes" : "no"}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Comparison</th><td>${escapeHtml(comparison.summary || "-")}</td></tr>
+        <tr><th>Same strategy</th><td>${comparison.sameStrategy ? "yes" : "no"}</td></tr>
+        <tr><th>Same symbol</th><td>${comparison.sameSymbol ? "yes" : "no"}</td></tr>
+        <tr><th>Same timeframe</th><td>${comparison.sameTimeframe ? "yes" : "no"}</td></tr>
+        <tr><th>Expected metrics</th><td>PF ${formatMaybeNumber(rec.profitFactor)} / Train ${formatMaybeNumber(candidateMetric(rec, "train", "totalReturn"))}% / Test ${formatMaybeNumber(candidateMetric(rec, "test", "totalReturn", ["totalReturnPct"]))}% / Full ${formatMaybeNumber(candidateMetric(rec, "full", "totalReturn"))}% / Test trades ${candidateMetric(rec, "test", "trades", ["trades"]) ?? "-"}</td></tr>
+      </tbody>
+    </table>
+    <h3 class="modal-section-title">Parameter Differences</h3>
+    <table class="trade-table"><thead><tr><th>Field</th><th>Current</th><th>Recommended</th></tr></thead><tbody>${renderDiffRows(comparison.paramDiffs, "No parameter differences.")}</tbody></table>
+    <h3 class="modal-section-title">Expected Metric Differences</h3>
+    <table class="trade-table"><thead><tr><th>Metric</th><th>Current</th><th>Preview</th></tr></thead><tbody>${renderDiffRows(comparison.expectedMetricDiffs, "No expected metric differences.")}</tbody></table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+function renderPromotionPreview(payload) {
+  const preview = payload.candidateConfigPreview || {};
+  const expected = payload.expectedBaselineMetrics || {};
+  const active = (preview.symbols || []).find((item) => item.mode === "active") || {};
+  return `
+    <h3 class="modal-section-title">Promotion Preview <span class="${payload.paperRemainsDisabled ? "positive" : "negative"}">${payload.paperRemainsDisabled ? "Paper disabled" : "Check paper"}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(preview.strategy || "-")}</strong></div>
+      <div class="metric"><span>Primary</span><strong>${escapeHtml(active.symbol || "-")} ${escapeHtml(active.interval || "")}</strong></div>
+      <div class="metric"><span>Enabled</span><strong>${preview.enabled ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>PF</span><strong>${formatMaybeNumber(expected.profitFactor)}</strong></div>
+      <div class="metric"><span>Trades</span><strong>${expected.trades ?? "-"}</strong></div>
+      <div class="metric"><span>Return</span><strong>${formatMaybeNumber(expected.totalReturnPct)}%</strong></div>
+    </div>
+    <p class="modal-note">${escapeHtml(payload.message || "Dry run only; no config was written.")}</p>
+    <table class="trade-table"><thead><tr><th>Field</th><th>Current</th><th>Preview</th></tr></thead><tbody>${renderDiffRows(payload.changedFields, "No config fields would change.")}</tbody></table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
 function candidateMetric(candidate, section, key, fallbackKeys = []) {
   const quality = candidate?.qualityMetrics || {};
   const qualityAliases = {
@@ -3147,7 +3240,8 @@ function renderLearningReport(report) {
             <tr><th>PF / Trades</th><td>${formatNumber(rec.candidate.profitFactor)} / ${rec.candidate.trades || 0}</td></tr>
           </tbody>
         </table>
-        <button type="button" class="small-action-button" data-promote-learning="1">Promote Recommended Candidate</button>
+        <button type="button" class="small-action-button" data-promote-learning="1">Promote config only</button>
+        <p class="modal-note">Paper remains disabled. No trades will be placed.</p>
       ` : ""}
       ${renderCandidateHealth(health)}
       ${report.autoPromotion ? `<h3 class="modal-section-title">Auto-Promotion</h3>${renderAutoPromoteResult(report.autoPromotion)}` : ""}
