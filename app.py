@@ -1277,6 +1277,14 @@ def candidate_review():
         return jsonify({"error": f"Could not build candidate review: {exc}"}), 502
 
 
+@app.get("/api/candidate/stability")
+def candidate_stability():
+    try:
+        return jsonify(build_candidate_stability_report(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not validate candidate stability: {exc}"}), 502
+
+
 @app.post("/api/candidate/promote-preview")
 def promote_candidate_preview():
     try:
@@ -2603,6 +2611,266 @@ def build_candidate_review() -> dict:
         },
         "promotionPreview": public_promotion_preview(preview) if preview.get("ok") else None,
         "warnings": dedupe_list(warnings),
+        "nextAction": next_action,
+    }
+
+
+def candidate_fee_slippage(candidate: dict | None, fallback: dict | None = None) -> tuple[float, float]:
+    candidate = candidate or {}
+    fallback = fallback or {}
+    fee = candidate.get("feePct")
+    if fee is None:
+        fee = candidate.get("takerFeePct", fallback.get("takerFeePct", 0.055))
+    slippage = candidate.get("slippagePct")
+    if slippage is None and candidate.get("slippageBps") is not None:
+        slippage = safe_float(candidate.get("slippageBps")) / 100.0
+    if slippage is None and fallback.get("slippageBps") is not None:
+        slippage = safe_float(fallback.get("slippageBps")) / 100.0
+    if slippage is None:
+        slippage = fallback.get("slippagePct", 0.02)
+    return safe_float(fee, 0.055), safe_float(slippage, 0.02)
+
+
+def candidate_stability_windows(period: str) -> list[dict]:
+    requested_days = parse_period_to_days(period) or 365
+    windows = []
+    for label, days in (("full", int(requested_days)), ("recent_180d", 180), ("recent_90d", 90)):
+        if days <= requested_days:
+            windows.append({"label": label, "period": f"{days}d", "minTrades": 30 if days >= 365 else 15 if days >= 180 else 8})
+    return windows or [{"label": "full", "period": period, "minTrades": 30}]
+
+
+def stability_window_status(metrics: dict, min_trades: int, allow_watch: bool = True) -> tuple[str, list[str]]:
+    warnings = []
+    trades = int(safe_float(metrics.get("trades")))
+    total_return = safe_float(metrics.get("totalReturn"))
+    drawdown = safe_float(metrics.get("maxDrawdown"))
+    profit_factor = safe_float(metrics.get("profitFactor"))
+    if trades == 0:
+        return "FAIL", ["Window generated zero trades."]
+    if total_return < 0:
+        warnings.append("Window return is negative.")
+    if trades < min_trades:
+        warnings.append(f"Window has too few trades ({trades} < {min_trades}).")
+    if drawdown > 25:
+        warnings.append(f"Window drawdown is high ({round(drawdown, 4)}%).")
+    if profit_factor <= 1:
+        warnings.append("Window profit factor is <= 1.")
+    if any("zero trades" in item.lower() for item in warnings):
+        return "FAIL", warnings
+    if warnings and allow_watch:
+        return "WATCH", warnings
+    return ("FAIL" if warnings else "PASS"), warnings
+
+
+def run_candidate_stability_windows(candidate: dict, source: str, symbol: str, timeframe: str, period: str, current_fallback: dict | None = None) -> dict:
+    fee_pct, slippage_pct = candidate_fee_slippage(candidate, current_fallback)
+    windows = []
+    all_warnings = []
+    for window in candidate_stability_windows(period):
+        try:
+            limit = research_limit_for(source, timeframe, window["period"], "auto")
+            payload = run_shared_backtest_engine(
+                source,
+                symbol,
+                timeframe,
+                window["period"],
+                candidate.get("strategy") or candidate.get("preset"),
+                fee_pct,
+                slippage_pct,
+                limit,
+                False,
+                False,
+                candidate.get("params") or {},
+            )
+            payload = normalize_backtest_response(payload, source, symbol, timeframe, window["period"], candidate.get("strategy") or candidate.get("preset"), fee_pct, slippage_pct)
+            metrics = ranking_metrics_from_backtest(payload)
+            status, warnings = stability_window_status(metrics, int(window["minTrades"]))
+            windows.append({
+                "label": window["label"],
+                "period": window["period"],
+                "status": status,
+                "trades": metrics["trades"],
+                "profitFactor": metrics["profitFactor"],
+                "totalReturnPct": metrics["totalReturn"],
+                "maxDrawdownPct": metrics["maxDrawdown"],
+                "winRate": metrics["winRate"],
+                "warnings": warnings + (payload.get("diagnostics") or {}).get("warnings", []),
+                "candlesLoaded": payload.get("candlesLoaded"),
+            })
+            all_warnings.extend(warnings)
+        except Exception as exc:
+            windows.append({
+                "label": window["label"],
+                "period": window["period"],
+                "status": "FAIL",
+                "trades": 0,
+                "profitFactor": 0,
+                "totalReturnPct": 0,
+                "maxDrawdownPct": 0,
+                "winRate": 0,
+                "warnings": [f"Backtest crashed: {exc}"],
+                "candlesLoaded": 0,
+            })
+            all_warnings.append(f"{window['period']} backtest crashed: {exc}")
+    aggregate = stability_aggregate(windows)
+    flags = stability_flags(windows, aggregate)
+    status = "UNKNOWN"
+    if windows:
+        if any(row.get("status") == "FAIL" for row in windows) or "negative_full_return" in flags or "too_few_full_trades" in flags:
+            status = "FAIL"
+        elif any(row.get("status") == "WATCH" for row in windows) or flags:
+            status = "WATCH"
+        else:
+            status = "PASS"
+    return {
+        "status": status,
+        "summary": stability_summary(status, aggregate, flags),
+        "windows": windows,
+        "aggregate": aggregate,
+        "robustnessFlags": flags,
+        "warnings": dedupe_list(all_warnings),
+    }
+
+
+def stability_aggregate(windows: list[dict]) -> dict:
+    full = next((row for row in windows if row.get("label") == "full"), windows[0] if windows else {})
+    return {
+        "trades": int(safe_float(full.get("trades"))),
+        "profitFactor": safe_float(full.get("profitFactor")),
+        "totalReturnPct": safe_float(full.get("totalReturnPct")),
+        "maxDrawdownPct": safe_float(full.get("maxDrawdownPct")),
+        "winRate": safe_float(full.get("winRate")),
+    }
+
+
+def stability_flags(windows: list[dict], aggregate: dict) -> list[str]:
+    flags = []
+    if safe_float(aggregate.get("totalReturnPct")) < 0:
+        flags.append("negative_full_return")
+    if safe_float(aggregate.get("trades")) < 30:
+        flags.append("too_few_full_trades")
+    recent_90 = next((row for row in windows if row.get("label") == "recent_90d"), None)
+    if recent_90 and safe_float(recent_90.get("totalReturnPct")) < 0:
+        flags.append("negative_recent_90d_return")
+    if any(safe_float(row.get("trades")) < 8 for row in windows):
+        flags.append("thin_window_trades")
+    if any(safe_float(row.get("maxDrawdownPct")) > 25 for row in windows):
+        flags.append("high_drawdown")
+    if any(row.get("status") == "FAIL" for row in windows):
+        flags.append("window_failed")
+    return dedupe_list(flags)
+
+
+def stability_summary(status: str, aggregate: dict, flags: list[str]) -> str:
+    base = f"{status}: full-window PF {round(safe_float(aggregate.get('profitFactor')), 4)}, return {round(safe_float(aggregate.get('totalReturnPct')), 4)}%, trades {int(safe_float(aggregate.get('trades')))}."
+    if flags:
+        return f"{base} Flags: {', '.join(flags)}."
+    return f"{base} No major stability flags."
+
+
+def current_candidate_as_recommended(current: dict) -> dict | None:
+    active = candidate_symbols_by_mode(current, "active")
+    primary = active[0] if active else {}
+    if not current.get("strategy") or not primary.get("symbol"):
+        return None
+    params = dict(current.get("params", {}) or {})
+    if current.get("regimeMode") and params.get("regimeMode") is None:
+        params["regimeMode"] = current.get("regimeMode")
+    return {
+        "source": current.get("source", "bybit"),
+        "symbol": primary.get("symbol"),
+        "timeframe": primary.get("interval") or primary.get("timeframe"),
+        "strategy": current.get("strategy"),
+        "preset": current.get("strategy"),
+        "params": params,
+        "qualityStatus": "UNKNOWN",
+        "valid": True,
+    }
+
+
+def compare_stability_results(candidate_validation: dict, current_validation: dict | None, candidate: dict | None, current: dict | None) -> dict:
+    if not current_validation:
+        return {"available": False, "candidateBetter": None, "metricDiffs": [], "summary": "Current paper candidate comparison was not requested or unavailable."}
+    candidate_metrics = candidate_validation.get("aggregate") or {}
+    current_metrics = current_validation.get("aggregate") or {}
+    diffs = []
+    for field in ("totalReturnPct", "profitFactor", "maxDrawdownPct", "trades", "winRate"):
+        diffs.append({
+            "field": field,
+            "candidate": candidate_metrics.get(field),
+            "current": current_metrics.get(field),
+            "diff": safe_float(candidate_metrics.get(field)) - safe_float(current_metrics.get(field)),
+        })
+    candidate_better = None
+    if candidate_validation.get("status") != "FAIL" and current_validation.get("status") == "FAIL":
+        candidate_better = True
+    elif candidate_validation.get("status") != "FAIL" and current_validation.get("status") != "UNKNOWN":
+        candidate_better = (
+            safe_float(candidate_metrics.get("profitFactor")) >= safe_float(current_metrics.get("profitFactor")) and
+            safe_float(candidate_metrics.get("totalReturnPct")) >= safe_float(current_metrics.get("totalReturnPct")) and
+            safe_float(candidate_metrics.get("maxDrawdownPct")) <= safe_float(current_metrics.get("maxDrawdownPct"), 999)
+        )
+    symbol_note = "same market" if candidate_primary_symbol(candidate) == candidate_primary_symbol(current) else "different market"
+    return {
+        "available": True,
+        "candidateBetter": candidate_better,
+        "metricDiffs": diffs,
+        "summary": f"Candidate compared against current paper candidate on bounded windows ({symbol_note}).",
+    }
+
+
+def build_candidate_stability_report(args) -> dict:
+    latest = latest_learning_report()
+    candidate = latest_learning_recommendation_candidate(latest)
+    current = load_paper_candidate_config()
+    if not candidate:
+        return {
+            "ok": True,
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "candidate": None,
+            "currentPaperCandidate": candidate_summary(current),
+            "validation": {"status": "FAIL", "summary": "No latest learning recommendation candidate exists.", "windows": [], "aggregate": {}, "robustnessFlags": ["no_candidate"], "warnings": ["No candidate available."]},
+            "comparisonToCurrent": {"available": False, "candidateBetter": None, "metricDiffs": [], "summary": "No candidate to compare."},
+            "nextAction": {"action": "NO_CANDIDATE", "reason": "No latest learning recommendation candidate exists."},
+        }
+    source = args.get("source") or candidate.get("source") or "bybit"
+    symbol = args.get("symbol") or candidate.get("symbol")
+    timeframe = args.get("timeframe") or candidate.get("timeframe")
+    period = args.get("period") or candidate.get("period") or "365d"
+    compare_current = str(args.get("compareCurrent", "true")).lower() not in {"0", "false", "no", "off"}
+    candidate_for_run = dict(candidate)
+    candidate_for_run.update({"source": source, "symbol": symbol, "timeframe": timeframe})
+    validation = run_candidate_stability_windows(candidate_for_run, source, symbol, timeframe, period, current)
+    audit = build_learning_quality_audit()
+    current_validation = None
+    current_candidate = current_candidate_as_recommended(current)
+    if compare_current and current_candidate:
+        current_validation = run_candidate_stability_windows(
+            current_candidate,
+            current_candidate.get("source") or "bybit",
+            current_candidate.get("symbol"),
+            current_candidate.get("timeframe"),
+            period,
+            current,
+        )
+    comparison = compare_stability_results(validation, current_validation, candidate_for_run, current_candidate)
+    if validation.get("status") == "FAIL":
+        next_action = {"action": "BLOCKED", "reason": "Candidate failed bounded stability validation."}
+    elif validation.get("status") == "PASS" and audit.get("status") != "WATCH":
+        next_action = {"action": "REVIEW_CONFIG_ONLY_PROMOTION", "reason": "Candidate passed bounded validation and can be reviewed for config-only promotion. Paper remains disabled."}
+    elif validation.get("status") == "PASS":
+        next_action = {"action": "OBSERVE_MORE", "reason": "Candidate passed bounded validation, but learning audit remains WATCH; observe more before promotion."}
+    else:
+        next_action = {"action": "OBSERVE_MORE", "reason": "Candidate has stability warnings; observe more before config-only promotion."}
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "candidate": compact_candidate(candidate_for_run),
+        "currentPaperCandidate": candidate_summary(current),
+        "validation": validation,
+        "comparisonToCurrent": comparison,
+        "currentValidation": current_validation,
         "nextAction": next_action,
     }
 

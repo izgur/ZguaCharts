@@ -2677,6 +2677,7 @@ function setupLearningControls() {
   document.querySelector("#learning-audit-summary-button")?.addEventListener("click", loadLearningAuditSummary);
   document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
+  document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
   document.querySelector("#learning-auto-run-button")?.addEventListener("click", runAutoPromote);
@@ -3048,6 +3049,65 @@ function renderPromotionPreview(payload) {
     <p class="modal-note">${escapeHtml(payload.message || "Dry run only; no config was written.")}</p>
     <table class="trade-table"><thead><tr><th>Field</th><th>Current</th><th>Preview</th></tr></thead><tbody>${renderDiffRows(payload.changedFields, "No config fields would change.")}</tbody></table>
     ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function loadCandidateStability() {
+  const host = document.querySelector("#candidate-stability-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running bounded stability validation...</p>`;
+    const payload = await apiGet("/api/candidate/stability");
+    host.innerHTML = renderCandidateStability(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate stability could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderCandidateStability(payload) {
+  const candidate = payload.candidate || {};
+  const validation = payload.validation || {};
+  const comparison = payload.comparisonToCurrent || {};
+  const next = payload.nextAction || {};
+  const statusTone = validation.status === "PASS" ? "positive" : validation.status === "FAIL" ? "negative" : "neutral";
+  const rows = (validation.windows || []).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.period || row.label || "-")}</td>
+      <td class="${row.status === "PASS" ? "positive" : row.status === "FAIL" ? "negative" : "neutral"}">${escapeHtml(row.status || "UNKNOWN")}</td>
+      <td>${row.trades ?? "-"}</td>
+      <td>${formatMaybeNumber(row.profitFactor)}</td>
+      <td>${formatMaybeNumber(row.totalReturnPct)}%</td>
+      <td>${formatMaybeNumber(row.maxDrawdownPct)}%</td>
+      <td>${formatMaybeNumber(row.winRate)}%</td>
+    </tr>
+  `).join("");
+  const diffRows = (comparison.metricDiffs || []).map((item) => `
+    <tr><td>${escapeHtml(item.field || "-")}</td><td>${formatMaybeNumber(item.candidate)}</td><td>${formatMaybeNumber(item.current)}</td><td>${formatMaybeNumber(item.diff)}</td></tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Candidate Stability <span class="${statusTone}">${escapeHtml(validation.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Trades</span><strong>${validation.aggregate?.trades ?? "-"}</strong></div>
+      <div class="metric"><span>PF</span><strong>${formatMaybeNumber(validation.aggregate?.profitFactor)}</strong></div>
+      <div class="metric"><span>Return</span><strong>${formatMaybeNumber(validation.aggregate?.totalReturnPct)}%</strong></div>
+      <div class="metric"><span>Drawdown</span><strong>${formatMaybeNumber(validation.aggregate?.maxDrawdownPct)}%</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note">${escapeHtml(validation.summary || "")}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Window</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>Drawdown</th><th>Win</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="7">No validation windows returned.</td></tr>`}</tbody>
+    </table>
+    <h3 class="modal-section-title">Comparison To Current</h3>
+    <p class="modal-note">${escapeHtml(comparison.summary || "-")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Metric</th><th>Candidate</th><th>Current</th><th>Diff</th></tr></thead>
+      <tbody>${diffRows || `<tr><td colspan="4">No current-candidate comparison available.</td></tr>`}</tbody>
+    </table>
+    ${(validation.robustnessFlags || []).length ? `<p class="modal-note"><strong>Flags:</strong> ${validation.robustnessFlags.map(escapeHtml).join(", ")}</p>` : ""}
+    ${(validation.warnings || []).length ? `<ul class="backtest-warnings">${validation.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
   `;
 }
 
