@@ -1216,7 +1216,13 @@ def paper_status():
         state = read_json_file(state_path, {})
         candidate = load_paper_candidate_config()
         events = read_jsonl_tail(journal_path, 30)
+        health_payload = build_candidate_health(candidate_health_rules(request.args))
+        readiness = build_paper_readiness_report(request.args)
+        real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
+            "ok": True,
+            "paperEnabled": bool(candidate.get("enabled", False)),
+            "realTradingEnabled": real_enabled,
             "openPositions": state.get("openPositions", []),
             "closedTrades": state.get("closedTrades", [])[-50:],
             "equity": state.get("accountEquity"),
@@ -1227,21 +1233,10 @@ def paper_status():
             "lastSignals": events,
             "lastProcessedCandle": state.get("lastProcessedCandleTime", {}),
             "warnings": state.get("warnings", []),
-            "candidate": {
-                "enabled": candidate.get("enabled", False),
-                "strategy": candidate.get("strategy"),
-                "source": candidate.get("source"),
-                "regimeMode": candidate.get("regimeMode"),
-                "params": candidate.get("params", {}),
-                "activeSymbols": candidate_symbols_by_mode(candidate, "active"),
-                "watchSymbols": candidate_symbols_by_mode(candidate, "watch"),
-                "promotedAt": candidate.get("promotedAt"),
-                "promotedFromRanking": candidate.get("promotedFromRanking"),
-                "fillModel": candidate.get("fillModel"),
-                "makerFeePct": candidate.get("makerFeePct"),
-                "takerFeePct": candidate.get("takerFeePct"),
-                "slippageBps": candidate.get("slippageBps"),
-            },
+            "candidate": candidate_summary(candidate),
+            "health": health_payload.get("health", {}),
+            "readiness": readiness,
+            "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
             "equityCurve": state.get("equityCurve", [])[-500:],
         })
     except Exception as exc:
@@ -1254,6 +1249,35 @@ def paper_readiness():
         return jsonify(build_paper_readiness_report(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper readiness report: {exc}"}), 502
+
+
+@app.post("/api/paper/enable-preview")
+def paper_enable_preview():
+    try:
+        preview = build_paper_enable_preview(request.args)
+        if not preview.get("ok"):
+            return jsonify(preview), 400
+        return jsonify(preview)
+    except Exception as exc:
+        return jsonify({"error": f"Could not preview paper enablement: {exc}"}), 502
+
+
+@app.post("/api/paper/enable")
+def paper_enable():
+    try:
+        result, status_code = enable_paper_simulation_controlled(request.args)
+        return jsonify(result), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not enable paper simulation: {exc}"}), 502
+
+
+@app.post("/api/paper/disable")
+def paper_disable():
+    try:
+        result = disable_paper_simulation_controlled()
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": f"Could not disable paper simulation: {exc}"}), 502
 
 
 @app.get("/api/candidate/current")
@@ -1319,42 +1343,8 @@ def promote_candidate_preview():
 @app.post("/api/candidate/enable-paper")
 def enable_paper_candidate():
     try:
-        payload = request.get_json(silent=True) or {}
-        force = bool(payload.get("force"))
-        readiness = build_paper_readiness_report(request.args)
-        if not readiness.get("ready"):
-            return jsonify({
-                "error": "Paper readiness gate is not ready; paper simulation was not enabled.",
-                "readiness": readiness,
-            }), 400
-        candidate = load_paper_candidate_config()
-        validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
-        if validation["status"] != "PASS" and not force:
-            return jsonify({
-                "error": f"Candidate validation status is {validation['status']}; paper simulation was not enabled.",
-                "validation": validation,
-                "candidate": candidate_summary(candidate),
-            }), 400
-
-        backup_path = backup_candidate_config(candidate)
-        updated = dict(candidate)
-        updated["enabled"] = True
-        updated["enabledAt"] = datetime.now(timezone.utc).isoformat()
-        if validation["status"] != "PASS":
-            updated.setdefault("validationWarnings", []).append({
-                "enabledWithForce": True,
-                "enabledAt": updated["enabledAt"],
-                "status": validation["status"],
-                "reasons": collect_validation_reasons(validation),
-            })
-        write_candidate_config(updated)
-        return jsonify({
-            "ok": True,
-            "message": "Paper simulation enabled for the current candidate.",
-            "backupPath": str(backup_path.relative_to(app.root_path)),
-            "candidate": candidate_summary(updated),
-            "validation": validation,
-        })
+        result, status_code = enable_paper_simulation_controlled(request.args)
+        return jsonify(result), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not enable paper simulation: {exc}"}), 502
 
@@ -1362,18 +1352,7 @@ def enable_paper_candidate():
 @app.post("/api/candidate/disable-paper")
 def disable_paper_candidate():
     try:
-        candidate = load_paper_candidate_config()
-        backup_path = backup_candidate_config(candidate)
-        updated = dict(candidate)
-        updated["enabled"] = False
-        updated["disabledAt"] = datetime.now(timezone.utc).isoformat()
-        write_candidate_config(updated)
-        return jsonify({
-            "ok": True,
-            "message": "Paper simulation disabled.",
-            "backupPath": str(backup_path.relative_to(app.root_path)),
-            "candidate": candidate_summary(updated),
-        })
+        return jsonify(disable_paper_simulation_controlled())
     except Exception as exc:
         return jsonify({"error": f"Could not disable paper simulation: {exc}"}), 502
 
@@ -4286,8 +4265,8 @@ def candidate_config_warnings(candidate: dict) -> list[str]:
     symbols_active = candidate_symbols_by_mode(candidate, "active")
     if active_symbols is not None and active_symbols != symbols_active:
         warnings.append("activeSymbols does not match active entries in symbols.")
-    if candidate.get("promotedAt") and candidate.get("enabled"):
-        warnings.append("Promoted config-only candidate is enabled; paper should remain disabled until explicitly enabled.")
+    if candidate.get("promotedAt") and candidate.get("enabled") and not candidate.get("enabledAt"):
+        warnings.append("Promoted candidate is enabled without an enabledAt audit marker.")
     if not isinstance(candidate.get("promotedFromOptimization"), dict):
         warnings.append("promotedFromOptimization baseline is missing.")
     if not isinstance(candidate.get("promotedFromRanking"), dict):
@@ -4342,7 +4321,7 @@ def build_paper_readiness_report(args) -> dict:
     paper_readiness_check(checks, "paper candidate config loads", not candidate_load_error, "BLOCK", candidate_load_error or "Paper candidate config loaded.")
     paper_readiness_check(checks, "current candidate exists", bool(candidate), "BLOCK", "Current paper candidate is available." if candidate else "No paper candidate config exists.")
     paper_readiness_check(checks, "configWarnings empty", not config_warnings, "BLOCK", "No config warnings." if not config_warnings else "; ".join(config_warnings))
-    paper_readiness_check(checks, "paper simulation disabled", not bool(candidate.get("enabled")), "BLOCK", "Paper simulation is disabled." if not candidate.get("enabled") else "Paper simulation is already enabled.")
+    paper_readiness_check(checks, "paper simulation disabled", not bool(candidate.get("enabled")), "WARN", "Paper simulation is disabled." if not candidate.get("enabled") else "Paper simulation is already enabled; readiness remains watch-only while paper is running.")
     paper_readiness_check(checks, "strategy exists", bool(candidate.get("strategy")), "BLOCK", f"Strategy: {candidate.get('strategy') or '-'}")
     paper_readiness_check(checks, "active symbol exists", bool(symbol), "BLOCK", f"Active symbol: {symbol or '-'}")
     paper_readiness_check(checks, "active timeframe exists", bool(timeframe), "BLOCK", f"Active timeframe: {timeframe or '-'}")
@@ -4392,11 +4371,14 @@ def build_paper_readiness_report(args) -> dict:
     health = health_payload.get("health") or {}
     paper_metrics = health.get("paper") or {}
     closed_trades = int(safe_float(paper_metrics.get("closedTrades")))
+    health_unknown_running_watch = health.get("status") == "UNKNOWN" and bool(candidate.get("enabled")) and closed_trades == 0
     health_unknown_ok = health.get("status") != "UNKNOWN" or (not candidate.get("enabled") and closed_trades == 0)
     health_detail = f"Health {health.get('status', 'UNKNOWN')}; closed paper trades {closed_trades}."
     if health.get("status") == "UNKNOWN" and health_unknown_ok:
         health_detail += " UNKNOWN is acceptable while paper is disabled and has 0 closed trades."
-    paper_readiness_check(checks, "paper health UNKNOWN is acceptable", health_unknown_ok, "BLOCK", health_detail)
+    elif health_unknown_running_watch:
+        health_detail += " Paper is running but has no closed trades yet; monitor paper status."
+    paper_readiness_check(checks, "paper health UNKNOWN is acceptable", health_unknown_ok, "WARN" if health_unknown_running_watch else "BLOCK", health_detail)
 
     paper_readiness_check(checks, "auto-promote disabled", not bool(learning_config.get("autoPromote")), "BLOCK", "autoPromote is disabled." if not learning_config.get("autoPromote") else "autoPromote is enabled.")
     paper_readiness_check(checks, "auto-enable paper disabled", not bool(learning_config.get("autoEnablePaper")), "BLOCK", "autoEnablePaper is disabled.")
@@ -4406,9 +4388,9 @@ def build_paper_readiness_report(args) -> dict:
     blocking = [item for item in checks if not item["pass"] and item["severity"] == "BLOCK"]
     warn_checks = [item for item in checks if not item["pass"] and item["severity"] == "WARN"]
     warnings.extend(item["detail"] for item in warn_checks)
-    warnings.extend(item["detail"] for item in checks if item["pass"] and item["severity"] == "WARN")
     ready = not blocking and not warn_checks
-    status = "READY_FOR_PAPER_REVIEW" if ready else "BLOCKED" if blocking else "WATCH"
+    paper_already_enabled = bool(candidate.get("enabled", False)) and not blocking
+    status = "READY_FOR_PAPER_REVIEW" if ready else "BLOCKED" if blocking else "WATCH_PAPER_RUNNING" if paper_already_enabled else "WATCH"
     if ready:
         next_action = {
             "action": "REVIEW_ENABLE_PAPER_SIMULATION",
@@ -4421,8 +4403,8 @@ def build_paper_readiness_report(args) -> dict:
         }
     else:
         next_action = {
-            "action": "WATCH_PAPER_READINESS_WARNINGS",
-            "reason": "Only warning-level readiness issues remain; paper enablement still requires manual review.",
+            "action": "PAPER_ALREADY_ENABLED" if paper_already_enabled else "WATCH_PAPER_READINESS_WARNINGS",
+            "reason": "Paper simulation is already enabled; continue monitoring paper status and candidate health." if paper_already_enabled else "Only warning-level readiness issues remain; paper enablement still requires manual review.",
         }
     return {
         "ok": True,
@@ -4446,6 +4428,97 @@ def build_paper_readiness_report(args) -> dict:
         "stability": stability.get("validation"),
         "dataReadiness": data_readiness,
         "candidateHealth": health,
+    }
+
+
+def paper_config_changed_fields(before: dict, after: dict) -> list[dict]:
+    keys = sorted(set(before.keys()) | set(after.keys()))
+    return [
+        {"field": key, "current": before.get(key), "preview": after.get(key)}
+        for key in keys
+        if before.get(key) != after.get(key)
+    ]
+
+
+def paper_enable_warning_text() -> list[str]:
+    return ["Paper simulation only. No real trades will be placed."]
+
+
+def build_enabled_paper_config(current: dict, enabled: bool) -> dict:
+    updated = dict(current)
+    now = datetime.now(timezone.utc).isoformat()
+    updated["enabled"] = bool(enabled)
+    if enabled:
+        updated["enabledAt"] = now
+        if "realTradingEnabled" in updated:
+            updated["realTradingEnabled"] = False
+    else:
+        updated["disabledAt"] = now
+    return normalize_promoted_candidate_config(updated)
+
+
+def build_paper_enable_preview(args) -> dict:
+    readiness = build_paper_readiness_report(args)
+    current = load_paper_candidate_config()
+    preview = build_enabled_paper_config(current, True) if readiness.get("ready") and readiness.get("status") == "READY_FOR_PAPER_REVIEW" else dict(current)
+    real_enabled, _ = paper_real_trading_enabled()
+    return {
+        "ok": True,
+        "dryRun": True,
+        "wouldEnablePaper": bool(readiness.get("ready") and readiness.get("status") == "READY_FOR_PAPER_REVIEW"),
+        "paperRemainsRealOnlyFalse": not real_enabled,
+        "readiness": readiness,
+        "currentConfig": current,
+        "previewConfig": preview,
+        "changedFields": paper_config_changed_fields(current, preview),
+        "warnings": paper_enable_warning_text(),
+        "message": "Preview only; paper simulation was not enabled.",
+    }
+
+
+def enable_paper_simulation_controlled(args) -> tuple[dict, int]:
+    readiness = build_paper_readiness_report(args)
+    if not readiness.get("ready") or readiness.get("status") != "READY_FOR_PAPER_REVIEW" or readiness.get("summary", {}).get("blockingIssues", 0):
+        return {
+            "ok": False,
+            "error": "Paper readiness gate is not ready; paper simulation was not enabled.",
+            "readiness": readiness,
+            "warnings": paper_enable_warning_text(),
+        }, 400
+    current = load_paper_candidate_config()
+    backup_path = backup_candidate_config(current)
+    updated = build_enabled_paper_config(current, True)
+    write_candidate_config(updated)
+    learning_config = safe_learning_config(load_learning_config())
+    real_enabled, _ = paper_real_trading_enabled()
+    return {
+        "ok": True,
+        "paperEnabled": bool(updated.get("enabled", False)),
+        "realTradingEnabled": real_enabled,
+        "autoPromoteEnabled": bool(learning_config.get("autoPromote", False)),
+        "backupPath": str(backup_path.relative_to(app.root_path)),
+        "writtenPath": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
+        "candidateConfig": updated,
+        "changedFields": paper_config_changed_fields(current, updated),
+        "warnings": paper_enable_warning_text(),
+    }, 200
+
+
+def disable_paper_simulation_controlled() -> dict:
+    current = load_paper_candidate_config()
+    backup_path = backup_candidate_config(current)
+    updated = build_enabled_paper_config(current, False)
+    write_candidate_config(updated)
+    real_enabled, _ = paper_real_trading_enabled()
+    return {
+        "ok": True,
+        "paperEnabled": bool(updated.get("enabled", False)),
+        "realTradingEnabled": real_enabled,
+        "backupPath": str(backup_path.relative_to(app.root_path)),
+        "writtenPath": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
+        "candidateConfig": updated,
+        "changedFields": paper_config_changed_fields(current, updated),
+        "warnings": [],
     }
 
 

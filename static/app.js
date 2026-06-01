@@ -505,14 +505,14 @@ async function handlePaperAction(action) {
     if (action === "enable") {
       const ok = window.confirm("Enable paper simulation for this candidate?\n\nThis is still simulated only. No real exchange orders will be placed.");
       if (!ok) return;
-      const payload = await apiPost("/api/candidate/enable-paper", { force: false });
-      if (resultEl) resultEl.innerHTML = renderCandidateValidation(payload.validation);
+      const payload = await apiPost("/api/paper/enable", {});
+      if (resultEl) resultEl.innerHTML = renderPaperControlResult(payload, "Paper simulation enabled.");
       await openPaperPanel();
       return;
     }
     if (action === "disable") {
-      const payload = await apiPost("/api/candidate/disable-paper", {});
-      if (resultEl) resultEl.innerHTML = `<p class="pane-status">${escapeHtml(payload.message || "Paper simulation disabled.")}</p>`;
+      const payload = await apiPost("/api/paper/disable", {});
+      if (resultEl) resultEl.innerHTML = renderPaperControlResult(payload, "Paper simulation disabled.");
       await openPaperPanel();
     }
   } catch (error) {
@@ -2679,6 +2679,10 @@ function setupLearningControls() {
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
+  document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
+  document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
+  document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
+  document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
@@ -3158,6 +3162,105 @@ function renderPaperReadiness(payload) {
     </table>
     ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
   `;
+}
+
+async function loadPaperSimulationControl() {
+  const host = document.querySelector("#paper-control-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper simulation control...</p>`;
+    const payload = await apiGet("/api/paper/status");
+    host.innerHTML = renderPaperSimulationControl(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper simulation control could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSimulationControl(payload) {
+  const candidate = payload.candidate || {};
+  const readiness = payload.readiness || {};
+  const next = readiness.nextAction || {};
+  const summary = readiness.summary || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const tone = payload.paperEnabled ? "positive" : readiness.ready ? "positive" : readiness.status === "BLOCKED" ? "negative" : "neutral";
+  return `
+    <h3 class="modal-section-title">Paper Simulation Control <span class="${tone}">${payload.paperEnabled ? "PAPER ENABLED" : escapeHtml(readiness.status || "UNKNOWN")}</span></h3>
+    <div class="paper-warning">Paper simulation only. No real trades. Real trading disabled.</div>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper enabled</span><strong>${payload.paperEnabled ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Readiness</span><strong>${escapeHtml(readiness.status || "-")}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Blocking</span><strong>${summary.blockingIssues ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${summary.warnings ?? 0}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+  `;
+}
+
+function renderPaperControlResult(payload, fallbackMessage) {
+  const changed = (payload.changedFields || []).map((item) => `
+    <tr><td>${escapeHtml(item.field || "-")}</td><td>${escapeHtml(formatDiffValue(item.current))}</td><td>${escapeHtml(formatDiffValue(item.preview))}</td></tr>
+  `).join("");
+  const readiness = payload.readiness || {};
+  const candidate = payload.candidateConfig || payload.previewConfig || {};
+  const active = (candidate.symbols || []).find((item) => item.mode === "active") || {};
+  return `
+    <p class="pane-status">${escapeHtml(payload.message || fallbackMessage)}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper enabled</span><strong>${payload.paperEnabled ?? payload.previewConfig?.enabled ?? "-"}</strong></div>
+      <div class="metric"><span>Would enable</span><strong>${payload.wouldEnablePaper === undefined ? "-" : payload.wouldEnablePaper ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled || payload.paperRemainsRealOnlyFalse === false ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Readiness</span><strong>${escapeHtml(readiness.status || "-")}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Backup</span><strong>${escapeHtml(payload.backupPath || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Field</th><th>Current</th><th>Preview</th></tr></thead>
+      <tbody>${changed || `<tr><td colspan="3">No config fields changed.</td></tr>`}</tbody>
+    </table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function previewPaperEnable() {
+  const host = document.querySelector("#paper-control-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Building paper enable preview...</p>`;
+    const payload = await apiPost("/api/paper/enable-preview", {});
+    host.innerHTML = renderPaperControlResult(payload, "Preview only; paper simulation was not enabled.");
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper enable preview failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function enablePaperSimulation() {
+  const host = document.querySelector("#paper-control-panel");
+  if (!host) return;
+  const ok = window.confirm("Enable paper simulation for this candidate?\n\nPaper simulation only. No real trades will be placed.");
+  if (!ok) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Enabling paper simulation...</p>`;
+    const payload = await apiPost("/api/paper/enable", {});
+    host.innerHTML = renderPaperControlResult(payload, "Paper simulation enabled.");
+    await loadPaperReadiness();
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper enable failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function disablePaperSimulation() {
+  const host = document.querySelector("#paper-control-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Disabling paper simulation...</p>`;
+    const payload = await apiPost("/api/paper/disable", {});
+    host.innerHTML = renderPaperControlResult(payload, "Paper simulation disabled.");
+    await loadPaperReadiness();
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper disable failed: ${escapeHtml(error.message)}</p>`;
+  }
 }
 
 async function loadLearningEvidence() {
