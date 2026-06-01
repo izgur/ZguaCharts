@@ -245,7 +245,7 @@ function processMarket(config, state, market, regimeCandles, options) {
     }
 
     const params = Object.assign({}, config.params || {}, {
-      regimeMode: config.regimeMode,
+      regimeMode: canonicalRegimeMode(config),
       fillModel: config.fillModel || "next-open",
       makerFeePct: Number(config.makerFeePct || 0),
       takerFeePct: Number(config.takerFeePct || 0),
@@ -611,7 +611,7 @@ function configSummary(config) {
   return {
     enabled: !!config.enabled,
     strategy: config.strategy,
-    regimeMode: config.regimeMode,
+    regimeMode: canonicalRegimeMode(config),
     fillModel: config.fillModel,
     makerFeePct: config.makerFeePct,
     takerFeePct: config.takerFeePct,
@@ -621,7 +621,11 @@ function configSummary(config) {
 }
 
 function paramsHash(config) {
-  return crypto.createHash("sha1").update(JSON.stringify({ strategy: config.strategy, regimeMode: config.regimeMode, params: config.params })).digest("hex").slice(0, 12);
+  return crypto.createHash("sha1").update(JSON.stringify({ strategy: config.strategy, regimeMode: canonicalRegimeMode(config), params: config.params })).digest("hex").slice(0, 12);
+}
+
+function canonicalRegimeMode(config) {
+  return (config.params && config.params.regimeMode) || config.regimeMode;
 }
 
 function tradeId(market, trade) {

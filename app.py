@@ -1273,6 +1273,7 @@ def validate_candidate():
         return jsonify({
             "candidate": candidate_summary(candidate),
             "validation": validation,
+            "configWarnings": candidate_config_warnings(candidate),
         })
     except Exception as exc:
         return jsonify({"error": f"Could not validate candidate: {exc}"}), 502
@@ -1391,6 +1392,7 @@ def promote_candidate():
             "candidate": candidate_summary(updated),
             "changedFields": preview.get("changedFields", []),
             "expectedBaselineMetrics": preview.get("expectedBaselineMetrics", {}),
+            "configWarnings": candidate_config_warnings(updated),
             "warnings": preview.get("warnings", []),
         })
     except Exception as exc:
@@ -2703,6 +2705,7 @@ def build_candidate_promotion_preview(payload: dict, dry_run: bool = True, force
         "currentPaperCandidateRaw": current,
         "changedFields": changed_field_rows(current, updated),
         "expectedBaselineMetrics": expected_metrics_from_candidate(updated),
+        "configWarnings": candidate_config_warnings(updated),
         "warnings": warnings,
         "paperRemainsDisabled": not bool(updated.get("enabled")),
         "message": "Dry run only; no config was written." if dry_run else "Promotion preview is ready.",
@@ -4258,6 +4261,45 @@ def candidate_symbols_by_mode(candidate: dict, mode: str) -> list[dict]:
     ]
 
 
+def candidate_config_warnings(candidate: dict) -> list[str]:
+    warnings = []
+    params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
+    top_regime = candidate.get("regimeMode")
+    param_regime = params.get("regimeMode")
+    if top_regime and param_regime and top_regime != param_regime:
+        warnings.append(f"Top-level regimeMode ({top_regime}) conflicts with params.regimeMode ({param_regime}); params.regimeMode is canonical.")
+    active_symbols = candidate.get("activeSymbols") if isinstance(candidate.get("activeSymbols"), list) else None
+    symbols_active = candidate_symbols_by_mode(candidate, "active")
+    if active_symbols is not None and active_symbols != symbols_active:
+        warnings.append("activeSymbols does not match active entries in symbols.")
+    if candidate.get("promotedAt") and candidate.get("enabled"):
+        warnings.append("Promoted config-only candidate is enabled; paper should remain disabled until explicitly enabled.")
+    if not isinstance(candidate.get("promotedFromOptimization"), dict):
+        warnings.append("promotedFromOptimization baseline is missing.")
+    if not isinstance(candidate.get("promotedFromRanking"), dict):
+        warnings.append("promotedFromRanking baseline is missing.")
+    expected = expected_metrics_from_candidate(candidate)
+    if safe_float(expected.get("trades")) <= 0:
+        warnings.append("Expected baseline trades are missing.")
+    if safe_float(expected.get("profitFactor")) <= 0:
+        warnings.append("Expected baseline profitFactor is missing.")
+    return dedupe_list(warnings)
+
+
+def normalize_promoted_candidate_config(candidate: dict) -> dict:
+    normalized = dict(candidate or {})
+    params = dict(normalized.get("params") or {})
+    top_regime = normalized.get("regimeMode")
+    param_regime = params.get("regimeMode")
+    if param_regime:
+        normalized["regimeMode"] = param_regime
+    elif top_regime:
+        params["regimeMode"] = top_regime
+        normalized["regimeMode"] = top_regime
+    normalized["params"] = params
+    return normalized
+
+
 def candidate_summary(candidate: dict) -> dict:
     return {
         "enabled": candidate.get("enabled", False),
@@ -4278,6 +4320,7 @@ def candidate_summary(candidate: dict) -> dict:
         "riskPct": candidate.get("riskPct"),
         "maxOpenTrades": candidate.get("maxOpenTrades"),
         "maxNotionalPerTrade": candidate.get("maxNotionalPerTrade"),
+        "configWarnings": candidate_config_warnings(candidate),
     }
 
 
@@ -4312,6 +4355,7 @@ def backup_candidate_config(candidate: dict) -> Path:
 
 
 def write_candidate_config(candidate: dict) -> None:
+    candidate = normalize_promoted_candidate_config(candidate)
     ensure_local_config_from_default(
         PAPER_CANDIDATE_DEFAULT_PATH,
         PAPER_CANDIDATE_LOCAL_PATH,
@@ -4358,20 +4402,25 @@ def merge_promoted_candidate(current: dict, payload: dict, ranking_snapshot: dic
         "trades": ranking_snapshot.get("trades"),
     }
     optimization_snapshot = payload.get("optimizationSnapshot") if isinstance(payload.get("optimizationSnapshot"), dict) else None
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else current.get("params", {})
+    params = dict(params or {})
+    regime_mode = params.get("regimeMode") or payload.get("regimeMode") or current.get("regimeMode")
+    if regime_mode:
+        params["regimeMode"] = regime_mode
     # TODO: Add scheduled ranking runs, automatic candidate suggestions,
     # a human approval queue, and automatic promotion only after paper validation.
     preserved.update({
         "enabled": False,
         "source": payload.get("source", current.get("source", "bybit")),
         "strategy": payload.get("strategy") or payload.get("preset") or current.get("strategy"),
-        "regimeMode": payload.get("regimeMode", current.get("regimeMode")),
-        "params": payload.get("params") if isinstance(payload.get("params"), dict) else current.get("params", {}),
+        "regimeMode": regime_mode,
+        "params": params,
         "symbols": symbols,
         "promotedAt": now,
         "promotedFromRanking": snapshot,
         "promotedFromOptimization": optimization_snapshot,
     })
-    return preserved
+    return normalize_promoted_candidate_config(preserved)
 
 
 def candidate_validation_rules(args) -> dict:
