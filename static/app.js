@@ -2683,6 +2683,7 @@ function setupLearningControls() {
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
   document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
+  document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
@@ -3245,6 +3246,7 @@ async function enablePaperSimulation() {
     const payload = await apiPost("/api/paper/enable", {});
     host.innerHTML = renderPaperControlResult(payload, "Paper simulation enabled.");
     await loadPaperReadiness();
+    await loadPaperRuntimeMonitor();
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Paper enable failed: ${escapeHtml(error.message)}</p>`;
   }
@@ -3258,9 +3260,71 @@ async function disablePaperSimulation() {
     const payload = await apiPost("/api/paper/disable", {});
     host.innerHTML = renderPaperControlResult(payload, "Paper simulation disabled.");
     await loadPaperReadiness();
+    await loadPaperRuntimeMonitor();
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Paper disable failed: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadPaperRuntimeMonitor() {
+  const host = document.querySelector("#paper-runtime-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper runtime monitor...</p>`;
+    const [runtime, stopRules] = await Promise.all([
+      apiGet("/api/paper/runtime-status"),
+      apiGet("/api/paper/stop-rules"),
+    ]);
+    host.innerHTML = renderPaperRuntimeMonitor(runtime, stopRules);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper runtime monitor could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperRuntimeMonitor(runtime, stopRules) {
+  const candidate = runtime.candidate || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const health = runtime.health || {};
+  const journal = runtime.journal || {};
+  const lastTick = runtime.lastTick || {};
+  const lastSignal = runtime.lastSignal || {};
+  const next = runtime.nextAction || {};
+  const stopNext = stopRules.nextAction || {};
+  const healthTone = health.status === "BLOCKED" ? "negative" : health.status === "WATCH" ? "neutral" : "positive";
+  const stopTone = stopRules.status === "STOP_RECOMMENDED" ? "negative" : stopRules.status === "WATCH" ? "neutral" : "positive";
+  const initCommand = runtime.initializationStatus === "NEEDS_INIT" ? `<p class="modal-note"><strong>Init command:</strong> npm run paper:init</p>` : "";
+  const stopRows = (stopRules.rules || []).map((rule) => `
+    <tr>
+      <td>${escapeHtml(rule.name || "-")}</td>
+      <td class="${rule.pass ? "positive" : rule.severity === "STOP" ? "negative" : "neutral"}">${rule.pass ? "yes" : "no"}</td>
+      <td>${escapeHtml(rule.severity || "-")}</td>
+      <td>${escapeHtml(rule.detail || "-")}</td>
+    </tr>
+  `).join("");
+  const reasonRows = (health.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Runtime Monitor <span class="${healthTone}">${escapeHtml(health.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Initialized</span><strong>${runtime.initialized ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Init status</span><strong>${escapeHtml(runtime.initializationStatus || "-")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${runtime.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${runtime.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Last tick</span><strong>${escapeHtml(lastTick.updatedAt || "-")}</strong></div>
+      <div class="metric"><span>Last signal</span><strong>${escapeHtml(lastSignal.processedAt || "-")}</strong></div>
+      <div class="metric"><span>Stop rules</span><strong class="${stopTone}">${escapeHtml(stopRules.status || "-")}</strong></div>
+      <div class="metric"><span>Stale warnings</span><strong>${(journal.staleWarnings || []).length}</strong></div>
+      <div class="metric"><span>Recent warnings</span><strong>${(journal.recentWarnings || []).length}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <p class="modal-note"><strong>${escapeHtml(stopNext.action || "-")}</strong> ${escapeHtml(stopNext.reason || "")}</p>
+    ${initCommand}
+    ${reasonRows ? `<ul class="backtest-warnings">${reasonRows}</ul>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Stop Rule</th><th>Pass</th><th>Severity</th><th>Detail</th></tr></thead>
+      <tbody>${stopRows || `<tr><td colspan="4">No stop rules returned.</td></tr>`}</tbody>
+    </table>
+  `;
 }
 
 async function loadLearningEvidence() {

@@ -1218,11 +1218,14 @@ def paper_status():
         events = read_jsonl_tail(journal_path, 30)
         health_payload = build_candidate_health(candidate_health_rules(request.args))
         readiness = build_paper_readiness_report(request.args)
+        runtime = build_paper_runtime_status(request.args)
+        stop_rules = build_paper_stop_rules(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
             "paperEnabled": bool(candidate.get("enabled", False)),
             "realTradingEnabled": real_enabled,
+            "initializationNeeded": runtime.get("initializationStatus") == "NEEDS_INIT",
             "openPositions": state.get("openPositions", []),
             "closedTrades": state.get("closedTrades", [])[-50:],
             "equity": state.get("accountEquity"),
@@ -1236,6 +1239,20 @@ def paper_status():
             "candidate": candidate_summary(candidate),
             "health": health_payload.get("health", {}),
             "readiness": readiness,
+            "runtimeStatus": {
+                "initialized": runtime.get("initialized"),
+                "initializationStatus": runtime.get("initializationStatus"),
+                "health": runtime.get("health"),
+                "lastTick": runtime.get("lastTick"),
+                "nextAction": runtime.get("nextAction"),
+            },
+            "stopRules": {
+                "status": stop_rules.get("status"),
+                "failed": len([rule for rule in stop_rules.get("rules", []) if not rule.get("pass")]),
+                "nextAction": stop_rules.get("nextAction"),
+            },
+            "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
+            "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
             "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
             "equityCurve": state.get("equityCurve", [])[-500:],
         })
@@ -1249,6 +1266,34 @@ def paper_readiness():
         return jsonify(build_paper_readiness_report(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper readiness report: {exc}"}), 502
+
+
+@app.get("/api/paper/runtime-status")
+def paper_runtime_status():
+    try:
+        return jsonify(build_paper_runtime_status(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper runtime status: {exc}"}), 502
+
+
+@app.get("/api/paper/init-instructions")
+def paper_init_instructions():
+    return jsonify({
+        "ok": True,
+        "commands": ["npm run paper:init"],
+        "notes": [
+            "Run this before enabling paper simulation if runtime status says NEEDS_INIT.",
+            "This initializes paper simulation state only and does not enable real trading.",
+        ],
+    })
+
+
+@app.get("/api/paper/stop-rules")
+def paper_stop_rules():
+    try:
+        return jsonify(build_paper_stop_rules(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper stop rules: {exc}"}), 502
 
 
 @app.post("/api/paper/enable-preview")
@@ -4299,6 +4344,279 @@ def paper_real_trading_enabled() -> tuple[bool, str]:
     if enabled:
         return True, f"Real trading flag(s) enabled: {', '.join(enabled)}."
     return False, "No real-trading mode or order-execution API path is enabled."
+
+
+def paper_market_key(market: dict) -> str:
+    symbol = market.get("symbol")
+    interval = market.get("interval") or market.get("timeframe")
+    return f"{symbol}:{interval}" if symbol and interval else ""
+
+
+def event_timestamp(event: dict) -> str | None:
+    return event.get("processedAt") or event.get("timestamp") or event.get("time")
+
+
+def parse_iso_timestamp(timestamp: str | None):
+    if not timestamp:
+        return None
+    try:
+        normalized = str(timestamp).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+
+def compact_journal_event(event: dict) -> dict:
+    return {
+        "eventType": event.get("eventType"),
+        "reason": event.get("reason"),
+        "marketKey": event.get("marketKey") or paper_market_key(event),
+        "symbol": event.get("symbol"),
+        "interval": event.get("interval") or event.get("timeframe"),
+        "processedAt": event_timestamp(event),
+    }
+
+
+def paper_runtime_warning_buckets(state: dict, journal: list[dict], initialized_markets: set[str]) -> dict:
+    now = datetime.now(timezone.utc)
+    updated_at = parse_iso_timestamp(state.get("updatedAt"))
+    warning_events = [
+        event for event in journal
+        if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"} or event.get("reason")
+    ]
+    stale = []
+    recent = []
+    for event in warning_events:
+        event_time = parse_iso_timestamp(event_timestamp(event))
+        market_key = event.get("marketKey") or paper_market_key(event)
+        reason = str(event.get("reason") or "")
+        old_by_state = bool(updated_at and event_time and event_time < updated_at)
+        old_by_age = bool(event_time and (now - event_time) > timedelta(hours=24))
+        stale_init_warning = "Market not initialized" in reason and market_key in initialized_markets
+        compact = compact_journal_event(event)
+        if old_by_state or old_by_age or stale_init_warning:
+            stale.append(compact)
+        else:
+            recent.append(compact)
+    state_warnings = [
+        {
+            "eventType": "STATE_WARNING",
+            "reason": warning,
+            "marketKey": None,
+            "processedAt": state.get("updatedAt"),
+        }
+        for warning in (state.get("warnings") or [])
+    ]
+    return {
+        "staleWarnings": stale[-25:],
+        "recentWarnings": (recent + state_warnings)[-25:],
+    }
+
+
+def latest_journal_event(journal: list[dict], types: set[str] | None = None) -> dict | None:
+    for event in reversed(journal):
+        event_type = str(event.get("eventType", "")).upper()
+        if types is None or event_type in types:
+            return compact_journal_event(event)
+    return None
+
+
+def build_paper_runtime_status(args) -> dict:
+    state_path = Path(app.root_path) / "data" / "paper-state.json"
+    journal_path = Path(app.root_path) / "reports" / "paper-journal.jsonl"
+    warnings = []
+    candidate_load_error = None
+    state_load_error = None
+    try:
+        candidate = load_paper_candidate_config()
+    except Exception as exc:
+        candidate = {}
+        candidate_load_error = str(exc)
+        warnings.append(f"Could not load paper candidate config: {exc}")
+    try:
+        state = read_json_file(str(state_path), {}) if state_path.exists() else {}
+    except Exception as exc:
+        state = {}
+        state_load_error = str(exc)
+        warnings.append(f"Could not load paper state: {exc}")
+    journal = read_jsonl_tail(str(journal_path), 500) if journal_path.exists() else []
+    active_markets = candidate_symbols_by_mode(candidate, "active") if candidate else []
+    required_markets = [paper_market_key(market) for market in active_markets if paper_market_key(market)]
+    last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
+    initialized_markets = {key for key in required_markets if key in last_processed}
+    missing_markets = [key for key in required_markets if key not in last_processed]
+    state_file_exists = state_path.exists()
+    journal_available = journal_path.exists()
+    initialized = bool(state_file_exists and required_markets and not missing_markets and not state_load_error)
+    if state_load_error:
+        initialization_status = "ERROR"
+    elif initialized:
+        initialization_status = "READY"
+    elif state_file_exists or required_markets:
+        initialization_status = "NEEDS_INIT"
+    else:
+        initialization_status = "UNKNOWN"
+    paper_enabled = bool(candidate.get("enabled", False))
+    real_enabled, real_detail = paper_real_trading_enabled()
+    warning_buckets = paper_runtime_warning_buckets(state, journal, initialized_markets)
+    last_event = latest_journal_event(journal)
+    last_signal = latest_journal_event(journal, {"SIGNAL", "ENTRY", "EXIT", "SKIP"})
+    last_tick_at = state.get("updatedAt")
+    health_reasons = []
+    if paper_enabled and not initialized:
+        health_status = "BLOCKED"
+        health_reasons.append("Paper simulation is enabled but runtime state is not initialized for the active market.")
+    elif real_enabled:
+        health_status = "BLOCKED"
+        health_reasons.append(real_detail)
+    else:
+        health_status = "OK"
+        if not initialized:
+            health_status = "WATCH"
+            health_reasons.append("Paper runtime state needs initialization before paper simulation can be enabled.")
+        if warning_buckets["recentWarnings"]:
+            health_status = "WATCH" if health_status == "OK" else health_status
+            health_reasons.append(f"{len(warning_buckets['recentWarnings'])} current runtime warning(s) are present.")
+        if warning_buckets["staleWarnings"]:
+            health_reasons.append(f"{len(warning_buckets['staleWarnings'])} older journal warning(s) were separated as stale.")
+    if not health_reasons:
+        health_reasons.append("Paper runtime state is initialized for the active market.")
+    if paper_enabled and not initialized:
+        next_action = {
+            "action": "NEEDS_INIT_BEFORE_RUNNING",
+            "reason": "Run npm run paper:init, then recheck runtime status before paper simulation continues.",
+        }
+    elif not paper_enabled and not initialized:
+        next_action = {
+            "action": "RUN_PAPER_INIT_BEFORE_ENABLE",
+            "reason": "Initialize paper runtime state before manually reviewing paper enablement.",
+        }
+    elif paper_enabled:
+        next_action = {
+            "action": "MONITOR_PAPER_SIMULATION",
+            "reason": "Paper simulation is enabled; monitor runtime warnings, stop rules, and candidate health.",
+        }
+    else:
+        next_action = {
+            "action": "REVIEW_ENABLE_PAPER_SIMULATION",
+            "reason": "Paper runtime is initialized. This does not enable paper automatically.",
+        }
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "initialized": initialized,
+        "initializationStatus": initialization_status,
+        "candidate": candidate_summary(candidate),
+        "marketState": {
+            "stateFileExists": state_file_exists,
+            "statePath": str(state_path.relative_to(app.root_path)),
+            "requiredMarkets": required_markets,
+            "initializedMarkets": sorted(initialized_markets),
+            "missingMarkets": missing_markets,
+            "lastProcessedCandleTime": {key: last_processed.get(key) for key in required_markets},
+            "freshness": {key: (state.get("freshness") or {}).get(key) for key in required_markets},
+        },
+        "lastTick": {
+            "updatedAt": last_tick_at,
+            "ageSeconds": seconds_since(last_tick_at),
+            "processedCandles": state.get("processedCandles", 0),
+            "openPositions": len(state.get("openPositions", []) or []),
+            "closedTrades": len(state.get("closedTrades", []) or []),
+        },
+        "lastSignal": last_signal,
+        "journal": {
+            "available": journal_available,
+            "path": str(journal_path.relative_to(app.root_path)),
+            "lastEventAt": event_timestamp(last_event or {}),
+            "staleWarnings": warning_buckets["staleWarnings"],
+            "recentWarnings": warning_buckets["recentWarnings"],
+        },
+        "health": {
+            "status": health_status,
+            "reasons": health_reasons,
+        },
+        "nextAction": next_action,
+        "warnings": dedupe_list(warnings + ([candidate_load_error] if candidate_load_error else [])),
+    }
+
+
+def paper_stop_rule(rules: list[dict], name: str, passed: bool, severity: str, detail: str):
+    rules.append({
+        "name": name,
+        "pass": bool(passed),
+        "severity": severity,
+        "detail": detail,
+    })
+
+
+def build_paper_stop_rules(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    runtime = build_paper_runtime_status(args)
+    paper_enabled = bool(candidate.get("enabled", False))
+    real_enabled, real_detail = paper_real_trading_enabled()
+    rules = []
+    if not paper_enabled:
+        paper_stop_rule(rules, "paper simulation disabled", True, "INFO", "Paper simulation is disabled; no stop action is recommended.")
+        paper_stop_rule(rules, "real trading disabled", not real_enabled, "STOP" if real_enabled else "INFO", real_detail)
+        status = "WATCH" if real_enabled else "OK"
+        next_action = {
+            "action": "PAPER_DISABLED_NO_STOP_NEEDED" if not real_enabled else "DISABLE_REAL_TRADING_FLAG",
+            "reason": "Paper is disabled, so stop rules are informational only." if not real_enabled else real_detail,
+        }
+        return {"ok": True, "status": status, "rules": rules, "nextAction": next_action}
+
+    config_warnings = candidate_config_warnings(candidate)
+    validation = validate_candidate_config(candidate, candidate_validation_rules(args))
+    stability = build_candidate_stability_report({"compareCurrent": "true"})
+    stability_status = (stability.get("validation") or {}).get("status")
+    active = candidate_symbols_by_mode(candidate, "active")
+    primary = active[0] if active else {}
+    symbol = primary.get("symbol")
+    timeframe = primary.get("interval") or primary.get("timeframe")
+    data_status = "UNKNOWN"
+    if symbol and timeframe:
+        data_readiness = research_data_readiness(candidate.get("source", "bybit"), [symbol], [timeframe], args.get("period", "365d"), args.get("limit", "auto"))
+        data_status = (((data_readiness.get("rows") or [{}])[0]) or {}).get("status", "UNKNOWN")
+    health_payload = build_candidate_health(candidate_health_rules(args))
+    paper_health = (health_payload.get("health") or {}).get("paper") or {}
+    max_tick_age = int(safe_float(args.get("max_tick_age_seconds", 21600), 21600))
+    last_tick_age = runtime.get("lastTick", {}).get("ageSeconds")
+    runtime_errors = [
+        warning for warning in runtime.get("journal", {}).get("recentWarnings", [])
+        if str(warning.get("eventType", "")).upper() == "ERROR" or "error" in str(warning.get("reason", "")).lower()
+    ]
+    repeated_errors = len(runtime_errors) >= int(safe_float(args.get("max_recent_runtime_errors", 3), 3))
+    max_open_trades = int(safe_float(candidate.get("maxOpenTrades"), 1))
+    open_positions = len(state.get("openPositions", []) or [])
+    drawdown = safe_float(paper_health.get("maxDrawdown"))
+    drawdown_limit = safe_float(args.get("watch_drawdown_above", candidate_health_rules(args)["failDrawdownAbove"]), 15)
+    paper_stop_rule(rules, "validation remains PASS", validation.get("status") == "PASS", "STOP", f"Validation status: {validation.get('status', 'UNKNOWN')}.")
+    paper_stop_rule(rules, "stability remains PASS", stability_status == "PASS", "STOP", f"Stability status: {stability_status or 'UNKNOWN'}.")
+    paper_stop_rule(rules, "configWarnings empty", not config_warnings, "STOP", "No config warnings." if not config_warnings else "; ".join(config_warnings))
+    paper_stop_rule(rules, "data readiness remains READY", data_status == "READY", "STOP", f"Data readiness status: {data_status}.")
+    paper_stop_rule(rules, "runtime initialized", runtime.get("initialized"), "STOP", f"Initialization status: {runtime.get('initializationStatus')}.")
+    paper_stop_rule(rules, "last tick is recent", last_tick_age is not None and last_tick_age <= max_tick_age, "WARN", f"Last tick age seconds: {last_tick_age}; watch threshold {max_tick_age}.")
+    paper_stop_rule(rules, "runtime errors below repeat threshold", not repeated_errors, "STOP", f"Recent runtime error count: {len(runtime_errors)}.")
+    paper_stop_rule(rules, "paper drawdown below watch threshold", drawdown <= drawdown_limit, "WARN", f"Paper drawdown: {drawdown}; watch threshold {drawdown_limit}.")
+    paper_stop_rule(rules, "open trades within maxOpenTrades", open_positions <= max_open_trades, "STOP", f"Open trades: {open_positions}; maxOpenTrades: {max_open_trades}.")
+    paper_stop_rule(rules, "real trading disabled", not real_enabled, "STOP", real_detail)
+    stop_failures = [rule for rule in rules if not rule["pass"] and rule["severity"] == "STOP"]
+    warn_failures = [rule for rule in rules if not rule["pass"] and rule["severity"] == "WARN"]
+    if stop_failures:
+        status = "STOP_RECOMMENDED"
+        next_action = {"action": "DISABLE_PAPER_SIMULATION", "reason": f"{len(stop_failures)} stop-level paper rule(s) failed."}
+    elif warn_failures:
+        status = "WATCH"
+        next_action = {"action": "WATCH_PAPER_RUNTIME", "reason": f"{len(warn_failures)} warning-level paper rule(s) failed."}
+    else:
+        status = "OK"
+        next_action = {"action": "KEEP_MONITORING", "reason": "Paper stop rules are passing."}
+    return {"ok": True, "status": status, "rules": rules, "nextAction": next_action}
 
 
 def build_paper_readiness_report(args) -> dict:
