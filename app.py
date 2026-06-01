@@ -1248,6 +1248,14 @@ def paper_status():
         return jsonify({"error": f"Could not load paper status: {exc}"}), 502
 
 
+@app.get("/api/paper/readiness")
+def paper_readiness():
+    try:
+        return jsonify(build_paper_readiness_report(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper readiness report: {exc}"}), 502
+
+
 @app.get("/api/candidate/current")
 def current_candidate():
     try:
@@ -1313,6 +1321,12 @@ def enable_paper_candidate():
     try:
         payload = request.get_json(silent=True) or {}
         force = bool(payload.get("force"))
+        readiness = build_paper_readiness_report(request.args)
+        if not readiness.get("ready"):
+            return jsonify({
+                "error": "Paper readiness gate is not ready; paper simulation was not enabled.",
+                "readiness": readiness,
+            }), 400
         candidate = load_paper_candidate_config()
         validation = validate_candidate_config(candidate, candidate_validation_rules(request.args))
         if validation["status"] != "PASS" and not force:
@@ -4284,6 +4298,155 @@ def candidate_config_warnings(candidate: dict) -> list[str]:
     if safe_float(expected.get("profitFactor")) <= 0:
         warnings.append("Expected baseline profitFactor is missing.")
     return dedupe_list(warnings)
+
+
+def paper_readiness_check(checks: list[dict], name: str, passed: bool, severity: str, detail: str) -> None:
+    checks.append({
+        "name": name,
+        "pass": bool(passed),
+        "severity": severity,
+        "detail": detail,
+    })
+
+
+def paper_real_trading_enabled() -> tuple[bool, str]:
+    enabled_flags = [
+        "ZGUA_REAL_TRADING_ENABLED",
+        "ZGUA_LIVE_TRADING_ENABLED",
+        "REAL_TRADING_ENABLED",
+        "LIVE_TRADING_ENABLED",
+    ]
+    enabled = [key for key in enabled_flags if str(os.environ.get(key, "")).lower() in {"1", "true", "yes", "on"}]
+    if enabled:
+        return True, f"Real trading flag(s) enabled: {', '.join(enabled)}."
+    return False, "No real-trading mode or order-execution API path is enabled."
+
+
+def build_paper_readiness_report(args) -> dict:
+    checks = []
+    warnings = []
+    candidate_load_error = None
+    try:
+        candidate = load_paper_candidate_config()
+    except Exception as exc:
+        candidate = {}
+        candidate_load_error = str(exc)
+    active = candidate_symbols_by_mode(candidate, "active") if candidate else []
+    primary = active[0] if active else {}
+    symbol = primary.get("symbol")
+    timeframe = primary.get("interval") or primary.get("timeframe")
+    expected = expected_metrics_from_candidate(candidate) if candidate else {"source": None}
+    config_warnings = candidate_config_warnings(candidate) if candidate else []
+    learning_config = safe_learning_config(load_learning_config())
+
+    paper_readiness_check(checks, "paper candidate config loads", not candidate_load_error, "BLOCK", candidate_load_error or "Paper candidate config loaded.")
+    paper_readiness_check(checks, "current candidate exists", bool(candidate), "BLOCK", "Current paper candidate is available." if candidate else "No paper candidate config exists.")
+    paper_readiness_check(checks, "configWarnings empty", not config_warnings, "BLOCK", "No config warnings." if not config_warnings else "; ".join(config_warnings))
+    paper_readiness_check(checks, "paper simulation disabled", not bool(candidate.get("enabled")), "BLOCK", "Paper simulation is disabled." if not candidate.get("enabled") else "Paper simulation is already enabled.")
+    paper_readiness_check(checks, "strategy exists", bool(candidate.get("strategy")), "BLOCK", f"Strategy: {candidate.get('strategy') or '-'}")
+    paper_readiness_check(checks, "active symbol exists", bool(symbol), "BLOCK", f"Active symbol: {symbol or '-'}")
+    paper_readiness_check(checks, "active timeframe exists", bool(timeframe), "BLOCK", f"Active timeframe: {timeframe or '-'}")
+    paper_readiness_check(checks, "promotedFromOptimization exists", isinstance(candidate.get("promotedFromOptimization"), dict), "BLOCK", "Optimization baseline exists." if isinstance(candidate.get("promotedFromOptimization"), dict) else "Optimization baseline is missing.")
+    paper_readiness_check(checks, "promotedFromRanking exists", isinstance(candidate.get("promotedFromRanking"), dict), "BLOCK", "Ranking baseline exists." if isinstance(candidate.get("promotedFromRanking"), dict) else "Ranking baseline is missing.")
+    baseline_ok = bool(expected.get("source") and safe_float(expected.get("trades")) > 0 and safe_float(expected.get("profitFactor")) > 0)
+    paper_readiness_check(checks, "expected baseline metrics exist", baseline_ok, "BLOCK", f"Expected source {expected.get('source') or '-'}, trades {expected.get('trades', '-')}, PF {expected.get('profitFactor', '-')}.")
+
+    quality_status = None
+    if isinstance(candidate.get("promotedFromOptimization"), dict):
+        quality_status = candidate["promotedFromOptimization"].get("qualityStatus")
+    if quality_status is None:
+        quality_status = candidate.get("qualityStatus")
+    quality_ok = quality_status in (None, "PASS") or quality_status != "FAIL"
+    paper_readiness_check(checks, "qualityStatus is not FAIL", quality_ok, "BLOCK", f"qualityStatus: {quality_status or 'UNKNOWN'}.")
+
+    validation = validate_candidate_config(candidate, candidate_validation_rules(args)) if candidate else {"status": "FAIL", "rows": []}
+    paper_readiness_check(checks, "candidate validation status is PASS", validation.get("status") == "PASS", "BLOCK", f"Validation status: {validation.get('status', 'UNKNOWN')}.")
+
+    stability = build_candidate_stability_report({"compareCurrent": "true"})
+    stability_status = (stability.get("validation") or {}).get("status")
+    paper_readiness_check(checks, "candidate stability status is PASS", stability_status == "PASS", "BLOCK", f"Stability status: {stability_status or 'UNKNOWN'}.")
+
+    data_ready = False
+    data_detail = "No active market to check."
+    data_readiness = None
+    if symbol and timeframe:
+        period = args.get("period", "365d")
+        limit = args.get("limit", "auto")
+        data_readiness = research_data_readiness(candidate.get("source", "bybit"), [symbol], [timeframe], period, limit)
+        row = (data_readiness.get("rows") or [{}])[0]
+        data_ready = row.get("status") == "READY"
+        data_detail = f"{symbol} {timeframe} data readiness: {row.get('status', 'UNKNOWN')}. {row.get('recommendedAction') or ''}".strip()
+    paper_readiness_check(checks, "data readiness for active market is READY", data_ready, "BLOCK", data_detail)
+
+    max_risk_pct = safe_float(args.get("max_risk_pct", 0.01), 0.01)
+    risk_pct = safe_float(candidate.get("riskPct"), None)
+    paper_readiness_check(checks, "riskPct is present and conservative", risk_pct is not None and risk_pct <= max_risk_pct, "BLOCK", f"riskPct: {candidate.get('riskPct', '-')}; maximum allowed {max_risk_pct}.")
+    max_open_trades = safe_float(candidate.get("maxOpenTrades"), None)
+    paper_readiness_check(checks, "maxOpenTrades is present and conservative", max_open_trades is not None and max_open_trades <= 1, "BLOCK", f"maxOpenTrades: {candidate.get('maxOpenTrades', '-')}; maximum allowed 1.")
+    max_notional = safe_float(candidate.get("maxNotionalPerTrade"), None)
+    paper_readiness_check(checks, "maxNotionalPerTrade is present", max_notional is not None and max_notional > 0, "BLOCK", f"maxNotionalPerTrade: {candidate.get('maxNotionalPerTrade', '-')}.")
+    paper_readiness_check(checks, "source is bybit", candidate.get("source") == "bybit", "BLOCK", f"source: {candidate.get('source') or '-'}.")
+    paper_readiness_check(checks, "fillModel is next-open", candidate.get("fillModel") == "next-open", "BLOCK", f"fillModel: {candidate.get('fillModel') or '-'}.")
+
+    health_payload = build_candidate_health(candidate_health_rules(args))
+    health = health_payload.get("health") or {}
+    paper_metrics = health.get("paper") or {}
+    closed_trades = int(safe_float(paper_metrics.get("closedTrades")))
+    health_unknown_ok = health.get("status") != "UNKNOWN" or (not candidate.get("enabled") and closed_trades == 0)
+    health_detail = f"Health {health.get('status', 'UNKNOWN')}; closed paper trades {closed_trades}."
+    if health.get("status") == "UNKNOWN" and health_unknown_ok:
+        health_detail += " UNKNOWN is acceptable while paper is disabled and has 0 closed trades."
+    paper_readiness_check(checks, "paper health UNKNOWN is acceptable", health_unknown_ok, "BLOCK", health_detail)
+
+    paper_readiness_check(checks, "auto-promote disabled", not bool(learning_config.get("autoPromote")), "BLOCK", "autoPromote is disabled." if not learning_config.get("autoPromote") else "autoPromote is enabled.")
+    paper_readiness_check(checks, "auto-enable paper disabled", not bool(learning_config.get("autoEnablePaper")), "BLOCK", "autoEnablePaper is disabled.")
+    real_enabled, real_detail = paper_real_trading_enabled()
+    paper_readiness_check(checks, "no real-trading mode/API path enabled", not real_enabled, "BLOCK", real_detail)
+
+    blocking = [item for item in checks if not item["pass"] and item["severity"] == "BLOCK"]
+    warn_checks = [item for item in checks if not item["pass"] and item["severity"] == "WARN"]
+    warnings.extend(item["detail"] for item in warn_checks)
+    warnings.extend(item["detail"] for item in checks if item["pass"] and item["severity"] == "WARN")
+    ready = not blocking and not warn_checks
+    status = "READY_FOR_PAPER_REVIEW" if ready else "BLOCKED" if blocking else "WATCH"
+    if ready:
+        next_action = {
+            "action": "REVIEW_ENABLE_PAPER_SIMULATION",
+            "reason": "All blockers passed. This only means paper simulation may be reviewed; it does not enable paper automatically.",
+        }
+    elif blocking:
+        next_action = {
+            "action": "FIX_BLOCKING_PAPER_READINESS_CHECKS",
+            "reason": f"{len(blocking)} blocking paper-readiness check(s) failed.",
+        }
+    else:
+        next_action = {
+            "action": "WATCH_PAPER_READINESS_WARNINGS",
+            "reason": "Only warning-level readiness issues remain; paper enablement still requires manual review.",
+        }
+    return {
+        "ok": True,
+        "ready": ready,
+        "status": status,
+        "candidate": candidate_summary(candidate),
+        "checks": checks,
+        "summary": {
+            "blockingIssues": len(blocking),
+            "warnings": len(warn_checks),
+            "paperEnabled": bool(candidate.get("enabled", False)),
+            "realTradingEnabled": real_enabled,
+            "closedPaperTrades": closed_trades,
+            "validationStatus": validation.get("status"),
+            "stabilityStatus": stability_status,
+            "dataReadinessStatus": ((data_readiness or {}).get("rows") or [{}])[0].get("status") if data_readiness else None,
+        },
+        "nextAction": next_action,
+        "warnings": dedupe_list(warnings),
+        "validation": validation,
+        "stability": stability.get("validation"),
+        "dataReadiness": data_readiness,
+        "candidateHealth": health,
+    }
 
 
 def normalize_promoted_candidate_config(candidate: dict) -> dict:

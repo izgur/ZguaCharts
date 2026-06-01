@@ -2678,6 +2678,7 @@ function setupLearningControls() {
   document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
+  document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
@@ -3109,6 +3110,53 @@ function renderCandidateStability(payload) {
     </table>
     ${(validation.robustnessFlags || []).length ? `<p class="modal-note"><strong>Flags:</strong> ${validation.robustnessFlags.map(escapeHtml).join(", ")}</p>` : ""}
     ${(validation.warnings || []).length ? `<ul class="backtest-warnings">${validation.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function loadPaperReadiness() {
+  const host = document.querySelector("#paper-readiness-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Checking paper readiness...</p>`;
+    const payload = await apiGet("/api/paper/readiness");
+    host.innerHTML = renderPaperReadiness(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper readiness could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperReadiness(payload) {
+  const candidate = payload.candidate || {};
+  const summary = payload.summary || {};
+  const next = payload.nextAction || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const tone = payload.status === "READY_FOR_PAPER_REVIEW" ? "positive" : payload.status === "BLOCKED" ? "negative" : "neutral";
+  const rows = (payload.checks || []).map((check) => `
+    <tr>
+      <td>${escapeHtml(check.name || "-")}</td>
+      <td class="${check.pass ? "positive" : check.severity === "BLOCK" ? "negative" : "neutral"}">${check.pass ? "yes" : "no"}</td>
+      <td>${escapeHtml(check.severity || "-")}</td>
+      <td>${escapeHtml(check.detail || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Paper Readiness <span class="${tone}">${escapeHtml(payload.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Ready</span><strong>${payload.ready ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Blocking</span><strong>${summary.blockingIssues ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${summary.warnings ?? 0}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${summary.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${summary.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Validation</span><strong>${escapeHtml(summary.validationStatus || "-")}</strong></div>
+      <div class="metric"><span>Stability</span><strong>${escapeHtml(summary.stabilityStatus || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Check</th><th>Pass</th><th>Severity</th><th>Detail</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4">No readiness checks returned.</td></tr>`}</tbody>
+    </table>
+    ${(payload.warnings || []).length ? `<ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
   `;
 }
 
