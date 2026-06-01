@@ -1298,11 +1298,8 @@ def candidate_stability():
 def promote_candidate_preview():
     try:
         payload = request.get_json(silent=True) or {}
-        candidate = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
-        promotion_payload = payload if payload.get("symbol") else promotion_payload_from_candidate(candidate or latest_learning_recommendation_candidate(latest_learning_report()))
-        if not promotion_payload:
-            return jsonify({"error": "No candidate is available for promotion preview."}), 404
-        preview = build_candidate_promotion_preview(promotion_payload, dry_run=True)
+        force = bool(payload.get("force")) or request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
+        preview = build_candidate_promotion_plan(payload, dry_run=True, force=force)
         if not preview.get("ok"):
             return jsonify(preview), 400
         return jsonify(public_promotion_preview(preview))
@@ -1371,10 +1368,8 @@ def promote_candidate():
     try:
         payload = request.get_json(force=True) or {}
         dry_run = request.args.get("dryRun", "false").lower() in {"1", "true", "yes", "on"}
-        if dry_run and not payload.get("symbol"):
-            payload = promotion_payload_from_candidate(latest_learning_recommendation_candidate(latest_learning_report())) or payload
         force = bool(payload.get("force")) or request.args.get("force", "false").lower() in {"1", "true", "yes", "on"}
-        preview = build_candidate_promotion_preview(payload, dry_run=dry_run, force=force)
+        preview = build_candidate_promotion_plan(payload, dry_run=dry_run, force=force)
         if not preview.get("ok"):
             return jsonify(preview), 400
         if dry_run:
@@ -1387,10 +1382,15 @@ def promote_candidate():
 
         return jsonify({
             "ok": True,
+            "promoted": True,
             "message": "Candidate promoted. Paper simulation remains disabled until explicitly enabled.",
             "backupPath": str(backup_path.relative_to(app.root_path)),
+            "writtenPath": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
+            "paperRemainsDisabled": not bool(updated.get("enabled")),
+            "candidateConfig": updated,
             "candidate": candidate_summary(updated),
             "changedFields": preview.get("changedFields", []),
+            "expectedBaselineMetrics": preview.get("expectedBaselineMetrics", {}),
             "warnings": preview.get("warnings", []),
         })
     except Exception as exc:
@@ -2510,6 +2510,140 @@ def promotion_payload_from_candidate(candidate: dict | None) -> dict | None:
     }
 
 
+def candidate_matches_promotion_selectors(candidate: dict | None, selectors: dict) -> bool:
+    if not candidate:
+        return False
+    expected_symbol = str(selectors.get("symbol") or "").strip()
+    expected_timeframe = str(selectors.get("timeframe") or selectors.get("interval") or "").strip()
+    expected_strategy = str(selectors.get("strategy") or selectors.get("preset") or "").strip()
+    expected_source = str(selectors.get("source") or "").strip()
+    candidate_symbol = str(candidate_primary_symbol(candidate) or "").strip()
+    candidate_timeframe = str(candidate_primary_timeframe(candidate) or "").strip()
+    candidate_strategy = str(candidate.get("strategy") or candidate.get("preset") or "").strip()
+    candidate_source = str(candidate.get("source") or "bybit").strip()
+    checks = [
+        (expected_symbol, candidate_symbol),
+        (expected_timeframe, candidate_timeframe),
+        (expected_strategy, candidate_strategy),
+        (expected_source, candidate_source),
+    ]
+    return all(not expected or expected == actual for expected, actual in checks)
+
+
+def saved_promotion_candidates() -> list[dict]:
+    candidates = []
+    latest_candidate = latest_learning_recommendation_candidate(latest_learning_report())
+    if latest_candidate:
+        candidates.append(latest_candidate)
+    best = best_saved_candidate(load_research_runs())
+    if best:
+        candidates.append(best)
+    for run in reversed(load_research_runs()):
+        for candidate in ([run.get("bestCandidate")] + run.get("rows", []) + run.get("topCandidates", [])):
+            if not isinstance(candidate, dict):
+                continue
+            item = dict(candidate)
+            item.setdefault("researchRunId", run.get("id"))
+            item.setdefault("researchRunType", run.get("type"))
+            item.setdefault("createdAt", run.get("createdAt"))
+            candidates.append(item)
+    deduped = []
+    seen = set()
+    for candidate in candidates:
+        key = (
+            normalized_candidate_key(candidate),
+            candidate.get("researchRunId"),
+            candidate.get("rank"),
+            candidate.get("score"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def resolve_promotion_candidate(payload: dict) -> dict | None:
+    payload = payload or {}
+    embedded = payload.get("candidate") if isinstance(payload.get("candidate"), dict) else None
+    selectors_present = any(payload.get(key) for key in ("symbol", "timeframe", "interval", "strategy", "preset", "source"))
+    for candidate in saved_promotion_candidates():
+        if selectors_present:
+            if candidate_matches_promotion_selectors(candidate, payload):
+                return candidate
+        elif candidate:
+            return candidate
+    if embedded and (not selectors_present or candidate_matches_promotion_selectors(embedded, payload)):
+        return embedded
+    if payload.get("rankingSnapshot") and payload.get("params"):
+        return payload
+    return None
+
+
+def promotion_safety_gate(candidate: dict | None, force: bool) -> tuple[bool, list[str], dict]:
+    if not candidate:
+        return False, ["No saved recommendation candidate is available for promotion."], {}
+    details = {
+        "candidateQualityStatus": candidate.get("qualityStatus"),
+    }
+    if candidate.get("qualityStatus") == "FAIL":
+        return False, ["Candidate qualityStatus is FAIL."], details
+    if candidate_has_robustness_blockers(candidate) and not force:
+        details["robustnessWarnings"] = candidate_robustness_warnings(candidate)
+        return False, ["Candidate has robustness blockers."], details
+    stability = build_candidate_stability_report({"compareCurrent": "true"})
+    stability_validation = stability.get("validation") or {}
+    stability_status = stability_validation.get("status")
+    details["candidateStability"] = {
+        "status": stability_status,
+        "nextAction": stability.get("nextAction"),
+        "summary": stability_validation.get("summary"),
+        "robustnessFlags": stability_validation.get("robustnessFlags", []),
+    }
+    if stability_status != "PASS":
+        return False, [f"Candidate stability is {stability_status or 'UNKNOWN'}, not PASS."], details
+    evidence = build_learning_evidence(include_stability=False)
+    repeatability = evidence.get("repeatability") or {}
+    readiness = repeatability.get("readiness") or {}
+    next_action = evidence.get("nextAction") or {}
+    details["learningEvidence"] = {
+        "readiness": readiness,
+        "nextAction": next_action,
+    }
+    if readiness.get("status") != "READY_FOR_CONFIG_REVIEW" and next_action.get("action") != "REVIEW_CONFIG_ONLY_PROMOTION":
+        return False, [f"Learning evidence is {readiness.get('status') or 'UNKNOWN'} with nextAction {next_action.get('action') or 'UNKNOWN'}."], details
+    return True, [], details
+
+
+def build_candidate_promotion_plan(payload: dict, dry_run: bool = True, force: bool = False) -> dict:
+    candidate = resolve_promotion_candidate(payload)
+    if not candidate:
+        return {"ok": False, "error": "No saved recommendation candidate is available for promotion."}
+    allowed, blocked_reasons, gate_details = promotion_safety_gate(candidate, force)
+    if not allowed:
+        return {
+            "ok": False,
+            "error": "Candidate promotion is blocked by safety gates.",
+            "blockedReasons": blocked_reasons,
+            "safetyGates": gate_details,
+            "candidate": compact_candidate(candidate),
+        }
+    promotion_payload = promotion_payload_from_candidate(candidate)
+    if not promotion_payload:
+        return {"ok": False, "error": "No candidate is available for promotion preview."}
+    preview = build_candidate_promotion_preview(promotion_payload, dry_run=dry_run, force=force, candidate=candidate)
+    preview["selectedCandidate"] = compact_candidate(candidate)
+    preview["safetyGates"] = gate_details
+    if not preview.get("paperRemainsDisabled"):
+        return {
+            "ok": False,
+            "error": "Promotion would enable paper; blocked.",
+            "safetyGates": gate_details,
+            "candidate": compact_candidate(candidate),
+        }
+    return preview
+
+
 def promotion_quality_status(payload: dict, ranking_snapshot: dict) -> str | None:
     for source in (payload, ranking_snapshot, payload.get("optimizationSnapshot") or {}):
         if isinstance(source, dict) and source.get("qualityStatus"):
@@ -2543,7 +2677,7 @@ def public_promotion_preview(preview: dict) -> dict:
     return public
 
 
-def build_candidate_promotion_preview(payload: dict, dry_run: bool = True, force: bool = False) -> dict:
+def build_candidate_promotion_preview(payload: dict, dry_run: bool = True, force: bool = False, candidate: dict | None = None) -> dict:
     payload = payload or {}
     ranking_snapshot = payload.get("rankingSnapshot") or {}
     min_trades = int(payload.get("minTrades") or ranking_snapshot.get("minTrades") or 10)
@@ -2557,7 +2691,7 @@ def build_candidate_promotion_preview(payload: dict, dry_run: bool = True, force
     promoted_symbol = str(payload.get("symbol") or "").strip()
     promoted_interval = str(payload.get("timeframe") or payload.get("interval") or "").strip()
     updated = merge_promoted_candidate(current, payload, ranking_snapshot, promoted_symbol, promoted_interval)
-    warnings = promotion_warnings(current, updated, payload)
+    warnings = promotion_warnings(current, updated, payload, candidate)
     if updated.get("enabled"):
         return {"ok": False, "error": "Promotion preview would enable paper; blocked.", "warnings": warnings}
     preview = {
