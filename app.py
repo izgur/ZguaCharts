@@ -1288,6 +1288,34 @@ def paper_init_instructions():
     })
 
 
+@app.get("/api/paper/tick-instructions")
+def paper_tick_instructions():
+    try:
+        candidate = load_paper_candidate_config()
+        real_enabled, _ = paper_real_trading_enabled()
+        return jsonify({
+            "ok": True,
+            "commands": [package_script_command("paper:tick")],
+            "notes": [
+                "Run this to process one paper tick.",
+                "This is simulated only and cannot place real trades.",
+            ],
+            "paperEnabled": bool(candidate.get("enabled", False)),
+            "realTradingEnabled": real_enabled,
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper tick instructions: {exc}"}), 502
+
+
+@app.post("/api/paper/tick-once")
+def paper_tick_once():
+    try:
+        result, status_code = run_paper_tick_once(request.args)
+        return jsonify(result), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not run paper tick: {exc}"}), 502
+
+
 @app.get("/api/paper/stop-rules")
 def paper_stop_rules():
     try:
@@ -4346,6 +4374,23 @@ def paper_real_trading_enabled() -> tuple[bool, str]:
     return False, "No real-trading mode or order-execution API path is enabled."
 
 
+def package_script_command(script_name: str) -> str:
+    package = read_json_file(os.path.join(app.root_path, "package.json"), {})
+    scripts = package.get("scripts") if isinstance(package.get("scripts"), dict) else {}
+    if script_name not in scripts:
+        raise ValueError(f"package.json script {script_name} is missing.")
+    return f"npm run {script_name}"
+
+
+def package_node_script_args(script_name: str) -> list[str]:
+    package = read_json_file(os.path.join(app.root_path, "package.json"), {})
+    script = ((package.get("scripts") or {}).get(script_name) or "").strip()
+    parts = script.split()
+    if len(parts) < 2 or parts[0] != "node":
+        raise ValueError(f"package.json script {script_name} is not a direct node command.")
+    return [node_executable()] + parts[1:]
+
+
 def paper_market_key(market: dict) -> str:
     symbol = market.get("symbol")
     interval = market.get("interval") or market.get("timeframe")
@@ -4465,6 +4510,15 @@ def build_paper_runtime_status(args) -> dict:
     last_event = latest_journal_event(journal)
     last_signal = latest_journal_event(journal, {"SIGNAL", "ENTRY", "EXIT", "SKIP"})
     last_tick_at = state.get("updatedAt")
+    primary_market_key = required_markets[0] if required_markets else None
+    primary_freshness = ((state.get("freshness") or {}).get(primary_market_key) or {}) if primary_market_key else {}
+    primary_last_processed = last_processed.get(primary_market_key) if primary_market_key else None
+    primary_latest_candle = primary_freshness.get("latestCandleTime")
+    active_market_processed = bool(primary_market_key and primary_last_processed and primary_latest_candle and primary_last_processed >= primary_latest_candle)
+    no_new_candle_available = bool(active_market_processed and primary_latest_candle)
+    max_tick_age = int(safe_float(args.get("max_tick_age_seconds", 21600), 21600))
+    last_tick_age = seconds_since(last_tick_at)
+    tick_stale = bool(paper_enabled and (last_tick_age is None or last_tick_age > max_tick_age))
     health_reasons = []
     if paper_enabled and not initialized:
         health_status = "BLOCKED"
@@ -4477,6 +4531,9 @@ def build_paper_runtime_status(args) -> dict:
         if not initialized:
             health_status = "WATCH"
             health_reasons.append("Paper runtime state needs initialization before paper simulation can be enabled.")
+        if tick_stale:
+            health_status = "WATCH" if health_status == "OK" else health_status
+            health_reasons.append(f"Paper simulation is enabled but the last tick is stale ({last_tick_age} seconds old; watch threshold {max_tick_age}).")
         if warning_buckets["recentWarnings"]:
             health_status = "WATCH" if health_status == "OK" else health_status
             health_reasons.append(f"{len(warning_buckets['recentWarnings'])} current runtime warning(s) are present.")
@@ -4522,10 +4579,17 @@ def build_paper_runtime_status(args) -> dict:
         },
         "lastTick": {
             "updatedAt": last_tick_at,
-            "ageSeconds": seconds_since(last_tick_at),
+            "ageSeconds": last_tick_age,
             "processedCandles": state.get("processedCandles", 0),
             "openPositions": len(state.get("openPositions", []) or []),
             "closedTrades": len(state.get("closedTrades", []) or []),
+            "activeMarket": primary_market_key,
+            "activeMarketLastProcessedCandleTime": primary_last_processed,
+            "activeMarketLatestCandleTime": primary_latest_candle,
+            "processedCurrentActiveMarket": active_market_processed,
+            "noNewCandleAvailable": no_new_candle_available,
+            "stale": tick_stale,
+            "staleThresholdSeconds": max_tick_age,
         },
         "lastSignal": last_signal,
         "journal": {
@@ -4617,6 +4681,118 @@ def build_paper_stop_rules(args) -> dict:
         status = "OK"
         next_action = {"action": "KEEP_MONITORING", "reason": "Paper stop rules are passing."}
     return {"ok": True, "status": status, "rules": rules, "nextAction": next_action}
+
+
+def paper_state_snapshot() -> dict:
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    open_positions = state.get("openPositions", []) or []
+    closed_trades = state.get("closedTrades", []) or []
+    return {
+        "updatedAt": state.get("updatedAt"),
+        "processedCandles": int(safe_float(state.get("processedCandles"))),
+        "openPositions": open_positions,
+        "closedTrades": closed_trades,
+        "openPositionIds": {str(item.get("id") or item.get("key") or idx) for idx, item in enumerate(open_positions)},
+        "closedTradeIds": {str(item.get("id") or idx) for idx, item in enumerate(closed_trades)},
+    }
+
+
+def paper_new_items(after_items: list[dict], before_ids: set[str], fallback_prefix: str) -> list[dict]:
+    new_items = []
+    for idx, item in enumerate(after_items):
+        item_id = str(item.get("id") or item.get("key") or f"{fallback_prefix}:{idx}")
+        if item_id not in before_ids:
+            new_items.append(item)
+    return new_items
+
+
+def run_paper_tick_once(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    real_enabled, real_detail = paper_real_trading_enabled()
+    if real_enabled:
+        return {"ok": False, "error": real_detail, "realTradingEnabled": True}, 400
+    if not bool(candidate.get("enabled", False)):
+        return {
+            "ok": False,
+            "error": "Paper simulation must be enabled manually before running one paper tick.",
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+        }, 400
+    readiness = build_paper_readiness_report(args)
+    if readiness.get("summary", {}).get("blockingIssues", 0):
+        return {
+            "ok": False,
+            "error": "Paper readiness has blocking issues; paper tick was not run.",
+            "readiness": readiness,
+        }, 400
+    before_runtime = build_paper_runtime_status(args)
+    if not before_runtime.get("initialized"):
+        return {
+            "ok": False,
+            "error": "Paper runtime is not initialized; run npm run paper:init before ticking.",
+            "runtimeStatus": before_runtime,
+        }, 400
+    before_state = paper_state_snapshot()
+    journal_path = os.path.join(app.root_path, "reports", "paper-journal.jsonl")
+    before_events = read_jsonl_tail(journal_path, 500)
+    before_event_ids = {str(event.get("eventId")) for event in before_events if event.get("eventId")}
+    completed = subprocess.run(
+        package_node_script_args("paper:tick"),
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
+    )
+    after_runtime = build_paper_runtime_status(args)
+    after_state = paper_state_snapshot()
+    after_events = read_jsonl_tail(journal_path, 500)
+    new_events = [
+        event for event in after_events
+        if event.get("eventId") and str(event.get("eventId")) not in before_event_ids
+    ]
+    stdout_payload = None
+    if completed.stdout.strip():
+        try:
+            stdout_payload = json.loads(completed.stdout)
+        except Exception:
+            stdout_payload = {"raw": completed.stdout.strip()}
+    warnings = []
+    processed_delta = after_state["processedCandles"] - before_state["processedCandles"]
+    if processed_delta <= 0 and not new_events:
+        warnings.append("No new candle or journal event was processed by this tick.")
+    if after_runtime.get("lastTick", {}).get("noNewCandleAvailable"):
+        warnings.append("Runtime status indicates no newer closed candle is available for the active market.")
+    payload = {
+        "ok": completed.returncode == 0,
+        "command": package_script_command("paper:tick"),
+        "ranCommand": " ".join(package_node_script_args("paper:tick")),
+        "returnCode": completed.returncode,
+        "paperEnabled": bool(load_paper_candidate_config().get("enabled", False)),
+        "realTradingEnabled": real_enabled,
+        "before": before_runtime,
+        "after": after_runtime,
+        "tickResult": stdout_payload,
+        "summary": {
+            "processedCandlesBefore": before_state["processedCandles"],
+            "processedCandlesAfter": after_state["processedCandles"],
+            "processedCandlesDelta": processed_delta,
+            "newJournalEvents": len(new_events),
+            "newSignals": len([event for event in new_events if str(event.get("eventType", "")).upper() in {"SIGNAL", "ENTRY", "EXIT", "SKIP"}]),
+            "openPositionsBefore": len(before_state["openPositions"]),
+            "openPositionsAfter": len(after_state["openPositions"]),
+            "closedTradesBefore": len(before_state["closedTrades"]),
+            "closedTradesAfter": len(after_state["closedTrades"]),
+        },
+        "newJournalEvents": new_events,
+        "newSignals": [event for event in new_events if str(event.get("eventType", "")).upper() in {"SIGNAL", "ENTRY", "EXIT", "SKIP"}],
+        "newOpenPositions": paper_new_items(after_state["openPositions"], before_state["openPositionIds"], "open"),
+        "newClosedTrades": paper_new_items(after_state["closedTrades"], before_state["closedTradeIds"], "closed"),
+        "warnings": dedupe_list(warnings),
+    }
+    if completed.returncode != 0:
+        payload["error"] = completed.stderr.strip() or "Paper tick command failed."
+        return payload, 502
+    return payload, 200
 
 
 def build_paper_readiness_report(args) -> dict:

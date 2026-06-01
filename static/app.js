@@ -409,10 +409,11 @@ function renderPaperStatus(payload) {
   const candidate = payload.candidate || {};
   const activeSymbols = candidate.activeSymbols || [];
   const watchSymbols = candidate.watchSymbols || [];
+  const paperEnabled = Boolean(payload.paperEnabled ?? candidate.enabled);
   return `
     <div class="paper-warning">Simulated only. No real order execution, no exchange account connection, no API keys.</div>
     <div class="metric-grid">
-      <div class="metric"><span>Enabled</span><strong>${candidate.enabled ? "Yes" : "No"}</strong></div>
+      <div class="metric"><span>Enabled</span><strong>${paperEnabled ? "Yes" : "No"}</strong></div>
       <div class="metric"><span>Equity</span><strong>${formatPrice(Number(payload.equity || 0))}</strong></div>
       <div class="metric"><span>Realized PnL</span><strong class="${payload.realizedPnL >= 0 ? "positive" : "negative"}">${formatSigned(payload.realizedPnL)}</strong></div>
       <div class="metric"><span>Unrealized PnL</span><strong class="${payload.unrealizedPnL >= 0 ? "positive" : "negative"}">${formatSigned(payload.unrealizedPnL)}</strong></div>
@@ -508,12 +509,14 @@ async function handlePaperAction(action) {
       const payload = await apiPost("/api/paper/enable", {});
       if (resultEl) resultEl.innerHTML = renderPaperControlResult(payload, "Paper simulation enabled.");
       await openPaperPanel();
+      await refreshPaperLearningPanels();
       return;
     }
     if (action === "disable") {
       const payload = await apiPost("/api/paper/disable", {});
       if (resultEl) resultEl.innerHTML = renderPaperControlResult(payload, "Paper simulation disabled.");
       await openPaperPanel();
+      await refreshPaperLearningPanels();
     }
   } catch (error) {
     const targetEl = action === "health" || action === "replacement"
@@ -521,6 +524,14 @@ async function handlePaperAction(action) {
       : resultEl;
     if (targetEl) targetEl.innerHTML = `<p class="pane-status">Paper action failed: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function refreshPaperLearningPanels() {
+  await Promise.all([
+    loadPaperReadiness(),
+    loadPaperSimulationControl(),
+    loadPaperRuntimeMonitor(),
+  ]);
 }
 
 function renderCandidateValidation(validation) {
@@ -3245,8 +3256,8 @@ async function enablePaperSimulation() {
     host.innerHTML = `<p class="pane-status">Enabling paper simulation...</p>`;
     const payload = await apiPost("/api/paper/enable", {});
     host.innerHTML = renderPaperControlResult(payload, "Paper simulation enabled.");
-    await loadPaperReadiness();
-    await loadPaperRuntimeMonitor();
+    await refreshPaperLearningPanels();
+    if (paperPanel && !paperPanel.hidden) await openPaperPanel();
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Paper enable failed: ${escapeHtml(error.message)}</p>`;
   }
@@ -3259,8 +3270,8 @@ async function disablePaperSimulation() {
     host.innerHTML = `<p class="pane-status">Disabling paper simulation...</p>`;
     const payload = await apiPost("/api/paper/disable", {});
     host.innerHTML = renderPaperControlResult(payload, "Paper simulation disabled.");
-    await loadPaperReadiness();
-    await loadPaperRuntimeMonitor();
+    await refreshPaperLearningPanels();
+    if (paperPanel && !paperPanel.hidden) await openPaperPanel();
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Paper disable failed: ${escapeHtml(error.message)}</p>`;
   }
