@@ -1220,6 +1220,7 @@ def paper_status():
         readiness = build_paper_readiness_report(request.args)
         runtime = build_paper_runtime_status(request.args)
         stop_rules = build_paper_stop_rules(request.args)
+        session_summary = build_paper_session_summary(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
@@ -1251,6 +1252,16 @@ def paper_status():
                 "failed": len([rule for rule in stop_rules.get("rules", []) if not rule.get("pass")]),
                 "nextAction": stop_rules.get("nextAction"),
             },
+            "sessionSummary": {
+                "status": session_summary.get("session", {}).get("status"),
+                "ticks": session_summary.get("activity", {}).get("ticks"),
+                "signals": session_summary.get("activity", {}).get("signals"),
+                "openPositions": session_summary.get("activity", {}).get("openPositions"),
+                "closedTrades": session_summary.get("activity", {}).get("closedTrades"),
+                "returnPct": session_summary.get("performance", {}).get("returnPct"),
+                "baselineComparisonStatus": session_summary.get("baselineComparison", {}).get("status"),
+                "nextAction": session_summary.get("nextAction"),
+            },
             "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
             "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
             "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
@@ -1274,6 +1285,22 @@ def paper_runtime_status():
         return jsonify(build_paper_runtime_status(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper runtime status: {exc}"}), 502
+
+
+@app.get("/api/paper/session-summary")
+def paper_session_summary():
+    try:
+        return jsonify(build_paper_session_summary(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper session summary: {exc}"}), 502
+
+
+@app.get("/api/paper/recent-events")
+def paper_recent_events():
+    try:
+        return jsonify(build_paper_recent_events(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not load paper recent events: {exc}"}), 502
 
 
 @app.get("/api/paper/init-instructions")
@@ -4469,6 +4496,230 @@ def latest_journal_event(journal: list[dict], types: set[str] | None = None) -> 
     return None
 
 
+def paper_session_window(candidate: dict) -> dict:
+    enabled_at = candidate.get("enabledAt")
+    disabled_at = candidate.get("disabledAt")
+    enabled_dt = parse_iso_timestamp(enabled_at)
+    disabled_dt = parse_iso_timestamp(disabled_at)
+    if disabled_dt and enabled_dt and disabled_dt < enabled_dt:
+        disabled_at = None
+        disabled_dt = None
+    if not enabled_dt:
+        return {
+            "sessionId": "no-paper-session",
+            "startedAt": None,
+            "endedAt": None,
+            "started": None,
+            "ended": None,
+        }
+    end_value = disabled_at if disabled_dt and not candidate.get("enabled") else None
+    session_key = f"{candidate.get('strategy', 'paper')}|{enabled_at}|{end_value or 'running'}"
+    return {
+        "sessionId": str(uuid.uuid5(uuid.NAMESPACE_URL, session_key)),
+        "startedAt": enabled_at,
+        "endedAt": end_value,
+        "started": enabled_dt,
+        "ended": disabled_dt if end_value else None,
+    }
+
+
+def event_in_session(event: dict, session: dict) -> bool:
+    started = session.get("started")
+    if not started:
+        return False
+    timestamp = parse_iso_timestamp(event_timestamp(event))
+    if not timestamp:
+        return False
+    ended = session.get("ended")
+    return timestamp >= started and (not ended or timestamp <= ended)
+
+
+def normalized_paper_event(event: dict, session: dict, initialized_markets: set[str] | None = None) -> dict:
+    timestamp = event_timestamp(event)
+    current_session = event_in_session(event, session)
+    market_key = event.get("marketKey") or paper_market_key(event)
+    reason = event.get("reason") or event.get("message") or ""
+    event_dt = parse_iso_timestamp(timestamp)
+    older_than_session = bool(session.get("started") and event_dt and event_dt < session["started"])
+    stale_init_warning = bool(initialized_markets and "Market not initialized" in str(reason) and market_key in initialized_markets)
+    return {
+        "timestamp": timestamp,
+        "eventType": event.get("eventType"),
+        "symbol": event.get("symbol"),
+        "interval": event.get("interval") or event.get("timeframe"),
+        "marketKey": market_key,
+        "reason": reason,
+        "message": reason,
+        "action": event.get("eventType"),
+        "signalPrice": event.get("signalPrice"),
+        "fillPrice": event.get("fillPrice"),
+        "netPnl": event.get("netPnl"),
+        "stale": bool(older_than_session or stale_init_warning),
+        "currentSession": current_session,
+    }
+
+
+def session_filtered_equity_curve(state: dict, session: dict) -> list[dict]:
+    started = session.get("started")
+    ended = session.get("ended")
+    if not started:
+        return state.get("equityCurve", []) or []
+    start_epoch = int(started.timestamp())
+    end_epoch = int(ended.timestamp()) if ended else None
+    return [
+        point for point in (state.get("equityCurve", []) or [])
+        if safe_float(point.get("time")) >= start_epoch and (end_epoch is None or safe_float(point.get("time")) <= end_epoch)
+    ]
+
+
+def paper_tick_bucket(timestamp: str | None) -> str | None:
+    parsed = parse_iso_timestamp(timestamp)
+    if not parsed:
+        return None
+    return parsed.replace(microsecond=0).isoformat()
+
+
+def build_paper_baseline_comparison(candidate: dict, state: dict, session_events: list[dict]) -> dict:
+    expected = expected_metrics_from_candidate(candidate)
+    paper_entries = [event for event in session_events if str(event.get("eventType", "")).upper() == "ENTRY"]
+    paper_exits = [event for event in session_events if str(event.get("eventType", "")).upper() == "EXIT"]
+    account_equity = safe_float(candidate.get("accountEquity", state.get("accountEquity", 10000)), 10000)
+    equity = safe_float(state.get("accountEquity", account_equity), account_equity)
+    paper_return = round(((equity - account_equity) / account_equity * 100) if account_equity else 0, 4)
+    available = bool(expected.get("source"))
+    expected_trades = int(safe_float(expected.get("trades")))
+    paper_trades = len(paper_exits)
+    if not available:
+        status = "TOO_EARLY"
+    elif paper_trades < max(3, min(10, expected_trades // 5 if expected_trades else 3)):
+        status = "TOO_EARLY"
+    elif paper_return < safe_float(expected.get("totalReturnPct")) * 0.25:
+        status = "UNDERPERFORMING"
+    elif paper_return < safe_float(expected.get("totalReturnPct")) * 0.75:
+        status = "WATCH"
+    else:
+        status = "OK"
+    return {
+        "available": available,
+        "expectedProfitFactor": expected.get("profitFactor"),
+        "expectedTrades": expected_trades,
+        "expectedReturnPct": expected.get("totalReturnPct"),
+        "paperTrades": paper_trades,
+        "paperReturnPct": paper_return,
+        "status": status,
+    }
+
+
+def paper_session_observation_status(paper_enabled: bool, real_enabled: bool, runtime: dict, stop_rules: dict, session_events: list[dict], session: dict) -> tuple[str, dict]:
+    if real_enabled:
+        return "STOP_RECOMMENDED", {"action": "DISABLE_REAL_TRADING_FLAG", "reason": "A real-trading flag is enabled; paper observation is blocked until it is disabled."}
+    if not paper_enabled:
+        return "DISABLED", {"action": "REVIEW_ENABLE_PAPER_SIMULATION", "reason": "Paper simulation is disabled. Enable manually only after readiness review."}
+    if stop_rules.get("status") == "STOP_RECOMMENDED":
+        return "STOP_RECOMMENDED", stop_rules.get("nextAction") or {"action": "REVIEW_STOP_RULES", "reason": "One or more stop rules recommend stopping paper simulation."}
+    last_tick = runtime.get("lastTick") or {}
+    updated_at = parse_iso_timestamp(last_tick.get("updatedAt"))
+    if not session_events and (not updated_at or (session.get("started") and updated_at < session["started"])):
+        return "WATCH_WAITING_FOR_FIRST_TICK", {"action": "RUN_ONE_PAPER_TICK", "reason": "Paper is enabled but no tick has been observed for this session."}
+    if last_tick.get("stale"):
+        return "WATCH_TICK_STALE", {"action": "RUN_ONE_PAPER_TICK", "reason": "Paper is enabled but the latest tick is stale."}
+    return "RUNNING", {"action": "MONITOR_PAPER_SESSION", "reason": "Paper session has recent tick activity. Continue observing without enabling real trading."}
+
+
+def build_paper_session_summary(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 1000)
+    runtime = build_paper_runtime_status(args)
+    stop_rules = build_paper_stop_rules(args)
+    real_enabled, _ = paper_real_trading_enabled()
+    paper_enabled = bool(candidate.get("enabled", False))
+    session = paper_session_window(candidate)
+    session_events = [event for event in journal if event_in_session(event, session)]
+    event_types = [str(event.get("eventType", "")).upper() for event in session_events]
+    tick_times = {
+        paper_tick_bucket(event_timestamp(event))
+        for event in session_events
+        if paper_tick_bucket(event_timestamp(event))
+    }
+    state_updated_at = parse_iso_timestamp(state.get("updatedAt"))
+    if state_updated_at and session.get("started") and state_updated_at >= session["started"] and (not session.get("ended") or state_updated_at <= session["ended"]):
+        bucket = paper_tick_bucket(state.get("updatedAt"))
+        if bucket:
+            tick_times.add(bucket)
+    ticks = len(tick_times)
+    status, next_action = paper_session_observation_status(paper_enabled, real_enabled, runtime, stop_rules, session_events, session)
+    now = datetime.now(timezone.utc)
+    started = session.get("started")
+    ended = session.get("ended") or (None if not started else now)
+    duration = int((ended - started).total_seconds()) if started and ended else 0
+    account_equity = safe_float(candidate.get("accountEquity", state.get("accountEquity", 10000)), 10000)
+    equity = safe_float(state.get("accountEquity", account_equity), account_equity)
+    equity_curve = session_filtered_equity_curve(state, session)
+    warnings = [
+        event.get("reason") or event.get("message")
+        for event in session_events
+        if str(event.get("eventType", "")).upper() == "WARNING"
+    ]
+    baseline = build_paper_baseline_comparison(candidate, state, session_events)
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "session": {
+            "sessionId": session["sessionId"],
+            "startedAt": session["startedAt"],
+            "endedAt": session["endedAt"],
+            "durationSeconds": duration,
+            "status": status,
+        },
+        "activity": {
+            "ticks": ticks,
+            "processedCandles": int(safe_float(state.get("processedCandles"))),
+            "signals": event_types.count("SIGNAL"),
+            "entries": event_types.count("ENTRY"),
+            "exits": event_types.count("EXIT"),
+            "openPositions": len(state.get("openPositions", []) or []),
+            "closedTrades": len(state.get("closedTrades", []) or []),
+        },
+        "performance": {
+            "equity": equity,
+            "realizedPnl": safe_float(state.get("realizedPnl")),
+            "unrealizedPnl": safe_float(state.get("unrealizedPnl")),
+            "fees": safe_float(state.get("cumulativeFees")),
+            "slippage": safe_float(state.get("cumulativeSlippage")),
+            "returnPct": round(((equity - account_equity) / account_equity * 100) if account_equity else 0, 4),
+            "maxDrawdownPct": paper_max_drawdown(equity_curve),
+        },
+        "baselineComparison": baseline,
+        "warnings": dedupe_list([warning for warning in warnings if warning]),
+        "nextAction": next_action,
+    }
+
+
+def build_paper_recent_events(args) -> dict:
+    limit = min(max(int(safe_float(args.get("limit", 50), 50)), 1), 200)
+    candidate = load_paper_candidate_config()
+    runtime = build_paper_runtime_status(args)
+    initialized_markets = set(runtime.get("marketState", {}).get("initializedMarkets") or [])
+    session = paper_session_window(candidate)
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), max(limit * 3, 100))
+    events = [normalized_paper_event(event, session, initialized_markets) for event in journal]
+    return {
+        "ok": True,
+        "limit": limit,
+        "paperEnabled": bool(candidate.get("enabled", False)),
+        "realTradingEnabled": paper_real_trading_enabled()[0],
+        "session": {
+            "sessionId": session["sessionId"],
+            "startedAt": session["startedAt"],
+            "endedAt": session["endedAt"],
+        },
+        "events": events[-limit:],
+    }
+
+
 def build_paper_runtime_status(args) -> dict:
     state_path = Path(app.root_path) / "data" / "paper-state.json"
     journal_path = Path(app.root_path) / "reports" / "paper-journal.jsonl"
@@ -5033,6 +5284,8 @@ def normalize_promoted_candidate_config(candidate: dict) -> dict:
 def candidate_summary(candidate: dict) -> dict:
     return {
         "enabled": candidate.get("enabled", False),
+        "enabledAt": candidate.get("enabledAt"),
+        "disabledAt": candidate.get("disabledAt"),
         "strategy": candidate.get("strategy"),
         "source": candidate.get("source"),
         "regimeMode": candidate.get("regimeMode"),

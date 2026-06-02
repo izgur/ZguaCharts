@@ -531,6 +531,7 @@ async function refreshPaperLearningPanels() {
     loadPaperReadiness(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
+    loadPaperSessionMonitor(),
   ]);
 }
 
@@ -2695,6 +2696,7 @@ function setupLearningControls() {
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
   document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
   document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
+  document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
@@ -3336,6 +3338,74 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
       <tbody>${stopRows || `<tr><td colspan="4">No stop rules returned.</td></tr>`}</tbody>
     </table>
   `;
+}
+
+async function loadPaperSessionMonitor() {
+  const host = document.querySelector("#paper-session-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper session monitor...</p>`;
+    const [summary, events] = await Promise.all([
+      apiGet("/api/paper/session-summary"),
+      apiGet("/api/paper/recent-events?limit=20"),
+    ]);
+    host.innerHTML = renderPaperSessionMonitor(summary, events);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper session monitor could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSessionMonitor(summary, eventsPayload) {
+  const session = summary.session || {};
+  const activity = summary.activity || {};
+  const performance = summary.performance || {};
+  const baseline = summary.baselineComparison || {};
+  const next = summary.nextAction || {};
+  const status = session.status || "UNKNOWN";
+  const tone = status === "RUNNING" ? "positive" : status === "STOP_RECOMMENDED" ? "negative" : "neutral";
+  const rows = (eventsPayload.events || []).slice().reverse().map((event) => `
+    <tr>
+      <td>${escapeHtml(event.timestamp || "-")}</td>
+      <td>${escapeHtml(event.eventType || "-")}</td>
+      <td>${escapeHtml(event.symbol || "-")} ${escapeHtml(event.interval || "")}</td>
+      <td>${event.currentSession ? "yes" : "no"}</td>
+      <td>${event.stale ? "yes" : "no"}</td>
+      <td>${escapeHtml(event.reason || event.message || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Paper Session Monitor <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${summary.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Duration</span><strong>${escapeHtml(formatDurationSeconds(session.durationSeconds || 0))}</strong></div>
+      <div class="metric"><span>Ticks</span><strong>${activity.ticks ?? 0}</strong></div>
+      <div class="metric"><span>Processed</span><strong>${activity.processedCandles ?? 0}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${activity.signals ?? 0}</strong></div>
+      <div class="metric"><span>Open</span><strong>${activity.openPositions ?? 0}</strong></div>
+      <div class="metric"><span>Closed</span><strong>${activity.closedTrades ?? 0}</strong></div>
+      <div class="metric"><span>Realized</span><strong>${formatSigned(performance.realizedPnl || 0)}</strong></div>
+      <div class="metric"><span>Unrealized</span><strong>${formatSigned(performance.unrealizedPnl || 0)}</strong></div>
+      <div class="metric"><span>Return</span><strong>${formatMaybeNumber(performance.returnPct)}%</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${escapeHtml(baseline.status || "-")}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${summary.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Time</th><th>Type</th><th>Market</th><th>Session</th><th>Stale</th><th>Message</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6">No paper events available.</td></tr>`}</tbody>
+    </table>
+    ${(summary.warnings || []).length ? `<ul class="backtest-warnings">${summary.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+function formatDurationSeconds(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = Math.floor(total % 60);
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
 }
 
 async function loadLearningEvidence() {
