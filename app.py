@@ -1222,6 +1222,7 @@ def paper_status():
         runtime = build_paper_runtime_status(request.args)
         stop_rules = build_paper_stop_rules(request.args)
         session_summary = build_paper_session_summary(request.args)
+        observation_quality = build_paper_observation_quality(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
@@ -1264,6 +1265,12 @@ def paper_status():
                 "baselineComparisonStatus": session_summary.get("baselineComparison", {}).get("status"),
                 "nextAction": session_summary.get("nextAction"),
             },
+            "observationQuality": {
+                "status": observation_quality.get("quality", {}).get("status"),
+                "score": observation_quality.get("quality", {}).get("score"),
+                "nextAction": observation_quality.get("nextAction"),
+                "evidence": observation_quality.get("evidence"),
+            },
             "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
             "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
             "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
@@ -1295,6 +1302,14 @@ def paper_session_summary():
         return jsonify(build_paper_session_summary(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper session summary: {exc}"}), 502
+
+
+@app.get("/api/paper/observation-quality")
+def paper_observation_quality():
+    try:
+        return jsonify(build_paper_observation_quality(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper observation quality: {exc}"}), 502
 
 
 @app.get("/api/paper/recent-events")
@@ -4655,6 +4670,188 @@ def paper_session_observation_status(paper_enabled: bool, real_enabled: bool, ru
     if last_tick.get("stale"):
         return "WATCH_TICK_STALE", {"action": "RUN_ONE_PAPER_TICK", "reason": "Paper is enabled but the latest tick is stale."}
     return "RUNNING", {"action": "MONITOR_PAPER_SESSION", "reason": "Paper session has recent tick activity. Continue observing without enabling real trading."}
+
+
+def first_baseline_value(*values, fallback=None):
+    for value in values:
+        if value is None:
+            continue
+        return value
+    return fallback
+
+
+def candidate_observation_baseline(candidate: dict) -> dict:
+    optimization = candidate.get("promotedFromOptimization") if isinstance(candidate.get("promotedFromOptimization"), dict) else {}
+    ranking = candidate.get("promotedFromRanking") if isinstance(candidate.get("promotedFromRanking"), dict) else {}
+    test = optimization.get("test") if isinstance(optimization.get("test"), dict) else {}
+    full = optimization.get("full") if isinstance(optimization.get("full"), dict) else {}
+    quality = optimization.get("qualityMetrics") if isinstance(optimization.get("qualityMetrics"), dict) else {}
+    expected_test_trades = int(safe_float(first_baseline_value(test.get("trades"), quality.get("testTrades"), ranking.get("trades")), 0))
+    expected_full_trades = int(safe_float(first_baseline_value(full.get("trades"), quality.get("fullTrades"), optimization.get("trades")), 0))
+    expected_profit_factor = safe_float(first_baseline_value(test.get("profitFactor"), quality.get("testProfitFactor"), full.get("profitFactor"), quality.get("fullProfitFactor"), ranking.get("profitFactor")), 0)
+    expected_return = safe_float(first_baseline_value(test.get("totalReturn"), quality.get("testReturnPct"), full.get("totalReturn"), quality.get("fullReturnPct"), ranking.get("totalReturnPct")), 0)
+    expected_drawdown = safe_float(first_baseline_value(test.get("maxDrawdown"), quality.get("testMaxDrawdownPct"), full.get("maxDrawdown"), quality.get("fullMaxDrawdownPct"), ranking.get("maxDrawdown")), 0)
+    available = bool(optimization or ranking)
+    return {
+        "available": available,
+        "source": "promotedFromOptimization" if optimization else "promotedFromRanking" if ranking else None,
+        "expectedProfitFactor": expected_profit_factor or None,
+        "expectedReturnPct": expected_return or None,
+        "expectedTrades": expected_test_trades or expected_full_trades or int(safe_float(ranking.get("trades"), 0)) or None,
+        "expectedMaxDrawdownPct": expected_drawdown or None,
+        "expectedTestTrades": expected_test_trades or None,
+        "expectedFullTrades": expected_full_trades or None,
+        "expectedTestProfitFactor": safe_float(first_baseline_value(test.get("profitFactor"), quality.get("testProfitFactor")), 0) or None,
+        "expectedFullProfitFactor": safe_float(first_baseline_value(full.get("profitFactor"), quality.get("fullProfitFactor")), 0) or None,
+        "expectedTestReturnPct": safe_float(first_baseline_value(test.get("totalReturn"), quality.get("testReturnPct")), 0) or None,
+        "expectedFullReturnPct": safe_float(first_baseline_value(full.get("totalReturn"), quality.get("fullReturnPct")), 0) or None,
+        "expectedTestMaxDrawdownPct": safe_float(first_baseline_value(test.get("maxDrawdown"), quality.get("testMaxDrawdownPct")), 0) or None,
+        "expectedFullMaxDrawdownPct": safe_float(first_baseline_value(full.get("maxDrawdown"), quality.get("fullMaxDrawdownPct")), 0) or None,
+    }
+
+
+def build_paper_observation_quality(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 1000)
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    runtime = build_paper_runtime_status(args)
+    stop_rules = build_paper_stop_rules(args)
+    session_summary = build_paper_session_summary(args)
+    activity = session_summary.get("activity") or {}
+    session = session_summary.get("session") or {}
+    performance = dict(session_summary.get("performance") or {})
+    paper_metrics = paper_metrics_from_state(state, candidate, journal)
+    baseline = candidate_observation_baseline(candidate)
+    min_closed_trades = int(safe_float(args.get("min_closed_trades_for_judgment", 10), 10))
+    min_signals = int(safe_float(args.get("min_signals_for_observation", 3), 3))
+    min_duration = int(safe_float(args.get("min_duration_seconds_for_observation", 3600), 3600))
+    ticks = int(safe_float(activity.get("ticks"), 0))
+    signals = int(safe_float(activity.get("signals"), 0))
+    entries = int(safe_float(activity.get("entries"), 0))
+    exits = int(safe_float(activity.get("exits"), 0))
+    closed_trades = int(safe_float(activity.get("closedTrades"), 0))
+    open_positions = int(safe_float(activity.get("openPositions"), 0))
+    duration = int(safe_float(session.get("durationSeconds"), 0))
+    evidence = {
+        "ticks": ticks,
+        "signals": signals,
+        "entries": entries,
+        "exits": exits,
+        "closedTrades": closed_trades,
+        "openPositions": open_positions,
+        "durationSeconds": duration,
+        "enoughTime": duration >= min_duration,
+        "enoughTrades": closed_trades >= min_closed_trades,
+        "enoughSignals": signals >= min_signals,
+        "thresholds": {
+            "minClosedTradesForJudgment": min_closed_trades,
+            "minSignalsForObservation": min_signals,
+            "minDurationSecondsForObservation": min_duration,
+        },
+    }
+    performance.update({
+        "profitFactor": paper_metrics.get("profitFactor"),
+        "winRate": paper_metrics.get("winRate"),
+        "paperClosedTrades": paper_metrics.get("closedTrades"),
+        "paperTotalReturnPct": paper_metrics.get("totalReturnPct"),
+    })
+    reasons = []
+    warnings = []
+    score = 0
+    status = "TOO_EARLY"
+    next_action = {
+        "action": "CONTINUE_PAPER_OBSERVATION",
+        "reason": "Continue collecting paper-only forward evidence. Do not enable real trading.",
+    }
+    runtime_health = ((runtime.get("health") or {}).get("status") or "UNKNOWN").upper()
+    stop_status = str(stop_rules.get("status") or "UNKNOWN").upper()
+    if not paper_enabled:
+        status = "DISABLED"
+        reasons.append("Paper simulation is disabled; no forward paper judgment is active.")
+        next_action = {
+            "action": "REVIEW_ENABLE_PAPER_SIMULATION",
+            "reason": "Readiness may be reviewed manually, but this endpoint does not enable paper automatically.",
+        }
+    elif real_enabled:
+        status = "PAUSE_RECOMMENDED"
+        reasons.append(real_detail)
+        warnings.append("Real trading must remain disabled while reviewing paper observation quality.")
+        next_action = {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail}
+    elif stop_status == "STOP_RECOMMENDED":
+        status = "PAUSE_RECOMMENDED"
+        score = 15
+        reasons.append("Paper stop rules recommend stopping or pausing paper simulation.")
+        warnings.extend([rule.get("detail") for rule in stop_rules.get("rules", []) if rule.get("severity") == "STOP" and not rule.get("pass") and rule.get("detail")])
+        next_action = stop_rules.get("nextAction") or {"action": "REVIEW_STOP_RULES", "reason": "One or more stop rules failed."}
+    elif runtime_health == "BLOCKED":
+        status = "PAUSE_RECOMMENDED"
+        score = 15
+        reasons.extend((runtime.get("health") or {}).get("reasons") or ["Paper runtime health is blocked."])
+        next_action = {"action": "REVIEW_RUNTIME_BLOCKERS", "reason": "Paper runtime health is BLOCKED."}
+    elif ticks <= 0:
+        status = "TOO_EARLY"
+        score = 10
+        reasons.append("Paper is enabled but no tick has been observed for this session.")
+        next_action = {"action": "RUN_ONE_PAPER_TICK", "reason": "Collect at least one paper tick before judging observation quality."}
+    elif closed_trades <= 0 and signals < min_signals:
+        status = "TOO_EARLY"
+        score = min(30, 15 + ticks * 5 + signals * 3)
+        reasons.append(f"Only {ticks} tick(s), {signals} signal(s), and no closed paper trades are available.")
+        next_action = {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Need more paper-only signals and closed trades before comparing to baseline."}
+    else:
+        score = min(70, 35 + min(ticks, 6) * 3 + min(signals, 10) * 2 + min(entries + exits, 10) * 2)
+        status = "OBSERVE"
+        reasons.append("Paper simulation is producing forward evidence, but judgment remains conservative.")
+        if not evidence["enoughTrades"]:
+            reasons.append(f"Closed trades are below the judgment threshold ({closed_trades}/{min_closed_trades}); profit factor is not compared strongly yet.")
+        if runtime_health == "WATCH" or stop_status == "WATCH":
+            status = "WATCH"
+            score = min(score, 55)
+            warnings.extend((runtime.get("health") or {}).get("reasons") or [])
+            if stop_status == "WATCH":
+                warnings.append("Paper stop rules are in WATCH status.")
+        if evidence["enoughTrades"]:
+            score = max(score, 72)
+            paper_pf = safe_float(performance.get("profitFactor"), 0)
+            paper_return = safe_float(performance.get("paperTotalReturnPct", performance.get("returnPct")), 0)
+            paper_drawdown = safe_float(performance.get("maxDrawdownPct", paper_metrics.get("maxDrawdown")), 0)
+            expected_pf = safe_float(baseline.get("expectedProfitFactor"), 0)
+            expected_return = safe_float(baseline.get("expectedReturnPct"), 0)
+            expected_drawdown = safe_float(baseline.get("expectedMaxDrawdownPct"), 0)
+            if baseline.get("available") and expected_pf and paper_pf and paper_pf < expected_pf * 0.65:
+                status = "WATCH"
+                score = min(score, 55)
+                warnings.append(f"Paper profit factor {paper_pf} is materially below baseline {expected_pf}.")
+            if baseline.get("available") and expected_return and paper_return < expected_return * 0.25:
+                status = "WATCH"
+                score = min(score, 55)
+                warnings.append(f"Paper return {round(paper_return, 4)}% is materially below baseline {expected_return}%.")
+            if baseline.get("available") and expected_drawdown and paper_drawdown > max(expected_drawdown * 2, expected_drawdown + 5):
+                status = "PAUSE_RECOMMENDED"
+                score = min(score, 35)
+                warnings.append(f"Paper drawdown {round(paper_drawdown, 4)}% is well above baseline {expected_drawdown}%.")
+        next_action = {
+            "action": "WATCH_PAPER_QUALITY" if status == "WATCH" else "REVIEW_BEFORE_CONTINUING_PAPER" if status == "PAUSE_RECOMMENDED" else "CONTINUE_PAPER_OBSERVATION",
+            "reason": "Keep observing paper-only evidence; this endpoint never recommends real trading.",
+        }
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "evidence": evidence,
+        "performance": performance,
+        "baseline": baseline,
+        "quality": {
+            "status": status,
+            "score": int(max(0, min(100, score))),
+            "reasons": dedupe_list([reason for reason in reasons if reason]),
+            "warnings": dedupe_list([warning for warning in warnings if warning]),
+        },
+        "nextAction": next_action,
+    }
 
 
 def build_paper_session_summary(args) -> dict:

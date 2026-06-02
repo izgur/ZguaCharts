@@ -533,6 +533,7 @@ async function refreshPaperLearningPanels() {
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
     loadPaperSessionMonitor(),
+    loadPaperObservationQuality(),
   ]);
 }
 
@@ -2698,6 +2699,7 @@ function setupLearningControls() {
   document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
   document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
+  document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
   document.querySelector("#learning-auto-status-button")?.addEventListener("click", loadAutoPromoteStatus);
@@ -3396,6 +3398,62 @@ function renderPaperSessionMonitor(summary, eventsPayload) {
       <tbody>${rows || `<tr><td colspan="6">No paper events available.</td></tr>`}</tbody>
     </table>
     ${(summary.warnings || []).length ? `<ul class="backtest-warnings">${summary.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function loadPaperObservationQuality() {
+  const host = document.querySelector("#paper-observation-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper observation quality...</p>`;
+    const payload = await apiGet("/api/paper/observation-quality");
+    host.innerHTML = renderPaperObservationQuality(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper observation quality could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperObservationQuality(payload) {
+  const candidate = payload.candidate || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const evidence = payload.evidence || {};
+  const performance = payload.performance || {};
+  const baseline = payload.baseline || {};
+  const quality = payload.quality || {};
+  const next = payload.nextAction || {};
+  const status = quality.status || "UNKNOWN";
+  const tone = status === "PAUSE_RECOMMENDED" ? "negative" : status === "WATCH" ? "neutral" : status === "DISABLED" || status === "TOO_EARLY" ? "neutral" : "positive";
+  const baselineSummary = baseline.available
+    ? `PF ${formatMaybeNumber(baseline.expectedProfitFactor)} / Return ${formatMaybeNumber(baseline.expectedReturnPct)}% / Trades ${baseline.expectedTrades ?? "-"} / DD ${formatMaybeNumber(baseline.expectedMaxDrawdownPct)}%`
+    : "No promoted baseline available";
+  const reasonRows = [
+    ...(quality.reasons || []).map((item) => ({ type: "Reason", detail: item })),
+    ...(quality.warnings || []).map((item) => ({ type: "Warning", detail: item })),
+  ].map((item) => `
+    <tr><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.detail || "-")}</td></tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Paper Observation Quality <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Score</span><strong>${quality.score ?? 0}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Ticks</span><strong>${evidence.ticks ?? 0}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${evidence.signals ?? 0}</strong></div>
+      <div class="metric"><span>Closed</span><strong>${evidence.closedTrades ?? 0}</strong></div>
+      <div class="metric"><span>Open</span><strong>${evidence.openPositions ?? 0}</strong></div>
+      <div class="metric"><span>Return</span><strong>${formatMaybeNumber(performance.returnPct ?? performance.paperTotalReturnPct)}%</strong></div>
+      <div class="metric"><span>Drawdown</span><strong>${formatMaybeNumber(performance.maxDrawdownPct)}%</strong></div>
+      <div class="metric"><span>Enough trades</span><strong>${evidence.enoughTrades ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Baseline:</strong> ${escapeHtml(baselineSummary)}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Type</th><th>Detail</th></tr></thead>
+      <tbody>${reasonRows || `<tr><td colspan="2">No observation quality reasons returned.</td></tr>`}</tbody>
+    </table>
   `;
 }
 
