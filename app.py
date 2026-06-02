@@ -1229,6 +1229,7 @@ def paper_status():
         session_events_summary = build_paper_session_events_summary(request.args)
         session_events_detail = build_paper_session_events(request.args)
         session_trades_detail = build_paper_session_trades(request.args)
+        active_observation = build_paper_active_observation(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
@@ -1284,6 +1285,11 @@ def paper_status():
             "recentSignalCount": session_events_detail.get("counts", {}).get("signals"),
             "recentTradeEventCount": session_trades_detail.get("totals", {}).get("recentTradeEvents"),
             "currentSessionTradeCount": session_trades_detail.get("totals", {}).get("currentSessionTradeEvents"),
+            "activeObservation": compact_active_observation(active_observation),
+            "activeSessionEventCount": active_observation.get("session", {}).get("activeSessionEventCount"),
+            "activeTradeEventCount": active_observation.get("trades", {}).get("tradeEventCount"),
+            "activeSignalCount": active_observation.get("signals", {}).get("count"),
+            "activeWarningCount": active_observation.get("warnings", {}).get("count"),
             "tickReadiness": {
                 "status": tick_readiness.get("tickReadiness", {}).get("status"),
                 "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
@@ -1340,6 +1346,14 @@ def paper_observation_quality():
         return jsonify(build_paper_observation_quality(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper observation quality: {exc}"}), 502
+
+
+@app.get("/api/paper/active-observation")
+def paper_active_observation():
+    try:
+        return jsonify(build_paper_active_observation(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build active paper observation: {exc}"}), 502
 
 
 @app.get("/api/paper/observation-targets")
@@ -4889,6 +4903,18 @@ def build_paper_observation_quality(args) -> dict:
     session_summary = build_paper_session_summary(args)
     activity = session_summary.get("activity") or {}
     session = session_summary.get("session") or {}
+    if request_active_only(args):
+        active_events = build_paper_session_events({**dict(args), "activeOnly": "true", "limit": "500"}).get("counts", {})
+        active_trades_payload = build_paper_session_trades({**dict(args), "activeOnly": "true"})
+        active_trades = active_trades_payload.get("totals", {})
+        activity = {
+            **activity,
+            "signals": active_events.get("signals", 0),
+            "entries": active_events.get("openTrades", 0),
+            "exits": active_events.get("closeTrades", 0),
+            "closedTrades": active_trades.get("closedTrades", 0),
+            "openPositions": len(active_trades_payload.get("openTrades") or []),
+        }
     performance = dict(session_summary.get("performance") or {})
     paper_metrics = paper_metrics_from_state(state, candidate, journal)
     baseline = candidate_observation_baseline(candidate)
@@ -5060,6 +5086,19 @@ def compact_observation_targets(targets: dict) -> dict:
     }
 
 
+def request_active_only(args) -> bool:
+    return str(args.get("activeOnly", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def active_market_keys_for_candidate(candidate: dict) -> set[str]:
+    return {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)}
+
+
+def primary_active_market(candidate: dict) -> dict:
+    active = candidate_symbols_by_mode(candidate, "active")
+    return active[0] if active else {}
+
+
 def build_paper_observation_targets(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -5076,6 +5115,9 @@ def build_paper_observation_targets(args) -> dict:
     }
     session = paper_session_window(candidate)
     session_events = [event for event in journal if event_in_session(event, session)]
+    if request_active_only(args):
+        active_keys = active_market_keys_for_candidate(candidate)
+        session_events = [event for event in session_events if (event.get("marketKey") or paper_market_key(event)) in active_keys]
     event_types = [str(event.get("eventType", "")).upper() for event in session_events]
     tick_times = {
         paper_tick_bucket(event_timestamp(event))
@@ -5105,12 +5147,20 @@ def build_paper_observation_targets(args) -> dict:
     duration_seconds = int((ended - started).total_seconds()) if started and ended else 0
     session_age_hours = round(duration_seconds / 3600, 4)
     ticks = len(tick_times)
-    closed_trades = len(state.get("closedTrades", []) or [])
+    if request_active_only(args):
+        active_symbols = {market.get("symbol") for market in candidate_symbols_by_mode(candidate, "active") if market.get("symbol")}
+        closed_trades = len([trade for trade in (state.get("closedTrades", []) or []) if not trade.get("symbol") or trade.get("symbol") in active_symbols])
+        open_positions = len([position for position in (state.get("openPositions", []) or []) if not position.get("symbol") or position.get("symbol") in active_symbols])
+    else:
+        closed_trades = len(state.get("closedTrades", []) or [])
+        open_positions = len(state.get("openPositions", []) or [])
     signals = event_types.count("SIGNAL")
-    open_positions = len(state.get("openPositions", []) or [])
     active_warning_count = int(safe_float(runtime_journal.get("activeWarningCount"), len(runtime_journal.get("activeWarnings") or [])))
     watch_warning_count = int(safe_float(runtime_journal.get("watchWarningCount"), len(runtime_journal.get("watchWarnings") or [])))
     stale_watch_warning_count = int(safe_float(runtime_journal.get("staleWatchWarningCount"), len(runtime_journal.get("staleWatchWarnings") or [])))
+    if request_active_only(args):
+        watch_warning_count = 0
+        stale_watch_warning_count = 0
     freshness_status = tick_state.get("status") or "UNKNOWN"
     if not paper_enabled:
         quality_status = "DISABLED"
@@ -5382,11 +5432,15 @@ def build_paper_session_events_summary(args) -> dict:
     active_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)}
     watch_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "watch") if paper_market_key(market)}
     normalized = [normalized_paper_event(event, session) for event in journal]
+    if request_active_only(args):
+        normalized = [event for event in normalized if event.get("marketKey") in active_keys]
     session_events = [event for event in normalized if event.get("currentSession")]
     stale_events = [event for event in normalized if event.get("stale")]
     event_types = [str(event.get("eventType", "")).upper() for event in session_events]
     latest_event = session_events[-1] if session_events else None
     state_warnings = state.get("warnings") if isinstance(state.get("warnings"), list) else []
+    if request_active_only(args):
+        state_warnings = [warning for warning in state_warnings if warning_market_key({"reason": warning}) in active_keys]
     counts = {
         "signals": event_types.count("SIGNAL"),
         "warnings": len([event for event in session_events if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"}]),
@@ -5423,6 +5477,7 @@ def build_paper_session_events_summary(args) -> dict:
             "startedAt": session.get("startedAt"),
             "endedAt": session.get("endedAt"),
         },
+        "filters": {"activeOnly": request_active_only(args)},
         "latestEventTime": latest_event.get("timestamp") if latest_event else None,
         "counts": counts,
         "recentWarnings": warnings[-10:],
@@ -5522,6 +5577,8 @@ def build_paper_session_events(args) -> dict:
     limit = min(max(int(safe_float(args.get("limit", 50), 50)), 1), 500)
     type_filter = str(args.get("type", "all") or "all").strip().lower()
     market_filter = str(args.get("market", "all") or "all").strip().lower()
+    if request_active_only(args):
+        market_filter = "active"
     session_filter = str(args.get("currentSession", "all") or "all").strip().lower()
     valid_types = {"all", "signal", "warning", "state_warning", "open_trade", "close_trade"}
     valid_markets = {"all", "active", "watch"}
@@ -5538,6 +5595,8 @@ def build_paper_session_events(args) -> dict:
         session_filter = "all"
     records, session, active_keys, watch_keys = paper_session_event_records(candidate, state)
     details = [compact_session_event_detail(event, active_keys, watch_keys) for event in records]
+    if request_active_only(args):
+        details = [event for event in details if event.get("marketRole") == "active"]
     counts = {
         "all": len(details),
         "signals": len([event for event in details if paper_event_type_bucket(event) == "signal"]),
@@ -5570,6 +5629,7 @@ def build_paper_session_events(args) -> dict:
             "type": type_filter,
             "market": market_filter,
             "currentSession": session_filter,
+            "activeOnly": request_active_only(args),
         },
         "counts": counts,
         "events": filtered[-limit:],
@@ -5608,6 +5668,11 @@ def build_paper_session_trades(args) -> dict:
     ]
     open_trades = [trade_state_item(item, "open") for item in (state.get("openPositions") or [])]
     closed_trades = [trade_state_item(item, "closed") for item in (state.get("closedTrades") or [])]
+    if request_active_only(args):
+        active_symbols = {market.get("symbol") for market in candidate_symbols_by_mode(candidate, "active") if market.get("symbol")}
+        trade_events = [event for event in trade_events if event.get("marketRole") == "active"]
+        open_trades = [trade for trade in open_trades if not trade.get("symbol") or trade.get("symbol") in active_symbols]
+        closed_trades = [trade for trade in closed_trades if not trade.get("symbol") or trade.get("symbol") in active_symbols]
     realized = sum(safe_float(item.get("pnl"), 0) for item in closed_trades)
     fees = sum(safe_float(item.get("feePaid"), 0) for item in open_trades + closed_trades)
     wins = [item for item in closed_trades if safe_float(item.get("pnl"), 0) > 0]
@@ -5621,6 +5686,7 @@ def build_paper_session_trades(args) -> dict:
         "realTradingEnabled": real_enabled,
         "sessionStartedAt": session.get("startedAt"),
         "sessionEndedAt": session.get("endedAt"),
+        "filters": {"activeOnly": request_active_only(args)},
         "openTrades": open_trades,
         "closedTrades": closed_trades[-50:],
         "recentTradeEvents": trade_events[-50:],
@@ -5635,6 +5701,101 @@ def build_paper_session_trades(args) -> dict:
             "avgLoss": round(sum(safe_float(item.get("pnl"), 0) for item in losses) / len(losses), 8) if losses else None,
         },
         "warnings": warnings,
+    }
+
+
+def compact_active_observation(payload: dict) -> dict:
+    return {
+        "activeMarket": payload.get("activeMarket"),
+        "session": payload.get("session"),
+        "tickReadiness": payload.get("tickReadiness"),
+        "signals": payload.get("signals"),
+        "warnings": payload.get("warnings"),
+        "trades": {
+            "tradeEventCount": (payload.get("trades") or {}).get("tradeEventCount"),
+            "openCount": (payload.get("trades") or {}).get("openCount"),
+            "closedCount": (payload.get("trades") or {}).get("closedCount"),
+        },
+        "observationTargets": payload.get("observationTargets"),
+        "nextAction": payload.get("nextAction"),
+    }
+
+
+def build_paper_active_observation(args) -> dict:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_key = paper_market_key(active)
+    session_summary = build_paper_session_summary(args)
+    tick_readiness_payload = build_paper_tick_readiness(args)
+    active_freshness = ((tick_readiness_payload.get("freshness") or {}).get("active") or [{}])[0]
+    tick_state = tick_readiness_payload.get("tickReadiness") or {}
+    active_args = {**dict(args), "activeOnly": "true"}
+    active_events = build_paper_session_events({**active_args, "limit": "200", "currentSession": "true"})
+    active_event_summary = build_paper_session_events_summary(active_args)
+    active_trades = build_paper_session_trades(active_args)
+    active_targets = build_paper_observation_targets(active_args)
+    events = active_events.get("events") or []
+    signal_events = [event for event in events if paper_event_type_bucket(event) == "signal"]
+    warning_events = [event for event in events if paper_event_type_bucket(event) in {"warning", "state_warning"}]
+    trade_events = active_trades.get("recentTradeEvents") or []
+    target_compact = compact_observation_targets(active_targets)
+    if real_enabled:
+        next_action = {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail}
+    elif not active:
+        next_action = {"action": "REVIEW_PAPER_CANDIDATE_CONFIG", "reason": "No active paper market is configured."}
+    elif tick_state.get("status") == "READY":
+        next_action = tick_readiness_payload.get("nextAction") or {"action": "RUN_PAPER_ONCE_WHEN_READY", "reason": "Active market has a useful closed candle available."}
+    else:
+        next_action = active_targets.get("nextAction") or tick_readiness_payload.get("nextAction")
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activeMarket": {
+            "symbol": active.get("symbol"),
+            "timeframe": active.get("interval") or active.get("timeframe"),
+            "marketKey": active_key,
+            "source": candidate.get("source"),
+        },
+        "session": {
+            "status": (session_summary.get("session") or {}).get("status"),
+            "startedAt": (session_summary.get("session") or {}).get("startedAt"),
+            "endedAt": (session_summary.get("session") or {}).get("endedAt"),
+            "durationSeconds": (session_summary.get("session") or {}).get("durationSeconds"),
+            "activeSessionEventCount": (active_event_summary.get("counts") or {}).get("currentSessionEvents"),
+        },
+        "freshness": active_freshness,
+        "tickReadiness": {
+            "status": tick_state.get("status"),
+            "usefulNow": tick_state.get("usefulNow"),
+            "latestClosedCandleTime": tick_state.get("latestClosedCandleTime"),
+            "lastProcessedCandleTime": tick_state.get("lastProcessedCandleTime"),
+            "nextUsefulTickAt": tick_state.get("nextUsefulTickAt"),
+            "secondsUntilNextUsefulTick": tick_state.get("secondsUntilNextUsefulTick"),
+            "activeMarketReason": tick_state.get("activeMarketReason"),
+        },
+        "signals": {
+            "count": len(signal_events),
+            "latest": signal_events[-1] if signal_events else None,
+        },
+        "warnings": {
+            "count": len(warning_events),
+            "latest": warning_events[-1] if warning_events else None,
+            "items": warning_events[-5:],
+        },
+        "trades": {
+            "tradeEventCount": (active_trades.get("totals") or {}).get("recentTradeEvents", 0),
+            "currentSessionTradeEvents": (active_trades.get("totals") or {}).get("currentSessionTradeEvents", 0),
+            "openCount": len(active_trades.get("openTrades") or []),
+            "closedCount": (active_trades.get("totals") or {}).get("closedTrades", 0),
+            "openPosition": (active_trades.get("openTrades") or [None])[-1],
+            "latestClosedTrade": (active_trades.get("closedTrades") or [None])[-1],
+            "latestTradeEvent": (trade_events or [None])[-1],
+        },
+        "observationTargets": target_compact,
+        "nextAction": next_action,
     }
 
 

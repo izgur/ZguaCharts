@@ -533,6 +533,7 @@ async function refreshPaperLearningPanels() {
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
+    loadActivePaperObservation(),
     loadPaperSessionMonitor(),
     loadPaperSessionEventsSummary(),
     loadPaperSessionEventsDetail(),
@@ -2707,6 +2708,7 @@ function setupLearningControls() {
   document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
   document.querySelector("#paper-tick-readiness-refresh")?.addEventListener("click", loadPaperTickReadiness);
   document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
+  document.querySelector("#paper-active-observation-refresh")?.addEventListener("click", loadActivePaperObservation);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#paper-session-events-refresh")?.addEventListener("click", loadPaperSessionEventsSummary);
   document.querySelector("#paper-session-events-detail-refresh")?.addEventListener("click", loadPaperSessionEventsDetail);
@@ -3410,6 +3412,7 @@ async function runPaperOnceFromPanel() {
     await Promise.all([
       loadPaperSimulationControl(),
       loadPaperRuntimeMonitor(),
+      loadActivePaperObservation(),
       loadPaperSessionMonitor(),
       loadPaperSessionEventsSummary(),
       loadPaperSessionEventsDetail(),
@@ -3510,6 +3513,58 @@ function renderPaperRefreshResult(payload) {
       <thead><tr><th>Market</th><th>Status</th><th>Candles Before</th><th>Candles After</th><th>Latest Before</th><th>Latest After</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="6">No active market refresh rows returned.</td></tr>`}</tbody>
     </table>
+  `;
+}
+
+async function loadActivePaperObservation() {
+  const host = document.querySelector("#paper-active-observation-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading active paper observation...</p>`;
+    const payload = await apiGet("/api/paper/active-observation");
+    host.innerHTML = renderActivePaperObservation(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Active paper observation could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderActivePaperObservation(payload) {
+  const market = payload.activeMarket || {};
+  const session = payload.session || {};
+  const tick = payload.tickReadiness || {};
+  const signals = payload.signals || {};
+  const warnings = payload.warnings || {};
+  const trades = payload.trades || {};
+  const targets = payload.observationTargets || {};
+  const targetProgress = targets.progress || {};
+  const next = payload.nextAction || {};
+  const status = tick.status || targets.status || "UNKNOWN";
+  const tone = status === "READY" || targets.status === "READY_FOR_PAPER_REVIEW" ? "positive" : status === "DATA_STALE" || targets.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
+  const latestSignal = signals.latest || {};
+  const latestWarning = warnings.latest || {};
+  return `
+    <h3 class="modal-section-title">Active Paper Observation <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(market.marketKey || `${market.symbol || "-"}:${market.timeframe || "-"}`)}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Session</span><strong>${escapeHtml(session.status || "-")}</strong></div>
+      <div class="metric"><span>Tick readiness</span><strong>${escapeHtml(tick.status || "-")}</strong></div>
+      <div class="metric"><span>Useful now</span><strong>${tick.usefulNow ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${signals.count ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${warnings.count ?? 0}</strong></div>
+      <div class="metric"><span>Trade events</span><strong>${trades.tradeEventCount ?? 0}</strong></div>
+      <div class="metric"><span>Open trades</span><strong>${trades.openCount ?? 0}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${trades.closedCount ?? 0}</strong></div>
+      <div class="metric"><span>Target</span><strong>${escapeHtml(targets.status || "-")}</strong></div>
+      <div class="metric"><span>Ticks target</span><strong>${targetProgress.ticksObserved ?? 0} / ${targetProgress.targetTicks ?? "-"}</strong></div>
+      <div class="metric"><span>Closed target</span><strong>${targetProgress.closedTrades ?? 0} / ${targetProgress.targetClosedTrades ?? "-"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(tick.activeMarketReason || "-")}</p>
+    <p class="modal-note"><strong>Latest signal:</strong> ${latestSignal.processedAt ? `${escapeHtml(latestSignal.processedAt)} ${escapeHtml(latestSignal.action || latestSignal.signal || "")} ${formatMaybeNumber(latestSignal.price)}` : "none"}</p>
+    <p class="modal-note"><strong>Latest warning:</strong> ${latestWarning.reason ? escapeHtml(latestWarning.reason) : "none"}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
   `;
 }
 
