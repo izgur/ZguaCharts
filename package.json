@@ -11,6 +11,7 @@
     "paper:tick": "node cli/paper_tick.js",
     "paper:init": "node cli/paper_init.js",
     "paper:refresh": "node cli/paper_refresh.js",
+    "paper:run-once": "python scripts/paper_run_once.py",
     "paper:status": "node cli/paper_status.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",

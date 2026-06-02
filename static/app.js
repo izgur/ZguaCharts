@@ -3359,6 +3359,11 @@ async function loadPaperTickReadiness() {
 }
 
 async function handlePaperTickReadinessAction(event) {
+  const runButton = event.target.closest("[data-paper-run-once]");
+  if (runButton) {
+    await runPaperOnceFromPanel();
+    return;
+  }
   const button = event.target.closest("[data-paper-refresh-active]");
   if (!button) return;
   const host = document.querySelector("#paper-tick-readiness-panel");
@@ -3376,6 +3381,24 @@ async function handlePaperTickReadinessAction(event) {
     } : payload) + renderPaperRefreshResult(payload);
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Active market refresh failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function runPaperOnceFromPanel() {
+  const host = document.querySelector("#paper-tick-readiness-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running safe paper once...</p>`;
+    const payload = await apiPost("/api/paper/run-once", {});
+    await Promise.all([
+      loadPaperSimulationControl(),
+      loadPaperRuntimeMonitor(),
+      loadPaperSessionMonitor(),
+      loadPaperObservationQuality(),
+    ]);
+    host.innerHTML = renderPaperTickReadiness(payload.tickReadinessAfter || payload.tickReadinessAfterRefresh || payload.tickReadinessBefore || payload) + renderPaperRunOnceResult(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper run-once failed: ${escapeHtml(error.message)}</p>`;
   }
 }
 
@@ -3404,6 +3427,7 @@ function renderPaperTickReadiness(payload) {
       <div class="metric"><span>Command</span><strong>${escapeHtml(next.recommendedCommand || "-")}</strong></div>
     </div>
     <div class="button-row">
+      <button type="button" data-paper-run-once="true">Run Paper Once</button>
       <button type="button" data-paper-refresh-active="refresh">Refresh Active Market</button>
       <button type="button" data-paper-refresh-active="tick">Refresh + Tick if Useful</button>
     </div>
@@ -3412,6 +3436,27 @@ function renderPaperTickReadiness(payload) {
       <thead><tr><th>Type</th><th>Detail</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="2">No tick readiness reasons returned.</td></tr>`}</tbody>
     </table>
+  `;
+}
+
+function renderPaperRunOnceResult(payload) {
+  const summary = payload.summary || {};
+  const next = payload.nextAction || {};
+  const refresh = payload.refresh || {};
+  const tick = payload.tickResult || {};
+  return `
+    <h3 class="modal-section-title">Paper Run Once <span class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "CHECK"}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Tick ran</span><strong>${payload.tickRan ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Refresh</span><strong>${refresh.ok === undefined ? refresh.attempted === false ? "skipped" : "-" : refresh.ok ? "ok" : "failed"}</strong></div>
+      <div class="metric"><span>Before</span><strong>${escapeHtml(summary.readinessBefore || "-")}</strong></div>
+      <div class="metric"><span>After</span><strong>${escapeHtml(summary.readinessAfter || "-")}</strong></div>
+      <div class="metric"><span>Stop before</span><strong>${escapeHtml(summary.stopRulesBefore || "-")}</strong></div>
+      <div class="metric"><span>Stop after</span><strong>${escapeHtml(summary.stopRulesAfter || "-")}</strong></div>
+      <div class="metric"><span>Processed</span><strong>${summary.processedCandlesDelta ?? tick.summary?.processedCandlesDelta ?? "-"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
   `;
 }
 

@@ -7,13 +7,14 @@ const data = require("../core/data");
 const paper = require("../core/paper");
 
 let staleMode = false;
+const fixedNowSeconds = Math.floor(Date.now() / 1000);
 
 function candles(count, stepSeconds) {
   const out = [];
   let price = 100;
   const base = staleMode
     ? 1700000000
-    : Math.floor(Date.now() / 1000) - (count - 1) * stepSeconds;
+    : fixedNowSeconds - (count - 1) * stepSeconds;
   for (let i = 0; i < count; i += 1) {
     price += Math.sin(i / 8) * 0.6 + 0.18;
     out.push({

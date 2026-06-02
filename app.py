@@ -1386,6 +1386,15 @@ def paper_refresh_active_market():
         return jsonify({"error": f"Could not refresh active paper market: {exc}"}), 502
 
 
+@app.post("/api/paper/run-once")
+def paper_run_once():
+    try:
+        result, status_code = run_paper_once_controlled(request.args, request.get_json(silent=True) or {})
+        return jsonify(result), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not run paper once: {exc}"}), 502
+
+
 @app.post("/api/paper/tick-once")
 def paper_tick_once():
     try:
@@ -5197,6 +5206,111 @@ def refresh_active_paper_market(args, payload: dict) -> tuple[dict, int]:
         result["error"] = result["nextAction"]["reason"]
         return result, 502
     return result, 200
+
+
+def compact_run_once_payload(payload: dict) -> dict:
+    refresh = payload.get("refresh") or {}
+    tick = payload.get("tickResult") or {}
+    return {
+        "ok": payload.get("ok"),
+        "paperEnabled": payload.get("paperEnabled"),
+        "realTradingEnabled": payload.get("realTradingEnabled"),
+        "action": (payload.get("nextAction") or {}).get("action"),
+        "reason": (payload.get("nextAction") or {}).get("reason"),
+        "readinessBefore": ((payload.get("tickReadinessBefore") or {}).get("tickReadiness") or {}).get("status"),
+        "readinessAfter": ((payload.get("tickReadinessAfter") or {}).get("tickReadiness") or {}).get("status"),
+        "refreshOk": refresh.get("ok"),
+        "refreshAction": (refresh.get("nextAction") or {}).get("action"),
+        "tickRan": payload.get("tickRan"),
+        "tickReturnCode": tick.get("returnCode"),
+        "processedCandlesDelta": (tick.get("summary") or {}).get("processedCandlesDelta"),
+        "stopRulesBefore": (payload.get("stopRulesBefore") or {}).get("status"),
+        "stopRulesAfter": (payload.get("stopRulesAfter") or {}).get("status"),
+        "observationStatus": (((payload.get("observationQuality") or {}).get("quality") or {}).get("status")),
+    }
+
+
+def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    readiness_before = build_paper_tick_readiness(args)
+    if real_enabled:
+        result = {
+            "ok": False,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": True,
+            "tickRan": False,
+            "tickReadinessBefore": readiness_before,
+            "nextAction": {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail},
+        }
+        result["summary"] = compact_run_once_payload(result)
+        return result, 400
+    if not paper_enabled:
+        stop_rules = build_paper_stop_rules(args)
+        observation = build_paper_observation_quality(args)
+        result = {
+            "ok": True,
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "tickRan": False,
+            "tickReadinessBefore": readiness_before,
+            "refresh": {"attempted": False, "reason": "Paper simulation is disabled."},
+            "stopRulesBefore": stop_rules,
+            "stopRulesAfter": stop_rules,
+            "observationQuality": observation,
+            "nextAction": {
+                "action": "PAPER_DISABLED",
+                "reason": "Paper simulation must be enabled manually before local run-once can refresh and tick.",
+            },
+        }
+        result["summary"] = compact_run_once_payload(result)
+        return result, 200
+    refresh_result, refresh_status = refresh_active_paper_market(args, {**payload, "thenTick": False})
+    readiness_after_refresh = build_paper_tick_readiness(args)
+    stop_rules_before = build_paper_stop_rules(args)
+    tick_result = None
+    tick_ran = False
+    stop_status = stop_rules_before.get("status")
+    readiness_status = (readiness_after_refresh.get("tickReadiness") or {}).get("status")
+    useful_now = bool((readiness_after_refresh.get("tickReadiness") or {}).get("usefulNow"))
+    if refresh_status >= 400:
+        next_action = {"action": "CHECK_DATA_SOURCE", "reason": (refresh_result.get("nextAction") or {}).get("reason") or "Active-market refresh failed."}
+    elif stop_status == "STOP_RECOMMENDED":
+        next_action = {"action": "REVIEW_STOP_RULES", "reason": "Stop rules recommend pausing paper; tick was not run."}
+    elif useful_now:
+        tick_result, _tick_status = run_paper_tick_once(args)
+        tick_ran = bool(tick_result and tick_result.get("ok"))
+        next_action = {"action": "MONITOR_PAPER", "reason": "Active market was refreshed and useful paper tick was run."}
+    elif readiness_status == "WAIT_FOR_NEXT_CANDLE":
+        next_action = {"action": "WAIT_FOR_NEXT_CANDLE", "reason": "Active market is current; no newer closed candle is available for a useful tick."}
+    elif readiness_status == "DATA_STALE":
+        next_action = {"action": "CHECK_DATA_SOURCE", "reason": "Active-market data remains stale after refresh; tick was not run."}
+    else:
+        next_action = {"action": "NO_ACTION", "reason": f"Tick was not run because readiness is {readiness_status or 'UNKNOWN'}."}
+    stop_rules_after = build_paper_stop_rules(args)
+    observation = build_paper_observation_quality(args)
+    final_candidate = load_paper_candidate_config()
+    final_enabled = canonical_paper_enabled(final_candidate)
+    final_real_enabled, _ = paper_real_trading_enabled()
+    result = {
+        "ok": refresh_status < 400,
+        "paperEnabled": final_enabled,
+        "realTradingEnabled": final_real_enabled,
+        "candidate": candidate_summary(final_candidate),
+        "tickRan": tick_ran,
+        "tickReadinessBefore": readiness_before,
+        "refresh": refresh_result,
+        "tickReadinessAfterRefresh": readiness_after_refresh,
+        "stopRulesBefore": stop_rules_before,
+        "tickResult": tick_result,
+        "stopRulesAfter": stop_rules_after,
+        "observationQuality": observation,
+        "tickReadinessAfter": build_paper_tick_readiness(args),
+        "nextAction": next_action,
+    }
+    result["summary"] = compact_run_once_payload(result)
+    return result, 200 if result["ok"] else refresh_status
 
 
 def build_paper_session_summary(args) -> dict:
