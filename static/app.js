@@ -534,8 +534,10 @@ async function refreshPaperLearningPanels() {
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
     loadPaperSessionMonitor(),
+    loadPaperSessionEventsSummary(),
     loadPaperObservationTargets(),
     loadPaperRunnerInstructions(),
+    loadPaperRunnerSummary(),
     loadPaperObservationQuality(),
   ]);
 }
@@ -2704,8 +2706,10 @@ function setupLearningControls() {
   document.querySelector("#paper-tick-readiness-refresh")?.addEventListener("click", loadPaperTickReadiness);
   document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
+  document.querySelector("#paper-session-events-refresh")?.addEventListener("click", loadPaperSessionEventsSummary);
   document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
   document.querySelector("#paper-runner-instructions-refresh")?.addEventListener("click", loadPaperRunnerInstructions);
+  document.querySelector("#paper-runner-summary-refresh")?.addEventListener("click", loadPaperRunnerSummary);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
@@ -3403,8 +3407,10 @@ async function runPaperOnceFromPanel() {
       loadPaperSimulationControl(),
       loadPaperRuntimeMonitor(),
       loadPaperSessionMonitor(),
+      loadPaperSessionEventsSummary(),
       loadPaperObservationTargets(),
       loadPaperRunnerInstructions(),
+      loadPaperRunnerSummary(),
       loadPaperObservationQuality(),
     ]);
     host.innerHTML = renderPaperTickReadiness(payload.tickReadinessAfter || payload.tickReadinessAfterRefresh || payload.tickReadinessBefore || payload) + renderPaperRunOnceResult(payload);
@@ -3559,6 +3565,59 @@ function renderPaperSessionMonitor(summary, eventsPayload) {
   `;
 }
 
+async function loadPaperSessionEventsSummary() {
+  const host = document.querySelector("#paper-session-events-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper session events summary...</p>`;
+    const payload = await apiGet("/api/paper/session-events-summary");
+    host.innerHTML = renderPaperSessionEventsSummary(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper session events summary could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSessionEventsSummary(payload) {
+  const counts = payload.counts || {};
+  const session = payload.session || {};
+  const next = payload.nextAction || {};
+  const tone = counts.currentSessionEvents > 0 ? "positive" : "neutral";
+  const warningRows = (payload.recentWarnings || payload.warnings || []).slice(-10).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const eventRows = (payload.recentEvents || []).slice().reverse().map((event) => `
+    <tr>
+      <td>${escapeHtml(event.timestamp || "-")}</td>
+      <td>${escapeHtml(event.eventType || "-")}</td>
+      <td>${escapeHtml(event.marketKey || "-")}</td>
+      <td>${event.stale ? "yes" : "no"}</td>
+      <td>${escapeHtml(event.reason || event.message || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Paper Session Events Summary <span class="${tone}">${counts.currentSessionEvents ?? 0} events</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${counts.signals ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${counts.warnings ?? 0}</strong></div>
+      <div class="metric"><span>State warnings</span><strong>${counts.stateWarnings ?? 0}</strong></div>
+      <div class="metric"><span>Opened</span><strong>${counts.openedVirtualTrades ?? 0}</strong></div>
+      <div class="metric"><span>Closed</span><strong>${counts.closedVirtualTrades ?? 0}</strong></div>
+      <div class="metric"><span>Session events</span><strong>${counts.currentSessionEvents ?? 0}</strong></div>
+      <div class="metric"><span>Stale events</span><strong>${counts.staleEvents ?? 0}</strong></div>
+      <div class="metric"><span>Active events</span><strong>${counts.activeMarketEvents ?? 0}</strong></div>
+      <div class="metric"><span>Watch events</span><strong>${counts.watchMarketEvents ?? 0}</strong></div>
+      <div class="metric"><span>Latest</span><strong>${escapeHtml(payload.latestEventTime || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Session:</strong> ${escapeHtml(session.startedAt || "-")} to ${escapeHtml(session.endedAt || "running")}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    ${warningRows ? `<ul class="backtest-warnings">${warningRows}</ul>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Time</th><th>Type</th><th>Market</th><th>Stale</th><th>Message</th></tr></thead>
+      <tbody>${eventRows || `<tr><td colspan="5">No current-session events returned.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
 async function loadPaperObservationTargets() {
   const host = document.querySelector("#paper-observation-targets-panel");
   if (!host) return;
@@ -3654,6 +3713,63 @@ function renderPaperRunnerInstructions(payload) {
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
     ${notes ? `<ul class="modal-note-list">${notes}</ul>` : ""}
+  `;
+}
+
+async function loadPaperRunnerSummary() {
+  const host = document.querySelector("#paper-runner-summary-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper runner summary...</p>`;
+    const payload = await apiGet("/api/paper/runner-summary");
+    host.innerHTML = renderPaperRunnerSummary(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper runner summary could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperRunnerSummary(payload) {
+  const counts = payload.counts || {};
+  const latest = payload.latestIteration || {};
+  const latestSummary = payload.latestSummary || {};
+  const next = payload.nextAction || {};
+  const tone = payload.exists ? counts.errors > 0 ? "negative" : counts.iterations > 0 ? "positive" : "neutral" : "neutral";
+  const skipRows = (payload.recentSkipReasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  const actionRows = (payload.recentActions || []).slice().reverse().map((item) => `
+    <tr>
+      <td>${item.iteration ?? "-"}</td>
+      <td>${escapeHtml(item.timestamp || "-")}</td>
+      <td>${escapeHtml(item.action || "-")}</td>
+      <td>${escapeHtml(item.reason || "-")}</td>
+    </tr>
+  `).join("");
+  const warningRows = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Runner Summary <span class="${tone}">${payload.exists ? `${counts.iterations ?? 0} iterations` : "no log"}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Entries read</span><strong>${payload.entriesRead ?? 0}</strong></div>
+      <div class="metric"><span>Iterations</span><strong>${counts.iterations ?? 0}</strong></div>
+      <div class="metric"><span>Summaries</span><strong>${counts.summaries ?? 0}</strong></div>
+      <div class="metric"><span>Ticks run</span><strong>${counts.ticksRun ?? 0}</strong></div>
+      <div class="metric"><span>Ticks skipped</span><strong>${counts.ticksSkipped ?? 0}</strong></div>
+      <div class="metric"><span>Errors</span><strong>${counts.errors ?? 0}</strong></div>
+      <div class="metric"><span>Refresh OK</span><strong>${counts.refreshOk ?? 0}</strong></div>
+      <div class="metric"><span>Refresh skipped</span><strong>${counts.refreshSkipped ?? 0}</strong></div>
+      <div class="metric"><span>Wait candle</span><strong>${counts.waitForNextCandle ?? 0}</strong></div>
+      <div class="metric"><span>Paper disabled</span><strong>${counts.paperDisabled ?? 0}</strong></div>
+      <div class="metric"><span>Stop blocks</span><strong>${counts.stopRuleBlocks ?? 0}</strong></div>
+      <div class="metric"><span>Latest target</span><strong>${escapeHtml(latest.observationTargetStatus || latestSummary.finalObservationTargetStatus || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Log:</strong> ${escapeHtml(payload.logFile || "-")}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    ${skipRows ? `<p class="modal-note"><strong>Recent skip reasons:</strong></p><ul class="backtest-warnings">${skipRows}</ul>` : ""}
+    ${warningRows ? `<ul class="backtest-warnings">${warningRows}</ul>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Iteration</th><th>Time</th><th>Action</th><th>Reason</th></tr></thead>
+      <tbody>${actionRows || `<tr><td colspan="4">No runner actions returned.</td></tr>`}</tbody>
+    </table>
   `;
 }
 

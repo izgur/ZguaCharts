@@ -1225,6 +1225,8 @@ def paper_status():
         session_summary = build_paper_session_summary(request.args)
         observation_quality = build_paper_observation_quality(request.args)
         observation_targets = build_paper_observation_targets(request.args)
+        runner_summary = build_paper_runner_summary(request.args)
+        session_events_summary = build_paper_session_events_summary(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
@@ -1275,6 +1277,8 @@ def paper_status():
                 "evidence": observation_quality.get("evidence"),
             },
             "observationTargets": compact_observation_targets(observation_targets),
+            "runnerSummary": compact_runner_summary(runner_summary),
+            "sessionEventsSummary": compact_session_events_summary(session_events_summary),
             "tickReadiness": {
                 "status": tick_readiness.get("tickReadiness", {}).get("status"),
                 "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
@@ -1339,6 +1343,22 @@ def paper_observation_targets():
         return jsonify(build_paper_observation_targets(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper observation targets: {exc}"}), 502
+
+
+@app.get("/api/paper/runner-summary")
+def paper_runner_summary():
+    try:
+        return jsonify(build_paper_runner_summary(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper runner summary: {exc}"}), 502
+
+
+@app.get("/api/paper/session-events-summary")
+def paper_session_events_summary():
+    try:
+        return jsonify(build_paper_session_events_summary(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper session events summary: {exc}"}), 502
 
 
 @app.get("/api/paper/recent-events")
@@ -5206,6 +5226,188 @@ def build_paper_observation_targets(args) -> dict:
         "blockingIssues": dedupe_list([item for item in blocking_issues if item]),
         "warnings": dedupe_list([item for item in warnings if item]),
         "informationalWarnings": dedupe_list([item for item in informational if item]),
+    }
+
+
+def requested_runner_log_path(args) -> tuple[Path, list[str]]:
+    warnings = []
+    raw = str(args.get("logFile") or "reports/paper-runner-session.jsonl").strip()
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(app.root_path) / path
+    resolved = path.resolve()
+    root = Path(app.root_path).resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        warnings.append("Requested logFile is outside the app root; using the default runner log.")
+        resolved = root / "reports" / "paper-runner-session.jsonl"
+    return resolved, warnings
+
+
+def runner_action_value(entry: dict) -> str | None:
+    action = entry.get("nextAction")
+    if isinstance(action, dict):
+        return action.get("action")
+    return entry.get("action")
+
+
+def runner_action_reason(entry: dict) -> str | None:
+    action = entry.get("nextAction")
+    if isinstance(action, dict):
+        return action.get("reason")
+    return entry.get("reason")
+
+
+def compact_runner_summary(summary: dict) -> dict:
+    counts = summary.get("counts") or {}
+    latest_iteration = summary.get("latestIteration") or {}
+    latest_summary = summary.get("latestSummary") or {}
+    return {
+        "exists": summary.get("exists"),
+        "entriesRead": summary.get("entriesRead"),
+        "latestIteration": latest_iteration,
+        "latestSummary": latest_summary,
+        "counts": counts,
+        "nextAction": summary.get("nextAction"),
+        "warnings": summary.get("warnings", []),
+    }
+
+
+def build_paper_runner_summary(args) -> dict:
+    log_path, warnings = requested_runner_log_path(args)
+    limit = min(max(int(safe_float(args.get("limit", 200), 200)), 1), 5000)
+    exists = log_path.exists()
+    entries = read_jsonl_tail(str(log_path), limit) if exists else []
+    iterations = [entry for entry in entries if entry.get("type") == "iteration" or entry.get("iteration") is not None]
+    summaries = [entry for entry in entries if entry.get("type") == "summary" or entry.get("iterationsAttempted") is not None]
+    latest_iteration = iterations[-1] if iterations else None
+    latest_summary = summaries[-1] if summaries else None
+    counts = {
+        "iterations": len(iterations),
+        "summaries": len(summaries),
+        "ticksRun": len([entry for entry in iterations if entry.get("tickRan")]),
+        "ticksSkipped": len([entry for entry in iterations if not entry.get("tickRan")]),
+        "errors": len([entry for entry in iterations if entry.get("ok") is False or str(entry.get("runStatus", "")).upper() == "ERROR"]),
+        "refreshOk": len([entry for entry in iterations if entry.get("refreshStatus") == "OK" or entry.get("refreshOk") is True]),
+        "refreshSkipped": len([entry for entry in iterations if entry.get("refreshStatus") == "SKIPPED" or entry.get("refreshAction") == "SKIPPED"]),
+        "waitForNextCandle": len([entry for entry in iterations if entry.get("tickReadinessStatus") == "WAIT_FOR_NEXT_CANDLE" or runner_action_value(entry) == "WAIT_FOR_NEXT_CANDLE"]),
+        "paperDisabled": len([entry for entry in iterations if entry.get("paperEnabled") is False or runner_action_value(entry) == "PAPER_DISABLED"]),
+        "stopRuleBlocks": len([entry for entry in iterations if entry.get("stopRulesStatus") == "STOP_RECOMMENDED" or runner_action_value(entry) == "REVIEW_STOP_RULES"]),
+    }
+    recent_skip_reasons = dedupe_list([
+        entry.get("tickSkipReason") or runner_action_reason(entry)
+        for entry in iterations[-25:]
+        if not entry.get("tickRan") and (entry.get("tickSkipReason") or runner_action_reason(entry))
+    ])[-10:]
+    recent_actions = [
+        {
+            "iteration": entry.get("iteration"),
+            "action": runner_action_value(entry),
+            "reason": runner_action_reason(entry),
+            "timestamp": entry.get("timestamp"),
+        }
+        for entry in iterations[-10:]
+        if runner_action_value(entry) or runner_action_reason(entry)
+    ]
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, _ = paper_real_trading_enabled()
+    if not exists:
+        warnings.append("Runner log file does not exist yet. Run python scripts/paper_run_once.py --log-file reports/paper-runner-session.jsonl to create one.")
+    if latest_iteration:
+        next_action = latest_iteration.get("nextAction") or {"action": runner_action_value(latest_iteration), "reason": runner_action_reason(latest_iteration)}
+    elif not exists:
+        next_action = {"action": "RUN_PAPER_RUNNER_WITH_LOG", "reason": "No runner JSONL log exists for the requested path."}
+    else:
+        next_action = {"action": "NO_RUNNER_ITERATIONS_FOUND", "reason": "The runner log exists but no iteration records were found."}
+    return {
+        "ok": True,
+        "logFile": str(log_path.relative_to(app.root_path)) if str(log_path).startswith(str(Path(app.root_path))) else str(log_path),
+        "exists": exists,
+        "entriesRead": len(entries),
+        "latestIteration": latest_iteration,
+        "latestSummary": latest_summary,
+        "counts": counts,
+        "recentSkipReasons": recent_skip_reasons,
+        "recentActions": recent_actions,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "nextAction": next_action,
+        "warnings": dedupe_list(warnings),
+    }
+
+
+def compact_session_events_summary(summary: dict) -> dict:
+    counts = summary.get("counts") or {}
+    return {
+        "sessionId": summary.get("session", {}).get("sessionId"),
+        "latestEventTime": summary.get("latestEventTime"),
+        "counts": counts,
+        "paperEnabled": summary.get("paperEnabled"),
+        "realTradingEnabled": summary.get("realTradingEnabled"),
+        "nextAction": summary.get("nextAction"),
+        "warnings": summary.get("warnings", []),
+    }
+
+
+def build_paper_session_events_summary(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 1000)
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, _ = paper_real_trading_enabled()
+    session = paper_session_window(candidate)
+    active_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)}
+    watch_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "watch") if paper_market_key(market)}
+    normalized = [normalized_paper_event(event, session) for event in journal]
+    session_events = [event for event in normalized if event.get("currentSession")]
+    stale_events = [event for event in normalized if event.get("stale")]
+    event_types = [str(event.get("eventType", "")).upper() for event in session_events]
+    latest_event = session_events[-1] if session_events else None
+    state_warnings = state.get("warnings") if isinstance(state.get("warnings"), list) else []
+    counts = {
+        "signals": event_types.count("SIGNAL"),
+        "warnings": len([event for event in session_events if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"}]),
+        "stateWarnings": len(state_warnings),
+        "openedVirtualTrades": event_types.count("ENTRY"),
+        "closedVirtualTrades": event_types.count("EXIT"),
+        "currentSessionEvents": len(session_events),
+        "staleEvents": len(stale_events),
+        "activeMarketEvents": len([event for event in session_events if event.get("marketKey") in active_keys]),
+        "watchMarketEvents": len([event for event in session_events if event.get("marketKey") in watch_keys]),
+    }
+    recent_warnings = [
+        event.get("reason") or event.get("message")
+        for event in session_events[-50:]
+        if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"} and (event.get("reason") or event.get("message"))
+    ]
+    warnings = dedupe_list(recent_warnings + [str(warning) for warning in state_warnings if warning])
+    if counts["currentSessionEvents"] <= 0:
+        next_action = {
+            "action": "WAIT_FOR_PAPER_SESSION_EVENTS" if paper_enabled else "PAPER_DISABLED",
+            "reason": "No current-session paper journal events are available yet." if paper_enabled else "Paper is disabled; session event summary is read-only.",
+        }
+    else:
+        next_action = {
+            "action": "REVIEW_PAPER_SESSION_EVENTS",
+            "reason": f"{counts['currentSessionEvents']} current-session paper journal event(s) are available for review.",
+        }
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "session": {
+            "sessionId": session.get("sessionId"),
+            "startedAt": session.get("startedAt"),
+            "endedAt": session.get("endedAt"),
+        },
+        "latestEventTime": latest_event.get("timestamp") if latest_event else None,
+        "counts": counts,
+        "recentWarnings": warnings[-10:],
+        "recentEvents": session_events[-10:],
+        "nextAction": next_action,
+        "warnings": warnings,
     }
 
 
