@@ -146,7 +146,7 @@ function refreshPaperCandles(options) {
   const statePath = options.statePath || DEFAULT_STATE_PATH;
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
   const state = loadState(statePath, config);
-  const markets = normalizeMarkets(config);
+  const markets = normalizeMarkets(config).filter((market) => !options.activeOnly || market.mode !== "watch");
   const freshness = {};
   const jobs = markets.map((market) => () => fetchMarketCandles(config, market, { forceRefresh: true }).then((payload) => {
     const candles = payload.candles.slice(0, -1);
@@ -167,6 +167,7 @@ function refreshPaperCandles(options) {
     writeStatusReports(reportDir, state, config, [], freshness);
     return {
       status: "refreshed",
+      activeOnly: !!options.activeOnly,
       marketsRefreshed: Object.keys(freshness).length,
       fetchedFromBybit: Object.keys(freshness).filter((key) => freshness[key].fetchedFromBybit).length,
       freshness

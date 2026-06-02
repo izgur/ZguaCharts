@@ -8,6 +8,7 @@ paper.refreshPaperCandles({
   configPath: args.config || "config/local/paper-candidate.json",
   statePath: args.state || "data/paper-state.json",
   reportDir: args.output || "reports",
+  activeOnly: args["active-only"] === true,
   advanceBaseline: args["advance-baseline"] === true
 }).then((result) => {
   process.stdout.write(JSON.stringify(result, null, 2));

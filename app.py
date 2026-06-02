@@ -21,6 +21,7 @@ from data_source import (
     fetch_candles,
     fetch_historical_candles,
     inspect_all_bybit_cache,
+    inspect_bybit_cache,
     parse_period_to_days,
     historical_limit_for_period,
     research_data_readiness,
@@ -1374,6 +1375,15 @@ def paper_tick_readiness():
         return jsonify(build_paper_tick_readiness(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper tick readiness: {exc}"}), 502
+
+
+@app.post("/api/paper/refresh-active-market")
+def paper_refresh_active_market():
+    try:
+        result, status_code = refresh_active_paper_market(request.args, request.get_json(silent=True) or {})
+        return jsonify(result), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not refresh active paper market: {exc}"}), 502
 
 
 @app.post("/api/paper/tick-once")
@@ -4896,9 +4906,16 @@ def epoch_to_iso(epoch_value) -> str | None:
     return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
 
 
-def paper_market_freshness(market: dict, state: dict) -> dict:
+def paper_report_freshness() -> dict:
+    report = read_json_file(os.path.join(app.root_path, "reports", "paper-freshness.json"), {})
+    return report.get("freshness") if isinstance(report.get("freshness"), dict) else {}
+
+
+def paper_market_freshness(market: dict, state: dict, report_freshness: dict | None = None) -> dict:
     key = paper_market_key(market)
-    freshness = ((state.get("freshness") or {}).get(key) or {}) if key else {}
+    state_freshness = ((state.get("freshness") or {}).get(key) or {}) if key else {}
+    report_item = ((report_freshness or {}).get(key) or {}) if key else {}
+    freshness = {**state_freshness, **report_item}
     last_processed = ((state.get("lastProcessedCandleTime") or {}).get(key)) if isinstance(state.get("lastProcessedCandleTime"), dict) else None
     latest = freshness.get("latestCandleTime")
     latest_epoch = safe_float(latest, 0)
@@ -4918,6 +4935,8 @@ def paper_market_freshness(market: dict, state: dict) -> dict:
         "staleThresholdSeconds": freshness.get("staleThresholdSeconds"),
         "expectedIntervalSeconds": interval_seconds,
         "isStale": bool(freshness.get("isStale")),
+        "dataStatus": "STALE_CACHE" if freshness.get("isStale") else "FRESH_OR_CURRENT",
+        "dataSourceFailureKnown": False,
         "cacheHit": bool(freshness.get("cacheHit")),
         "cacheMiss": bool(freshness.get("cacheMiss")),
         "fetchedFromBybit": bool(freshness.get("fetchedFromBybit")),
@@ -4942,12 +4961,13 @@ def paper_next_useful_tick(active: dict) -> tuple[str | None, int | None]:
 def build_paper_tick_readiness(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    report_freshness = paper_report_freshness()
     paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
     active_markets = candidate_symbols_by_mode(candidate, "active")
     watch_markets = candidate_symbols_by_mode(candidate, "watch")
-    active_freshness = [paper_market_freshness(market, state) for market in active_markets]
-    watch_freshness = [paper_market_freshness(market, state) for market in watch_markets]
+    active_freshness = [paper_market_freshness(market, state, report_freshness) for market in active_markets]
+    watch_freshness = [paper_market_freshness(market, state, report_freshness) for market in watch_markets]
     active = active_freshness[0] if active_freshness else {}
     next_at, seconds_until = paper_next_useful_tick(active) if active else (None, None)
     reasons = []
@@ -5017,9 +5037,166 @@ def build_paper_tick_readiness(args) -> dict:
             "action": action,
             "reason": reason,
             "recommendedCommand": package_script_command("paper:tick") if useful_now else None,
-            "recommendedApiAction": "POST /api/paper/tick-once" if useful_now else None,
+            "recommendedApiAction": "POST /api/paper/tick-once" if useful_now else "POST /api/paper/refresh-active-market" if status == "DATA_STALE" else None,
         },
     }
+
+
+def request_bool(args, payload: dict, name: str, default: bool = False) -> bool:
+    if name in payload:
+        value = payload.get(name)
+    else:
+        value = args.get(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def cache_snapshot_for_market(market: dict, source: str) -> dict:
+    symbol = market.get("symbol")
+    timeframe = market.get("interval") or market.get("timeframe")
+    if source != "bybit" or not symbol or not timeframe:
+        return {"cachedCandles": None, "latestCandleTime": None, "warnings": [f"Cache inspection is only supported for Bybit, not {source}."]}
+    cache = inspect_bybit_cache(symbol, timeframe)
+    return {
+        "cachedCandles": cache.get("cachedCandles"),
+        "latestCandleTime": cache.get("lastCandleTime"),
+        "warnings": cache.get("warnings") or [],
+    }
+
+
+def active_market_refresh_rows(active_markets: list[dict], source: str, before_cache: dict, after_cache: dict, stdout_payload: dict | None, return_code: int) -> list[dict]:
+    freshness = (stdout_payload or {}).get("freshness") if isinstance(stdout_payload, dict) else {}
+    rows = []
+    for market in active_markets:
+        key = paper_market_key(market)
+        before = before_cache.get(key) or {}
+        after = after_cache.get(key) or {}
+        item_freshness = (freshness or {}).get(key) or {}
+        status = "FAILED" if return_code != 0 else "UNCHANGED"
+        if return_code == 0 and (
+            safe_float(after.get("latestCandleTime"), 0) > safe_float(before.get("latestCandleTime"), 0)
+            or safe_float(after.get("cachedCandles"), 0) > safe_float(before.get("cachedCandles"), 0)
+            or item_freshness.get("fetchedFromBybit")
+        ):
+            status = "REFRESHED"
+        rows.append({
+            "symbol": market.get("symbol"),
+            "timeframe": market.get("interval") or market.get("timeframe"),
+            "status": status,
+            "candlesBefore": before.get("cachedCandles"),
+            "candlesAfter": after.get("cachedCandles"),
+            "latestCandleTimeBefore": before.get("latestCandleTime"),
+            "latestCandleTimeAfter": after.get("latestCandleTime"),
+            "freshness": item_freshness,
+            "warnings": dedupe_list((before.get("warnings") or []) + (after.get("warnings") or [])),
+        })
+    return rows
+
+
+def refresh_active_paper_market(args, payload: dict) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    before = build_paper_tick_readiness(args)
+    active_markets = candidate_symbols_by_mode(candidate, "active")
+    source = candidate.get("source") or "bybit"
+    if real_enabled:
+        return {
+            "ok": False,
+            "error": real_detail,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": True,
+            "activeMarkets": active_markets,
+            "before": {"tickReadiness": before.get("tickReadiness"), "freshness": before.get("freshness")},
+        }, 400
+    if source != "bybit":
+        return {
+            "ok": False,
+            "error": f"Active paper refresh currently supports Bybit only, not {source}.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "activeMarkets": active_markets,
+            "before": {"tickReadiness": before.get("tickReadiness"), "freshness": before.get("freshness")},
+        }, 400
+    before_cache = {paper_market_key(market): cache_snapshot_for_market(market, source) for market in active_markets}
+    command_args = package_node_script_args("paper:refresh") + ["--active-only"]
+    completed = subprocess.run(
+        command_args,
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=int(safe_float(args.get("timeout_seconds", payload.get("timeoutSeconds", 90)), 90)),
+    )
+    stdout_payload = None
+    if completed.stdout.strip():
+        try:
+            stdout_payload = json.loads(completed.stdout)
+        except Exception:
+            stdout_payload = {"raw": completed.stdout.strip()}
+    after = build_paper_tick_readiness(args)
+    after_cache = {paper_market_key(market): cache_snapshot_for_market(market, source) for market in active_markets}
+    markets = active_market_refresh_rows(active_markets, source, before_cache, after_cache, stdout_payload, completed.returncode)
+    after_readiness = after.get("tickReadiness") or {}
+    then_tick = request_bool(args, payload, "thenTick", False)
+    tick_result = None
+    if completed.returncode == 0 and then_tick and after_readiness.get("usefulNow"):
+        tick_result, _tick_status = run_paper_tick_once(args)
+    if completed.returncode != 0:
+        action = "CHECK_DATA_SOURCE"
+        reason = completed.stderr.strip() or "Active-market refresh command failed."
+    elif then_tick and tick_result is not None:
+        action = "NO_ACTION"
+        reason = "Refresh completed and useful paper tick was run."
+    elif after_readiness.get("usefulNow"):
+        action = "RUN_TICK"
+        reason = "Active-market candles are usable; run POST /api/paper/tick-once or npm run paper:tick."
+    elif after_readiness.get("status") == "WAIT_FOR_NEXT_CANDLE":
+        action = "WAIT_FOR_NEXT_CANDLE"
+        reason = "Refresh completed, but the latest closed active-market candle is already processed."
+    elif after_readiness.get("status") == "DATA_STALE":
+        action = "CHECK_DATA_SOURCE"
+        reason = "Refresh completed, but active-market data is still stale."
+    else:
+        action = "NO_ACTION"
+        reason = "Refresh completed; no useful paper tick is available right now."
+    result = {
+        "ok": completed.returncode == 0,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": False,
+        "activeMarkets": active_markets,
+        "before": {
+            "tickReadiness": before.get("tickReadiness"),
+            "freshness": before.get("freshness"),
+        },
+        "refresh": {
+            "attempted": True,
+            "command": package_script_command("paper:refresh") + " -- --active-only",
+            "returnCode": completed.returncode,
+            "markets": markets,
+            "stdout": stdout_payload,
+            "stderr": completed.stderr.strip(),
+        },
+        "after": {
+            "tickReadiness": after.get("tickReadiness"),
+            "freshness": after.get("freshness"),
+        },
+        "nextAction": {
+            "action": action,
+            "reason": reason,
+        },
+    }
+    if then_tick:
+        result["thenTick"] = {
+            "requested": True,
+            "ran": tick_result is not None,
+            "reason": "Tick ran because refreshed readiness was useful." if tick_result is not None else f"Tick was not run because refreshed readiness is {after_readiness.get('status')}.",
+            "tickResult": tick_result,
+        }
+    if completed.returncode != 0:
+        result["error"] = result["nextAction"]["reason"]
+        return result, 502
+    return result, 200
 
 
 def build_paper_session_summary(args) -> dict:

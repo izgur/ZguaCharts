@@ -2700,6 +2700,7 @@ function setupLearningControls() {
   document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
   document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
   document.querySelector("#paper-tick-readiness-refresh")?.addEventListener("click", loadPaperTickReadiness);
+  document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
@@ -3357,6 +3358,27 @@ async function loadPaperTickReadiness() {
   }
 }
 
+async function handlePaperTickReadinessAction(event) {
+  const button = event.target.closest("[data-paper-refresh-active]");
+  if (!button) return;
+  const host = document.querySelector("#paper-tick-readiness-panel");
+  if (!host) return;
+  const thenTick = button.dataset.paperRefreshActive === "tick";
+  try {
+    host.innerHTML = `<p class="pane-status">${thenTick ? "Refreshing active market and checking tick usefulness..." : "Refreshing active market..."}</p>`;
+    const payload = await apiPost(`/api/paper/refresh-active-market${thenTick ? "?thenTick=true" : ""}`, {});
+    host.innerHTML = renderPaperTickReadiness(payload.after ? {
+      paperEnabled: payload.paperEnabled,
+      realTradingEnabled: payload.realTradingEnabled,
+      freshness: payload.after.freshness,
+      tickReadiness: payload.after.tickReadiness,
+      nextAction: payload.nextAction,
+    } : payload) + renderPaperRefreshResult(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Active market refresh failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
 function renderPaperTickReadiness(payload) {
   const readiness = payload.tickReadiness || {};
   const next = payload.nextAction || {};
@@ -3381,10 +3403,38 @@ function renderPaperTickReadiness(payload) {
       <div class="metric"><span>Stale</span><strong>${active.isStale ? "yes" : "no"}</strong></div>
       <div class="metric"><span>Command</span><strong>${escapeHtml(next.recommendedCommand || "-")}</strong></div>
     </div>
+    <div class="button-row">
+      <button type="button" data-paper-refresh-active="refresh">Refresh Active Market</button>
+      <button type="button" data-paper-refresh-active="tick">Refresh + Tick if Useful</button>
+    </div>
     <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
     <table class="trade-table">
       <thead><tr><th>Type</th><th>Detail</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="2">No tick readiness reasons returned.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+function renderPaperRefreshResult(payload) {
+  const refresh = payload.refresh || {};
+  const rows = (refresh.markets || []).map((market) => `
+    <tr>
+      <td>${escapeHtml(market.symbol || "-")} ${escapeHtml(market.timeframe || "")}</td>
+      <td>${escapeHtml(market.status || "-")}</td>
+      <td>${market.candlesBefore ?? "-"}</td>
+      <td>${market.candlesAfter ?? "-"}</td>
+      <td>${escapeHtml(String(market.latestCandleTimeBefore ?? "-"))}</td>
+      <td>${escapeHtml(String(market.latestCandleTimeAfter ?? "-"))}</td>
+    </tr>
+  `).join("");
+  const thenTick = payload.thenTick || {};
+  return `
+    <h3 class="modal-section-title">Active Market Refresh <span class="${payload.ok ? "positive" : "negative"}">${payload.ok ? "OK" : "FAILED"}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(payload.nextAction?.action || "-")}</strong> ${escapeHtml(payload.nextAction?.reason || "")}</p>
+    ${thenTick.requested ? `<p class="modal-note"><strong>Refresh + tick:</strong> ${thenTick.ran ? "tick ran" : "tick not run"} - ${escapeHtml(thenTick.reason || "")}</p>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Market</th><th>Status</th><th>Candles Before</th><th>Candles After</th><th>Latest Before</th><th>Latest After</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="6">No active market refresh rows returned.</td></tr>`}</tbody>
     </table>
   `;
 }
