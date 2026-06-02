@@ -3321,6 +3321,8 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
     </tr>
   `).join("");
   const reasonRows = (health.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  const activeWarningRows = (journal.activeWarnings || []).map((warning) => `<li>${escapeHtml(warning.reason || warning.message || "-")}</li>`).join("");
+  const watchWarningRows = (journal.watchWarnings || []).map((warning) => `<li>${escapeHtml(warning.reason || warning.message || "-")}</li>`).join("");
   return `
     <h3 class="modal-section-title">Paper Runtime Monitor <span class="${healthTone}">${escapeHtml(health.status || "UNKNOWN")}</span></h3>
     <div class="metric-grid">
@@ -3332,13 +3334,16 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
       <div class="metric"><span>Last tick</span><strong>${escapeHtml(lastTick.updatedAt || "-")}</strong></div>
       <div class="metric"><span>Last signal</span><strong>${escapeHtml(lastSignal.processedAt || "-")}</strong></div>
       <div class="metric"><span>Stop rules</span><strong class="${stopTone}">${escapeHtml(stopRules.status || "-")}</strong></div>
-      <div class="metric"><span>Stale warnings</span><strong>${(journal.staleWarnings || []).length}</strong></div>
-      <div class="metric"><span>Recent warnings</span><strong>${(journal.recentWarnings || []).length}</strong></div>
+      <div class="metric"><span>Active warnings</span><strong>${journal.activeWarningCount ?? (journal.activeWarnings || []).length}</strong></div>
+      <div class="metric"><span>Watch warnings</span><strong>${journal.watchWarningCount ?? (journal.watchWarnings || []).length}</strong></div>
+      <div class="metric"><span>Stale watch</span><strong>${journal.staleWatchWarningCount ?? (journal.staleWatchWarnings || []).length}</strong></div>
     </div>
     <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
     <p class="modal-note"><strong>${escapeHtml(stopNext.action || "-")}</strong> ${escapeHtml(stopNext.reason || "")}</p>
     ${initCommand}
     ${reasonRows ? `<ul class="backtest-warnings">${reasonRows}</ul>` : ""}
+    ${activeWarningRows ? `<p class="modal-note"><strong>Active warnings:</strong></p><ul class="backtest-warnings">${activeWarningRows}</ul>` : ""}
+    ${watchWarningRows ? `<p class="modal-note"><strong>Watch warnings:</strong> informational only.</p><ul class="backtest-warnings">${watchWarningRows}</ul>` : ""}
     <table class="trade-table">
       <thead><tr><th>Stop Rule</th><th>Pass</th><th>Severity</th><th>Detail</th></tr></thead>
       <tbody>${stopRows || `<tr><td colspan="4">No stop rules returned.</td></tr>`}</tbody>
@@ -3410,7 +3415,8 @@ function renderPaperTickReadiness(payload) {
   const tone = status === "READY" ? "positive" : status === "BLOCKED" || status === "DATA_STALE" || status === "NOT_INITIALIZED" ? "negative" : "neutral";
   const rows = [
     ...(readiness.reasons || []).map((detail) => ({ type: "Reason", detail })),
-    ...(readiness.warnings || []).map((detail) => ({ type: "Warning", detail })),
+    ...(readiness.blockingWarnings || []).map((detail) => ({ type: "Active warning", detail })),
+    ...(readiness.informationalWarnings || []).map((detail) => ({ type: "Watch info", detail })),
   ].map((item) => `<tr><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.detail || "-")}</td></tr>`).join("");
   return `
     <h3 class="modal-section-title">Paper Tick Readiness <span class="${tone}">${escapeHtml(status)}</span></h3>
@@ -3421,11 +3427,15 @@ function renderPaperTickReadiness(payload) {
       <div class="metric"><span>Active market</span><strong>${active.marketKey ? escapeHtml(active.marketKey) : "-"}</strong></div>
       <div class="metric"><span>Latest candle</span><strong>${escapeHtml(active.latestCandleAt || "-")}</strong></div>
       <div class="metric"><span>Last processed</span><strong>${escapeHtml(active.lastProcessedCandleAt || "-")}</strong></div>
+      <div class="metric"><span>Next closed</span><strong>${escapeHtml(readiness.nextExpectedClosedCandleTime || active.nextExpectedClosedCandleAt || "-")}</strong></div>
       <div class="metric"><span>Next useful</span><strong>${escapeHtml(readiness.nextUsefulTickAt || "-")}</strong></div>
       <div class="metric"><span>Wait</span><strong>${readiness.secondsUntilNextUsefulTick === null || readiness.secondsUntilNextUsefulTick === undefined ? "-" : formatDurationSeconds(readiness.secondsUntilNextUsefulTick)}</strong></div>
       <div class="metric"><span>Stale</span><strong>${active.isStale ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Active warn</span><strong>${(readiness.activeWarnings || []).length}</strong></div>
+      <div class="metric"><span>Watch info</span><strong>${(readiness.watchWarnings || []).length}</strong></div>
       <div class="metric"><span>Command</span><strong>${escapeHtml(next.recommendedCommand || "-")}</strong></div>
     </div>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(readiness.activeMarketReason || "-")}</p>
     <div class="button-row">
       <button type="button" data-paper-run-once="true">Run Paper Once</button>
       <button type="button" data-paper-refresh-active="refresh">Refresh Active Market</button>

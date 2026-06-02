@@ -1278,10 +1278,20 @@ def paper_status():
                 "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
                 "nextUsefulTickAt": tick_readiness.get("tickReadiness", {}).get("nextUsefulTickAt"),
                 "secondsUntilNextUsefulTick": tick_readiness.get("tickReadiness", {}).get("secondsUntilNextUsefulTick"),
-                "activeMarketReason": (tick_readiness.get("tickReadiness", {}).get("reasons") or [None])[0],
+                "activeMarketReason": tick_readiness.get("tickReadiness", {}).get("activeMarketReason"),
+                "activeWarningCount": len(tick_readiness.get("tickReadiness", {}).get("activeWarnings") or []),
+                "watchWarningCount": len(tick_readiness.get("tickReadiness", {}).get("watchWarnings") or []),
+                "staleWatchWarningCount": len(tick_readiness.get("tickReadiness", {}).get("staleWatchWarnings") or []),
             },
             "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
             "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
+            "activeWarnings": runtime.get("journal", {}).get("activeWarnings", []),
+            "watchWarnings": runtime.get("journal", {}).get("watchWarnings", []),
+            "staleWatchWarnings": runtime.get("journal", {}).get("staleWatchWarnings", []),
+            "blockingWarnings": runtime.get("journal", {}).get("blockingWarnings", []),
+            "activeWarningCount": len(runtime.get("journal", {}).get("activeWarnings", [])),
+            "watchWarningCount": len(runtime.get("journal", {}).get("watchWarnings", [])),
+            "staleWatchWarningCount": len(runtime.get("journal", {}).get("staleWatchWarnings", [])),
             "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
             "equityCurve": state.get("equityCurve", [])[-500:],
         })
@@ -4540,9 +4550,27 @@ def compact_journal_event(event: dict) -> dict:
     }
 
 
-def paper_runtime_warning_buckets(state: dict, journal: list[dict], initialized_markets: set[str]) -> dict:
+def warning_market_key(warning: dict) -> str | None:
+    key = warning.get("marketKey")
+    if key:
+        return key
+    symbol = warning.get("symbol")
+    interval = warning.get("interval") or warning.get("timeframe")
+    if symbol and interval:
+        return f"{symbol}:{interval}"
+    reason = str(warning.get("reason") or "")
+    prefix = reason.split(":", 1)[0].strip()
+    parts = prefix.split()
+    if len(parts) >= 2:
+        return f"{parts[0]}:{parts[1]}"
+    return None
+
+
+def paper_runtime_warning_buckets(state: dict, journal: list[dict], initialized_markets: set[str], active_market_keys: set[str] | None = None, watch_market_keys: set[str] | None = None) -> dict:
     now = datetime.now(timezone.utc)
     updated_at = parse_iso_timestamp(state.get("updatedAt"))
+    active_market_keys = active_market_keys or set()
+    watch_market_keys = watch_market_keys or set()
     warning_events = [
         event for event in journal
         if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"} or event.get("reason")
@@ -4557,6 +4585,7 @@ def paper_runtime_warning_buckets(state: dict, journal: list[dict], initialized_
         old_by_age = bool(event_time and (now - event_time) > timedelta(hours=24))
         stale_init_warning = "Market not initialized" in reason and market_key in initialized_markets
         compact = compact_journal_event(event)
+        compact["marketKey"] = warning_market_key(compact) or market_key
         if old_by_state or old_by_age or stale_init_warning:
             stale.append(compact)
         else:
@@ -4565,14 +4594,31 @@ def paper_runtime_warning_buckets(state: dict, journal: list[dict], initialized_
         {
             "eventType": "STATE_WARNING",
             "reason": warning,
-            "marketKey": None,
+            "marketKey": warning_market_key({"reason": warning}),
             "processedAt": state.get("updatedAt"),
         }
         for warning in (state.get("warnings") or [])
     ]
+    current = recent + state_warnings
+    active_warnings = [warning for warning in current if warning_market_key(warning) in active_market_keys]
+    watch_warnings = [warning for warning in current if warning_market_key(warning) in watch_market_keys]
+    unknown_warnings = [warning for warning in current if warning_market_key(warning) not in active_market_keys and warning_market_key(warning) not in watch_market_keys]
+    stale_watch = [
+        warning for warning in watch_warnings
+        if "stale" in str(warning.get("reason", "")).lower()
+    ]
+    blocking = [
+        warning for warning in active_warnings + unknown_warnings
+        if str(warning.get("eventType", "")).upper() == "ERROR" or warning.get("reason")
+    ]
     return {
         "staleWarnings": stale[-25:],
-        "recentWarnings": (recent + state_warnings)[-25:],
+        "recentWarnings": current[-25:],
+        "activeWarnings": active_warnings[-25:],
+        "watchWarnings": watch_warnings[-25:],
+        "staleWatchWarnings": stale_watch[-25:],
+        "blockingWarnings": blocking[-25:],
+        "informationalWarnings": watch_warnings[-25:],
     }
 
 
@@ -4930,6 +4976,7 @@ def paper_market_freshness(market: dict, state: dict, report_freshness: dict | N
     latest_epoch = safe_float(latest, 0)
     processed_epoch = safe_float(last_processed, 0)
     interval_seconds = int(safe_float(freshness.get("expectedIntervalSeconds"), paper_interval_seconds(market.get("interval") or market.get("timeframe"))))
+    next_expected = processed_epoch + interval_seconds if processed_epoch else None
     return {
         "marketKey": key,
         "symbol": market.get("symbol"),
@@ -4937,9 +4984,13 @@ def paper_market_freshness(market: dict, state: dict, report_freshness: dict | N
         "mode": market.get("mode", "active"),
         "initialized": processed_epoch > 0,
         "latestCandleTime": latest,
+        "latestClosedCandleTime": latest,
         "latestCandleAt": epoch_to_iso(latest),
+        "latestClosedCandleAt": epoch_to_iso(latest),
         "lastProcessedCandleTime": last_processed,
         "lastProcessedCandleAt": epoch_to_iso(last_processed),
+        "nextExpectedClosedCandleTime": next_expected,
+        "nextExpectedClosedCandleAt": epoch_to_iso(next_expected),
         "latestClosedCandleAgeSeconds": freshness.get("latestClosedCandleAgeSeconds"),
         "staleThresholdSeconds": freshness.get("staleThresholdSeconds"),
         "expectedIntervalSeconds": interval_seconds,
@@ -4953,18 +5004,19 @@ def paper_market_freshness(market: dict, state: dict, report_freshness: dict | N
     }
 
 
-def paper_next_useful_tick(active: dict) -> tuple[str | None, int | None]:
+def paper_next_useful_tick(active: dict, useful_now: bool = False) -> tuple[str | None, int | None, float | None]:
+    if useful_now:
+        return None, 0, None
     latest = safe_float(active.get("latestCandleTime"), 0)
     processed = safe_float(active.get("lastProcessedCandleTime"), 0)
     interval = int(safe_float(active.get("expectedIntervalSeconds"), paper_interval_seconds(active.get("interval"))))
-    if latest and processed and latest > processed:
-        target = latest
-    elif latest or processed:
-        target = max(latest, processed) + interval
-    else:
-        return None, None
+    if not latest and not processed:
+        return None, None, None
+    target = (processed or latest) + interval
     now_epoch = datetime.now(timezone.utc).timestamp()
-    return epoch_to_iso(target), max(0, int(target - now_epoch))
+    while target <= now_epoch:
+        target += interval
+    return epoch_to_iso(target), max(0, int(target - now_epoch)), target
 
 
 def build_paper_tick_readiness(args) -> dict:
@@ -4978,9 +5030,12 @@ def build_paper_tick_readiness(args) -> dict:
     active_freshness = [paper_market_freshness(market, state, report_freshness) for market in active_markets]
     watch_freshness = [paper_market_freshness(market, state, report_freshness) for market in watch_markets]
     active = active_freshness[0] if active_freshness else {}
-    next_at, seconds_until = paper_next_useful_tick(active) if active else (None, None)
     reasons = []
-    warnings = []
+    active_warnings = []
+    watch_warnings = []
+    stale_watch_warnings = []
+    blocking_warnings = []
+    informational_warnings = []
     useful_now = False
     if not paper_enabled:
         status = "DISABLED"
@@ -5004,7 +5059,9 @@ def build_paper_tick_readiness(args) -> dict:
         reason = "Run npm run paper:init, then recheck tick readiness."
     elif active.get("isStale"):
         status = "DATA_STALE"
-        reasons.append(f"Active market {active.get('marketKey')} data is stale; paper tick is expected to skip processing.")
+        active_warnings.append(f"Active market {active.get('marketKey')} data is stale; paper tick is expected to skip processing.")
+        blocking_warnings.append(active_warnings[-1])
+        reasons.append(active_warnings[-1])
         action = "REFRESH_MARKET_DATA"
         reason = "Refresh market data before running another paper tick."
     elif active.get("newerClosedCandleAvailable"):
@@ -5020,9 +5077,17 @@ def build_paper_tick_readiness(args) -> dict:
         reason = "A manual tick is allowed but is expected to produce no new trade event until the next closed candle."
     for item in watch_freshness:
         if item.get("isStale"):
-            warnings.append(f"Watch market {item.get('marketKey')} data is stale; active-market readiness is unaffected.")
+            warning = f"Watch market {item.get('marketKey')} data is stale; active-market readiness is unaffected."
+            watch_warnings.append(warning)
+            stale_watch_warnings.append(warning)
         if not item.get("initialized"):
-            warnings.append(f"Watch market {item.get('marketKey')} is not initialized; active-market readiness is unaffected.")
+            watch_warnings.append(f"Watch market {item.get('marketKey')} is not initialized; active-market readiness is unaffected.")
+    informational_warnings = watch_warnings[:]
+    if active and (useful_now or status == "WAIT_FOR_NEXT_CANDLE"):
+        next_at, seconds_until, next_target = paper_next_useful_tick(active, useful_now)
+    else:
+        next_at, seconds_until, next_target = None, None, None
+    active_market_reason = reasons[0] if reasons else None
     return {
         "ok": True,
         "paperEnabled": paper_enabled,
@@ -5037,10 +5102,19 @@ def build_paper_tick_readiness(args) -> dict:
         "tickReadiness": {
             "status": status,
             "usefulNow": useful_now,
+            "latestClosedCandleTime": active.get("latestClosedCandleAt"),
+            "lastProcessedCandleTime": active.get("lastProcessedCandleAt"),
+            "nextExpectedClosedCandleTime": epoch_to_iso(next_target) if next_target else active.get("nextExpectedClosedCandleAt"),
             "nextUsefulTickAt": next_at,
             "secondsUntilNextUsefulTick": seconds_until,
+            "activeMarketReason": active_market_reason,
             "reasons": dedupe_list(reasons),
-            "warnings": dedupe_list(warnings),
+            "warnings": dedupe_list(blocking_warnings + informational_warnings),
+            "activeWarnings": dedupe_list(active_warnings),
+            "watchWarnings": dedupe_list(watch_warnings),
+            "staleWatchWarnings": dedupe_list(stale_watch_warnings),
+            "blockingWarnings": dedupe_list(blocking_warnings),
+            "informationalWarnings": dedupe_list(informational_warnings),
         },
         "nextAction": {
             "action": action,
@@ -5430,7 +5504,10 @@ def build_paper_runtime_status(args) -> dict:
         warnings.append(f"Could not load paper state: {exc}")
     journal = read_jsonl_tail(str(journal_path), 500) if journal_path.exists() else []
     active_markets = candidate_symbols_by_mode(candidate, "active") if candidate else []
+    watch_markets = candidate_symbols_by_mode(candidate, "watch") if candidate else []
     required_markets = [paper_market_key(market) for market in active_markets if paper_market_key(market)]
+    active_market_keys = set(required_markets)
+    watch_market_keys = {paper_market_key(market) for market in watch_markets if paper_market_key(market)}
     last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
     initialized_markets = {key for key in required_markets if key in last_processed}
     missing_markets = [key for key in required_markets if key not in last_processed]
@@ -5447,7 +5524,7 @@ def build_paper_runtime_status(args) -> dict:
         initialization_status = "UNKNOWN"
     paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
-    warning_buckets = paper_runtime_warning_buckets(state, journal, initialized_markets)
+    warning_buckets = paper_runtime_warning_buckets(state, journal, initialized_markets, active_market_keys, watch_market_keys)
     last_event = latest_journal_event(journal)
     last_signal = latest_journal_event(journal, {"SIGNAL", "ENTRY", "EXIT", "SKIP"})
     last_tick_at = state.get("updatedAt")
@@ -5475,9 +5552,11 @@ def build_paper_runtime_status(args) -> dict:
         if tick_stale:
             health_status = "WATCH" if health_status == "OK" else health_status
             health_reasons.append(f"Paper simulation is enabled but the last tick is stale ({last_tick_age} seconds old; watch threshold {max_tick_age}).")
-        if warning_buckets["recentWarnings"]:
+        if warning_buckets["blockingWarnings"]:
             health_status = "WATCH" if health_status == "OK" else health_status
-            health_reasons.append(f"{len(warning_buckets['recentWarnings'])} current runtime warning(s) are present.")
+            health_reasons.append(f"{len(warning_buckets['blockingWarnings'])} active or unclassified runtime warning(s) are present.")
+        if warning_buckets["watchWarnings"]:
+            health_reasons.append(f"{len(warning_buckets['watchWarnings'])} watch-market warning(s) are informational and do not block active paper ticking.")
         if warning_buckets["staleWarnings"]:
             health_reasons.append(f"{len(warning_buckets['staleWarnings'])} older journal warning(s) were separated as stale.")
     if not health_reasons:
@@ -5540,6 +5619,14 @@ def build_paper_runtime_status(args) -> dict:
             "lastEventAt": event_timestamp(last_event or {}),
             "staleWarnings": warning_buckets["staleWarnings"],
             "recentWarnings": warning_buckets["recentWarnings"],
+            "activeWarnings": warning_buckets["activeWarnings"],
+            "watchWarnings": warning_buckets["watchWarnings"],
+            "staleWatchWarnings": warning_buckets["staleWatchWarnings"],
+            "blockingWarnings": warning_buckets["blockingWarnings"],
+            "informationalWarnings": warning_buckets["informationalWarnings"],
+            "activeWarningCount": len(warning_buckets["activeWarnings"]),
+            "watchWarningCount": len(warning_buckets["watchWarnings"]),
+            "staleWatchWarningCount": len(warning_buckets["staleWatchWarnings"]),
         },
         "health": {
             "status": health_status,
@@ -5593,7 +5680,7 @@ def build_paper_stop_rules(args) -> dict:
     max_tick_age = int(safe_float(args.get("max_tick_age_seconds", 21600), 21600))
     last_tick_age = runtime.get("lastTick", {}).get("ageSeconds")
     runtime_errors = [
-        warning for warning in runtime.get("journal", {}).get("recentWarnings", [])
+        warning for warning in runtime.get("journal", {}).get("blockingWarnings", [])
         if str(warning.get("eventType", "")).upper() == "ERROR" or "error" in str(warning.get("reason", "")).lower()
     ]
     repeated_errors = len(runtime_errors) >= int(safe_float(args.get("max_recent_runtime_errors", 3), 3))
