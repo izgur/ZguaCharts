@@ -535,6 +535,7 @@ async function refreshPaperLearningPanels() {
     loadPaperTickReadiness(),
     loadPaperSessionMonitor(),
     loadPaperObservationTargets(),
+    loadPaperRunnerInstructions(),
     loadPaperObservationQuality(),
   ]);
 }
@@ -2704,6 +2705,7 @@ function setupLearningControls() {
   document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
+  document.querySelector("#paper-runner-instructions-refresh")?.addEventListener("click", loadPaperRunnerInstructions);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
@@ -3402,6 +3404,7 @@ async function runPaperOnceFromPanel() {
       loadPaperRuntimeMonitor(),
       loadPaperSessionMonitor(),
       loadPaperObservationTargets(),
+      loadPaperRunnerInstructions(),
       loadPaperObservationQuality(),
     ]);
     host.innerHTML = renderPaperTickReadiness(payload.tickReadinessAfter || payload.tickReadinessAfterRefresh || payload.tickReadinessBefore || payload) + renderPaperRunOnceResult(payload);
@@ -3607,6 +3610,50 @@ function renderPaperObservationTargets(payload) {
       <thead><tr><th>Type</th><th>Detail</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="2">No observation target issues returned.</td></tr>`}</tbody>
     </table>
+  `;
+}
+
+async function loadPaperRunnerInstructions() {
+  const host = document.querySelector("#paper-runner-instructions-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper runner instructions...</p>`;
+    const payload = await apiGet("/api/paper/runner-instructions");
+    host.innerHTML = renderPaperRunnerInstructions(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper runner instructions could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperRunnerInstructions(payload) {
+  const candidate = payload.candidate || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const targets = payload.observationTargets || {};
+  const progress = targets.progress || {};
+  const next = payload.nextAction || {};
+  const tone = targets.status === "READY_FOR_PAPER_REVIEW" ? "positive" : targets.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const notes = (payload.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Runner Instructions <span class="${tone}">${escapeHtml(targets.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Target status</span><strong>${escapeHtml(targets.status || "-")}</strong></div>
+      <div class="metric"><span>Ticks</span><strong>${progress.ticksObserved ?? 0} / ${progress.targetTicks ?? "-"}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${progress.closedTrades ?? 0} / ${progress.targetClosedTrades ?? "-"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>One-shot command</th><td><code>${escapeHtml(payload.oneShotCommand || "-")}</code></td></tr>
+        <tr><th>Loop command</th><td><code>${escapeHtml(payload.loopCommand || "-")}</code></td></tr>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+      </tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    ${notes ? `<ul class="modal-note-list">${notes}</ul>` : ""}
   `;
 }
 

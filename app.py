@@ -1389,6 +1389,35 @@ def paper_tick_instructions():
         return jsonify({"error": f"Could not build paper tick instructions: {exc}"}), 502
 
 
+@app.get("/api/paper/runner-instructions")
+def paper_runner_instructions():
+    try:
+        candidate = load_paper_candidate_config()
+        paper_enabled = canonical_paper_enabled(candidate)
+        real_enabled, _ = paper_real_trading_enabled()
+        observation_targets = build_paper_observation_targets(request.args)
+        return jsonify({
+            "ok": True,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "oneShotCommand": package_script_command("paper:run-once"),
+            "loopCommand": "python scripts/paper_run_once.py --loop --interval-minutes 5 --max-iterations 12 --log-file reports/paper-runner-session.jsonl",
+            "notes": [
+                "This is local paper simulation only and cannot place real trades.",
+                "The loop runs only when started manually; no daemon or scheduled task is created.",
+                "Generated runner JSONL logs are local runtime files and should not be committed.",
+            ],
+            "observationTargets": compact_observation_targets(observation_targets),
+            "nextAction": observation_targets.get("nextAction"),
+            "warnings": [
+                "This endpoint only returns instructions. It does not start the runner, enable paper, or enable real trading.",
+            ],
+        })
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper runner instructions: {exc}"}), 502
+
+
 @app.get("/api/paper/tick-readiness")
 def paper_tick_readiness():
     try:
