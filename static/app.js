@@ -532,6 +532,7 @@ async function refreshPaperLearningPanels() {
     loadPaperReadiness(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
+    loadPaperTickReadiness(),
     loadPaperSessionMonitor(),
     loadPaperObservationQuality(),
   ]);
@@ -2698,6 +2699,7 @@ function setupLearningControls() {
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
   document.querySelector("#paper-disable-run")?.addEventListener("click", disablePaperSimulation);
   document.querySelector("#paper-runtime-refresh")?.addEventListener("click", loadPaperRuntimeMonitor);
+  document.querySelector("#paper-tick-readiness-refresh")?.addEventListener("click", loadPaperTickReadiness);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
@@ -3339,6 +3341,50 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
     <table class="trade-table">
       <thead><tr><th>Stop Rule</th><th>Pass</th><th>Severity</th><th>Detail</th></tr></thead>
       <tbody>${stopRows || `<tr><td colspan="4">No stop rules returned.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+async function loadPaperTickReadiness() {
+  const host = document.querySelector("#paper-tick-readiness-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper tick readiness...</p>`;
+    const payload = await apiGet("/api/paper/tick-readiness");
+    host.innerHTML = renderPaperTickReadiness(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper tick readiness could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperTickReadiness(payload) {
+  const readiness = payload.tickReadiness || {};
+  const next = payload.nextAction || {};
+  const active = ((payload.freshness || {}).active || [])[0] || {};
+  const status = readiness.status || "UNKNOWN";
+  const tone = status === "READY" ? "positive" : status === "BLOCKED" || status === "DATA_STALE" || status === "NOT_INITIALIZED" ? "negative" : "neutral";
+  const rows = [
+    ...(readiness.reasons || []).map((detail) => ({ type: "Reason", detail })),
+    ...(readiness.warnings || []).map((detail) => ({ type: "Warning", detail })),
+  ].map((item) => `<tr><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.detail || "-")}</td></tr>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Tick Readiness <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Useful now</span><strong>${readiness.usefulNow ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Active market</span><strong>${active.marketKey ? escapeHtml(active.marketKey) : "-"}</strong></div>
+      <div class="metric"><span>Latest candle</span><strong>${escapeHtml(active.latestCandleAt || "-")}</strong></div>
+      <div class="metric"><span>Last processed</span><strong>${escapeHtml(active.lastProcessedCandleAt || "-")}</strong></div>
+      <div class="metric"><span>Next useful</span><strong>${escapeHtml(readiness.nextUsefulTickAt || "-")}</strong></div>
+      <div class="metric"><span>Wait</span><strong>${readiness.secondsUntilNextUsefulTick === null || readiness.secondsUntilNextUsefulTick === undefined ? "-" : formatDurationSeconds(readiness.secondsUntilNextUsefulTick)}</strong></div>
+      <div class="metric"><span>Stale</span><strong>${active.isStale ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Command</span><strong>${escapeHtml(next.recommendedCommand || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Type</th><th>Detail</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="2">No tick readiness reasons returned.</td></tr>`}</tbody>
     </table>
   `;
 }

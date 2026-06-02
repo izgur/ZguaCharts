@@ -1223,6 +1223,7 @@ def paper_status():
         stop_rules = build_paper_stop_rules(request.args)
         session_summary = build_paper_session_summary(request.args)
         observation_quality = build_paper_observation_quality(request.args)
+        tick_readiness = build_paper_tick_readiness(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
@@ -1270,6 +1271,13 @@ def paper_status():
                 "score": observation_quality.get("quality", {}).get("score"),
                 "nextAction": observation_quality.get("nextAction"),
                 "evidence": observation_quality.get("evidence"),
+            },
+            "tickReadiness": {
+                "status": tick_readiness.get("tickReadiness", {}).get("status"),
+                "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
+                "nextUsefulTickAt": tick_readiness.get("tickReadiness", {}).get("nextUsefulTickAt"),
+                "secondsUntilNextUsefulTick": tick_readiness.get("tickReadiness", {}).get("secondsUntilNextUsefulTick"),
+                "activeMarketReason": (tick_readiness.get("tickReadiness", {}).get("reasons") or [None])[0],
             },
             "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
             "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
@@ -1338,11 +1346,18 @@ def paper_tick_instructions():
         candidate = load_paper_candidate_config()
         paper_enabled = canonical_paper_enabled(candidate)
         real_enabled, _ = paper_real_trading_enabled()
+        readiness = build_paper_tick_readiness(request.args)
+        useful_now = readiness.get("tickReadiness", {}).get("usefulNow")
+        recommended = package_script_command("paper:tick") if useful_now else None
         return jsonify({
             "ok": True,
             "commands": [package_script_command("paper:tick")],
+            "recommendedCommand": recommended,
+            "recommendedApiAction": "POST /api/paper/tick-once" if useful_now else None,
+            "tickReadiness": readiness.get("tickReadiness"),
+            "nextAction": readiness.get("nextAction"),
             "notes": [
-                "Run this to process one paper tick.",
+                "Run this to process one paper tick only when tickReadiness.usefulNow is true.",
                 "This is simulated only and cannot place real trades.",
             ],
             "paperEnabled": paper_enabled,
@@ -1351,6 +1366,14 @@ def paper_tick_instructions():
         })
     except Exception as exc:
         return jsonify({"error": f"Could not build paper tick instructions: {exc}"}), 502
+
+
+@app.get("/api/paper/tick-readiness")
+def paper_tick_readiness():
+    try:
+        return jsonify(build_paper_tick_readiness(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper tick readiness: {exc}"}), 502
 
 
 @app.post("/api/paper/tick-once")
@@ -4854,6 +4877,151 @@ def build_paper_observation_quality(args) -> dict:
     }
 
 
+def paper_interval_seconds(interval: str | None) -> int:
+    raw = str(interval or "").strip().lower()
+    if raw.endswith("m"):
+        return int(safe_float(raw[:-1], 0) * 60)
+    if raw.endswith("h"):
+        return int(safe_float(raw[:-1], 0) * 3600)
+    if raw.endswith("d"):
+        return int(safe_float(raw[:-1], 0) * 86400)
+    minutes = safe_float(raw, 0)
+    return int(minutes * 60) if minutes else 3600
+
+
+def epoch_to_iso(epoch_value) -> str | None:
+    epoch = safe_float(epoch_value, 0)
+    if epoch <= 0:
+        return None
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
+def paper_market_freshness(market: dict, state: dict) -> dict:
+    key = paper_market_key(market)
+    freshness = ((state.get("freshness") or {}).get(key) or {}) if key else {}
+    last_processed = ((state.get("lastProcessedCandleTime") or {}).get(key)) if isinstance(state.get("lastProcessedCandleTime"), dict) else None
+    latest = freshness.get("latestCandleTime")
+    latest_epoch = safe_float(latest, 0)
+    processed_epoch = safe_float(last_processed, 0)
+    interval_seconds = int(safe_float(freshness.get("expectedIntervalSeconds"), paper_interval_seconds(market.get("interval") or market.get("timeframe"))))
+    return {
+        "marketKey": key,
+        "symbol": market.get("symbol"),
+        "interval": market.get("interval") or market.get("timeframe"),
+        "mode": market.get("mode", "active"),
+        "initialized": processed_epoch > 0,
+        "latestCandleTime": latest,
+        "latestCandleAt": epoch_to_iso(latest),
+        "lastProcessedCandleTime": last_processed,
+        "lastProcessedCandleAt": epoch_to_iso(last_processed),
+        "latestClosedCandleAgeSeconds": freshness.get("latestClosedCandleAgeSeconds"),
+        "staleThresholdSeconds": freshness.get("staleThresholdSeconds"),
+        "expectedIntervalSeconds": interval_seconds,
+        "isStale": bool(freshness.get("isStale")),
+        "cacheHit": bool(freshness.get("cacheHit")),
+        "cacheMiss": bool(freshness.get("cacheMiss")),
+        "fetchedFromBybit": bool(freshness.get("fetchedFromBybit")),
+        "newerClosedCandleAvailable": bool(latest_epoch and processed_epoch and latest_epoch > processed_epoch),
+    }
+
+
+def paper_next_useful_tick(active: dict) -> tuple[str | None, int | None]:
+    latest = safe_float(active.get("latestCandleTime"), 0)
+    processed = safe_float(active.get("lastProcessedCandleTime"), 0)
+    interval = int(safe_float(active.get("expectedIntervalSeconds"), paper_interval_seconds(active.get("interval"))))
+    if latest and processed and latest > processed:
+        target = latest
+    elif latest or processed:
+        target = max(latest, processed) + interval
+    else:
+        return None, None
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    return epoch_to_iso(target), max(0, int(target - now_epoch))
+
+
+def build_paper_tick_readiness(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active_markets = candidate_symbols_by_mode(candidate, "active")
+    watch_markets = candidate_symbols_by_mode(candidate, "watch")
+    active_freshness = [paper_market_freshness(market, state) for market in active_markets]
+    watch_freshness = [paper_market_freshness(market, state) for market in watch_markets]
+    active = active_freshness[0] if active_freshness else {}
+    next_at, seconds_until = paper_next_useful_tick(active) if active else (None, None)
+    reasons = []
+    warnings = []
+    useful_now = False
+    if not paper_enabled:
+        status = "DISABLED"
+        reasons.append("Paper simulation is disabled; ticking is not useful until paper is manually enabled.")
+        action = "REVIEW_ENABLE_PAPER_SIMULATION"
+        reason = "Paper is disabled. This endpoint does not enable paper automatically."
+    elif real_enabled:
+        status = "BLOCKED"
+        reasons.append(real_detail)
+        action = "DISABLE_REAL_TRADING_FLAG"
+        reason = real_detail
+    elif not active:
+        status = "NOT_INITIALIZED"
+        reasons.append("No active paper market is configured.")
+        action = "REVIEW_PAPER_CANDIDATE_CONFIG"
+        reason = "An active market is required before a useful paper tick can run."
+    elif not active.get("initialized"):
+        status = "NOT_INITIALIZED"
+        reasons.append(f"Active market {active.get('marketKey') or '-'} is not initialized.")
+        action = "RUN_PAPER_INIT_BEFORE_TICK"
+        reason = "Run npm run paper:init, then recheck tick readiness."
+    elif active.get("isStale"):
+        status = "DATA_STALE"
+        reasons.append(f"Active market {active.get('marketKey')} data is stale; paper tick is expected to skip processing.")
+        action = "REFRESH_MARKET_DATA"
+        reason = "Refresh market data before running another paper tick."
+    elif active.get("newerClosedCandleAvailable"):
+        status = "READY"
+        useful_now = True
+        reasons.append(f"Active market {active.get('marketKey')} has a newer closed candle available.")
+        action = "RUN_PAPER_TICK"
+        reason = "Run npm run paper:tick or POST /api/paper/tick-once to process the newer closed candle."
+    else:
+        status = "WAIT_FOR_NEXT_CANDLE"
+        reasons.append(f"Active market {active.get('marketKey')} already processed the latest closed candle.")
+        action = "WAIT_FOR_NEXT_CLOSED_CANDLE"
+        reason = "A manual tick is allowed but is expected to produce no new trade event until the next closed candle."
+    for item in watch_freshness:
+        if item.get("isStale"):
+            warnings.append(f"Watch market {item.get('marketKey')} data is stale; active-market readiness is unaffected.")
+        if not item.get("initialized"):
+            warnings.append(f"Watch market {item.get('marketKey')} is not initialized; active-market readiness is unaffected.")
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "activeMarkets": active_markets,
+        "watchMarkets": watch_markets,
+        "freshness": {
+            "active": active_freshness,
+            "watch": watch_freshness,
+        },
+        "tickReadiness": {
+            "status": status,
+            "usefulNow": useful_now,
+            "nextUsefulTickAt": next_at,
+            "secondsUntilNextUsefulTick": seconds_until,
+            "reasons": dedupe_list(reasons),
+            "warnings": dedupe_list(warnings),
+        },
+        "nextAction": {
+            "action": action,
+            "reason": reason,
+            "recommendedCommand": package_script_command("paper:tick") if useful_now else None,
+            "recommendedApiAction": "POST /api/paper/tick-once" if useful_now else None,
+        },
+    }
+
+
 def build_paper_session_summary(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -5193,14 +5361,16 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
     candidate = load_paper_candidate_config()
     paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
+    tick_readiness_before = build_paper_tick_readiness(args)
     if real_enabled:
-        return {"ok": False, "error": real_detail, "paperEnabled": paper_enabled, "realTradingEnabled": True, "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled)}, 400
+        return {"ok": False, "error": real_detail, "paperEnabled": paper_enabled, "realTradingEnabled": True, "tickReadinessBefore": tick_readiness_before, "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled)}, 400
     if not paper_enabled:
         return {
             "ok": False,
             "error": "Paper simulation must be enabled manually before running one paper tick.",
             "paperEnabled": False,
             "realTradingEnabled": False,
+            "tickReadinessBefore": tick_readiness_before,
             "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         }, 400
     readiness = build_paper_readiness_report(args)
@@ -5209,12 +5379,14 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
             "ok": False,
             "error": "Paper readiness has blocking issues; paper tick was not run.",
             "readiness": readiness,
+            "tickReadinessBefore": tick_readiness_before,
         }, 400
     before_runtime = build_paper_runtime_status(args)
     if not before_runtime.get("initialized"):
         return {
             "ok": False,
             "error": "Paper runtime is not initialized; run npm run paper:init before ticking.",
+            "tickReadinessBefore": tick_readiness_before,
             "runtimeStatus": before_runtime,
         }, 400
     before_state = paper_state_snapshot()
@@ -5233,12 +5405,15 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
         after_runtime = build_paper_runtime_status(args)
         fresh = load_paper_candidate_config()
         fresh_enabled = canonical_paper_enabled(fresh)
+        tick_readiness_after = build_paper_tick_readiness(args)
         return {
             "ok": False,
             "error": "Paper tick command timed out.",
             "command": package_script_command("paper:tick"),
             "paperEnabled": fresh_enabled,
             "realTradingEnabled": paper_real_trading_enabled()[0],
+            "tickReadinessBefore": tick_readiness_before,
+            "tickReadinessAfter": tick_readiness_after,
             "before": before_runtime,
             "after": after_runtime,
             "stdout": exc.stdout,
@@ -5259,6 +5434,11 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
         except Exception:
             stdout_payload = {"raw": completed.stdout.strip()}
     warnings = []
+    before_tick_status = tick_readiness_before.get("tickReadiness", {}).get("status")
+    if before_tick_status == "WAIT_FOR_NEXT_CANDLE":
+        warnings.append("No newer closed active-market candle is available; tick is expected to produce no new trade event.")
+    if before_tick_status == "DATA_STALE":
+        warnings.append("Active-market data is stale; tick is expected to skip paper processing until market data is refreshed.")
     processed_delta = after_state["processedCandles"] - before_state["processedCandles"]
     if processed_delta <= 0 and not new_events:
         warnings.append("No new candle or journal event was processed by this tick.")
@@ -5267,6 +5447,7 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
     fresh = load_paper_candidate_config()
     fresh_enabled = canonical_paper_enabled(fresh)
     fresh_real_enabled, _ = paper_real_trading_enabled()
+    tick_readiness_after = build_paper_tick_readiness(args)
     payload = {
         "ok": completed.returncode == 0,
         "command": package_script_command("paper:tick"),
@@ -5274,6 +5455,8 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
         "returnCode": completed.returncode,
         "paperEnabled": fresh_enabled,
         "realTradingEnabled": fresh_real_enabled,
+        "tickReadinessBefore": tick_readiness_before,
+        "tickReadinessAfter": tick_readiness_after,
         "before": before_runtime,
         "after": after_runtime,
         "sessionSummary": build_paper_session_summary(args),
