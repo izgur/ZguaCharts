@@ -535,6 +535,8 @@ async function refreshPaperLearningPanels() {
     loadPaperTickReadiness(),
     loadPaperSessionMonitor(),
     loadPaperSessionEventsSummary(),
+    loadPaperSessionEventsDetail(),
+    loadPaperSessionTrades(),
     loadPaperObservationTargets(),
     loadPaperRunnerInstructions(),
     loadPaperRunnerSummary(),
@@ -2707,6 +2709,8 @@ function setupLearningControls() {
   document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
   document.querySelector("#paper-session-events-refresh")?.addEventListener("click", loadPaperSessionEventsSummary);
+  document.querySelector("#paper-session-events-detail-refresh")?.addEventListener("click", loadPaperSessionEventsDetail);
+  document.querySelector("#paper-session-trades-refresh")?.addEventListener("click", loadPaperSessionTrades);
   document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
   document.querySelector("#paper-runner-instructions-refresh")?.addEventListener("click", loadPaperRunnerInstructions);
   document.querySelector("#paper-runner-summary-refresh")?.addEventListener("click", loadPaperRunnerSummary);
@@ -3408,6 +3412,8 @@ async function runPaperOnceFromPanel() {
       loadPaperRuntimeMonitor(),
       loadPaperSessionMonitor(),
       loadPaperSessionEventsSummary(),
+      loadPaperSessionEventsDetail(),
+      loadPaperSessionTrades(),
       loadPaperObservationTargets(),
       loadPaperRunnerInstructions(),
       loadPaperRunnerSummary(),
@@ -3615,6 +3621,122 @@ function renderPaperSessionEventsSummary(payload) {
       <thead><tr><th>Time</th><th>Type</th><th>Market</th><th>Stale</th><th>Message</th></tr></thead>
       <tbody>${eventRows || `<tr><td colspan="5">No current-session events returned.</td></tr>`}</tbody>
     </table>
+  `;
+}
+
+async function loadPaperSessionEventsDetail() {
+  const host = document.querySelector("#paper-session-events-detail-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper session events...</p>`;
+    const payload = await apiGet("/api/paper/session-events?limit=10&currentSession=all");
+    host.innerHTML = renderPaperSessionEventsDetail(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper session events could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSessionEventsDetail(payload) {
+  const counts = payload.counts || {};
+  const filters = payload.filters || {};
+  const rows = (payload.events || []).slice().reverse().map((event) => `
+    <tr>
+      <td>${escapeHtml(event.processedAt || "-")}</td>
+      <td>${escapeHtml(event.eventType || "-")}</td>
+      <td>${escapeHtml(event.marketKey || "-")}</td>
+      <td>${escapeHtml(event.marketRole || "-")}</td>
+      <td>${event.currentSession ? "yes" : "no"}</td>
+      <td>${event.stale ? "yes" : "no"}</td>
+      <td>${escapeHtml(event.action || event.signal || "-")}</td>
+      <td>${formatMaybeNumber(event.price)}</td>
+      <td>${escapeHtml(event.reason || "-")}</td>
+    </tr>
+  `).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Session Events <span class="neutral">${(payload.events || []).length} shown</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${counts.signals ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${counts.warnings ?? 0}</strong></div>
+      <div class="metric"><span>State warnings</span><strong>${counts.stateWarnings ?? 0}</strong></div>
+      <div class="metric"><span>Open events</span><strong>${counts.openTrades ?? 0}</strong></div>
+      <div class="metric"><span>Close events</span><strong>${counts.closeTrades ?? 0}</strong></div>
+      <div class="metric"><span>Active</span><strong>${counts.active ?? 0}</strong></div>
+      <div class="metric"><span>Watch</span><strong>${counts.watch ?? 0}</strong></div>
+      <div class="metric"><span>Current</span><strong>${counts.currentSession ?? 0}</strong></div>
+      <div class="metric"><span>Stale</span><strong>${counts.stale ?? 0}</strong></div>
+      <div class="metric"><span>Filter</span><strong>${escapeHtml(`${filters.type || "all"} / ${filters.market || "all"}`)}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Session:</strong> ${escapeHtml(payload.sessionStartedAt || "-")} to ${escapeHtml(payload.sessionEndedAt || "running")}</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Time</th><th>Type</th><th>Market</th><th>Role</th><th>Session</th><th>Stale</th><th>Action</th><th>Price</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="9">No paper session events match the current filters.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+async function loadPaperSessionTrades() {
+  const host = document.querySelector("#paper-session-trades-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper session trades...</p>`;
+    const payload = await apiGet("/api/paper/session-trades");
+    host.innerHTML = renderPaperSessionTrades(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper session trades could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSessionTrades(payload) {
+  const totals = payload.totals || {};
+  const tradeRows = (payload.recentTradeEvents || []).slice(-10).reverse().map((event) => `
+    <tr>
+      <td>${escapeHtml(event.processedAt || "-")}</td>
+      <td>${escapeHtml(event.eventType || "-")}</td>
+      <td>${escapeHtml(event.marketKey || "-")}</td>
+      <td>${escapeHtml(event.side || "-")}</td>
+      <td>${formatMaybeNumber(event.price)}</td>
+      <td>${formatMaybeNumber(event.pnl)}</td>
+      <td>${event.currentSession ? "yes" : "no"}</td>
+      <td>${escapeHtml(event.reason || "-")}</td>
+    </tr>
+  `).join("");
+  const openRows = (payload.openTrades || []).slice(-10).map((trade) => `
+    <tr><td>${escapeHtml(trade.tradeId || "-")}</td><td>${escapeHtml(trade.symbol || "-")}</td><td>${escapeHtml(trade.side || "-")}</td><td>${formatMaybeNumber(trade.entryPrice)}</td><td>${formatMaybeNumber(trade.size)}</td><td>${escapeHtml(trade.openedAt || "-")}</td></tr>
+  `).join("");
+  const closedRows = (payload.closedTrades || []).slice(-10).reverse().map((trade) => `
+    <tr><td>${escapeHtml(trade.tradeId || "-")}</td><td>${escapeHtml(trade.symbol || "-")}</td><td>${formatMaybeNumber(trade.entryPrice)}</td><td>${formatMaybeNumber(trade.exitPrice)}</td><td>${formatMaybeNumber(trade.pnl)}</td><td>${escapeHtml(trade.closedAt || "-")}</td></tr>
+  `).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Session Trades <span class="neutral">${totals.closedTrades ?? 0} closed</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Open trades</span><strong>${(payload.openTrades || []).length}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${totals.closedTrades ?? 0}</strong></div>
+      <div class="metric"><span>Trade events</span><strong>${totals.recentTradeEvents ?? 0}</strong></div>
+      <div class="metric"><span>Session trade events</span><strong>${totals.currentSessionTradeEvents ?? 0}</strong></div>
+      <div class="metric"><span>Realized</span><strong>${formatSigned(totals.realizedPnl || 0)}</strong></div>
+      <div class="metric"><span>Fees</span><strong>${formatMaybeNumber(totals.fees)}</strong></div>
+      <div class="metric"><span>Win rate</span><strong>${formatMaybeNumber(totals.winRate)}%</strong></div>
+      <div class="metric"><span>Avg win</span><strong>${formatMaybeNumber(totals.avgWin)}</strong></div>
+      <div class="metric"><span>Avg loss</span><strong>${formatMaybeNumber(totals.avgLoss)}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Session:</strong> ${escapeHtml(payload.sessionStartedAt || "-")} to ${escapeHtml(payload.sessionEndedAt || "running")}</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <h3 class="modal-section-title">Latest Trade Events</h3>
+    <table class="trade-table">
+      <thead><tr><th>Time</th><th>Type</th><th>Market</th><th>Side</th><th>Price</th><th>PnL</th><th>Session</th><th>Reason</th></tr></thead>
+      <tbody>${tradeRows || `<tr><td colspan="8">No virtual trade events available yet.</td></tr>`}</tbody>
+    </table>
+    <h3 class="modal-section-title">Open Virtual Trades</h3>
+    <table class="trade-table"><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Size</th><th>Opened</th></tr></thead><tbody>${openRows || `<tr><td colspan="6">No open virtual trades.</td></tr>`}</tbody></table>
+    <h3 class="modal-section-title">Closed Virtual Trades</h3>
+    <table class="trade-table"><thead><tr><th>ID</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Closed</th></tr></thead><tbody>${closedRows || `<tr><td colspan="6">No closed virtual trades.</td></tr>`}</tbody></table>
   `;
 }
 

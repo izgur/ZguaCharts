@@ -1227,6 +1227,8 @@ def paper_status():
         observation_targets = build_paper_observation_targets(request.args)
         runner_summary = build_paper_runner_summary(request.args)
         session_events_summary = build_paper_session_events_summary(request.args)
+        session_events_detail = build_paper_session_events(request.args)
+        session_trades_detail = build_paper_session_trades(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
@@ -1279,6 +1281,9 @@ def paper_status():
             "observationTargets": compact_observation_targets(observation_targets),
             "runnerSummary": compact_runner_summary(runner_summary),
             "sessionEventsSummary": compact_session_events_summary(session_events_summary),
+            "recentSignalCount": session_events_detail.get("counts", {}).get("signals"),
+            "recentTradeEventCount": session_trades_detail.get("totals", {}).get("recentTradeEvents"),
+            "currentSessionTradeCount": session_trades_detail.get("totals", {}).get("currentSessionTradeEvents"),
             "tickReadiness": {
                 "status": tick_readiness.get("tickReadiness", {}).get("status"),
                 "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
@@ -1359,6 +1364,22 @@ def paper_session_events_summary():
         return jsonify(build_paper_session_events_summary(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper session events summary: {exc}"}), 502
+
+
+@app.get("/api/paper/session-events")
+def paper_session_events():
+    try:
+        return jsonify(build_paper_session_events(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper session events: {exc}"}), 502
+
+
+@app.get("/api/paper/session-trades")
+def paper_session_trades():
+    try:
+        return jsonify(build_paper_session_trades(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper session trades: {exc}"}), 502
 
 
 @app.get("/api/paper/recent-events")
@@ -5407,6 +5428,212 @@ def build_paper_session_events_summary(args) -> dict:
         "recentWarnings": warnings[-10:],
         "recentEvents": session_events[-10:],
         "nextAction": next_action,
+        "warnings": warnings,
+    }
+
+
+def paper_event_type_bucket(event: dict) -> str:
+    event_type = str(event.get("eventType") or "").upper()
+    if event_type == "SIGNAL":
+        return "signal"
+    if event_type in {"WARNING", "ERROR", "STATE_WARNING"}:
+        return "state_warning" if event_type == "STATE_WARNING" else "warning"
+    if event_type == "ENTRY":
+        return "open_trade"
+    if event_type == "EXIT":
+        return "close_trade"
+    return event_type.lower() or "unknown"
+
+
+def paper_event_market_role(event: dict, active_keys: set[str], watch_keys: set[str]) -> str:
+    key = event.get("marketKey")
+    if key in active_keys:
+        return "active"
+    if key in watch_keys:
+        return "watch"
+    mode = str(event.get("mode") or "").lower()
+    if mode in {"active", "watch"}:
+        return mode
+    return "unknown"
+
+
+def compact_session_event_detail(event: dict, active_keys: set[str], watch_keys: set[str]) -> dict:
+    signal_price = safe_float(event.get("signalPrice"), None)
+    fill_price = safe_float(event.get("fillPrice"), None)
+    pnl = safe_float(event.get("netPnl"), None)
+    raw = {
+        key: event.get(key)
+        for key in ("eventId", "tradeId", "candleTime", "mode", "strategy", "paramsHash", "feePaid", "slippagePaid", "accountEquity")
+        if event.get(key) not in (None, "")
+    }
+    return {
+        "processedAt": event.get("timestamp"),
+        "eventType": event.get("eventType"),
+        "symbol": event.get("symbol"),
+        "interval": event.get("interval"),
+        "marketKey": event.get("marketKey"),
+        "marketRole": paper_event_market_role(event, active_keys, watch_keys),
+        "currentSession": bool(event.get("currentSession")),
+        "stale": bool(event.get("stale")),
+        "reason": event.get("reason") or event.get("message"),
+        "signal": event.get("signal") or event.get("action") or event.get("eventType"),
+        "action": event.get("action") or event.get("eventType"),
+        "side": event.get("side"),
+        "price": fill_price if fill_price is not None else signal_price,
+        "signalPrice": signal_price,
+        "fillPrice": fill_price,
+        "pnl": pnl,
+        "rawEvent": raw,
+    }
+
+
+def paper_session_event_records(candidate: dict, state: dict | None = None) -> tuple[list[dict], dict, set[str], set[str]]:
+    session = paper_session_window(candidate)
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 2000)
+    active_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)}
+    watch_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "watch") if paper_market_key(market)}
+    records = [normalized_paper_event(event, session) for event in journal]
+    state = state or {}
+    for idx, warning in enumerate(state.get("warnings") or []):
+        records.append({
+            "timestamp": state.get("updatedAt"),
+            "eventType": "STATE_WARNING",
+            "symbol": None,
+            "interval": None,
+            "marketKey": warning_market_key({"reason": warning}),
+            "reason": str(warning),
+            "message": str(warning),
+            "action": "STATE_WARNING",
+            "signalPrice": None,
+            "fillPrice": None,
+            "netPnl": None,
+            "stale": False,
+            "currentSession": bool(session.get("started")),
+            "rawIndex": idx,
+        })
+    return records, session, active_keys, watch_keys
+
+
+def build_paper_session_events(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, _ = paper_real_trading_enabled()
+    limit = min(max(int(safe_float(args.get("limit", 50), 50)), 1), 500)
+    type_filter = str(args.get("type", "all") or "all").strip().lower()
+    market_filter = str(args.get("market", "all") or "all").strip().lower()
+    session_filter = str(args.get("currentSession", "all") or "all").strip().lower()
+    valid_types = {"all", "signal", "warning", "state_warning", "open_trade", "close_trade"}
+    valid_markets = {"all", "active", "watch"}
+    valid_sessions = {"all", "true", "false"}
+    warnings = []
+    if type_filter not in valid_types:
+        warnings.append(f"Unknown type filter {type_filter}; using all.")
+        type_filter = "all"
+    if market_filter not in valid_markets:
+        warnings.append(f"Unknown market filter {market_filter}; using all.")
+        market_filter = "all"
+    if session_filter not in valid_sessions:
+        warnings.append(f"Unknown currentSession filter {session_filter}; using all.")
+        session_filter = "all"
+    records, session, active_keys, watch_keys = paper_session_event_records(candidate, state)
+    details = [compact_session_event_detail(event, active_keys, watch_keys) for event in records]
+    counts = {
+        "all": len(details),
+        "signals": len([event for event in details if paper_event_type_bucket(event) == "signal"]),
+        "warnings": len([event for event in details if paper_event_type_bucket(event) == "warning"]),
+        "stateWarnings": len([event for event in details if paper_event_type_bucket(event) == "state_warning"]),
+        "openTrades": len([event for event in details if paper_event_type_bucket(event) == "open_trade"]),
+        "closeTrades": len([event for event in details if paper_event_type_bucket(event) == "close_trade"]),
+        "active": len([event for event in details if event.get("marketRole") == "active"]),
+        "watch": len([event for event in details if event.get("marketRole") == "watch"]),
+        "currentSession": len([event for event in details if event.get("currentSession")]),
+        "stale": len([event for event in details if event.get("stale")]),
+    }
+    filtered = details
+    if type_filter != "all":
+        filtered = [event for event in filtered if paper_event_type_bucket(event) == type_filter]
+    if market_filter != "all":
+        filtered = [event for event in filtered if event.get("marketRole") == market_filter]
+    if session_filter != "all":
+        expected = session_filter == "true"
+        filtered = [event for event in filtered if bool(event.get("currentSession")) == expected]
+    filtered = sorted(filtered, key=lambda item: parse_iso_timestamp(item.get("processedAt")) or datetime.min.replace(tzinfo=timezone.utc))
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "sessionStartedAt": session.get("startedAt"),
+        "sessionEndedAt": session.get("endedAt"),
+        "limit": limit,
+        "filters": {
+            "type": type_filter,
+            "market": market_filter,
+            "currentSession": session_filter,
+        },
+        "counts": counts,
+        "events": filtered[-limit:],
+        "warnings": dedupe_list(warnings),
+    }
+
+
+def trade_state_item(item: dict, default_status: str) -> dict:
+    pnl = safe_float(first_baseline_value(item.get("netPnl"), item.get("realizedPnl"), item.get("pnl")), 0)
+    return {
+        "tradeId": item.get("id") or item.get("tradeId") or item.get("key"),
+        "symbol": item.get("symbol"),
+        "interval": item.get("interval") or item.get("timeframe"),
+        "side": item.get("side"),
+        "entryPrice": safe_float(item.get("entryPrice"), None),
+        "exitPrice": safe_float(item.get("exitPrice"), None),
+        "size": safe_float(item.get("size"), None),
+        "pnl": pnl,
+        "feePaid": safe_float(first_baseline_value(item.get("feePaid"), item.get("fees")), 0),
+        "openedAt": item.get("openedAt") or item.get("entryAt") or item.get("timestamp"),
+        "closedAt": item.get("closedAt") or item.get("exitAt"),
+        "status": item.get("status") or default_status,
+    }
+
+
+def build_paper_session_trades(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, _ = paper_real_trading_enabled()
+    records, session, active_keys, watch_keys = paper_session_event_records(candidate, state)
+    details = [compact_session_event_detail(event, active_keys, watch_keys) for event in records]
+    trade_events = [
+        event for event in details
+        if paper_event_type_bucket(event) in {"open_trade", "close_trade"} and (event.get("currentSession") or event.get("stale"))
+    ]
+    open_trades = [trade_state_item(item, "open") for item in (state.get("openPositions") or [])]
+    closed_trades = [trade_state_item(item, "closed") for item in (state.get("closedTrades") or [])]
+    realized = sum(safe_float(item.get("pnl"), 0) for item in closed_trades)
+    fees = sum(safe_float(item.get("feePaid"), 0) for item in open_trades + closed_trades)
+    wins = [item for item in closed_trades if safe_float(item.get("pnl"), 0) > 0]
+    losses = [item for item in closed_trades if safe_float(item.get("pnl"), 0) < 0]
+    warnings = []
+    if not trade_events and not open_trades and not closed_trades:
+        warnings.append("No virtual trade events are available yet for the current paper session.")
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "sessionStartedAt": session.get("startedAt"),
+        "sessionEndedAt": session.get("endedAt"),
+        "openTrades": open_trades,
+        "closedTrades": closed_trades[-50:],
+        "recentTradeEvents": trade_events[-50:],
+        "totals": {
+            "closedTrades": len(closed_trades),
+            "recentTradeEvents": len(trade_events),
+            "currentSessionTradeEvents": len([event for event in trade_events if event.get("currentSession")]),
+            "realizedPnl": round(realized, 8),
+            "fees": round(fees, 8),
+            "winRate": round((len(wins) / len(closed_trades) * 100), 4) if closed_trades else None,
+            "avgWin": round(sum(safe_float(item.get("pnl"), 0) for item in wins) / len(wins), 8) if wins else None,
+            "avgLoss": round(sum(safe_float(item.get("pnl"), 0) for item in losses) / len(losses), 8) if losses else None,
+        },
         "warnings": warnings,
     }
 
