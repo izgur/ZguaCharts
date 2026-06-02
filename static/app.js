@@ -528,6 +528,7 @@ async function handlePaperAction(action) {
 
 async function refreshPaperLearningPanels() {
   await Promise.all([
+    apiGet("/api/candidate/current").catch(() => null),
     loadPaperReadiness(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),

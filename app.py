@@ -1215,6 +1215,7 @@ def paper_status():
         journal_path = os.path.join(app.root_path, "reports", "paper-journal.jsonl")
         state = read_json_file(state_path, {})
         candidate = load_paper_candidate_config()
+        paper_enabled = canonical_paper_enabled(candidate)
         events = read_jsonl_tail(journal_path, 30)
         health_payload = build_candidate_health(candidate_health_rules(request.args))
         readiness = build_paper_readiness_report(request.args)
@@ -1224,8 +1225,9 @@ def paper_status():
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
-            "paperEnabled": bool(candidate.get("enabled", False)),
+            "paperEnabled": paper_enabled,
             "realTradingEnabled": real_enabled,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
             "initializationNeeded": runtime.get("initializationStatus") == "NEEDS_INIT",
             "openPositions": state.get("openPositions", []),
             "closedTrades": state.get("closedTrades", [])[-50:],
@@ -1319,6 +1321,7 @@ def paper_init_instructions():
 def paper_tick_instructions():
     try:
         candidate = load_paper_candidate_config()
+        paper_enabled = canonical_paper_enabled(candidate)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
@@ -1327,8 +1330,9 @@ def paper_tick_instructions():
                 "Run this to process one paper tick.",
                 "This is simulated only and cannot place real trades.",
             ],
-            "paperEnabled": bool(candidate.get("enabled", False)),
+            "paperEnabled": paper_enabled,
             "realTradingEnabled": real_enabled,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         })
     except Exception as exc:
         return jsonify({"error": f"Could not build paper tick instructions: {exc}"}), 502
@@ -1374,7 +1378,7 @@ def paper_enable():
 @app.post("/api/paper/disable")
 def paper_disable():
     try:
-        result = disable_paper_simulation_controlled()
+        result = disable_paper_simulation_controlled(request.args)
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": f"Could not disable paper simulation: {exc}"}), 502
@@ -1384,7 +1388,11 @@ def paper_disable():
 def current_candidate():
     try:
         candidate = load_paper_candidate_config()
-        return jsonify(candidate_summary(candidate))
+        paper_enabled = canonical_paper_enabled(candidate)
+        payload = candidate_summary(candidate)
+        payload["paperEnabled"] = paper_enabled
+        payload["consistencyWarnings"] = paper_enabled_consistency_warnings(candidate, paper_enabled)
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": f"Could not load current candidate: {exc}"}), 502
 
@@ -1452,7 +1460,7 @@ def enable_paper_candidate():
 @app.post("/api/candidate/disable-paper")
 def disable_paper_candidate():
     try:
-        return jsonify(disable_paper_simulation_controlled())
+        return jsonify(disable_paper_simulation_controlled(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not disable paper simulation: {exc}"}), 502
 
@@ -1548,11 +1556,34 @@ def read_jsonl_tail(path: str, limit: int):
 
 
 def load_paper_candidate_config() -> dict:
-    return load_config_pair(
+    return normalize_promoted_candidate_config(load_config_pair(
         PAPER_CANDIDATE_DEFAULT_PATH,
         PAPER_CANDIDATE_LOCAL_PATH,
         {},
-    )
+    ))
+
+
+def canonical_paper_enabled(candidate: dict | None = None) -> bool:
+    config = normalize_promoted_candidate_config(candidate if candidate is not None else load_paper_candidate_config())
+    value = config.get("enabled", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def paper_enabled_consistency_warnings(candidate: dict, paper_enabled: bool | None = None) -> list[str]:
+    config = normalize_promoted_candidate_config(candidate or {})
+    canonical = canonical_paper_enabled(config) if paper_enabled is None else bool(paper_enabled)
+    warnings = []
+    raw_enabled = config.get("enabled", False)
+    raw_bool = raw_enabled if isinstance(raw_enabled, bool) else canonical_paper_enabled(config)
+    if not isinstance(raw_enabled, bool):
+        warnings.append("candidate.enabled is not a boolean; parsed canonical paperEnabled is used.")
+    if bool(raw_bool) != canonical:
+        warnings.append("paperEnabled does not match normalized candidate.enabled; normalized candidate.enabled is canonical.")
+    return warnings
 
 
 def run_strategy_ranking_payload(
@@ -1992,7 +2023,7 @@ def append_learning_decision(record: dict) -> str:
     decision.setdefault("id", f"decision-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}")
     decision.setdefault("createdAt", datetime.now(timezone.utc).isoformat())
     decision.setdefault("promoted", False)
-    decision.setdefault("paperEnabledAfter", bool(load_paper_candidate_config().get("enabled", False)))
+    decision.setdefault("paperEnabledAfter", canonical_paper_enabled())
     decision.setdefault("errors", [])
     decision.setdefault("warnings", [])
     decisions = load_learning_decisions()
@@ -2082,7 +2113,7 @@ def append_learning_decision_from_context(
         "reason": reason,
         "reportId": report_id,
         "promoted": bool(promoted),
-        "paperEnabledAfter": bool(current.get("enabled", False)),
+        "paperEnabledAfter": canonical_paper_enabled(current),
         "errors": errors or [],
         "warnings": warnings or [],
     }
@@ -2817,7 +2848,7 @@ def build_candidate_review() -> dict:
     preview_config = preview.get("candidateConfigPreview") if preview.get("ok") else None
     quality_pass = candidate_passes_quality(recommended)
     candidate_exists = bool(recommended)
-    paper_enabled = bool(current.get("enabled", False))
+    paper_enabled = canonical_paper_enabled(current)
     warnings = []
     if not candidate_exists:
         next_action = {"action": "NO_CANDIDATE", "reason": "No latest learning recommendation candidate is available."}
@@ -3550,7 +3581,7 @@ def learning_audit_readiness(reports: list[dict], best_candidate: dict | None, c
         "enoughLearningReports": len(reports) >= learning_trust_rules()["minReports"],
         "hasValidCandidate": bool(best_candidate),
         "hasPassOptimizerCandidate": bool(has_pass),
-        "paperEnabled": bool(current_candidate.get("enabled", False)),
+        "paperEnabled": canonical_paper_enabled(current_candidate),
         "safeForManualReview": bool(best_candidate and not candidate_blocked and (has_pass or best_candidate.get("origin") == "ranking") and health.get("status") != "FAILED"),
     }
 
@@ -4633,7 +4664,7 @@ def build_paper_session_summary(args) -> dict:
     runtime = build_paper_runtime_status(args)
     stop_rules = build_paper_stop_rules(args)
     real_enabled, _ = paper_real_trading_enabled()
-    paper_enabled = bool(candidate.get("enabled", False))
+    paper_enabled = canonical_paper_enabled(candidate)
     session = paper_session_window(candidate)
     session_events = [event for event in journal if event_in_session(event, session)]
     event_types = [str(event.get("eventType", "")).upper() for event in session_events]
@@ -4666,6 +4697,7 @@ def build_paper_session_summary(args) -> dict:
         "ok": True,
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
+        "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         "candidate": candidate_summary(candidate),
         "session": {
             "sessionId": session["sessionId"],
@@ -4701,6 +4733,7 @@ def build_paper_session_summary(args) -> dict:
 def build_paper_recent_events(args) -> dict:
     limit = min(max(int(safe_float(args.get("limit", 50), 50)), 1), 200)
     candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
     runtime = build_paper_runtime_status(args)
     initialized_markets = set(runtime.get("marketState", {}).get("initializedMarkets") or [])
     session = paper_session_window(candidate)
@@ -4709,8 +4742,9 @@ def build_paper_recent_events(args) -> dict:
     return {
         "ok": True,
         "limit": limit,
-        "paperEnabled": bool(candidate.get("enabled", False)),
+        "paperEnabled": paper_enabled,
         "realTradingEnabled": paper_real_trading_enabled()[0],
+        "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         "session": {
             "sessionId": session["sessionId"],
             "startedAt": session["startedAt"],
@@ -4755,7 +4789,7 @@ def build_paper_runtime_status(args) -> dict:
         initialization_status = "NEEDS_INIT"
     else:
         initialization_status = "UNKNOWN"
-    paper_enabled = bool(candidate.get("enabled", False))
+    paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
     warning_buckets = paper_runtime_warning_buckets(state, journal, initialized_markets)
     last_event = latest_journal_event(journal)
@@ -4816,6 +4850,7 @@ def build_paper_runtime_status(args) -> dict:
         "ok": True,
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
+        "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         "initialized": initialized,
         "initializationStatus": initialization_status,
         "candidate": candidate_summary(candidate),
@@ -4872,7 +4907,7 @@ def build_paper_stop_rules(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
     runtime = build_paper_runtime_status(args)
-    paper_enabled = bool(candidate.get("enabled", False))
+    paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
     rules = []
     if not paper_enabled:
@@ -4883,7 +4918,7 @@ def build_paper_stop_rules(args) -> dict:
             "action": "PAPER_DISABLED_NO_STOP_NEEDED" if not real_enabled else "DISABLE_REAL_TRADING_FLAG",
             "reason": "Paper is disabled, so stop rules are informational only." if not real_enabled else real_detail,
         }
-        return {"ok": True, "status": status, "rules": rules, "nextAction": next_action}
+        return {"ok": True, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled, "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled), "status": status, "rules": rules, "nextAction": next_action}
 
     config_warnings = candidate_config_warnings(candidate)
     validation = validate_candidate_config(candidate, candidate_validation_rules(args))
@@ -4931,7 +4966,7 @@ def build_paper_stop_rules(args) -> dict:
     else:
         status = "OK"
         next_action = {"action": "KEEP_MONITORING", "reason": "Paper stop rules are passing."}
-    return {"ok": True, "status": status, "rules": rules, "nextAction": next_action}
+    return {"ok": True, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled, "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled), "status": status, "rules": rules, "nextAction": next_action}
 
 
 def paper_state_snapshot() -> dict:
@@ -4959,15 +4994,17 @@ def paper_new_items(after_items: list[dict], before_ids: set[str], fallback_pref
 
 def run_paper_tick_once(args) -> tuple[dict, int]:
     candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()
     if real_enabled:
-        return {"ok": False, "error": real_detail, "realTradingEnabled": True}, 400
-    if not bool(candidate.get("enabled", False)):
+        return {"ok": False, "error": real_detail, "paperEnabled": paper_enabled, "realTradingEnabled": True, "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled)}, 400
+    if not paper_enabled:
         return {
             "ok": False,
             "error": "Paper simulation must be enabled manually before running one paper tick.",
             "paperEnabled": False,
             "realTradingEnabled": False,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         }, 400
     readiness = build_paper_readiness_report(args)
     if readiness.get("summary", {}).get("blockingIssues", 0):
@@ -4987,13 +5024,30 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
     journal_path = os.path.join(app.root_path, "reports", "paper-journal.jsonl")
     before_events = read_jsonl_tail(journal_path, 500)
     before_event_ids = {str(event.get("eventId")) for event in before_events if event.get("eventId")}
-    completed = subprocess.run(
-        package_node_script_args("paper:tick"),
-        text=True,
-        capture_output=True,
-        cwd=app.root_path,
-        timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
-    )
+    try:
+        completed = subprocess.run(
+            package_node_script_args("paper:tick"),
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        after_runtime = build_paper_runtime_status(args)
+        fresh = load_paper_candidate_config()
+        fresh_enabled = canonical_paper_enabled(fresh)
+        return {
+            "ok": False,
+            "error": "Paper tick command timed out.",
+            "command": package_script_command("paper:tick"),
+            "paperEnabled": fresh_enabled,
+            "realTradingEnabled": paper_real_trading_enabled()[0],
+            "before": before_runtime,
+            "after": after_runtime,
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "consistencyWarnings": paper_enabled_consistency_warnings(fresh, fresh_enabled),
+        }, 504
     after_runtime = build_paper_runtime_status(args)
     after_state = paper_state_snapshot()
     after_events = read_jsonl_tail(journal_path, 500)
@@ -5013,15 +5067,20 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
         warnings.append("No new candle or journal event was processed by this tick.")
     if after_runtime.get("lastTick", {}).get("noNewCandleAvailable"):
         warnings.append("Runtime status indicates no newer closed candle is available for the active market.")
+    fresh = load_paper_candidate_config()
+    fresh_enabled = canonical_paper_enabled(fresh)
+    fresh_real_enabled, _ = paper_real_trading_enabled()
     payload = {
         "ok": completed.returncode == 0,
         "command": package_script_command("paper:tick"),
         "ranCommand": " ".join(package_node_script_args("paper:tick")),
         "returnCode": completed.returncode,
-        "paperEnabled": bool(load_paper_candidate_config().get("enabled", False)),
-        "realTradingEnabled": real_enabled,
+        "paperEnabled": fresh_enabled,
+        "realTradingEnabled": fresh_real_enabled,
         "before": before_runtime,
         "after": after_runtime,
+        "sessionSummary": build_paper_session_summary(args),
+        "stopRules": build_paper_stop_rules(args),
         "tickResult": stdout_payload,
         "summary": {
             "processedCandlesBefore": before_state["processedCandles"],
@@ -5038,6 +5097,7 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
         "newSignals": [event for event in new_events if str(event.get("eventType", "")).upper() in {"SIGNAL", "ENTRY", "EXIT", "SKIP"}],
         "newOpenPositions": paper_new_items(after_state["openPositions"], before_state["openPositionIds"], "open"),
         "newClosedTrades": paper_new_items(after_state["closedTrades"], before_state["closedTradeIds"], "closed"),
+        "consistencyWarnings": paper_enabled_consistency_warnings(fresh, fresh_enabled),
         "warnings": dedupe_list(warnings),
     }
     if completed.returncode != 0:
@@ -5062,11 +5122,12 @@ def build_paper_readiness_report(args) -> dict:
     expected = expected_metrics_from_candidate(candidate) if candidate else {"source": None}
     config_warnings = candidate_config_warnings(candidate) if candidate else []
     learning_config = safe_learning_config(load_learning_config())
+    paper_enabled = canonical_paper_enabled(candidate) if candidate else False
 
     paper_readiness_check(checks, "paper candidate config loads", not candidate_load_error, "BLOCK", candidate_load_error or "Paper candidate config loaded.")
     paper_readiness_check(checks, "current candidate exists", bool(candidate), "BLOCK", "Current paper candidate is available." if candidate else "No paper candidate config exists.")
     paper_readiness_check(checks, "configWarnings empty", not config_warnings, "BLOCK", "No config warnings." if not config_warnings else "; ".join(config_warnings))
-    paper_readiness_check(checks, "paper simulation disabled", not bool(candidate.get("enabled")), "WARN", "Paper simulation is disabled." if not candidate.get("enabled") else "Paper simulation is already enabled; readiness remains watch-only while paper is running.")
+    paper_readiness_check(checks, "paper simulation disabled", not paper_enabled, "WARN", "Paper simulation is disabled." if not paper_enabled else "Paper simulation is already enabled; readiness remains watch-only while paper is running.")
     paper_readiness_check(checks, "strategy exists", bool(candidate.get("strategy")), "BLOCK", f"Strategy: {candidate.get('strategy') or '-'}")
     paper_readiness_check(checks, "active symbol exists", bool(symbol), "BLOCK", f"Active symbol: {symbol or '-'}")
     paper_readiness_check(checks, "active timeframe exists", bool(timeframe), "BLOCK", f"Active timeframe: {timeframe or '-'}")
@@ -5116,8 +5177,8 @@ def build_paper_readiness_report(args) -> dict:
     health = health_payload.get("health") or {}
     paper_metrics = health.get("paper") or {}
     closed_trades = int(safe_float(paper_metrics.get("closedTrades")))
-    health_unknown_running_watch = health.get("status") == "UNKNOWN" and bool(candidate.get("enabled")) and closed_trades == 0
-    health_unknown_ok = health.get("status") != "UNKNOWN" or (not candidate.get("enabled") and closed_trades == 0)
+    health_unknown_running_watch = health.get("status") == "UNKNOWN" and paper_enabled and closed_trades == 0
+    health_unknown_ok = health.get("status") != "UNKNOWN" or (not paper_enabled and closed_trades == 0)
     health_detail = f"Health {health.get('status', 'UNKNOWN')}; closed paper trades {closed_trades}."
     if health.get("status") == "UNKNOWN" and health_unknown_ok:
         health_detail += " UNKNOWN is acceptable while paper is disabled and has 0 closed trades."
@@ -5134,7 +5195,7 @@ def build_paper_readiness_report(args) -> dict:
     warn_checks = [item for item in checks if not item["pass"] and item["severity"] == "WARN"]
     warnings.extend(item["detail"] for item in warn_checks)
     ready = not blocking and not warn_checks
-    paper_already_enabled = bool(candidate.get("enabled", False)) and not blocking
+    paper_already_enabled = paper_enabled and not blocking
     status = "READY_FOR_PAPER_REVIEW" if ready else "BLOCKED" if blocking else "WATCH_PAPER_RUNNING" if paper_already_enabled else "WATCH"
     if ready:
         next_action = {
@@ -5160,8 +5221,9 @@ def build_paper_readiness_report(args) -> dict:
         "summary": {
             "blockingIssues": len(blocking),
             "warnings": len(warn_checks),
-            "paperEnabled": bool(candidate.get("enabled", False)),
+            "paperEnabled": paper_enabled,
             "realTradingEnabled": real_enabled,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
             "closedPaperTrades": closed_trades,
             "validationStatus": validation.get("status"),
             "stabilityStatus": stability_status,
@@ -5169,6 +5231,7 @@ def build_paper_readiness_report(args) -> dict:
         },
         "nextAction": next_action,
         "warnings": dedupe_list(warnings),
+        "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         "validation": validation,
         "stability": stability.get("validation"),
         "dataReadiness": data_readiness,
@@ -5205,17 +5268,22 @@ def build_enabled_paper_config(current: dict, enabled: bool) -> dict:
 def build_paper_enable_preview(args) -> dict:
     readiness = build_paper_readiness_report(args)
     current = load_paper_candidate_config()
+    current_enabled = canonical_paper_enabled(current)
     preview = build_enabled_paper_config(current, True) if readiness.get("ready") and readiness.get("status") == "READY_FOR_PAPER_REVIEW" else dict(current)
+    preview_enabled = canonical_paper_enabled(preview)
     real_enabled, _ = paper_real_trading_enabled()
     return {
         "ok": True,
         "dryRun": True,
         "wouldEnablePaper": bool(readiness.get("ready") and readiness.get("status") == "READY_FOR_PAPER_REVIEW"),
+        "paperEnabled": current_enabled,
         "paperRemainsRealOnlyFalse": not real_enabled,
         "readiness": readiness,
         "currentConfig": current,
         "previewConfig": preview,
+        "previewPaperEnabled": preview_enabled,
         "changedFields": paper_config_changed_fields(current, preview),
+        "consistencyWarnings": paper_enabled_consistency_warnings(current, current_enabled),
         "warnings": paper_enable_warning_text(),
         "message": "Preview only; paper simulation was not enabled.",
     }
@@ -5234,35 +5302,47 @@ def enable_paper_simulation_controlled(args) -> tuple[dict, int]:
     backup_path = backup_candidate_config(current)
     updated = build_enabled_paper_config(current, True)
     write_candidate_config(updated)
+    fresh = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(fresh)
     learning_config = safe_learning_config(load_learning_config())
     real_enabled, _ = paper_real_trading_enabled()
     return {
         "ok": True,
-        "paperEnabled": bool(updated.get("enabled", False)),
+        "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "autoPromoteEnabled": bool(learning_config.get("autoPromote", False)),
         "backupPath": str(backup_path.relative_to(app.root_path)),
         "writtenPath": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
-        "candidateConfig": updated,
-        "changedFields": paper_config_changed_fields(current, updated),
+        "candidateConfig": fresh,
+        "changedFields": paper_config_changed_fields(current, fresh),
+        "runtimeStatus": build_paper_runtime_status(args),
+        "stopRules": build_paper_stop_rules(args),
+        "sessionSummary": build_paper_session_summary(args),
+        "consistencyWarnings": paper_enabled_consistency_warnings(fresh, paper_enabled),
         "warnings": paper_enable_warning_text(),
     }, 200
 
 
-def disable_paper_simulation_controlled() -> dict:
+def disable_paper_simulation_controlled(args=None) -> dict:
+    args = args or {}
     current = load_paper_candidate_config()
     backup_path = backup_candidate_config(current)
     updated = build_enabled_paper_config(current, False)
     write_candidate_config(updated)
+    fresh = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(fresh)
     real_enabled, _ = paper_real_trading_enabled()
     return {
         "ok": True,
-        "paperEnabled": bool(updated.get("enabled", False)),
+        "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "backupPath": str(backup_path.relative_to(app.root_path)),
         "writtenPath": str(PAPER_CANDIDATE_LOCAL_PATH.relative_to(app.root_path)),
-        "candidateConfig": updated,
-        "changedFields": paper_config_changed_fields(current, updated),
+        "candidateConfig": fresh,
+        "changedFields": paper_config_changed_fields(current, fresh),
+        "stopRules": build_paper_stop_rules(args),
+        "sessionSummary": build_paper_session_summary(args),
+        "consistencyWarnings": paper_enabled_consistency_warnings(fresh, paper_enabled),
         "warnings": [],
     }
 
@@ -5282,8 +5362,10 @@ def normalize_promoted_candidate_config(candidate: dict) -> dict:
 
 
 def candidate_summary(candidate: dict) -> dict:
+    paper_enabled = canonical_paper_enabled(candidate)
     return {
-        "enabled": candidate.get("enabled", False),
+        "enabled": paper_enabled,
+        "paperEnabled": paper_enabled,
         "enabledAt": candidate.get("enabledAt"),
         "disabledAt": candidate.get("disabledAt"),
         "strategy": candidate.get("strategy"),
@@ -5304,6 +5386,7 @@ def candidate_summary(candidate: dict) -> dict:
         "maxOpenTrades": candidate.get("maxOpenTrades"),
         "maxNotionalPerTrade": candidate.get("maxNotionalPerTrade"),
         "configWarnings": candidate_config_warnings(candidate),
+        "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
     }
 
 
