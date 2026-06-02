@@ -1224,6 +1224,7 @@ def paper_status():
         stop_rules = build_paper_stop_rules(request.args)
         session_summary = build_paper_session_summary(request.args)
         observation_quality = build_paper_observation_quality(request.args)
+        observation_targets = build_paper_observation_targets(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
@@ -1273,6 +1274,7 @@ def paper_status():
                 "nextAction": observation_quality.get("nextAction"),
                 "evidence": observation_quality.get("evidence"),
             },
+            "observationTargets": compact_observation_targets(observation_targets),
             "tickReadiness": {
                 "status": tick_readiness.get("tickReadiness", {}).get("status"),
                 "usefulNow": tick_readiness.get("tickReadiness", {}).get("usefulNow"),
@@ -1329,6 +1331,14 @@ def paper_observation_quality():
         return jsonify(build_paper_observation_quality(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper observation quality: {exc}"}), 502
+
+
+@app.get("/api/paper/observation-targets")
+def paper_observation_targets():
+    try:
+        return jsonify(build_paper_observation_targets(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper observation targets: {exc}"}), 502
 
 
 @app.get("/api/paper/recent-events")
@@ -4942,6 +4952,234 @@ def build_paper_observation_quality(args) -> dict:
     }
 
 
+def paper_observation_target_policy(args) -> dict:
+    return {
+        "minSessionHours": safe_float(args.get("min_session_hours", 72), 72),
+        "minPaperTicks": int(safe_float(args.get("min_paper_ticks", 24), 24)),
+        "minClosedTrades": int(safe_float(args.get("min_closed_trades", 10), 10)),
+        "preferredClosedTrades": int(safe_float(args.get("preferred_closed_trades", 30), 30)),
+        "minActiveMarketFreshnessStatus": ["READY", "WAIT_FOR_NEXT_CANDLE"],
+        "maxStopRuleFailures": int(safe_float(args.get("max_stop_rule_failures", 0), 0)),
+        "maxRuntimeActiveWarnings": int(safe_float(args.get("max_runtime_active_warnings", 0), 0)),
+    }
+
+
+def compact_observation_targets(targets: dict) -> dict:
+    progress = targets.get("progress") or {}
+    readiness = targets.get("readiness") or {}
+    return {
+        "status": targets.get("status"),
+        "nextAction": targets.get("nextAction"),
+        "blockingIssues": len(targets.get("blockingIssues") or []),
+        "warnings": len(targets.get("warnings") or []),
+        "progress": {
+            "sessionAgeHours": progress.get("sessionAgeHours"),
+            "ticksObserved": progress.get("ticksObserved"),
+            "targetTicks": (targets.get("targets") or {}).get("minPaperTicks"),
+            "closedTrades": progress.get("closedTrades"),
+            "targetClosedTrades": (targets.get("targets") or {}).get("minClosedTrades"),
+            "signalsObserved": progress.get("signalsObserved"),
+            "activeWarningCount": progress.get("activeWarningCount"),
+            "watchWarningCount": progress.get("watchWarningCount"),
+        },
+        "readiness": {
+            "minimumTargetsMet": readiness.get("minimumTargetsMet"),
+            "preferredTradesMet": readiness.get("preferredTradesMet"),
+            "safeToReview": readiness.get("safeToReview"),
+        },
+    }
+
+
+def build_paper_observation_targets(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
+    journal = read_jsonl_tail(os.path.join(app.root_path, "reports", "paper-journal.jsonl"), 1000)
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    targets = paper_observation_target_policy(args)
+    tick_readiness = build_paper_tick_readiness(args)
+    runtime = build_paper_runtime_status(args)
+    stop_rules = build_paper_stop_rules(args) if paper_enabled else {
+        "status": "OK",
+        "rules": [],
+        "nextAction": {"action": "PAPER_DISABLED_NO_STOP_NEEDED", "reason": "Paper is disabled, so stop rules are informational only."},
+    }
+    session = paper_session_window(candidate)
+    session_events = [event for event in journal if event_in_session(event, session)]
+    event_types = [str(event.get("eventType", "")).upper() for event in session_events]
+    tick_times = {
+        paper_tick_bucket(event_timestamp(event))
+        for event in session_events
+        if paper_tick_bucket(event_timestamp(event))
+    }
+    state_updated_at = parse_iso_timestamp(state.get("updatedAt"))
+    if state_updated_at and session.get("started") and state_updated_at >= session["started"] and (not session.get("ended") or state_updated_at <= session["ended"]):
+        bucket = paper_tick_bucket(state.get("updatedAt"))
+        if bucket:
+            tick_times.add(bucket)
+    freshness_active = (tick_readiness.get("freshness") or {}).get("active") or []
+    active = freshness_active[0] if freshness_active else {}
+    tick_state = tick_readiness.get("tickReadiness") or {}
+    runtime_journal = runtime.get("journal") or {}
+    stop_failures = [
+        rule for rule in stop_rules.get("rules", [])
+        if not rule.get("pass") and rule.get("severity") == "STOP"
+    ]
+    warn_failures = [
+        rule for rule in stop_rules.get("rules", [])
+        if not rule.get("pass") and rule.get("severity") == "WARN"
+    ]
+    now = datetime.now(timezone.utc)
+    started = session.get("started")
+    ended = session.get("ended") or (None if not started else now)
+    duration_seconds = int((ended - started).total_seconds()) if started and ended else 0
+    session_age_hours = round(duration_seconds / 3600, 4)
+    ticks = len(tick_times)
+    closed_trades = len(state.get("closedTrades", []) or [])
+    signals = event_types.count("SIGNAL")
+    open_positions = len(state.get("openPositions", []) or [])
+    active_warning_count = int(safe_float(runtime_journal.get("activeWarningCount"), len(runtime_journal.get("activeWarnings") or [])))
+    watch_warning_count = int(safe_float(runtime_journal.get("watchWarningCount"), len(runtime_journal.get("watchWarnings") or [])))
+    stale_watch_warning_count = int(safe_float(runtime_journal.get("staleWatchWarningCount"), len(runtime_journal.get("staleWatchWarnings") or [])))
+    freshness_status = tick_state.get("status") or "UNKNOWN"
+    if not paper_enabled:
+        quality_status = "DISABLED"
+    elif closed_trades <= 0:
+        quality_status = "TOO_EARLY"
+    elif closed_trades < targets["minClosedTrades"]:
+        quality_status = "OBSERVE"
+    else:
+        quality_status = "OBSERVE"
+    stop_status = str(stop_rules.get("status") or "UNKNOWN").upper()
+
+    meets_session = session_age_hours >= safe_float(targets.get("minSessionHours"), 0)
+    meets_ticks = ticks >= int(safe_float(targets.get("minPaperTicks"), 0))
+    meets_closed = closed_trades >= int(safe_float(targets.get("minClosedTrades"), 0))
+    meets_preferred = closed_trades >= int(safe_float(targets.get("preferredClosedTrades"), 0))
+    freshness_ok = freshness_status in set(targets.get("minActiveMarketFreshnessStatus") or [])
+    stop_failures_ok = len(stop_failures) <= int(safe_float(targets.get("maxStopRuleFailures"), 0))
+    active_warnings_ok = active_warning_count <= int(safe_float(targets.get("maxRuntimeActiveWarnings"), 0))
+
+    blocking_issues = []
+    warnings = []
+    informational = []
+    if real_enabled:
+        blocking_issues.append(real_detail)
+    if paper_enabled and stop_status == "STOP_RECOMMENDED":
+        blocking_issues.append(f"{len(stop_failures)} stop-level paper rule(s) failed.")
+    if paper_enabled and stop_status == "WATCH":
+        warnings.append(f"{len(warn_failures)} warning-level paper rule(s) failed.")
+    if paper_enabled and active_warning_count > targets["maxRuntimeActiveWarnings"]:
+        blocking_issues.append(f"Active runtime warnings exceed policy ({active_warning_count}/{targets['maxRuntimeActiveWarnings']}).")
+    if paper_enabled and freshness_status not in targets["minActiveMarketFreshnessStatus"]:
+        warnings.append(f"Active-market tick readiness is {freshness_status}; target expects READY or WAIT_FOR_NEXT_CANDLE.")
+    if watch_warning_count:
+        informational.append(f"{watch_warning_count} watch-market warning(s) are informational and do not block active paper observation.")
+    if stale_watch_warning_count:
+        informational.append(f"{stale_watch_warning_count} stale watch-market warning(s) are separated from active-market blockers.")
+
+    minimum_targets_met = meets_session and meets_ticks and meets_closed and freshness_ok and stop_failures_ok and active_warnings_ok
+    evidence_exists = bool(ticks or signals or closed_trades or open_positions or session_age_hours > 0)
+    if not paper_enabled:
+        status = "DISABLED"
+        next_action = {
+            "action": "ENABLE_PAPER_SIMULATION",
+            "reason": "Paper is disabled; enable it manually only after reviewing readiness. This endpoint never enables paper automatically.",
+        }
+    elif real_enabled or (stop_status == "STOP_RECOMMENDED") or not active_warnings_ok:
+        status = "PAUSE_RECOMMENDED"
+        next_action = {
+            "action": "PAUSE_PAPER_SIMULATION",
+            "reason": "Stop rules, real-trading safety, or active runtime warnings require review before more paper observation.",
+        }
+    elif warnings or stop_status == "WATCH" or quality_status == "WATCH":
+        status = "WATCH"
+        next_action = {
+            "action": "OBSERVE_MORE" if evidence_exists else "RUN_PAPER_ONCE_WHEN_READY",
+            "reason": "Some paper evidence exists, but warnings should be reviewed before judging the candidate.",
+        }
+    elif minimum_targets_met:
+        status = "READY_FOR_PAPER_REVIEW"
+        next_action = {
+            "action": "REVIEW_PAPER_RESULTS",
+            "reason": "Minimum forward paper targets are met with no active blockers. This is review-only and never recommends real trading.",
+        }
+    elif not evidence_exists or closed_trades <= 0:
+        status = "TOO_EARLY"
+        next_action_value = "WAIT_FOR_NEXT_CANDLE" if freshness_status == "WAIT_FOR_NEXT_CANDLE" and evidence_exists else "RUN_PAPER_ONCE_WHEN_READY"
+        next_reason = "No closed paper trades are available yet; wait for the next closed active-market candle before another useful tick." if next_action_value == "WAIT_FOR_NEXT_CANDLE" else "No closed paper trades are available yet, so the forward evidence is still too early for judgment."
+        next_action = {
+            "action": next_action_value,
+            "reason": next_reason,
+        }
+    elif freshness_status == "WAIT_FOR_NEXT_CANDLE":
+        status = "OBSERVE_MORE"
+        next_action = {
+            "action": "WAIT_FOR_NEXT_CANDLE",
+            "reason": "Continue observation after the next closed active-market candle becomes available.",
+        }
+    else:
+        status = "OBSERVE_MORE"
+        next_action = {
+            "action": "OBSERVE_MORE",
+            "reason": "Forward paper evidence is accumulating, but minimum observation targets are not met yet.",
+        }
+
+    progress = {
+        "sessionStartedAt": session.get("startedAt"),
+        "sessionAgeHours": session_age_hours,
+        "ticksObserved": ticks,
+        "closedTrades": closed_trades,
+        "openPositions": open_positions,
+        "signalsObserved": signals,
+        "activeMarket": active.get("marketKey") or paper_market_key((candidate_symbols_by_mode(candidate, "active") or [{}])[0]),
+        "latestClosedCandleTime": tick_state.get("latestClosedCandleTime") or active.get("latestClosedCandleAt"),
+        "lastProcessedCandleTime": tick_state.get("lastProcessedCandleTime") or active.get("lastProcessedCandleAt"),
+        "activeWarningCount": active_warning_count,
+        "watchWarningCount": watch_warning_count,
+        "staleWatchWarningCount": stale_watch_warning_count,
+        "stopRulesStatus": stop_rules.get("status"),
+        "observationQualityStatus": quality_status,
+        "remainingSessionHours": round(max(0, targets["minSessionHours"] - session_age_hours), 4),
+        "remainingPaperTicks": max(0, targets["minPaperTicks"] - ticks),
+        "remainingClosedTrades": max(0, targets["minClosedTrades"] - closed_trades),
+        "remainingPreferredClosedTrades": max(0, targets["preferredClosedTrades"] - closed_trades),
+    }
+    readiness = {
+        "minimumTargetsMet": minimum_targets_met,
+        "preferredTradesMet": meets_preferred,
+        "safeToReview": status == "READY_FOR_PAPER_REVIEW",
+        "meetsSessionHours": meets_session,
+        "meetsPaperTicks": meets_ticks,
+        "meetsClosedTrades": meets_closed,
+        "activeMarketFreshnessOk": freshness_ok,
+        "stopRuleFailuresOk": stop_failures_ok,
+        "runtimeActiveWarningsOk": active_warnings_ok,
+        "meaningfulEvidence": evidence_exists and (ticks > 0 or signals > 0 or closed_trades > 0),
+    }
+    if paper_enabled and not meets_session:
+        warnings.append(f"Session age is below target ({session_age_hours}/{targets['minSessionHours']} hours).")
+    if paper_enabled and not meets_ticks:
+        warnings.append(f"Paper ticks are below target ({ticks}/{targets['minPaperTicks']}).")
+    if paper_enabled and not meets_closed:
+        warnings.append(f"Closed paper trades are below judgment target ({closed_trades}/{targets['minClosedTrades']}).")
+
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "targets": targets,
+        "progress": progress,
+        "readiness": readiness,
+        "status": status,
+        "nextAction": next_action,
+        "blockingIssues": dedupe_list([item for item in blocking_issues if item]),
+        "warnings": dedupe_list([item for item in warnings if item]),
+        "informationalWarnings": dedupe_list([item for item in informational if item]),
+    }
+
+
 def paper_interval_seconds(interval: str | None) -> int:
     raw = str(interval or "").strip().lower()
     if raw.endswith("m"):
@@ -5301,6 +5539,7 @@ def compact_run_once_payload(payload: dict) -> dict:
         "stopRulesBefore": (payload.get("stopRulesBefore") or {}).get("status"),
         "stopRulesAfter": (payload.get("stopRulesAfter") or {}).get("status"),
         "observationStatus": (((payload.get("observationQuality") or {}).get("quality") or {}).get("status")),
+        "observationTargetStatus": (payload.get("observationTargets") or {}).get("status"),
     }
 
 
@@ -5316,6 +5555,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
             "realTradingEnabled": True,
             "tickRan": False,
             "tickReadinessBefore": readiness_before,
+            "observationTargets": build_paper_observation_targets(args),
             "nextAction": {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail},
         }
         result["summary"] = compact_run_once_payload(result)
@@ -5323,6 +5563,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
     if not paper_enabled:
         stop_rules = build_paper_stop_rules(args)
         observation = build_paper_observation_quality(args)
+        observation_targets = build_paper_observation_targets(args)
         result = {
             "ok": True,
             "paperEnabled": False,
@@ -5333,6 +5574,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
             "stopRulesBefore": stop_rules,
             "stopRulesAfter": stop_rules,
             "observationQuality": observation,
+            "observationTargets": observation_targets,
             "nextAction": {
                 "action": "PAPER_DISABLED",
                 "reason": "Paper simulation must be enabled manually before local run-once can refresh and tick.",
@@ -5364,6 +5606,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
         next_action = {"action": "NO_ACTION", "reason": f"Tick was not run because readiness is {readiness_status or 'UNKNOWN'}."}
     stop_rules_after = build_paper_stop_rules(args)
     observation = build_paper_observation_quality(args)
+    observation_targets = build_paper_observation_targets(args)
     final_candidate = load_paper_candidate_config()
     final_enabled = canonical_paper_enabled(final_candidate)
     final_real_enabled, _ = paper_real_trading_enabled()
@@ -5380,6 +5623,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
         "tickResult": tick_result,
         "stopRulesAfter": stop_rules_after,
         "observationQuality": observation,
+        "observationTargets": observation_targets,
         "tickReadinessAfter": build_paper_tick_readiness(args),
         "nextAction": next_action,
     }

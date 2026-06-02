@@ -534,6 +534,7 @@ async function refreshPaperLearningPanels() {
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
     loadPaperSessionMonitor(),
+    loadPaperObservationTargets(),
     loadPaperObservationQuality(),
   ]);
 }
@@ -2702,6 +2703,7 @@ function setupLearningControls() {
   document.querySelector("#paper-tick-readiness-refresh")?.addEventListener("click", loadPaperTickReadiness);
   document.querySelector("#paper-tick-readiness-panel")?.addEventListener("click", handlePaperTickReadinessAction);
   document.querySelector("#paper-session-refresh")?.addEventListener("click", loadPaperSessionMonitor);
+  document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
@@ -3399,6 +3401,7 @@ async function runPaperOnceFromPanel() {
       loadPaperSimulationControl(),
       loadPaperRuntimeMonitor(),
       loadPaperSessionMonitor(),
+      loadPaperObservationTargets(),
       loadPaperObservationQuality(),
     ]);
     host.innerHTML = renderPaperTickReadiness(payload.tickReadinessAfter || payload.tickReadinessAfterRefresh || payload.tickReadinessBefore || payload) + renderPaperRunOnceResult(payload);
@@ -3463,6 +3466,7 @@ function renderPaperRunOnceResult(payload) {
       <div class="metric"><span>After</span><strong>${escapeHtml(summary.readinessAfter || "-")}</strong></div>
       <div class="metric"><span>Stop before</span><strong>${escapeHtml(summary.stopRulesBefore || "-")}</strong></div>
       <div class="metric"><span>Stop after</span><strong>${escapeHtml(summary.stopRulesAfter || "-")}</strong></div>
+      <div class="metric"><span>Targets</span><strong>${escapeHtml(summary.observationTargetStatus || payload.observationTargets?.status || "-")}</strong></div>
       <div class="metric"><span>Processed</span><strong>${summary.processedCandlesDelta ?? tick.summary?.processedCandlesDelta ?? "-"}</strong></div>
       <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
     </div>
@@ -3549,6 +3553,60 @@ function renderPaperSessionMonitor(summary, eventsPayload) {
       <tbody>${rows || `<tr><td colspan="6">No paper events available.</td></tr>`}</tbody>
     </table>
     ${(summary.warnings || []).length ? `<ul class="backtest-warnings">${summary.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+async function loadPaperObservationTargets() {
+  const host = document.querySelector("#paper-observation-targets-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper observation targets...</p>`;
+    const payload = await apiGet("/api/paper/observation-targets");
+    host.innerHTML = renderPaperObservationTargets(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper observation targets could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperObservationTargets(payload) {
+  const candidate = payload.candidate || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const targets = payload.targets || {};
+  const progress = payload.progress || {};
+  const readiness = payload.readiness || {};
+  const next = payload.nextAction || {};
+  const status = payload.status || "UNKNOWN";
+  const tone = status === "READY_FOR_PAPER_REVIEW" ? "positive" : status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
+  const rows = [
+    ...(payload.blockingIssues || []).map((detail) => ({ type: "Blocking", detail })),
+    ...(payload.warnings || []).map((detail) => ({ type: "Warning", detail })),
+    ...(payload.informationalWarnings || []).map((detail) => ({ type: "Info", detail })),
+  ].map((item) => `<tr><td>${escapeHtml(item.type)}</td><td>${escapeHtml(item.detail || "-")}</td></tr>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Observation Targets <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Session age</span><strong>${formatMaybeNumber(progress.sessionAgeHours)} / ${formatMaybeNumber(targets.minSessionHours)}h</strong></div>
+      <div class="metric"><span>Ticks</span><strong>${progress.ticksObserved ?? 0} / ${targets.minPaperTicks ?? "-"}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${progress.closedTrades ?? 0} / ${targets.minClosedTrades ?? "-"}</strong></div>
+      <div class="metric"><span>Preferred trades</span><strong>${progress.closedTrades ?? 0} / ${targets.preferredClosedTrades ?? "-"}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${progress.signalsObserved ?? 0}</strong></div>
+      <div class="metric"><span>Open</span><strong>${progress.openPositions ?? 0}</strong></div>
+      <div class="metric"><span>Active warnings</span><strong>${progress.activeWarningCount ?? 0}</strong></div>
+      <div class="metric"><span>Watch warnings</span><strong>${progress.watchWarningCount ?? 0}</strong></div>
+      <div class="metric"><span>Quality</span><strong>${escapeHtml(progress.observationQualityStatus || "-")}</strong></div>
+      <div class="metric"><span>Minimum met</span><strong>${readiness.minimumTargetsMet ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Meaningful</span><strong>${readiness.meaningfulEvidence ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Active market:</strong> ${escapeHtml(progress.activeMarket || "-")} latest ${escapeHtml(progress.latestClosedCandleTime || "-")} processed ${escapeHtml(progress.lastProcessedCandleTime || "-")}</p>
+    <p class="modal-note"><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Type</th><th>Detail</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="2">No observation target issues returned.</td></tr>`}</tbody>
+    </table>
   `;
 }
 
