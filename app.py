@@ -1234,6 +1234,12 @@ def paper_status():
         tick_readiness = build_paper_tick_readiness(request.args)
         observation_report = build_paper_observation_report(request.args)
         real_enabled, _ = paper_real_trading_enabled()
+        runtime_journal = runtime.get("journal", {}) or {}
+        blocking_warnings = runtime_journal.get("blockingWarnings", []) or []
+        active_warnings = runtime_journal.get("activeWarnings", []) or []
+        watch_warnings = runtime_journal.get("watchWarnings", []) or []
+        stale_watch_warnings = runtime_journal.get("staleWatchWarnings", []) or []
+        informational_warnings = runtime_journal.get("informationalWarnings", []) or []
         return jsonify({
             "ok": True,
             "paperEnabled": paper_enabled,
@@ -1249,7 +1255,8 @@ def paper_status():
             "totalSlippage": state.get("cumulativeSlippage", 0),
             "lastSignals": events,
             "lastProcessedCandle": state.get("lastProcessedCandleTime", {}),
-            "warnings": state.get("warnings", []),
+            "warnings": blocking_warnings,
+            "informationalWarnings": informational_warnings,
             "candidate": candidate_summary(candidate),
             "health": health_payload.get("health", {}),
             "readiness": readiness,
@@ -1307,15 +1314,15 @@ def paper_status():
                 "watchWarningCount": len(tick_readiness.get("tickReadiness", {}).get("watchWarnings") or []),
                 "staleWatchWarningCount": len(tick_readiness.get("tickReadiness", {}).get("staleWatchWarnings") or []),
             },
-            "staleWarnings": runtime.get("journal", {}).get("staleWarnings", []),
-            "recentWarnings": runtime.get("journal", {}).get("recentWarnings", []),
-            "activeWarnings": runtime.get("journal", {}).get("activeWarnings", []),
-            "watchWarnings": runtime.get("journal", {}).get("watchWarnings", []),
-            "staleWatchWarnings": runtime.get("journal", {}).get("staleWatchWarnings", []),
-            "blockingWarnings": runtime.get("journal", {}).get("blockingWarnings", []),
-            "activeWarningCount": len(runtime.get("journal", {}).get("activeWarnings", [])),
-            "watchWarningCount": len(runtime.get("journal", {}).get("watchWarnings", [])),
-            "staleWatchWarningCount": len(runtime.get("journal", {}).get("staleWatchWarnings", [])),
+            "staleWarnings": runtime_journal.get("staleWarnings", []),
+            "recentWarnings": runtime_journal.get("recentWarnings", []),
+            "activeWarnings": active_warnings,
+            "watchWarnings": watch_warnings,
+            "staleWatchWarnings": stale_watch_warnings,
+            "blockingWarnings": blocking_warnings,
+            "activeWarningCount": len(active_warnings),
+            "watchWarningCount": len(watch_warnings),
+            "staleWatchWarningCount": len(stale_watch_warnings),
             "lastUpdated": candidate.get("enabledAt") or candidate.get("disabledAt") or state.get("updatedAt") or candidate.get("promotedAt"),
             "equityCurve": state.get("equityCurve", [])[-500:],
         })
@@ -6573,7 +6580,7 @@ def build_paper_tick_readiness(args) -> dict:
             "secondsUntilNextUsefulTick": seconds_until,
             "activeMarketReason": active_market_reason,
             "reasons": dedupe_list(reasons),
-            "warnings": dedupe_list(blocking_warnings + informational_warnings),
+            "warnings": dedupe_list(blocking_warnings),
             "activeWarnings": dedupe_list(active_warnings),
             "watchWarnings": dedupe_list(watch_warnings),
             "staleWatchWarnings": dedupe_list(stale_watch_warnings),
@@ -7025,8 +7032,6 @@ def build_paper_runtime_status(args) -> dict:
         if warning_buckets["blockingWarnings"]:
             health_status = "WATCH" if health_status == "OK" else health_status
             health_reasons.append(f"{len(warning_buckets['blockingWarnings'])} active or unclassified runtime warning(s) are present.")
-        if warning_buckets["watchWarnings"]:
-            health_reasons.append(f"{len(warning_buckets['watchWarnings'])} watch-market warning(s) are informational and do not block active paper ticking.")
         if warning_buckets["staleWarnings"]:
             health_reasons.append(f"{len(warning_buckets['staleWarnings'])} older journal warning(s) were separated as stale.")
     if not health_reasons:
@@ -7103,6 +7108,14 @@ def build_paper_runtime_status(args) -> dict:
             "reasons": health_reasons,
         },
         "nextAction": next_action,
+        "activeWarnings": warning_buckets["activeWarnings"],
+        "watchWarnings": warning_buckets["watchWarnings"],
+        "staleWatchWarnings": warning_buckets["staleWatchWarnings"],
+        "blockingWarnings": warning_buckets["blockingWarnings"],
+        "informationalWarnings": warning_buckets["informationalWarnings"],
+        "activeWarningCount": len(warning_buckets["activeWarnings"]),
+        "watchWarningCount": len(warning_buckets["watchWarnings"]),
+        "staleWatchWarningCount": len(warning_buckets["staleWatchWarnings"]),
         "warnings": dedupe_list(warnings + ([candidate_load_error] if candidate_load_error else [])),
     }
 
