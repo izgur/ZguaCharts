@@ -1380,6 +1380,15 @@ def paper_candidate_comparison():
         return jsonify({"error": f"Could not build paper candidate comparison: {exc}"}), 502
 
 
+@app.get("/api/paper/discover-fast-candidate")
+def paper_discover_fast_candidate():
+    try:
+        payload, status_code = build_paper_fast_candidate_discovery(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not discover fast paper candidate: {exc}"}), 502
+
+
 @app.get("/api/paper/observation-report")
 def paper_observation_report():
     try:
@@ -6063,6 +6072,153 @@ def candidate_comparison_recommendation(rows: list[dict], active_symbol: str | N
     return {
         "action": "NO_ACTION",
         "reason": "No inspected candidate is strong enough for review. This endpoint does not promote or enable paper.",
+    }
+
+
+def build_paper_fast_candidate_discovery(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    symbols = parse_csv_arg(args.get("symbols"), ["ETHUSDT", "BTCUSDT"])
+    timeframes = parse_csv_arg(args.get("timeframes"), ["15m"])
+    strategy = (args.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    max_combos = max(1, min(int(safe_float(args.get("max_combos", args.get("maxCombos", 100)), 100)), 500))
+    limit_raw = args.get("limit", "auto")
+    command = package_node_script_args("paper:discover-fast-candidate")
+    command.extend([
+        "--symbols", ",".join(symbols),
+        "--timeframes", ",".join(timeframes),
+        "--strategy", strategy,
+        "--period", period,
+        "--max-combos", str(max_combos),
+        "--limit", str(limit_raw),
+        "--fee-pct", str(safe_float(candidate.get("takerFeePct", 0))),
+        "--slippage-pct", str(safe_float(candidate.get("slippageBps", 0)) / 100),
+    ])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 180), 180)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Fast candidate discovery timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activePaperCandidate": candidate_summary(candidate),
+            "search": {"symbols": symbols, "timeframes": timeframes, "strategy": strategy, "period": period, "maxCombos": max_combos, "limit": limit_raw},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Discovery timed out before returning candidate rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Fast candidate discovery returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Fast candidate discovery returned no output."}
+    rows = [normalize_fast_candidate_row(row) for row in payload.get("rows", [])]
+    best = best_fast_candidate(rows)
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Fast candidate discovery command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "realTradingEnabled": real_enabled,
+        "paperEnabled": paper_enabled,
+        "activePaperCandidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategy": strategy, "period": period, "maxCombos": max_combos, "limit": limit_raw},
+        "rows": rows,
+        "bestCandidate": best,
+        "recommendation": fast_candidate_recommendation(best, rows),
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def normalize_fast_candidate_row(row: dict) -> dict:
+    status = row.get("status") or row.get("qualityStatus") or "FAIL"
+    rejection_reasons = row.get("rejectionReasons") or []
+    warnings = row.get("warnings") or []
+    return {
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "strategy": row.get("strategy"),
+        "status": status,
+        "qualityStatus": row.get("qualityStatus") or status,
+        "params": row.get("params") or {},
+        "train": row.get("train") or {},
+        "test": row.get("test") or {},
+        "full": row.get("full") or {},
+        "trades": int(safe_float(row.get("trades"), 0)),
+        "profitFactor": safe_float(row.get("profitFactor"), 0),
+        "totalReturnPct": safe_float(row.get("totalReturnPct"), 0),
+        "maxDrawdownPct": safe_float(row.get("maxDrawdownPct"), 0),
+        "winRate": safe_float(row.get("winRate"), 0),
+        "score": safe_float(row.get("score"), -999),
+        "warnings": warnings,
+        "rejectionReasons": rejection_reasons,
+    }
+
+
+def best_fast_candidate(rows: list[dict]) -> dict | None:
+    reviewable = [row for row in rows if fast_candidate_reviewable(row)]
+    if not reviewable:
+        return None
+    return sorted(reviewable, key=lambda row: safe_float(row.get("score"), -999), reverse=True)[0]
+
+
+def fast_candidate_reviewable(row: dict) -> bool:
+    severe_codes = {
+        "zero_trades",
+        "too_few_test_trades",
+        "too_few_full_trades",
+        "test_profit_factor_below_min",
+        "full_profit_factor_below_min",
+        "negative_test_return",
+        "negative_full_return",
+        "high_drawdown",
+        "train_test_overfit_gap",
+        "unstable_walk_forward",
+        "strongly_negative_train_return",
+        "train_only_success_test_failure",
+    }
+    codes = {str(item.get("code") or item).lower() for item in row.get("rejectionReasons", [])}
+    return (
+        row.get("qualityStatus") in {"PASS", "WARN"}
+        and int(safe_float(row.get("trades"), 0)) >= 20
+        and safe_float(row.get("totalReturnPct"), 0) > 0
+        and safe_float(row.get("profitFactor"), 0) >= 1.05
+        and safe_float(row.get("maxDrawdownPct"), 999) <= 25
+        and not (codes & severe_codes)
+    )
+
+
+def fast_candidate_recommendation(best: dict | None, rows: list[dict]) -> dict:
+    if best:
+        return {
+            "action": "REVIEW_FAST_CANDIDATE",
+            "reason": f"{best.get('symbol')} {best.get('timeframe')} has enough trades, positive return, PF {best.get('profitFactor')}, and acceptable drawdown for manual review only.",
+        }
+    if rows:
+        return {
+            "action": "KEEP_1H",
+            "reason": "No separately optimized fast-timeframe row passed the review gate. Keep observing the current 1h paper candidate.",
+        }
+    return {
+        "action": "NO_FAST_CANDIDATE",
+        "reason": "Discovery returned no candidate rows.",
     }
 
 
