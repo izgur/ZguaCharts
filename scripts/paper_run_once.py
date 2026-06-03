@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,6 +13,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app import app  # noqa: E402
+
+
+def raise_keyboard_interrupt(_signum, _frame) -> None:
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, raise_keyboard_interrupt)
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, raise_keyboard_interrupt)
 
 
 def utc_now() -> str:
@@ -70,13 +80,16 @@ def write_jsonl(handle, item: dict) -> None:
         handle.flush()
 
 
-def final_summary(results: list[dict]) -> dict:
+def final_summary(results: list[dict], interrupted: bool = False) -> dict:
     errors = [item for item in results if not item.get("ok")]
     final = results[-1] if results else {}
+    exit_code = 130 if interrupted else 0 if not errors else 1
     return {
         "type": "summary",
         "timestamp": utc_now(),
-        "ok": not errors,
+        "ok": not errors and not interrupted,
+        "interrupted": interrupted,
+        "exitCode": exit_code,
         "iterationsAttempted": len(results),
         "ticksRun": len([item for item in results if item.get("tickRan")]),
         "ticksSkipped": len([item for item in results if not item.get("tickRan")]),
@@ -99,6 +112,8 @@ def main() -> int:
 
     results = []
     log_handle = None
+    interrupted = False
+    output = final_summary(results)
     if args.log_file:
         log_path = Path(args.log_file)
         if not log_path.is_absolute():
@@ -118,12 +133,14 @@ def main() -> int:
                 if not args.loop or index >= iterations - 1:
                     break
                 time.sleep(max(0, args.interval_minutes) * 60)
+        except KeyboardInterrupt:
+            interrupted = True
         finally:
-            output = final_summary(results)
+            output = final_summary(results, interrupted=interrupted)
             write_jsonl(log_handle, output)
             if log_handle:
                 log_handle.close()
-    return 0 if output["ok"] else 1
+    return output["exitCode"]
 
 
 if __name__ == "__main__":

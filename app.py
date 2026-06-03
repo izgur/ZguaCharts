@@ -1461,6 +1461,8 @@ def paper_runner_instructions():
             "notes": [
                 "This is local paper simulation only and cannot place real trades.",
                 "The loop runs only when started manually; no daemon or scheduled task is created.",
+                "Press Ctrl+C to stop a manually started loop; the runner prints a final interrupted summary.",
+                "Ctrl+C does not disable paper automatically; run POST /api/paper/disable manually when finished.",
                 "Generated runner JSONL logs are local runtime files and should not be committed.",
             ],
             "observationTargets": compact_observation_targets(observation_targets),
