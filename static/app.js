@@ -531,6 +531,7 @@ async function refreshPaperLearningPanels() {
     apiGet("/api/candidate/current").catch(() => null),
     loadPaperReadiness(),
     loadPaperObservationReport(),
+    loadPaperSignalDiagnostics(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
@@ -2703,6 +2704,7 @@ function setupLearningControls() {
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
+  document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3355,6 +3357,62 @@ function renderPaperObservationReport(payload) {
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
     ${info ? `<ul class="modal-note-list">${info}</ul>` : ""}
+  `;
+}
+
+async function loadPaperSignalDiagnostics() {
+  const host = document.querySelector("#paper-signal-diagnostics-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading active signal diagnostics...</p>`;
+    const payload = await apiGet("/api/paper/active-signal-diagnostics");
+    host.innerHTML = renderPaperSignalDiagnostics(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Active signal diagnostics could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperSignalDiagnostics(payload) {
+  const diagnostic = payload.diagnostics || {};
+  const active = payload.activeMarket || {};
+  const latest = payload.latestCandle || {};
+  const snapshot = diagnostic.indicatorSnapshot || {};
+  const position = diagnostic.positionState || {};
+  const next = payload.nextAction || {};
+  const signal = diagnostic.signal || "UNKNOWN";
+  const tone = ["BUY", "SHORT", "EXIT"].includes(signal) ? "positive" : payload.ok === false ? "negative" : "neutral";
+  const checks = (diagnostic.checks || []).slice(0, 8).map((check) => `
+    <tr>
+      <td>${escapeHtml(check.name || "-")}</td>
+      <td class="${check.pass === true ? "positive" : check.pass === false ? "negative" : "neutral"}">${check.pass === null || check.pass === undefined ? "n/a" : check.pass ? "pass" : "block"}</td>
+      <td><code>${escapeHtml(compactJson(check.value ?? "-"))}</code></td>
+      <td>${escapeHtml(check.threshold || "-")}</td>
+    </tr>
+  `).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Active Signal Diagnostics <span class="${tone}">${escapeHtml(signal)}</span></h3>
+    <p class="modal-note">${escapeHtml(diagnostic.reason || payload.error || "No diagnostic reason returned.")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(active.symbol || "-")} ${escapeHtml(active.timeframe || "")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Latest candle</span><strong>${escapeHtml(latest.isoTime || "-")}</strong></div>
+      <div class="metric"><span>Close</span><strong>${latest.close ?? "-"}</strong></div>
+      <div class="metric"><span>Position</span><strong>${position.hasOpenPosition ? escapeHtml(position.side || "open") : "flat"}</strong></div>
+      <div class="metric"><span>Next</span><strong>${escapeHtml(next.action || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+        <tr><th>Snapshot</th><td>Close ${snapshot.close ?? "-"} · EMA fast ${snapshot.emaFast ?? "-"} · EMA slow ${snapshot.emaSlow ?? "-"} · EMA trend ${snapshot.emaTrend ?? "-"} · ATR ${snapshot.atr ?? "-"} · RSI ${snapshot.rsi ?? "-"}</td></tr>
+      </tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Check</th><th>Status</th><th>Value</th><th>Threshold</th></tr></thead>
+      <tbody>${checks || `<tr><td colspan="4">No checks returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }
 

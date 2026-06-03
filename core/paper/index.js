@@ -3,6 +3,8 @@ const path = require("path");
 const crypto = require("crypto");
 
 const data = require("../data");
+const indicators = require("../indicators");
+const regime = require("../regime");
 const backtest = require("../backtest");
 
 const DEFAULT_STATE_PATH = path.join(process.cwd(), "data", "paper-state.json");
@@ -217,6 +219,301 @@ function getPaperStatus(options) {
     status.lastJournalEvent = null;
   }
   return status;
+}
+
+function activeSignalDiagnostics(options) {
+  options = options || {};
+  const configPath = resolveConfigPath(options.configPath);
+  const config = loadConfig(configPath);
+  const statePath = options.statePath || DEFAULT_STATE_PATH;
+  const state = loadState(statePath, config);
+  const active = normalizeMarkets(config).find((market) => market.mode !== "watch");
+  const limit = Math.max(1, Math.min(Number(options.limit || 20), 100));
+  if (!active) {
+    return Promise.resolve({
+      ok: false,
+      error: "No active paper market is configured.",
+      paperEnabled: !!config.enabled,
+      realTradingEnabled: false,
+      candidate: configSummary(config),
+      warnings: ["No active market found in paper candidate config."]
+    });
+  }
+  return Promise.all([
+    fetchMarketCandles(config, active, { forceRefresh: options.refresh === true }),
+    data.fetchCandles({
+      source: config.source || "bybit",
+      symbol: "BTCUSDT",
+      interval: "4h",
+      limit: 3000,
+      forceRefresh: options.refresh === true
+    })
+  ]).then(([payload, regimeCandles]) => {
+    let candles = payload.candles || [];
+    if (candles.length) candles = candles.slice(0, -1);
+    const freshness = freshnessForMarket(active, candles, payload.metadata);
+    const params = Object.assign({}, config.params || {}, {
+      regimeMode: canonicalRegimeMode(config),
+      fillModel: config.fillModel || "next-open",
+      makerFeePct: Number(config.makerFeePct || 0),
+      takerFeePct: Number(config.takerFeePct || 0),
+      slippageBps: Number(config.slippageBps || 0),
+      accountEquity: Number(config.accountEquity || 10000),
+      riskPct: Number(config.riskPct || 0.005),
+      maxOpenTrades: Number(config.maxOpenTrades || 1),
+      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000)
+    });
+    const result = backtest.runBacktestOnCandles({
+      symbol: active.symbol,
+      interval: active.interval,
+      strategy: config.strategy,
+      candles,
+      regimeCandles,
+      params
+    });
+    const frame = buildDiagnosticFrame(candles, regimeCandles, result.params || params);
+    const previews = ((result.diagnostics || {}).lastSignalsPreview || []).slice(-limit);
+    const previewByTime = {};
+    previews.forEach((item) => { previewByTime[Number(item.time)] = item; });
+    const trades = result.tradeList || [];
+    const recentRows = frame.slice(-limit).map((row) => diagnosticCandle(row, previewByTime[Number(row.time)], result.params || params, trades));
+    const latestRow = frame.length ? frame[frame.length - 1] : null;
+    const latestPreview = latestRow ? previewByTime[Number(latestRow.time)] : null;
+    const latestTrade = latestRow ? signalTradeForTime(trades, latestRow.time) : null;
+    const latestSignal = signalForRow(latestPreview, latestTrade, latestRow ? latestRow.time : null);
+    const openPosition = (state.openPositions || []).find((position) => position.key === marketKey(active) || (position.symbol === active.symbol && position.interval === active.interval));
+    const checks = latestRow ? checksForSimpleAtrTrendV2(latestRow, result.params || params, state, active, latestPreview) : [];
+    const reason = latestReason(latestSignal, latestPreview, latestTrade, checks);
+    const warnings = [];
+    if (!candles.length) warnings.push("No closed active-market candles were available for diagnostics.");
+    if (freshness.isStale) warnings.push("Active-market candle data is stale; refresh=true can attempt to refresh cache before diagnostics.");
+    return {
+      ok: true,
+      paperEnabled: !!config.enabled,
+      realTradingEnabled: false,
+      candidate: configSummary(config),
+      activeMarket: {
+        symbol: active.symbol,
+        timeframe: active.interval,
+        source: config.source || "bybit",
+        marketKey: marketKey(active),
+        freshness
+      },
+      latestCandle: latestRow ? compactCandle(latestRow) : null,
+      diagnostics: {
+        strategy: config.strategy,
+        params: result.params || params,
+        signal: latestSignal,
+        reason,
+        checks,
+        indicatorSnapshot: latestRow ? indicatorSnapshot(latestRow, result.params || params) : {},
+        positionState: {
+          hasOpenPosition: !!openPosition,
+          side: openPosition ? (openPosition.side || "long") : null,
+          barsHeld: openPosition && openPosition.entrySignalTime && latestRow ? Math.max(0, Math.round((latestRow.time - Number(openPosition.entrySignalTime)) / data.intervalToMs(active.interval) * 1000)) : null
+        },
+        blockerCounts: (result.diagnostics || {}).blockerCounts || {},
+        primaryBlocker: (result.diagnostics || {}).primaryBlocker || null
+      },
+      recentCandles: recentRows,
+      nextAction: nextSignalDiagnosticAction(latestSignal, freshness, latestPreview),
+      warnings
+    };
+  });
+}
+
+function buildDiagnosticFrame(candles, regimeCandles, params) {
+  const normalized = data.normalizeCandles(candles || []);
+  const mapped = regime.mapRegimeToCandles(normalized, data.normalizeCandles(regimeCandles || []));
+  return indicators.buildIndicatorFrame(mapped, {
+    emaReclaim: params.emaFast || 20,
+    emaTrendFast: params.emaSlow || 50,
+    emaSlow: params.emaTrend || params.emaTrendLength,
+    atrPeriod: 14,
+    adxPeriod: 14
+  }).map((row, index) => Object.assign({}, row, {
+    btcRegime: mapped[index] ? mapped[index].btcRegime : "neutral",
+    btcRegimeTime: mapped[index] ? mapped[index].btcRegimeTime : null
+  }));
+}
+
+function compactCandle(row) {
+  return {
+    time: row.time,
+    isoTime: new Date(Number(row.time) * 1000).toISOString(),
+    open: row.open,
+    high: row.high,
+    low: row.low,
+    close: row.close,
+    volume: row.volume
+  };
+}
+
+function signalTradeForTime(trades, time) {
+  return (trades || []).find((trade) => Number(trade.entrySignalTime || trade.entryTime) === Number(time))
+    || (trades || []).find((trade) => Number(trade.exitSignalTime || trade.exitTime) === Number(time))
+    || null;
+}
+
+function signalForRow(preview, trade, rowTime) {
+  const time = Number(rowTime || (preview && preview.time) || 0);
+  if (trade && Number(trade.exitSignalTime || trade.exitTime) === time) return "EXIT";
+  if (trade && Number(trade.entrySignalTime || trade.entryTime) === time) return trade.side === "short" ? "SHORT" : "BUY";
+  if (preview && preview.entry) return "BUY";
+  return preview ? "HOLD" : "NONE";
+}
+
+function diagnosticCandle(row, preview, params, trades) {
+  const trade = signalTradeForTime(trades, row.time);
+  const signal = signalForRow(preview, trade, row.time);
+  return {
+    time: new Date(Number(row.time) * 1000).toISOString(),
+    close: row.close,
+    signal,
+    reason: latestReason(signal, preview, trade, checksForSimpleAtrTrendV2(row, params, {}, {}, preview)),
+    summaryChecks: uniqueList(preview && preview.blockedBy || []).slice(0, 4)
+  };
+}
+
+function checksForSimpleAtrTrendV2(row, params, state, market, preview) {
+  const stopDistance = Number(row.atr14 || 0) * Number(params.atrMultiplier || 0);
+  const size = stopDistance > 0 ? Number(params.accountEquity || 10000) * Number(params.riskPct || 0.005) / stopDistance : null;
+  const notional = size ? row.close * size : null;
+  const openPosition = state && Array.isArray(state.openPositions)
+    ? state.openPositions.find((position) => position.key === marketKey(market) || (position.symbol === market.symbol && position.interval === market.interval))
+    : null;
+  const checks = [
+    {
+      name: "atr available",
+      pass: !!(row.atr14 && row.atr14 > 0),
+      value: round(row.atr14 || 0, 8),
+      threshold: "> 0",
+      detail: "ATR must be available so the strategy can size the virtual position and stop."
+    },
+    {
+      name: "regime trend",
+      pass: trendModePasses(row, params),
+      value: trendModeValue(row, params),
+      threshold: params.regimeMode || "looseBtcBull",
+      detail: "Matches the SimpleAtrTrendV2 regimeMode gate used by the paper strategy."
+    },
+    {
+      name: "ema trend",
+      pass: !!(row.ema20 > row.ema50 && row.close > row.ema50),
+      value: { close: round(row.close, 8), ema20: round(row.ema20, 8), ema50: round(row.ema50, 8) },
+      threshold: "ema20 > ema50 and close > ema50",
+      detail: "SimpleAtrTrendV2 requires short-term EMA trend alignment."
+    },
+    {
+      name: "rsi range",
+      pass: params.useRsiFilter ? !!(row.rsi14 >= params.rsiMin && row.rsi14 <= params.rsiMax) : null,
+      value: round(row.rsi14 || 0, 4),
+      threshold: params.useRsiFilter ? String(params.rsiMin) + "..." + String(params.rsiMax) : "disabled",
+      detail: "When enabled, RSI must be inside the configured pullback/reclaim range."
+    },
+    {
+      name: "volume filter",
+      pass: params.volumeFilter ? !!(row.volumeMa20 && row.volume > row.volumeMa20) : null,
+      value: { volume: round(row.volume || 0, 4), volumeMa20: round(row.volumeMa20 || 0, 4) },
+      threshold: params.volumeFilter ? "volume > volumeMa20" : "disabled",
+      detail: "Volume filtering is checked only when enabled in params."
+    },
+    {
+      name: "position state",
+      pass: !openPosition,
+      value: openPosition ? "open position exists" : "flat",
+      threshold: "flat",
+      detail: "A new active entry requires no open virtual position for this market."
+    },
+    {
+      name: "position size",
+      pass: Number.isFinite(size) && size > 0 && notional <= Number(params.maxNotional || 100000),
+      value: { stopDistance: round(stopDistance, 8), notional: round(notional || 0, 4) },
+      threshold: "<= " + String(params.maxNotional || 100000),
+      detail: "Risk sizing must produce a finite size within max notional."
+    }
+  ];
+  const blockers = uniqueList(preview && preview.blockedBy || []);
+  blockers.forEach((blocker) => {
+    if (!checks.some((check) => check.detail.indexOf(blocker) >= 0 || check.name === blocker)) {
+      checks.push({
+        name: blocker,
+        pass: false,
+        value: blocker,
+        threshold: "not present",
+        detail: "Backtest diagnostic blocker from the active paper strategy path."
+      });
+    }
+  });
+  return checks;
+}
+
+function trendModePasses(row, params) {
+  const mode = params.regimeMode || "strictBtcBull";
+  if (mode === "strictBtcBull") return row.btcRegime === "bullish";
+  if (mode === "looseBtcBull") return row.btcClose4h && row.btcEma200_4h && row.btcClose4h > row.btcEma200_4h;
+  if (mode === "symbolTrend") return row.close > row.ema200;
+  if (mode === "symbolFastTrend") return row.ema50 > row.ema200;
+  if (mode === "noRegime") return true;
+  return row.btcRegime === "bullish";
+}
+
+function trendModeValue(row, params) {
+  const mode = params.regimeMode || "strictBtcBull";
+  if (mode === "symbolFastTrend") return { ema50: round(row.ema50, 8), ema200: round(row.ema200, 8) };
+  if (mode === "symbolTrend") return { close: round(row.close, 8), ema200: round(row.ema200, 8) };
+  if (mode === "looseBtcBull") return { btcClose4h: round(row.btcClose4h || 0, 8), btcEma200_4h: round(row.btcEma200_4h || 0, 8) };
+  return row.btcRegime;
+}
+
+function indicatorSnapshot(row, params) {
+  return {
+    close: row.close,
+    emaFast: row.ema20,
+    emaSlow: row.ema50,
+    emaTrend: row.ema200,
+    atr: row.atr14,
+    rsi: row.rsi14,
+    adx: row.adx14,
+    volume: row.volume,
+    volumeMa20: row.volumeMa20,
+    btcRegime: row.btcRegime,
+    regimeMode: params.regimeMode
+  };
+}
+
+function latestReason(signal, preview, trade, checks) {
+  if (signal === "BUY" || signal === "SHORT") return "Entry signal matched the active paper strategy path on this candle.";
+  if (signal === "EXIT") return (trade && trade.exitReason) || "Exit signal matched the active paper strategy path on this candle.";
+  const blockers = uniqueList(preview && preview.blockedBy || []);
+  if (blockers.length) return "No entry signal because " + blockers.slice(0, 4).join(", ") + ".";
+  const failed = (checks || []).filter((check) => check.pass === false).map((check) => check.name);
+  if (failed.length) return "No entry signal because " + failed.slice(0, 4).join(", ") + ".";
+  return signal === "NONE" ? "No closed candle diagnostics were available." : "No entry or exit signal on the latest active-market candle.";
+}
+
+function nextSignalDiagnosticAction(signal, freshness, preview) {
+  if (freshness && freshness.isStale) {
+    return { action: "CHECK_STRATEGY_ACTIVITY", reason: "Active-market data is stale; rerun diagnostics with refresh=true before judging recent signal activity." };
+  }
+  if (signal === "BUY" || signal === "SHORT" || signal === "EXIT") {
+    return { action: "READY_TO_TICK", reason: "A strategy signal is visible in diagnostics. Paper tick still remains simulated only." };
+  }
+  const blockers = uniqueList(preview && preview.blockedBy || []);
+  if (blockers.length) {
+    return { action: "OBSERVE_MORE", reason: "The latest active candle is blocked by " + blockers.slice(0, 3).join(", ") + "." };
+  }
+  return { action: "WAIT", reason: "No actionable active-market strategy signal is visible on the latest closed candle." };
+}
+
+function uniqueList(items) {
+  const seen = {};
+  return (items || []).filter((item) => {
+    const key = String(item);
+    if (seen[key]) return false;
+    seen[key] = true;
+    return true;
+  });
 }
 
 function processMarket(config, state, market, regimeCandles, options) {
@@ -669,6 +966,7 @@ module.exports = {
   runPaperTick,
   initializePaper,
   refreshPaperCandles,
+  activeSignalDiagnostics,
   setPaperEnabled,
   getPaperStatus,
   rebuildStateFromJournal,

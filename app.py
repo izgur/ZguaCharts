@@ -1362,6 +1362,15 @@ def paper_active_observation():
         return jsonify({"error": f"Could not build active paper observation: {exc}"}), 502
 
 
+@app.get("/api/paper/active-signal-diagnostics")
+def paper_active_signal_diagnostics():
+    try:
+        payload, status_code = build_paper_active_signal_diagnostics(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build active signal diagnostics: {exc}"}), 502
+
+
 @app.get("/api/paper/observation-report")
 def paper_observation_report():
     try:
@@ -5815,6 +5824,61 @@ def build_paper_active_observation(args) -> dict:
     }
 
 
+def build_paper_active_signal_diagnostics(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    command = package_node_script_args("paper:signal-diagnostics")
+    limit = min(max(int(safe_float(args.get("limit", 20), 20)), 1), 100)
+    command.extend(["--limit", str(limit)])
+    refresh_requested = str(args.get("refresh", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    if refresh_requested:
+        command.append("--refresh")
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Active signal diagnostics timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "refreshRequested": refresh_requested,
+            "limit": limit,
+            "command": " ".join(command),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Active signal diagnostics returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Active signal diagnostics returned no output."}
+    payload["paperEnabled"] = paper_enabled
+    payload["realTradingEnabled"] = real_enabled
+    payload["refreshRequested"] = refresh_requested
+    payload["limit"] = limit
+    payload["command"] = " ".join(command)
+    payload["consistencyWarnings"] = paper_enabled_consistency_warnings(candidate, paper_enabled)
+    if real_enabled:
+        payload.setdefault("warnings", []).append(real_detail)
+    if completed.returncode != 0:
+        payload["ok"] = False
+        payload["returnCode"] = completed.returncode
+        if completed.stderr.strip():
+            payload["stderr"] = completed.stderr.strip()
+    return payload, 200 if payload.get("ok") else 502
+
+
 def build_paper_observation_report(args) -> dict:
     report_args = {**dict(args), "activeOnly": "true"}
     candidate = load_paper_candidate_config()
@@ -5826,6 +5890,7 @@ def build_paper_observation_report(args) -> dict:
     active_observation = build_paper_active_observation(report_args)
     observation_targets = build_paper_observation_targets(report_args)
     observation_quality = build_paper_observation_quality(report_args)
+    signal_diagnostics, _signal_status = build_paper_active_signal_diagnostics({"limit": "20"})
     runner_summary = build_paper_runner_summary(args)
     stop_rules = build_paper_stop_rules(args) if paper_enabled else {
         "status": "OK",
@@ -5839,6 +5904,8 @@ def build_paper_observation_report(args) -> dict:
     target_status = observation_targets.get("status")
     quality = observation_quality.get("quality") or {}
     quality_status = quality.get("status")
+    diagnostic = signal_diagnostics.get("diagnostics") or {}
+    diagnostic_next = signal_diagnostics.get("nextAction") or {}
     tick_state = active_observation.get("tickReadiness") or {}
     freshness = active_observation.get("freshness") or {}
     warnings = []
@@ -5988,6 +6055,9 @@ def build_paper_observation_report(args) -> dict:
             "expectedTrades": baseline_source.get("expectedTrades"),
             "expectedMaxDrawdownPct": baseline_source.get("expectedMaxDrawdownPct"),
         },
+        "latestSignalDiagnosticStatus": diagnostic.get("signal"),
+        "latestSignalDiagnosticReason": diagnostic.get("reason"),
+        "latestSignalDiagnosticAction": diagnostic_next.get("action"),
         "warnings": dedupe_list([warning for warning in warnings if warning]),
         "informationalWarnings": dedupe_list([warning for warning in informational_warnings if warning]),
     }
