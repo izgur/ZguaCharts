@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1369,6 +1370,14 @@ def paper_active_signal_diagnostics():
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not build active signal diagnostics: {exc}"}), 502
+
+
+@app.get("/api/paper/candidate-comparison")
+def paper_candidate_comparison():
+    try:
+        return jsonify(build_paper_candidate_comparison(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper candidate comparison: {exc}"}), 502
 
 
 @app.get("/api/paper/observation-report")
@@ -5877,6 +5886,184 @@ def build_paper_active_signal_diagnostics(args) -> tuple[dict, int]:
         if completed.stderr.strip():
             payload["stderr"] = completed.stderr.strip()
     return payload, 200 if payload.get("ok") else 502
+
+
+def build_paper_candidate_comparison(args) -> dict:
+    candidate = load_paper_candidate_config()
+    real_enabled, real_detail = paper_real_trading_enabled()
+    symbols = parse_csv_arg(args.get("symbols"), ["ETHUSDT", "BTCUSDT"])
+    timeframes = parse_csv_arg(args.get("timeframes"), ["15m", "1h"])
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    limit_raw = args.get("limit", "auto")
+    max_combos = max(1, min(int(safe_float(args.get("maxCombos", args.get("max_combos", 8)), 8)), 20))
+    requested_pairs = [(symbol, timeframe) for symbol in symbols for timeframe in timeframes]
+    pairs = requested_pairs[:max_combos]
+    rules = candidate_validation_rules({
+        "period": period,
+        "limit": "5000",
+    })
+    rules["limitRaw"] = limit_raw
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("takerFeePct", 0))
+    slippage_pct = safe_float(candidate.get("slippageBps", 0)) / 100
+    active = primary_active_market(candidate)
+    active_symbol = active.get("symbol")
+    active_timeframe = active.get("interval") or active.get("timeframe")
+    rows = []
+    for symbol, timeframe in pairs:
+        rows.append(compare_candidate_market_row(
+            candidate,
+            symbol,
+            timeframe,
+            strategy,
+            period,
+            rules,
+            params,
+            fee_pct,
+            slippage_pct,
+            active_symbol,
+            active_timeframe,
+        ))
+    active_rows = [row for row in rows if row.get("comparableToActive")]
+    active_trades = max([int(safe_float(row.get("trades"), 0)) for row in active_rows] or [0])
+    for row in rows:
+        row["diagnostics"]["moreActiveThanCurrent"] = int(safe_float(row.get("trades"), 0)) > active_trades
+    recommendation = candidate_comparison_recommendation(rows, active_symbol, active_timeframe)
+    warnings = []
+    if len(requested_pairs) > len(pairs):
+        warnings.append(f"Comparison capped at {max_combos} combination(s); narrow symbols/timeframes or raise maxCombos intentionally.")
+    if real_enabled:
+        warnings.append(real_detail)
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "realTradingEnabled": real_enabled,
+        "paperEnabled": canonical_paper_enabled(candidate),
+        "activePaperCandidate": candidate_summary(candidate),
+        "request": {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategy": strategy,
+            "period": period,
+            "limit": limit_raw,
+            "maxCombos": max_combos,
+            "evaluatedCombos": len(rows),
+        },
+        "rows": rows,
+        "recommendation": recommendation,
+        "warnings": warnings,
+    }
+
+
+def compare_candidate_market_row(candidate: dict, symbol: str, timeframe: str, strategy: str, period: str, rules: dict, params: dict, fee_pct: float, slippage_pct: float, active_symbol: str | None, active_timeframe: str | None) -> dict:
+    comparable = symbol == active_symbol and timeframe == active_timeframe and strategy == candidate.get("strategy")
+    try:
+        limit = research_limit_for(candidate.get("source", "bybit"), timeframe, period, rules.get("limitRaw", "auto"))
+        payload = run_shared_backtest_engine(
+            candidate.get("source", "bybit"),
+            symbol,
+            timeframe,
+            period,
+            strategy,
+            fee_pct,
+            slippage_pct,
+            limit,
+            allow_shorts=False,
+            strategy_params=params,
+        )
+        metrics = ranking_metrics_from_backtest(payload)
+        status, reasons = candidate_market_status(metrics, rules)
+        if int(safe_float(metrics.get("trades"), 0)) <= 0:
+            status = "NO_TRADES"
+            reasons = ["No trades generated for this symbol/timeframe with the current candidate params."]
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy": payload.get("preset") or payload.get("strategy") or strategy,
+            "status": status,
+            "trades": int(safe_float(metrics.get("trades"), 0)),
+            "totalReturnPct": metrics.get("totalReturn"),
+            "profitFactor": metrics.get("profitFactor"),
+            "maxDrawdownPct": metrics.get("maxDrawdown"),
+            "winRate": metrics.get("winRate"),
+            "score": ranking_score(metrics, min_trades=rules["minTrades"]),
+            "qualityStatus": "FAIL" if status in {"FAIL", "NO_TRADES"} else status,
+            "rejectionReasons": comparison_rejection_reasons(status, reasons),
+            "warnings": payload.get("warnings", []) + (payload.get("diagnostics", {}).get("warnings", []) or []),
+            "comparableToActive": comparable,
+            "diagnostics": {
+                "enoughTrades": int(safe_float(metrics.get("trades"), 0)) >= rules["minTrades"],
+                "moreActiveThanCurrent": False,
+                "period": period,
+                "limit": limit,
+                "averageBarsHeld": metrics.get("averageBarsHeld"),
+            },
+        }
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy": strategy,
+            "status": "ERROR",
+            "trades": 0,
+            "totalReturnPct": 0,
+            "profitFactor": 0,
+            "maxDrawdownPct": 0,
+            "winRate": 0,
+            "score": -999,
+            "qualityStatus": "FAIL",
+            "rejectionReasons": [{"code": "backtest_error", "label": str(exc)}],
+            "warnings": [str(exc)],
+            "comparableToActive": comparable,
+            "diagnostics": {
+                "enoughTrades": False,
+                "moreActiveThanCurrent": False,
+                "period": period,
+                "limit": rules.get("limit"),
+            },
+        }
+
+
+def comparison_rejection_reasons(status: str, reasons: list[str]) -> list[dict]:
+    if status in {"PASS", "WARN"} and not reasons:
+        return []
+    if status == "NO_TRADES":
+        return [{"code": "no_trades", "label": "No trades generated"}]
+    return [{"code": reason_code_from_text(reason), "label": reason} for reason in reasons]
+
+
+def reason_code_from_text(reason: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9]+", "_", str(reason).lower()).strip("_")
+    return text[:80] or "candidate_warning"
+
+
+def candidate_comparison_recommendation(rows: list[dict], active_symbol: str | None, active_timeframe: str | None) -> dict:
+    active_rows = [row for row in rows if row.get("comparableToActive")]
+    active_score = max([safe_float(row.get("score"), -999) for row in active_rows] or [-999])
+    fifteen_minute = [
+        row for row in rows
+        if row.get("timeframe") == "15m"
+        and row.get("status") in {"PASS", "WARN"}
+        and safe_float(row.get("score"), -999) >= max(active_score - 5, -999)
+        and row.get("diagnostics", {}).get("moreActiveThanCurrent")
+    ]
+    if fifteen_minute:
+        best = sorted(fifteen_minute, key=lambda row: safe_float(row.get("score"), -999), reverse=True)[0]
+        return {
+            "action": "REVIEW_15M_CANDIDATE",
+            "reason": f"{best['symbol']} 15m generated more trades than the active {active_symbol} {active_timeframe} candidate with comparable inspection score. Review only; no promotion was performed.",
+        }
+    active_pass = any(row.get("status") in {"PASS", "WARN"} for row in active_rows)
+    if active_pass:
+        return {
+            "action": "KEEP_CURRENT",
+            "reason": "No faster inspected candidate clearly beats the current active paper candidate on this read-only comparison.",
+        }
+    return {
+        "action": "NO_ACTION",
+        "reason": "No inspected candidate is strong enough for review. This endpoint does not promote or enable paper.",
+    }
 
 
 def build_paper_observation_report(args) -> dict:

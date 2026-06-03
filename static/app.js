@@ -532,6 +532,7 @@ async function refreshPaperLearningPanels() {
     loadPaperReadiness(),
     loadPaperObservationReport(),
     loadPaperSignalDiagnostics(),
+    loadPaperCandidateComparison(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
@@ -2705,6 +2706,7 @@ function setupLearningControls() {
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
+  document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3411,6 +3413,61 @@ function renderPaperSignalDiagnostics(payload) {
     <table class="trade-table">
       <thead><tr><th>Check</th><th>Status</th><th>Value</th><th>Threshold</th></tr></thead>
       <tbody>${checks || `<tr><td colspan="4">No checks returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadPaperCandidateComparison() {
+  const host = document.querySelector("#paper-candidate-comparison-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading candidate timeframe comparison...</p>`;
+    const payload = await apiGet("/api/paper/candidate-comparison");
+    host.innerHTML = renderPaperCandidateComparison(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate comparison could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperCandidateComparison(payload) {
+  const active = payload.activePaperCandidate || {};
+  const activeMarket = (active.activeSymbols || [])[0] || {};
+  const recommendation = payload.recommendation || {};
+  const rows = (payload.rows || []).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    const flags = [];
+    if (row.comparableToActive) flags.push("active");
+    if (row.diagnostics?.moreActiveThanCurrent) flags.push("more active");
+    if (row.diagnostics?.enoughTrades) flags.push("enough trades");
+    return `
+      <tr>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.winRate)}%</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${escapeHtml(flags.join(", ") || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Candidate Timeframe Comparison <span class="neutral">${escapeHtml(recommendation.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(active.strategy || "-")} ${escapeHtml(activeMarket.symbol || "-")} ${escapeHtml(activeMarket.interval || "")}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Rows</span><strong>${payload.rows?.length || 0}</strong></div>
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(payload.request?.strategy || "-")}</strong></div>
+      <div class="metric"><span>Period</span><strong>${escapeHtml(payload.request?.period || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Market</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Score</th><th>Notes</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="9">No comparison rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
