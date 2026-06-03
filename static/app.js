@@ -530,6 +530,7 @@ async function refreshPaperLearningPanels() {
   await Promise.all([
     apiGet("/api/candidate/current").catch(() => null),
     loadPaperReadiness(),
+    loadPaperObservationReport(),
     loadPaperSimulationControl(),
     loadPaperRuntimeMonitor(),
     loadPaperTickReadiness(),
@@ -2701,6 +2702,7 @@ function setupLearningControls() {
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
+  document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3297,6 +3299,63 @@ async function disablePaperSimulation() {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Paper disable failed: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadPaperObservationReport() {
+  const host = document.querySelector("#paper-observation-report-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper observation report...</p>`;
+    const payload = await apiGet("/api/paper/observation-report");
+    host.innerHTML = renderPaperObservationReport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper observation report could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperObservationReport(payload) {
+  const verdict = payload.verdict || {};
+  const evidence = payload.evidence || {};
+  const progress = payload.progress || {};
+  const performance = payload.performance || {};
+  const baseline = payload.baseline || {};
+  const active = payload.activeMarket || {};
+  const next = verdict.nextAction || {};
+  const tone = verdict.status === "READY_FOR_REVIEW" ? "positive" : verdict.status === "PAUSE_RECOMMENDED" || payload.realTradingEnabled ? "negative" : verdict.status === "WATCH" ? "negative" : "neutral";
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const info = (payload.informationalWarnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const baselineText = baseline.available
+    ? `PF ${baseline.expectedProfitFactor ?? "-"} · Return ${baseline.expectedReturnPct ?? "-"}% · Trades ${baseline.expectedTrades ?? "-"}`
+    : "No baseline";
+  const paperText = `PF ${performance.profitFactor ?? "-"} · Return ${performance.returnPct ?? "-"}% · Drawdown ${performance.maxDrawdownPct ?? "-"}%`;
+  return `
+    <h3 class="modal-section-title">Paper Observation Report <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(verdict.title || "Paper observation")}</strong> ${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(active.symbol || "-")} ${escapeHtml(active.timeframe || "")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Tick readiness</span><strong>${escapeHtml(active.tickReadinessStatus || "-")}</strong></div>
+      <div class="metric"><span>Session hours</span><strong>${evidence.sessionAgeHours ?? 0} / ${progress.minSessionHours ?? "-"}</strong></div>
+      <div class="metric"><span>Ticks</span><strong>${evidence.ticksObserved ?? 0} / ${progress.minPaperTicks ?? "-"}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${evidence.closedTrades ?? 0} / ${progress.minClosedTrades ?? "-"}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${evidence.signalsObserved ?? 0}</strong></div>
+      <div class="metric"><span>Open positions</span><strong>${evidence.openPositions ?? 0}</strong></div>
+      <div class="metric"><span>Active warnings</span><strong>${evidence.activeWarnings ?? 0}</strong></div>
+      <div class="metric"><span>Stop rules</span><strong>${escapeHtml(evidence.stopRulesStatus || "-")}</strong></div>
+      <div class="metric"><span>Targets</span><strong>${escapeHtml(evidence.observationTargetStatus || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+        <tr><th>Remaining</th><td>${progress.remainingSessionHours ?? 0}h · ${progress.remainingPaperTicks ?? 0} tick(s) · ${progress.remainingClosedTrades ?? 0} closed trade(s)</td></tr>
+        <tr><th>Paper performance</th><td>${escapeHtml(paperText)}</td></tr>
+        <tr><th>Baseline</th><td>${escapeHtml(baselineText)}</td></tr>
+      </tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    ${info ? `<ul class="modal-note-list">${info}</ul>` : ""}
+  `;
 }
 
 async function loadPaperRuntimeMonitor() {

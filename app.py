@@ -1231,6 +1231,7 @@ def paper_status():
         session_trades_detail = build_paper_session_trades(request.args)
         active_observation = build_paper_active_observation(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
+        observation_report = build_paper_observation_report(request.args)
         real_enabled, _ = paper_real_trading_enabled()
         return jsonify({
             "ok": True,
@@ -1280,6 +1281,11 @@ def paper_status():
                 "evidence": observation_quality.get("evidence"),
             },
             "observationTargets": compact_observation_targets(observation_targets),
+            "observationReport": {
+                "status": observation_report.get("verdict", {}).get("status"),
+                "title": observation_report.get("verdict", {}).get("title"),
+                "nextAction": observation_report.get("verdict", {}).get("nextAction"),
+            },
             "runnerSummary": compact_runner_summary(runner_summary),
             "sessionEventsSummary": compact_session_events_summary(session_events_summary),
             "recentSignalCount": session_events_detail.get("counts", {}).get("signals"),
@@ -1354,6 +1360,14 @@ def paper_active_observation():
         return jsonify(build_paper_active_observation(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build active paper observation: {exc}"}), 502
+
+
+@app.get("/api/paper/observation-report")
+def paper_observation_report():
+    try:
+        return jsonify(build_paper_observation_report(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper observation report: {exc}"}), 502
 
 
 @app.get("/api/paper/observation-targets")
@@ -5798,6 +5812,184 @@ def build_paper_active_observation(args) -> dict:
         },
         "observationTargets": target_compact,
         "nextAction": next_action,
+    }
+
+
+def build_paper_observation_report(args) -> dict:
+    report_args = {**dict(args), "activeOnly": "true"}
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_key = paper_market_key(active)
+    session_summary = build_paper_session_summary(report_args)
+    active_observation = build_paper_active_observation(report_args)
+    observation_targets = build_paper_observation_targets(report_args)
+    observation_quality = build_paper_observation_quality(report_args)
+    runner_summary = build_paper_runner_summary(args)
+    stop_rules = build_paper_stop_rules(args) if paper_enabled else {
+        "status": "OK",
+        "rules": [],
+        "nextAction": {"action": "PAPER_DISABLED_NO_STOP_NEEDED", "reason": "Paper is disabled; stop rules are informational only."},
+    }
+    performance = session_summary.get("performance") or {}
+    baseline_source = observation_quality.get("baseline") or build_paper_baseline_comparison(candidate, {}, [])
+    targets = observation_targets.get("targets") or {}
+    target_progress = observation_targets.get("progress") or {}
+    target_status = observation_targets.get("status")
+    quality = observation_quality.get("quality") or {}
+    quality_status = quality.get("status")
+    tick_state = active_observation.get("tickReadiness") or {}
+    freshness = active_observation.get("freshness") or {}
+    warnings = []
+    informational_warnings = []
+    stop_status = str(stop_rules.get("status") or "UNKNOWN").upper()
+    tick_status = str(tick_state.get("status") or "UNKNOWN").upper()
+    target_status_upper = str(target_status or "UNKNOWN").upper()
+    quality_status_upper = str(quality_status or "UNKNOWN").upper()
+    active_warning_count = int(safe_float((active_observation.get("warnings") or {}).get("count"), 0))
+    stop_failures = [
+        rule for rule in stop_rules.get("rules", [])
+        if not rule.get("pass") and str(rule.get("severity") or "").upper() == "STOP"
+    ]
+    if real_enabled:
+        warnings.append(real_detail)
+    if stop_failures:
+        warnings.extend([rule.get("detail") for rule in stop_failures if rule.get("detail")])
+    warnings.extend(observation_targets.get("blockingIssues") or [])
+    if active_warning_count:
+        latest_warning = ((active_observation.get("warnings") or {}).get("latest") or {}).get("reason")
+        warnings.append(latest_warning or f"{active_warning_count} active-market warning(s) need review.")
+    if tick_status in {"DATA_STALE", "NOT_INITIALIZED", "BLOCKED"}:
+        warnings.append(tick_state.get("activeMarketReason") or f"Active-market tick readiness is {tick_status}.")
+    warnings.extend(quality.get("warnings") or [])
+    warnings.extend(observation_targets.get("warnings") or [])
+    informational_warnings.extend(observation_targets.get("informationalWarnings") or [])
+    runner_counts = runner_summary.get("counts") or {}
+    if runner_summary.get("exists"):
+        informational_warnings.append(
+            f"Runner log has {runner_counts.get('iterations', 0)} iteration(s), {runner_counts.get('ticksRun', 0)} tick(s) run, and {runner_counts.get('ticksSkipped', 0)} skipped tick(s)."
+        )
+    else:
+        informational_warnings.extend(runner_summary.get("warnings") or [])
+
+    ticks = int(safe_float(target_progress.get("ticksObserved"), 0))
+    signals = int(safe_float(target_progress.get("signalsObserved"), 0))
+    closed_trades = int(safe_float(target_progress.get("closedTrades"), 0))
+    open_positions = int(safe_float(target_progress.get("openPositions"), 0))
+    session_age_hours = safe_float(target_progress.get("sessionAgeHours"), 0)
+    minimum_met = bool((observation_targets.get("readiness") or {}).get("minimumTargetsMet"))
+    active_market_healthy = active_warning_count <= 0 and tick_status not in {"DATA_STALE", "NOT_INITIALIZED", "BLOCKED"}
+
+    if real_enabled:
+        status = "PAUSE_RECOMMENDED"
+        title = "Real Trading Safety Review Required"
+        summary = "Real trading appears enabled, so paper observation should pause until the flag or mode is reviewed."
+        next_action = {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail}
+    elif not paper_enabled:
+        status = "DISABLED"
+        title = "Paper Observation Disabled"
+        summary = "Paper simulation is disabled. The promoted candidate is not collecting forward paper evidence right now."
+        next_action = {"action": "ENABLE_PAPER_SIMULATION", "reason": "Enable paper manually only after reviewing readiness. This report does not enable paper automatically."}
+    elif stop_status == "STOP_RECOMMENDED":
+        status = "PAUSE_RECOMMENDED"
+        title = "Pause Paper Observation"
+        summary = "One or more stop rules recommend pausing paper observation before more ticks run."
+        next_action = stop_rules.get("nextAction") or {"action": "PAUSE_PAPER_SIMULATION", "reason": "Review failed paper stop rules."}
+    elif not active_market_healthy:
+        status = "WATCH"
+        title = "Active Market Needs Attention"
+        summary = "The active paper market is not clean enough for a confident observation verdict."
+        next_action = {"action": "REVIEW_ACTIVE_MARKET_HEALTH", "reason": tick_state.get("activeMarketReason") or "Review active-market warnings and tick readiness."}
+    elif ticks <= 0 and signals <= 0 and closed_trades <= 0:
+        status = "TOO_EARLY"
+        title = "Too Early To Judge"
+        summary = "No meaningful forward paper evidence has accumulated for the active market yet."
+        next_action = {"action": "RUN_PAPER_ONCE_WHEN_READY", "reason": "Run a paper tick only when tick readiness says it is useful. Never use this as a real-trading signal."}
+    elif tick_status == "WAIT_FOR_NEXT_CANDLE":
+        status = "WAIT_FOR_NEXT_CANDLE"
+        title = "Waiting For Next Closed Candle"
+        summary = "The active market is healthy, but no newer closed candle is available for a useful paper tick yet."
+        next_action = {"action": "WAIT_FOR_NEXT_CANDLE", "reason": tick_state.get("activeMarketReason") or "Wait until the next active-market candle closes before running another useful tick."}
+    elif quality_status_upper == "TOO_EARLY" or closed_trades <= 0:
+        status = "TOO_EARLY"
+        title = "Evidence Still Too Early"
+        summary = "Paper has started producing session evidence, but closed paper trades are not available yet."
+        next_action = {"action": "OBSERVE_MORE", "reason": "Continue paper-only observation until closed trades and target hours/ticks accumulate."}
+    elif not minimum_met or target_status_upper in {"TOO_EARLY", "OBSERVE_MORE"}:
+        status = "OBSERVE_MORE"
+        title = "Continue Observing"
+        summary = "Forward paper evidence is accumulating, but the minimum observation targets are not met yet."
+        next_action = {"action": "OBSERVE_MORE", "reason": "Keep collecting paper-only evidence; this report never recommends real trading."}
+    elif target_status_upper == "READY_FOR_PAPER_REVIEW":
+        status = "READY_FOR_REVIEW"
+        title = "Ready For Paper Review"
+        summary = "Minimum paper observation targets are met with no active blockers. This is a review verdict only."
+        next_action = {"action": "REVIEW_PAPER_RESULTS", "reason": "Review the paper evidence manually. Do not enable real trading from this report."}
+    else:
+        status = "WATCH" if quality_status_upper == "WATCH" or stop_status == "WATCH" else "OBSERVE_MORE"
+        title = "Review Paper Observation"
+        summary = "Paper observation is available, but the current signals should be reviewed before any judgment."
+        next_action = {"action": "REVIEW_PAPER_OBSERVATION", "reason": "Review warnings, stop rules, and target progress. This report never recommends real trading."}
+
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "activeMarket": {
+            "symbol": active.get("symbol"),
+            "timeframe": active.get("interval") or active.get("timeframe"),
+            "marketKey": active_key,
+            "source": candidate.get("source"),
+            "freshnessStatus": freshness.get("status"),
+            "tickReadinessStatus": tick_status,
+        },
+        "verdict": {
+            "status": status,
+            "title": title,
+            "summary": summary,
+            "nextAction": next_action,
+        },
+        "evidence": {
+            "sessionAgeHours": session_age_hours,
+            "ticksObserved": ticks,
+            "signalsObserved": signals,
+            "closedTrades": closed_trades,
+            "openPositions": open_positions,
+            "activeWarnings": active_warning_count,
+            "stopRulesStatus": stop_rules.get("status"),
+            "observationTargetStatus": target_status,
+            "observationQualityStatus": quality_status,
+        },
+        "progress": {
+            "minSessionHours": targets.get("minSessionHours"),
+            "minPaperTicks": targets.get("minPaperTicks"),
+            "minClosedTrades": targets.get("minClosedTrades"),
+            "preferredClosedTrades": targets.get("preferredClosedTrades"),
+            "remainingSessionHours": target_progress.get("remainingSessionHours"),
+            "remainingPaperTicks": target_progress.get("remainingPaperTicks"),
+            "remainingClosedTrades": target_progress.get("remainingClosedTrades"),
+        },
+        "performance": {
+            "equity": performance.get("equity"),
+            "realizedPnl": performance.get("realizedPnl"),
+            "unrealizedPnl": performance.get("unrealizedPnl"),
+            "returnPct": performance.get("returnPct"),
+            "winRate": (observation_quality.get("performance") or {}).get("winRate"),
+            "profitFactor": (observation_quality.get("performance") or {}).get("profitFactor"),
+            "maxDrawdownPct": performance.get("maxDrawdownPct"),
+        },
+        "baseline": {
+            "available": baseline_source.get("available"),
+            "expectedReturnPct": baseline_source.get("expectedReturnPct"),
+            "expectedProfitFactor": baseline_source.get("expectedProfitFactor"),
+            "expectedTrades": baseline_source.get("expectedTrades"),
+            "expectedMaxDrawdownPct": baseline_source.get("expectedMaxDrawdownPct"),
+        },
+        "warnings": dedupe_list([warning for warning in warnings if warning]),
+        "informationalWarnings": dedupe_list([warning for warning in informational_warnings if warning]),
     }
 
 
