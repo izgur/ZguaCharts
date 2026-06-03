@@ -541,6 +541,7 @@ async function refreshPaperLearningPanels() {
     loadPaperSessionEventsSummary(),
     loadPaperSessionEventsDetail(),
     loadPaperSessionTrades(),
+    loadPaperObservationCounters(),
     loadPaperObservationTargets(),
     loadPaperRunnerInstructions(),
     loadPaperRunnerSummary(),
@@ -2720,6 +2721,7 @@ function setupLearningControls() {
   document.querySelector("#paper-session-events-refresh")?.addEventListener("click", loadPaperSessionEventsSummary);
   document.querySelector("#paper-session-events-detail-refresh")?.addEventListener("click", loadPaperSessionEventsDetail);
   document.querySelector("#paper-session-trades-refresh")?.addEventListener("click", loadPaperSessionTrades);
+  document.querySelector("#paper-observation-counters-refresh")?.addEventListener("click", loadPaperObservationCounters);
   document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
   document.querySelector("#paper-runner-instructions-refresh")?.addEventListener("click", loadPaperRunnerInstructions);
   document.querySelector("#paper-runner-summary-refresh")?.addEventListener("click", loadPaperRunnerSummary);
@@ -4021,6 +4023,53 @@ function renderPaperSessionTrades(payload) {
     <table class="trade-table"><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Size</th><th>Opened</th></tr></thead><tbody>${openRows || `<tr><td colspan="6">No open virtual trades.</td></tr>`}</tbody></table>
     <h3 class="modal-section-title">Closed Virtual Trades</h3>
     <table class="trade-table"><thead><tr><th>ID</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Closed</th></tr></thead><tbody>${closedRows || `<tr><td colspan="6">No closed virtual trades.</td></tr>`}</tbody></table>
+  `;
+}
+
+async function loadPaperObservationCounters() {
+  const host = document.querySelector("#paper-observation-counters-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper observation counters...</p>`;
+    const payload = await apiGet("/api/paper/observation-counters");
+    host.innerHTML = renderPaperObservationCounters(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper observation counters could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperObservationCounters(payload) {
+  const sources = payload.counterSources || {};
+  const runnerSource = sources.runnerLog || {};
+  const runner = payload.runnerCounters || {};
+  const session = payload.sessionCounters || {};
+  const active = payload.activeMarketCounters || {};
+  const consistency = payload.consistency || {};
+  const tone = consistency.status === "OK" ? "positive" : "neutral";
+  const warningRows = (consistency.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Paper Observation Counters <span class="${tone}">${escapeHtml(consistency.status || "UNKNOWN")}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Runner iterations</span><strong>${runner.iterations ?? 0}</strong></div>
+      <div class="metric"><span>Runner ticks run</span><strong>${runner.ticksRun ?? 0}</strong></div>
+      <div class="metric"><span>Runner ticks skipped</span><strong>${runner.ticksSkipped ?? 0}</strong></div>
+      <div class="metric"><span>Runner errors</span><strong>${runner.errors ?? 0}</strong></div>
+      <div class="metric"><span>Processed delta</span><strong>${runner.processedCandleDeltaTotal ?? 0}</strong></div>
+      <div class="metric"><span>Session paper ticks</span><strong>${session.paperTicks ?? "-"}</strong></div>
+      <div class="metric"><span>Session signals</span><strong>${session.signals ?? 0}</strong></div>
+      <div class="metric"><span>Closed trades</span><strong>${session.closedTrades ?? 0}</strong></div>
+      <div class="metric"><span>Open positions</span><strong>${session.openPositions ?? 0}</strong></div>
+      <div class="metric"><span>Trade events</span><strong>${session.currentSessionTradeEvents ?? 0}</strong></div>
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(active.marketKey || `${active.symbol || "-"}:${active.timeframe || "-"}`)}</strong></div>
+      <div class="metric"><span>Active signals</span><strong>${active.signals ?? 0}</strong></div>
+      <div class="metric"><span>Active warnings</span><strong>${active.warnings ?? 0}</strong></div>
+      <div class="metric"><span>Active candle count</span><strong>${active.processedCandleCount ?? "-"}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Runner log:</strong> ${escapeHtml(runnerSource.path || "-")} (${escapeHtml(runnerSource.selectedBy || "-")}, ${runnerSource.entriesRead ?? 0} entries)</p>
+    <p class="modal-note"><strong>Active candle count:</strong> ${escapeHtml(active.processedCandleCountExplanation || "No explanation returned.")}</p>
+    ${warningRows ? `<ul class="backtest-warnings">${warningRows}</ul>` : ""}
   `;
 }
 

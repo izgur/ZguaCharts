@@ -1233,6 +1233,8 @@ def paper_status():
         active_observation = build_paper_active_observation(request.args)
         tick_readiness = build_paper_tick_readiness(request.args)
         observation_report = build_paper_observation_report(request.args)
+        observation_counters = build_paper_observation_counters({**dict(request.args), "activeOnly": "true"})
+        compact_counters = compact_observation_counters(observation_counters)
         real_enabled, _ = paper_real_trading_enabled()
         runtime_journal = runtime.get("journal", {}) or {}
         blocking_warnings = runtime_journal.get("blockingWarnings", []) or []
@@ -1294,6 +1296,11 @@ def paper_status():
                 "title": observation_report.get("verdict", {}).get("title"),
                 "nextAction": observation_report.get("verdict", {}).get("nextAction"),
             },
+            "observationCounters": compact_counters,
+            "runnerTicksRun": compact_counters.get("runnerTicksRun"),
+            "runnerTicksSkipped": compact_counters.get("runnerTicksSkipped"),
+            "processedCandleDeltaTotal": compact_counters.get("processedCandleDeltaTotal"),
+            "counterConsistencyStatus": compact_counters.get("counterConsistencyStatus"),
             "runnerSummary": compact_runner_summary(runner_summary),
             "sessionEventsSummary": compact_session_events_summary(session_events_summary),
             "recentSignalCount": session_events_detail.get("counts", {}).get("signals"),
@@ -1410,6 +1417,14 @@ def paper_observation_targets():
         return jsonify(build_paper_observation_targets(request.args))
     except Exception as exc:
         return jsonify({"error": f"Could not build paper observation targets: {exc}"}), 502
+
+
+@app.get("/api/paper/observation-counters")
+def paper_observation_counters():
+    try:
+        return jsonify(build_paper_observation_counters(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper observation counters: {exc}"}), 502
 
 
 @app.get("/api/paper/runner-summary")
@@ -5133,6 +5148,11 @@ def compact_observation_targets(targets: dict) -> dict:
             "preferredTradesMet": readiness.get("preferredTradesMet"),
             "safeToReview": readiness.get("safeToReview"),
         },
+        "observationCounters": targets.get("observationCounters"),
+        "runnerTicksRun": targets.get("runnerTicksRun"),
+        "runnerTicksSkipped": targets.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": targets.get("processedCandleDeltaTotal"),
+        "counterConsistencyStatus": targets.get("counterConsistencyStatus"),
     }
 
 
@@ -5334,6 +5354,9 @@ def build_paper_observation_targets(args) -> dict:
     if paper_enabled and not meets_closed:
         warnings.append(f"Closed paper trades are below judgment target ({closed_trades}/{targets['minClosedTrades']}).")
 
+    counter_args = {**dict(args), "activeOnly": "true" if request_active_only(args) else "false"}
+    observation_counters = build_paper_observation_counters(counter_args)
+    compact_counters = compact_observation_counters(observation_counters)
     return {
         "ok": True,
         "paperEnabled": paper_enabled,
@@ -5347,11 +5370,31 @@ def build_paper_observation_targets(args) -> dict:
         "blockingIssues": dedupe_list([item for item in blocking_issues if item]),
         "warnings": dedupe_list([item for item in warnings if item]),
         "informationalWarnings": dedupe_list([item for item in informational if item]),
+        "observationCounters": compact_counters,
+        "runnerTicksRun": compact_counters.get("runnerTicksRun"),
+        "runnerTicksSkipped": compact_counters.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": compact_counters.get("processedCandleDeltaTotal"),
+        "counterConsistencyStatus": compact_counters.get("counterConsistencyStatus"),
     }
 
 
 def requested_runner_log_path(args) -> tuple[Path, list[str]]:
+    selection = resolve_runner_log_selection(args)
+    return selection["path"], selection["warnings"]
+
+
+def relative_app_path(path: Path) -> str:
+    root = Path(app.root_path).resolve()
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(root)).replace("\\", "/")
+    except ValueError:
+        return str(resolved)
+
+
+def resolve_runner_log_selection(args) -> dict:
     warnings = []
+    explicit = bool(args.get("logFile"))
     raw = str(args.get("logFile") or "reports/paper-runner-session.jsonl").strip()
     path = Path(raw)
     if not path.is_absolute():
@@ -5363,7 +5406,178 @@ def requested_runner_log_path(args) -> tuple[Path, list[str]]:
     except ValueError:
         warnings.append("Requested logFile is outside the app root; using the default runner log.")
         resolved = root / "reports" / "paper-runner-session.jsonl"
-    return resolved, warnings
+        explicit = False
+    selected_by = "query" if explicit else "default"
+    if not resolved.exists() and not explicit:
+        candidates = sorted((root / "reports").glob("paper-runner-session*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if candidates:
+            resolved = candidates[0].resolve()
+            selected_by = "latest"
+            warnings.append(f"Default runner log was not found; using latest available runner log {relative_app_path(resolved)}.")
+    return {
+        "path": resolved,
+        "selectedBy": selected_by,
+        "availableLogs": [relative_app_path(item.resolve()) for item in sorted((root / "reports").glob("paper-runner-session*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)[:10]],
+        "warnings": warnings,
+    }
+
+
+def runner_log_entries(args) -> tuple[dict, list[dict], int]:
+    selection = resolve_runner_log_selection(args)
+    limit = min(max(int(safe_float(args.get("limit", 500), 500)), 1), 5000)
+    log_path = selection["path"]
+    entries = read_jsonl_tail(str(log_path), limit) if log_path.exists() else []
+    return selection, entries, limit
+
+
+def runner_log_counter_summary(entries: list[dict]) -> dict:
+    iterations = [entry for entry in entries if entry.get("type") == "iteration" or entry.get("iteration") is not None]
+    summaries = [entry for entry in entries if entry.get("type") == "summary" or entry.get("iterationsAttempted") is not None]
+    successful_iterations = [
+        entry for entry in iterations
+        if entry.get("ok") is not False and str(entry.get("runStatus", "")).upper() != "ERROR"
+    ]
+    return {
+        "iterations": len(iterations),
+        "summaries": len(summaries),
+        "ticksRun": len([entry for entry in iterations if entry.get("tickRan")]),
+        "ticksSkipped": len([entry for entry in iterations if not entry.get("tickRan")]),
+        "errors": len([entry for entry in iterations if entry.get("ok") is False or str(entry.get("runStatus", "")).upper() == "ERROR"]),
+        "processedCandleDeltaTotal": int(sum(safe_float(entry.get("processedCandlesDelta"), 0) for entry in successful_iterations if entry.get("processedCandlesDelta") is not None)),
+        "refreshOk": len([entry for entry in iterations if entry.get("refreshStatus") == "OK" or entry.get("refreshOk") is True]),
+        "refreshSkipped": len([entry for entry in iterations if entry.get("refreshStatus") == "SKIPPED" or entry.get("refreshAction") == "SKIPPED"]),
+        "waitForNextCandle": len([entry for entry in iterations if entry.get("tickReadinessStatus") == "WAIT_FOR_NEXT_CANDLE" or runner_action_value(entry) == "WAIT_FOR_NEXT_CANDLE"]),
+        "paperDisabled": len([entry for entry in iterations if entry.get("paperEnabled") is False or runner_action_value(entry) == "PAPER_DISABLED"]),
+        "stopRuleBlocks": len([entry for entry in iterations if entry.get("stopRulesStatus") == "STOP_RECOMMENDED" or runner_action_value(entry) == "REVIEW_STOP_RULES"]),
+    }
+
+
+def current_session_journal_counters(candidate: dict, state: dict, active_only: bool) -> tuple[dict, dict]:
+    records, session, active_keys, _watch_keys = paper_session_event_records(candidate, state)
+    details = [compact_session_event_detail(event, active_keys, set()) for event in records]
+    session_events = [event for event in details if event.get("currentSession")]
+    if active_only:
+        session_events = [event for event in session_events if event.get("marketRole") == "active"]
+    tick_buckets = {
+        paper_tick_bucket(event.get("processedAt"))
+        for event in session_events
+        if paper_tick_bucket(event.get("processedAt"))
+    }
+    signals = [event for event in session_events if paper_event_type_bucket(event) == "signal"]
+    trade_events = [event for event in session_events if paper_event_type_bucket(event) in {"open_trade", "close_trade"}]
+    active_events = [event for event in session_events if event.get("marketRole") == "active"]
+    active_signals = [event for event in active_events if paper_event_type_bucket(event) == "signal"]
+    active_warnings = [event for event in active_events if paper_event_type_bucket(event) in {"warning", "state_warning"}]
+    active_symbols = {market.get("symbol") for market in candidate_symbols_by_mode(candidate, "active") if market.get("symbol")}
+    if active_only:
+        closed_trades = [trade for trade in (state.get("closedTrades") or []) if not trade.get("symbol") or trade.get("symbol") in active_symbols]
+        open_positions = [position for position in (state.get("openPositions") or []) if not position.get("symbol") or position.get("symbol") in active_symbols]
+    else:
+        closed_trades = state.get("closedTrades") or []
+        open_positions = state.get("openPositions") or []
+    return {
+        "paperTicks": len(tick_buckets) if session_events else 0,
+        "signals": len(signals),
+        "closedTrades": len(closed_trades),
+        "openPositions": len(open_positions),
+        "activeSessionEvents": len(active_events),
+        "currentSessionTradeEvents": len(trade_events),
+    }, {
+        "session": session,
+        "activeEvents": active_events,
+        "activeSignals": active_signals,
+        "activeWarnings": active_warnings,
+    }
+
+
+def compact_observation_counters(counters: dict) -> dict:
+    runner = counters.get("runnerCounters") or {}
+    session = counters.get("sessionCounters") or {}
+    active = counters.get("activeMarketCounters") or {}
+    consistency = counters.get("consistency") or {}
+    return {
+        "runnerIterations": runner.get("iterations"),
+        "runnerTicksRun": runner.get("ticksRun"),
+        "runnerTicksSkipped": runner.get("ticksSkipped"),
+        "runnerErrors": runner.get("errors"),
+        "processedCandleDeltaTotal": runner.get("processedCandleDeltaTotal"),
+        "sessionPaperTicks": session.get("paperTicks"),
+        "sessionSignals": session.get("signals"),
+        "closedTrades": session.get("closedTrades"),
+        "openPositions": session.get("openPositions"),
+        "activeSessionEvents": session.get("activeSessionEvents"),
+        "currentSessionTradeEvents": session.get("currentSessionTradeEvents"),
+        "activeMarketProcessedCandleCount": active.get("processedCandleCount"),
+        "counterConsistencyStatus": consistency.get("status"),
+        "warnings": consistency.get("warnings") or [],
+    }
+
+
+def build_paper_observation_counters(args) -> dict:
+    candidate = load_paper_candidate_config()
+    state_path = Path(app.root_path) / "data" / "paper-state.json"
+    journal_path = Path(app.root_path) / "reports" / "paper-journal.jsonl"
+    state = read_json_file(str(state_path), {}) if state_path.exists() else {}
+    active_only = str(args.get("activeOnly", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    selection, runner_entries, _limit = runner_log_entries(args)
+    runner_counts = runner_log_counter_summary(runner_entries)
+    session_counts, session_meta = current_session_journal_counters(candidate, state, active_only)
+    active = primary_active_market(candidate)
+    active_key = paper_market_key(active)
+    consistency_warnings = []
+    if runner_counts["ticksRun"] != session_counts["paperTicks"]:
+        consistency_warnings.append(
+            f"runnerTicksRun ({runner_counts['ticksRun']}) differs from sessionPaperTicks ({session_counts['paperTicks']}) because runner ticks come from the selected runner JSONL log while sessionPaperTicks are inferred from current-session paper journal events."
+        )
+    if runner_counts["processedCandleDeltaTotal"] and session_counts["paperTicks"] <= 0:
+        consistency_warnings.append("processedCandleDeltaTotal is available from runner records, but no current-session active paper tick events were found in the journal.")
+    processed_explanation = "Active-market processed candle count is not directly derivable from current journal/state; use runner processedCandleDeltaTotal for per-run progress."
+    return {
+        "ok": True,
+        "paperEnabled": canonical_paper_enabled(candidate),
+        "realTradingEnabled": paper_real_trading_enabled()[0],
+        "candidate": candidate_summary(candidate),
+        "filters": {"activeOnly": active_only},
+        "counterSources": {
+            "runnerLog": {
+                "path": relative_app_path(selection["path"]),
+                "exists": selection["path"].exists(),
+                "selectedBy": selection.get("selectedBy"),
+                "entriesRead": len(runner_entries),
+                "availableLogs": selection.get("availableLogs") or [],
+            },
+            "paperJournal": {
+                "path": relative_app_path(journal_path),
+                "exists": journal_path.exists(),
+            },
+            "paperState": {
+                "path": relative_app_path(state_path),
+                "exists": state_path.exists(),
+            },
+        },
+        "runnerCounters": {
+            "iterations": runner_counts["iterations"],
+            "ticksRun": runner_counts["ticksRun"],
+            "ticksSkipped": runner_counts["ticksSkipped"],
+            "errors": runner_counts["errors"],
+            "processedCandleDeltaTotal": runner_counts["processedCandleDeltaTotal"],
+        },
+        "sessionCounters": session_counts,
+        "activeMarketCounters": {
+            "symbol": active.get("symbol"),
+            "timeframe": active.get("interval") or active.get("timeframe"),
+            "marketKey": active_key,
+            "processedCandleCount": None,
+            "processedCandleCountExplanation": processed_explanation,
+            "signals": len(session_meta["activeSignals"]),
+            "closedTrades": session_counts["closedTrades"],
+            "warnings": len(session_meta["activeWarnings"]),
+        },
+        "consistency": {
+            "status": "WATCH" if consistency_warnings else "OK",
+            "warnings": dedupe_list(consistency_warnings + selection.get("warnings", [])),
+        },
+    }
 
 
 def runner_action_value(entry: dict) -> str | None:
@@ -5396,26 +5610,15 @@ def compact_runner_summary(summary: dict) -> dict:
 
 
 def build_paper_runner_summary(args) -> dict:
-    log_path, warnings = requested_runner_log_path(args)
-    limit = min(max(int(safe_float(args.get("limit", 200), 200)), 1), 5000)
+    selection, entries, _limit = runner_log_entries({**dict(args), "limit": args.get("limit", 200)})
+    log_path = selection["path"]
+    warnings = list(selection.get("warnings") or [])
     exists = log_path.exists()
-    entries = read_jsonl_tail(str(log_path), limit) if exists else []
     iterations = [entry for entry in entries if entry.get("type") == "iteration" or entry.get("iteration") is not None]
     summaries = [entry for entry in entries if entry.get("type") == "summary" or entry.get("iterationsAttempted") is not None]
     latest_iteration = iterations[-1] if iterations else None
     latest_summary = summaries[-1] if summaries else None
-    counts = {
-        "iterations": len(iterations),
-        "summaries": len(summaries),
-        "ticksRun": len([entry for entry in iterations if entry.get("tickRan")]),
-        "ticksSkipped": len([entry for entry in iterations if not entry.get("tickRan")]),
-        "errors": len([entry for entry in iterations if entry.get("ok") is False or str(entry.get("runStatus", "")).upper() == "ERROR"]),
-        "refreshOk": len([entry for entry in iterations if entry.get("refreshStatus") == "OK" or entry.get("refreshOk") is True]),
-        "refreshSkipped": len([entry for entry in iterations if entry.get("refreshStatus") == "SKIPPED" or entry.get("refreshAction") == "SKIPPED"]),
-        "waitForNextCandle": len([entry for entry in iterations if entry.get("tickReadinessStatus") == "WAIT_FOR_NEXT_CANDLE" or runner_action_value(entry) == "WAIT_FOR_NEXT_CANDLE"]),
-        "paperDisabled": len([entry for entry in iterations if entry.get("paperEnabled") is False or runner_action_value(entry) == "PAPER_DISABLED"]),
-        "stopRuleBlocks": len([entry for entry in iterations if entry.get("stopRulesStatus") == "STOP_RECOMMENDED" or runner_action_value(entry) == "REVIEW_STOP_RULES"]),
-    }
+    counts = runner_log_counter_summary(entries)
     recent_skip_reasons = dedupe_list([
         entry.get("tickSkipReason") or runner_action_reason(entry)
         for entry in iterations[-25:]
@@ -5444,7 +5647,9 @@ def build_paper_runner_summary(args) -> dict:
         next_action = {"action": "NO_RUNNER_ITERATIONS_FOUND", "reason": "The runner log exists but no iteration records were found."}
     return {
         "ok": True,
-        "logFile": str(log_path.relative_to(app.root_path)) if str(log_path).startswith(str(Path(app.root_path))) else str(log_path),
+        "logFile": relative_app_path(log_path),
+        "selectedBy": selection.get("selectedBy"),
+        "availableLogs": selection.get("availableLogs") or [],
         "exists": exists,
         "entriesRead": len(entries),
         "latestIteration": latest_iteration,
@@ -5767,6 +5972,11 @@ def compact_active_observation(payload: dict) -> dict:
             "closedCount": (payload.get("trades") or {}).get("closedCount"),
         },
         "observationTargets": payload.get("observationTargets"),
+        "observationCounters": payload.get("observationCounters"),
+        "runnerTicksRun": payload.get("runnerTicksRun"),
+        "runnerTicksSkipped": payload.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": payload.get("processedCandleDeltaTotal"),
+        "counterConsistencyStatus": payload.get("counterConsistencyStatus"),
         "nextAction": payload.get("nextAction"),
     }
 
@@ -5786,6 +5996,8 @@ def build_paper_active_observation(args) -> dict:
     active_event_summary = build_paper_session_events_summary(active_args)
     active_trades = build_paper_session_trades(active_args)
     active_targets = build_paper_observation_targets(active_args)
+    observation_counters = build_paper_observation_counters(active_args)
+    compact_counters = compact_observation_counters(observation_counters)
     events = active_events.get("events") or []
     signal_events = [event for event in events if paper_event_type_bucket(event) == "signal"]
     warning_events = [event for event in events if paper_event_type_bucket(event) in {"warning", "state_warning"}]
@@ -5845,6 +6057,11 @@ def build_paper_active_observation(args) -> dict:
             "latestTradeEvent": (trade_events or [None])[-1],
         },
         "observationTargets": target_compact,
+        "observationCounters": compact_counters,
+        "runnerTicksRun": compact_counters.get("runnerTicksRun"),
+        "runnerTicksSkipped": compact_counters.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": compact_counters.get("processedCandleDeltaTotal"),
+        "counterConsistencyStatus": compact_counters.get("counterConsistencyStatus"),
         "nextAction": next_action,
     }
 
@@ -6242,6 +6459,8 @@ def build_paper_observation_report(args) -> dict:
     observation_quality = build_paper_observation_quality(report_args)
     signal_diagnostics, _signal_status = build_paper_active_signal_diagnostics({"limit": "20"})
     runner_summary = build_paper_runner_summary(args)
+    observation_counters = build_paper_observation_counters(report_args)
+    compact_counters = compact_observation_counters(observation_counters)
     stop_rules = build_paper_stop_rules(args) if paper_enabled else {
         "status": "OK",
         "rules": [],
@@ -6372,6 +6591,10 @@ def build_paper_observation_report(args) -> dict:
         "evidence": {
             "sessionAgeHours": session_age_hours,
             "ticksObserved": ticks,
+            "runnerTicksRun": compact_counters.get("runnerTicksRun"),
+            "runnerTicksSkipped": compact_counters.get("runnerTicksSkipped"),
+            "sessionPaperTicks": compact_counters.get("sessionPaperTicks"),
+            "processedCandleDeltaTotal": compact_counters.get("processedCandleDeltaTotal"),
             "signalsObserved": signals,
             "closedTrades": closed_trades,
             "openPositions": open_positions,
@@ -6379,6 +6602,7 @@ def build_paper_observation_report(args) -> dict:
             "stopRulesStatus": stop_rules.get("status"),
             "observationTargetStatus": target_status,
             "observationQualityStatus": quality_status,
+            "counterConsistencyStatus": compact_counters.get("counterConsistencyStatus"),
         },
         "progress": {
             "minSessionHours": targets.get("minSessionHours"),
@@ -6408,8 +6632,13 @@ def build_paper_observation_report(args) -> dict:
         "latestSignalDiagnosticStatus": diagnostic.get("signal"),
         "latestSignalDiagnosticReason": diagnostic.get("reason"),
         "latestSignalDiagnosticAction": diagnostic_next.get("action"),
+        "observationCounters": compact_counters,
+        "runnerTicksRun": compact_counters.get("runnerTicksRun"),
+        "runnerTicksSkipped": compact_counters.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": compact_counters.get("processedCandleDeltaTotal"),
+        "counterConsistencyStatus": compact_counters.get("counterConsistencyStatus"),
         "warnings": dedupe_list([warning for warning in warnings if warning]),
-        "informationalWarnings": dedupe_list([warning for warning in informational_warnings if warning]),
+        "informationalWarnings": dedupe_list([warning for warning in informational_warnings + compact_counters.get("warnings", []) if warning]),
     }
 
 
