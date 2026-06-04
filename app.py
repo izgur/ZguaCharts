@@ -1210,6 +1210,15 @@ def strategy_ranking():
         }), 400
 
 
+@app.get("/api/research/activity-lab")
+def research_activity_lab():
+    try:
+        payload, status_code = build_research_activity_lab(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research activity lab: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6189,6 +6198,163 @@ def build_paper_candidate_comparison(args) -> dict:
     }
 
 
+def build_research_activity_lab(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    symbols = parse_csv_arg(args.get("symbols"), ["ETHUSDT", "BTCUSDT"])
+    timeframes = parse_csv_arg(args.get("timeframes"), ["15m", "1h"])
+    strategies = parse_csv_arg(args.get("strategies"), ["SimpleAtrTrendV2"])
+    period = args.get("period", "365d")
+    optimize = str(args.get("optimize", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    default_max = 50 if optimize else max(1, len(symbols) * len(timeframes) * len(strategies))
+    max_combos = max(1, min(int(safe_float(args.get("maxCombos", args.get("max_combos", default_max)), default_max)), 200))
+    fee_pct = safe_float(args.get("feePct", args.get("fee_pct", candidate.get("takerFeePct", 0.055))), 0.055)
+    slippage_pct = safe_float(args.get("slippagePct", args.get("slippage_pct", safe_float(candidate.get("slippageBps", 2), 2) / 100)), 0.02)
+    limit_raw = args.get("limit", "auto")
+    command = package_node_script_args("research:activity-lab")
+    command.extend([
+        "--symbols", ",".join(symbols),
+        "--timeframes", ",".join(timeframes),
+        "--strategies", ",".join(strategies),
+        "--period", period,
+        "--maxCombos", str(max_combos),
+        "--limit", str(limit_raw),
+        "--optimize", "true" if optimize else "false",
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+        "--activeStrategy", str(candidate.get("strategy") or "SimpleAtrTrendV2"),
+        "--activeParams", json.dumps(candidate.get("params") or {}),
+    ])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 240), 240)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Research activity lab timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activePaperCandidate": candidate_summary(candidate),
+            "search": {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "optimize": optimize, "maxCombos": max_combos},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Activity lab timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Research activity lab returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Research activity lab returned no output."}
+    rows = [normalize_activity_lab_row(row) for row in payload.get("rows", [])]
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Research activity lab command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "realTradingEnabled": real_enabled,
+        "paperEnabled": paper_enabled,
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "optimize": optimize, "maxCombos": max_combos, "limit": limit_raw, "feePct": fee_pct, "slippagePct": slippage_pct},
+        "activePaperCandidate": candidate_summary(candidate),
+        "rows": rows,
+        "summary": activity_lab_summary(rows),
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def normalize_activity_lab_row(row: dict) -> dict:
+    return {
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "mode": row.get("mode"),
+        "status": row.get("status") or "FAIL",
+        "trades": int(safe_float(row.get("trades"), 0)),
+        "tradesPerDay": safe_float(row.get("tradesPerDay"), 0),
+        "tradesPerMonth": safe_float(row.get("tradesPerMonth"), 0),
+        "avgBarsHeld": safe_float(row.get("avgBarsHeld"), 0),
+        "totalReturnPct": safe_float(row.get("totalReturnPct"), 0),
+        "profitFactor": safe_float(row.get("profitFactor"), 0),
+        "winRate": safe_float(row.get("winRate"), 0),
+        "maxDrawdownPct": safe_float(row.get("maxDrawdownPct"), 0),
+        "expectancyPctPerTrade": safe_float(row.get("expectancyPctPerTrade"), 0),
+        "feesEstimatedPct": safe_float(row.get("feesEstimatedPct"), 0),
+        "score": safe_float(row.get("score"), 0),
+        "qualityStatus": row.get("qualityStatus") or row.get("status") or "FAIL",
+        "mainFailureReason": row.get("mainFailureReason") or "ERROR",
+        "warnings": row.get("warnings") or [],
+        "params": row.get("params") or {},
+    }
+
+
+def activity_lab_viable(row: dict) -> bool:
+    return (
+        row.get("status") in {"PASS", "WARN"}
+        and int(safe_float(row.get("trades"), 0)) >= 20
+        and safe_float(row.get("totalReturnPct"), 0) > 0
+        and safe_float(row.get("profitFactor"), 0) > 1
+        and safe_float(row.get("expectancyPctPerTrade"), 0) > 0
+        and safe_float(row.get("maxDrawdownPct"), 999) <= 25
+    )
+
+
+def best_activity_row(rows: list[dict]) -> dict | None:
+    if not rows:
+        return None
+    return sorted(rows, key=lambda row: (
+        1 if activity_lab_viable(row) else 0,
+        safe_float(row.get("score"), 0),
+        safe_float(row.get("profitFactor"), 0),
+        safe_float(row.get("totalReturnPct"), 0),
+        safe_float(row.get("tradesPerMonth"), 0),
+    ), reverse=True)[0]
+
+
+def activity_lab_summary(rows: list[dict]) -> dict:
+    viable = [row for row in rows if activity_lab_viable(row)]
+    best_overall = best_activity_row(rows)
+    most_active_passing = sorted(viable, key=lambda row: safe_float(row.get("tradesPerMonth"), 0), reverse=True)[0] if viable else None
+    best_15m = best_activity_row([row for row in rows if str(row.get("timeframe")) == "15m"])
+    best_1h = best_activity_row([row for row in rows if str(row.get("timeframe")) == "1h"])
+    fastest_viable = most_active_passing
+    if fastest_viable:
+        recommendation = {
+            "action": "REVIEW_ACTIVITY_CANDIDATE",
+            "reason": f"{fastest_viable.get('strategy')} {fastest_viable.get('symbol')} {fastest_viable.get('timeframe')} is viable in this read-only lab with {fastest_viable.get('tradesPerMonth')} trades/month. Review only; no promotion is automatic.",
+        }
+    elif best_overall:
+        recommendation = {
+            "action": "KEEP_CURRENT_OBSERVATION",
+            "reason": "No lab row met the viability gate. Continue observing the current promoted paper candidate or widen research intentionally.",
+        }
+    else:
+        recommendation = {
+            "action": "NO_ACTION",
+            "reason": "Activity lab returned no rows.",
+        }
+    return {
+        "bestOverall": best_overall,
+        "mostActivePassing": most_active_passing,
+        "best15m": best_15m,
+        "best1h": best_1h,
+        "fastestViable": fastest_viable,
+        "recommendation": recommendation,
+    }
+
+
 def compare_candidate_market_row(candidate: dict, symbol: str, timeframe: str, strategy: str, period: str, rules: dict, params: dict, fee_pct: float, slippage_pct: float, active_symbol: str | None, active_timeframe: str | None) -> dict:
     comparable = symbol == active_symbol and timeframe == active_timeframe and strategy == candidate.get("strategy")
     try:
@@ -6448,6 +6614,8 @@ def fast_candidate_recommendation(best: dict | None, rows: list[dict]) -> dict:
 
 def build_paper_observation_report(args) -> dict:
     report_args = {**dict(args), "activeOnly": "true"}
+    if args.get("counterLimit") and not report_args.get("limit"):
+        report_args["limit"] = args.get("counterLimit")
     candidate = load_paper_candidate_config()
     paper_enabled = canonical_paper_enabled(candidate)
     real_enabled, real_detail = paper_real_trading_enabled()

@@ -2709,6 +2709,7 @@ function setupLearningControls() {
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
+  document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3525,6 +3526,68 @@ function renderPaperFastDiscovery(payload) {
     <table class="trade-table">
       <thead><tr><th>Market</th><th>Quality</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Score</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="8">No discovery rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchActivityLab() {
+  const host = document.querySelector("#research-activity-lab-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading backtest activity lab...</p>`;
+    const payload = await apiGet("/api/research/activity-lab");
+    host.innerHTML = renderResearchActivityLab(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Backtest activity lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchActivityLab(payload) {
+  const search = payload.search || {};
+  const active = payload.activePaperCandidate || {};
+  const activeMarket = (active.activeSymbols || [])[0] || {};
+  const summary = payload.summary || {};
+  const recommendation = summary.recommendation || {};
+  const rows = (payload.rows || []).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td>${escapeHtml(row.mode || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.expectancyPctPerTrade)}%</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const best15 = summary.best15m || {};
+  const best1h = summary.best1h || {};
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Backtest Activity Lab <span class="neutral">${escapeHtml(recommendation.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(active.strategy || "-")} ${escapeHtml(activeMarket.symbol || "-")} ${escapeHtml(activeMarket.interval || "")}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Mode</span><strong>${search.optimize ? "optimized" : "current params"}</strong></div>
+      <div class="metric"><span>Symbols</span><strong>${escapeHtml((search.symbols || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Timeframes</span><strong>${escapeHtml((search.timeframes || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Strategies</span><strong>${escapeHtml((search.strategies || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Fee/slip</span><strong>${formatNumber(search.feePct)}% / ${formatNumber(search.slippagePct)}%</strong></div>
+      <div class="metric"><span>Rows</span><strong>${payload.rows?.length || 0}</strong></div>
+      <div class="metric"><span>Best 15m</span><strong>${best15.symbol ? `${escapeHtml(best15.symbol)} ${formatNumber(best15.tradesPerMonth)}/mo` : "-"}</strong></div>
+      <div class="metric"><span>Best 1h</span><strong>${best1h.symbol ? `${escapeHtml(best1h.symbol)} ${formatNumber(best1h.tradesPerMonth)}/mo` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Market</th><th>Mode</th><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Expectancy</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="11">No activity lab rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

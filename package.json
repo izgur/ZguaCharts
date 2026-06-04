@@ -15,6 +15,7 @@
     "paper:status": "node cli/paper_status.js",
     "paper:signal-diagnostics": "node cli/paper_signal_diagnostics.js",
     "paper:discover-fast-candidate": "node cli/paper_discover_fast_candidate.js",
+    "research:activity-lab": "node cli/research_activity_lab.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",
     "optimize:v2": "node cli/optimize_v2.js",
