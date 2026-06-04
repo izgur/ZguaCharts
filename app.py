@@ -1300,6 +1300,15 @@ def research_timeframe_preset_search():
         return jsonify({"error": f"Could not build timeframe preset search lab: {exc}"}), 502
 
 
+@app.get("/api/research/candidate-deep-compare")
+def research_candidate_deep_compare():
+    try:
+        payload, status_code = build_research_candidate_deep_compare(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build candidate deep compare: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6958,6 +6967,92 @@ def build_research_timeframe_preset_search(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    baseline_symbol = (args.get("baselineSymbol") or active.get("symbol") or "ETHUSDT").strip()
+    baseline_timeframe = (args.get("baselineTimeframe") or args.get("baselineInterval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    baseline_strategy = (args.get("baselineStrategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    challenger_symbol = (args.get("challengerSymbol") or "ETHUSDT").strip()
+    challenger_timeframe = (args.get("challengerTimeframe") or "4h").strip()
+    challenger_strategy = (args.get("challengerStrategy") or "SimpleAtrTrendV2").strip()
+    challenger_preset = args.get("challengerPreset", "swing_native_4h_1")
+    period = args.get("period", "365d")
+    include_details = str(args.get("includeDetails", args.get("include_details", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    command = package_node_script_args("research:candidate-deep-compare")
+    command.extend([
+        "--baselineSymbol", baseline_symbol,
+        "--baselineTimeframe", baseline_timeframe,
+        "--baselineStrategy", baseline_strategy,
+        "--challengerSymbol", challenger_symbol,
+        "--challengerTimeframe", challenger_timeframe,
+        "--challengerStrategy", challenger_strategy,
+        "--challengerPreset", str(challenger_preset),
+        "--period", period,
+        "--includeDetails", "true" if include_details else "false",
+        "--baseParams", json.dumps(params),
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 360), 360)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Candidate deep compare timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activeCandidate": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Candidate deep compare timed out before returning evidence."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Candidate deep compare returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Candidate deep compare returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Candidate deep compare command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activeCandidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"period": period, "includeDetails": include_details},
+        "baseline": payload.get("baseline") or {},
+        "challenger": payload.get("challenger") or {},
+        "comparison": payload.get("comparison") or {},
+        "evidence": payload.get("evidence") or {},
+        "recommendation": payload.get("recommendation") or {},
+        "warnings": warnings,
+        "availablePresets": payload.get("availablePresets"),
+        "error": payload.get("error"),
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 400 if payload.get("error") == "Unknown challengerPreset." else 502
 
 
 def build_research_blocker_analytics(args) -> tuple[dict, int]:

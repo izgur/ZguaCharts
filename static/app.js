@@ -2716,6 +2716,7 @@ function setupLearningControls() {
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
   document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
+  document.querySelector("#research-candidate-deep-compare-refresh")?.addEventListener("click", loadResearchCandidateDeepCompare);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -4011,6 +4012,74 @@ function renderResearchTimeframePresetSearch(payload) {
     <table class="trade-table">
       <thead><tr><th>Family</th><th>Preset</th><th>TF</th><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Trend hrs</th><th>Cooldown hrs</th><th>Score</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="13">No preset rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchCandidateDeepCompare() {
+  const host = document.querySelector("#research-candidate-deep-compare-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading candidate deep compare...</p>`;
+    const payload = await apiGet("/api/research/candidate-deep-compare");
+    host.innerHTML = renderResearchCandidateDeepCompare(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate deep compare could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderCompareMetricRow(label, baseline, challenger, formatter) {
+  const fmt = formatter || ((value) => value ?? "-");
+  return `
+    <tr>
+      <td>${escapeHtml(label)}</td>
+      <td>${fmt(baseline)}</td>
+      <td>${fmt(challenger)}</td>
+    </tr>
+  `;
+}
+
+function renderResearchCandidateDeepCompare(payload) {
+  const comparison = payload.comparison || {};
+  const recommendation = payload.recommendation || {};
+  const evidence = payload.evidence || {};
+  const activity = evidence.activity || {};
+  const stress = evidence.stress || {};
+  const walk = evidence.walkForward || {};
+  const regime = evidence.regime || {};
+  const baseline = payload.baseline || {};
+  const challenger = payload.challenger || {};
+  const ba = activity.baseline || {};
+  const ca = activity.challenger || {};
+  const tone = comparison.winner === "CHALLENGER" ? "positive" : comparison.winner === "BASELINE" ? "neutral" : "negative";
+  const metricRows = [
+    renderCompareMetricRow("Status", ba.status, ca.status, (value) => escapeHtml(value || "-")),
+    renderCompareMetricRow("Trades", ba.trades, ca.trades),
+    renderCompareMetricRow("Trades/month", ba.tradesPerMonth, ca.tradesPerMonth, formatNumber),
+    renderCompareMetricRow("Profit factor", ba.profitFactor, ca.profitFactor, formatNumber),
+    renderCompareMetricRow("Return", ba.totalReturnPct, ca.totalReturnPct, (value) => `${formatSigned(value || 0)}%`),
+    renderCompareMetricRow("Max DD", ba.maxDrawdownPct, ca.maxDrawdownPct, (value) => `${formatNumber(value)}%`),
+    renderCompareMetricRow("Walk-forward", walk.baseline?.status, walk.challenger?.status, (value) => escapeHtml(value || "-")),
+    renderCompareMetricRow("Stress", stress.baseline?.status, stress.challenger?.status, (value) => escapeHtml(value || "-")),
+    renderCompareMetricRow("Regime", regime.baseline?.regimeDependencyStatus, regime.challenger?.regimeDependencyStatus, (value) => escapeHtml(value || "-"))
+  ].join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Candidate Deep Compare <span class="${tone}">${escapeHtml(comparison.winner || "NO_DECISION")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(recommendation.action || "-")}</strong> ${escapeHtml(recommendation.reason || comparison.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${escapeHtml(baseline.symbol || "-")} ${escapeHtml(baseline.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Challenger</span><strong>${escapeHtml(challenger.symbol || "-")} ${escapeHtml(challenger.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Preset</span><strong>${escapeHtml(challenger.presetName || "-")}</strong></div>
+      <div class="metric"><span>Score diff</span><strong>${formatSigned(comparison.scoreDiff || 0)}</strong></div>
+    </div>
+    <p class="modal-note">${escapeHtml(comparison.tradeoffSummary || comparison.reason || "")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Metric</th><th>Baseline</th><th>Challenger</th></tr></thead>
+      <tbody>${metricRows}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
