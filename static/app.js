@@ -2711,6 +2711,7 @@ function setupLearningControls() {
   document.querySelector("#research-blocker-analytics-refresh")?.addEventListener("click", loadResearchBlockerAnalytics);
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
+  document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -3678,6 +3679,68 @@ function renderPaperFastDiscovery(payload) {
     <table class="trade-table">
       <thead><tr><th>Market</th><th>Quality</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Score</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="8">No discovery rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchCandidateLeaderboard() {
+  const host = document.querySelector("#research-candidate-leaderboard-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading research candidate leaderboard...</p>`;
+    const payload = await apiGet("/api/research/candidate-leaderboard");
+    host.innerHTML = renderResearchCandidateLeaderboard(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research candidate leaderboard could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchCandidateLeaderboard(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const recommendation = summary.recommendation || {};
+  const best = summary.bestOverall || {};
+  const active = summary.activeCandidate || {};
+  const rows = (payload.rows || []).slice(0, 12).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    const activeFlag = row.isActivePaperCandidate ? "yes" : "";
+    return `
+      <tr>
+        <td>${row.rank ?? "-"}</td>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td>${activeFlag}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const bestText = best.symbol ? `${best.strategy} ${best.symbol} ${best.timeframe} PF ${best.profitFactor} Return ${best.totalReturnPct}%` : "-";
+  return `
+    <h3 class="modal-section-title">Research Candidate Leaderboard <span class="neutral">${escapeHtml(recommendation.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Best:</strong> ${escapeHtml(bestText)}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Active rank</span><strong>${summary.activeCandidateRank ?? "-"}</strong></div>
+      <div class="metric"><span>PASS/WARN</span><strong>${summary.passCount ?? 0}</strong></div>
+      <div class="metric"><span>FAIL/ERROR</span><strong>${summary.failCount ?? 0}</strong></div>
+      <div class="metric"><span>Rows</span><strong>${payload.rows?.length || 0}</strong></div>
+      <div class="metric"><span>Symbols</span><strong>${escapeHtml((search.symbols || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Timeframes</span><strong>${escapeHtml((search.timeframes || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Active</span><strong>${active.symbol ? `${escapeHtml(active.symbol)} ${escapeHtml(active.timeframe || "")}` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Rank</th><th>Strategy</th><th>Market</th><th>Status</th><th>Active</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="12">No leaderboard rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

@@ -1255,6 +1255,15 @@ def research_candidate_review_report():
         return jsonify({"error": f"Could not build candidate review report: {exc}"}), 502
 
 
+@app.get("/api/research/candidate-leaderboard")
+def research_candidate_leaderboard():
+    try:
+        payload, status_code = build_research_candidate_leaderboard(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research candidate leaderboard: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6387,6 +6396,221 @@ def activity_lab_summary(rows: list[dict]) -> dict:
         "best15m": best_15m,
         "best1h": best_1h,
         "fastestViable": fastest_viable,
+        "recommendation": recommendation,
+    }
+
+
+def build_research_candidate_leaderboard(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = active.get("symbol") or "ETHUSDT"
+    active_timeframe = active.get("interval") or active.get("timeframe") or "1h"
+    active_strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
+    symbols = parse_csv_arg(args.get("symbols"), ["ETHUSDT", "BTCUSDT", "SOLUSDT"])
+    timeframes = parse_csv_arg(args.get("timeframes"), ["1h", "4h"])
+    strategies = parse_csv_arg(args.get("strategies"), ["SimpleAtrTrendV2"])
+    period = args.get("period", "365d")
+    requested = len(symbols) * len(timeframes) * len(strategies)
+    default_max = requested if str(args.get("maxCombos", args.get("max_combos", "auto"))).strip().lower() == "auto" else 24
+    max_combos = max(1, min(int(safe_float(args.get("maxCombos", args.get("max_combos", default_max)), default_max)), 60))
+    include_robustness = str(args.get("includeRobustness", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    include_variant = str(args.get("includeVariantSummary", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    activity_payload, activity_status = build_research_activity_lab({
+        "symbols": ",".join(symbols),
+        "timeframes": ",".join(timeframes),
+        "strategies": ",".join(strategies),
+        "period": period,
+        "maxCombos": str(max_combos),
+        "limit": args.get("limit", "auto"),
+        "optimize": "false",
+        "timeout_seconds": args.get("timeout_seconds", "240"),
+    })
+    rows = []
+    for row in activity_payload.get("rows") or []:
+        next_row = candidate_leaderboard_row(row, active_strategy, active_symbol, active_timeframe)
+        rows.append(next_row)
+    rows = sorted(rows, key=lambda item: candidate_leaderboard_sort_key(item), reverse=True)
+    for index, row in enumerate(rows, start=1):
+        row["rank"] = index
+    warnings = list(activity_payload.get("warnings") or [])
+    if real_enabled:
+        warnings.append(real_detail)
+    if activity_status >= 400 or activity_payload.get("ok") is False:
+        warnings.append("Activity lab did not complete cleanly; leaderboard rows may be incomplete.")
+    if include_robustness:
+        for row in rows[: min(3, len(rows))]:
+            robust_payload, robust_status = build_research_parameter_robustness({
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "strategy": row.get("strategy"),
+                "period": period,
+                "maxVariants": args.get("robustnessMaxVariants", "20"),
+                "includeBase": "true",
+            })
+            row["robustness"] = compact_candidate_robustness_evidence(robust_payload)
+            if robust_status >= 400 or robust_payload.get("ok") is False:
+                row.setdefault("warnings", []).append("Bounded robustness summary failed for this row.")
+    variant_summary = None
+    if include_variant:
+        variant_target = next((row for row in rows if row.get("isActivePaperCandidate")), rows[0] if rows else None)
+        if variant_target:
+            variant_payload, variant_status = build_research_strategy_variant_lab({
+                "symbol": variant_target.get("symbol"),
+                "timeframe": variant_target.get("timeframe"),
+                "baseStrategy": variant_target.get("strategy"),
+                "period": period,
+                "maxVariants": args.get("variantMaxVariants", "10"),
+            })
+            variant_summary = compact_candidate_variant_evidence(variant_payload)
+            if variant_status >= 400 or variant_payload.get("ok") is False:
+                warnings.append("Bounded variant summary failed for the selected leaderboard row.")
+    summary = candidate_leaderboard_summary(rows)
+    if variant_summary:
+        summary["variantSummary"] = variant_summary
+    return {
+        "ok": activity_payload.get("ok", True) is not False and activity_status < 400,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "search": {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": strategies,
+            "period": period,
+            "maxCombos": max_combos,
+            "includeRobustness": include_robustness,
+            "includeVariantSummary": include_variant,
+        },
+        "activePaperCandidate": candidate_summary(candidate),
+        "rows": rows,
+        "summary": summary,
+        "warnings": dedupe_list([warning for warning in warnings if warning]),
+    }, 200 if activity_status < 400 else 502
+
+
+def candidate_leaderboard_row(row: dict, active_strategy: str, active_symbol: str, active_timeframe: str) -> dict:
+    is_active = (
+        str(row.get("strategy")) == str(active_strategy)
+        and str(row.get("symbol")) == str(active_symbol)
+        and str(row.get("timeframe")) == str(active_timeframe)
+    )
+    score = candidate_leaderboard_score(row)
+    recommendation = "KEEP_CURRENT" if is_active and row.get("status") in {"PASS", "WARN"} else (
+        "REVIEW_NEW_CANDIDATE" if row.get("status") in {"PASS", "WARN"} and safe_float(row.get("profitFactor"), 0) >= 1.1 and safe_float(row.get("totalReturnPct"), 0) > 0 else
+        "RESEARCH_MORE" if row.get("status") in {"FAIL", "ERROR"} else
+        "NO_ACTION"
+    )
+    return {
+        "rank": None,
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "status": row.get("status") or "FAIL",
+        "totalReturnPct": safe_float(row.get("totalReturnPct"), 0),
+        "profitFactor": safe_float(row.get("profitFactor"), 0),
+        "maxDrawdownPct": safe_float(row.get("maxDrawdownPct"), 0),
+        "winRate": safe_float(row.get("winRate"), 0),
+        "trades": int(safe_float(row.get("trades"), 0)),
+        "tradesPerMonth": safe_float(row.get("tradesPerMonth"), 0),
+        "expectancyPctPerTrade": safe_float(row.get("expectancyPctPerTrade"), 0),
+        "score": score,
+        "qualityStatus": row.get("qualityStatus") or row.get("status") or "FAIL",
+        "mainFailureReason": row.get("mainFailureReason") or candidate_leaderboard_failure_reason(row),
+        "recommendation": recommendation,
+        "isActivePaperCandidate": is_active,
+        "warnings": row.get("warnings") or [],
+    }
+
+
+def candidate_leaderboard_score(row: dict) -> float:
+    trades = safe_float(row.get("trades"), 0)
+    trades_per_month = safe_float(row.get("tradesPerMonth"), 0)
+    pf = safe_float(row.get("profitFactor"), 0)
+    total_return = safe_float(row.get("totalReturnPct"), 0)
+    drawdown = safe_float(row.get("maxDrawdownPct"), 0)
+    expectancy = safe_float(row.get("expectancyPctPerTrade"), 0)
+    status_bonus = 30 if row.get("status") == "PASS" else 12 if row.get("status") == "WARN" else -25
+    score = (
+        status_bonus
+        + min(trades, 150) * 0.16
+        + min(trades_per_month, 12) * 1.6
+        + pf * 18
+        + total_return * 2.2
+        + expectancy * 12
+        - drawdown * 1.25
+    )
+    if pf < 1.1:
+        score -= 18
+    if total_return <= 0:
+        score -= 20
+    if trades < 20:
+        score -= 15
+    if drawdown > 25:
+        score -= 20
+    return round(score, 5)
+
+
+def candidate_leaderboard_failure_reason(row: dict) -> str:
+    if safe_float(row.get("trades"), 0) <= 0:
+        return "NO_TRADES"
+    if safe_float(row.get("trades"), 0) < 20:
+        return "TOO_FEW_TRADES"
+    if safe_float(row.get("totalReturnPct"), 0) <= 0:
+        return "NEGATIVE_RETURN"
+    if safe_float(row.get("profitFactor"), 0) < 1.1:
+        return "WEAK_PROFIT_FACTOR"
+    if safe_float(row.get("maxDrawdownPct"), 0) > 25:
+        return "HIGH_DRAWDOWN"
+    return row.get("mainFailureReason") or "OK"
+
+
+def candidate_leaderboard_sort_key(row: dict) -> tuple:
+    return (
+        1 if row.get("status") == "PASS" else 0,
+        1 if row.get("status") == "WARN" else 0,
+        safe_float(row.get("score"), 0),
+        safe_float(row.get("profitFactor"), 0),
+        safe_float(row.get("totalReturnPct"), 0),
+        safe_float(row.get("tradesPerMonth"), 0),
+    )
+
+
+def candidate_leaderboard_summary(rows: list[dict]) -> dict:
+    best_overall = rows[0] if rows else None
+    best_by_timeframe = {}
+    best_by_symbol = {}
+    for row in rows:
+        timeframe = str(row.get("timeframe") or "")
+        symbol = str(row.get("symbol") or "")
+        if timeframe and timeframe not in best_by_timeframe:
+            best_by_timeframe[timeframe] = row
+        if symbol and symbol not in best_by_symbol:
+            best_by_symbol[symbol] = row
+    active = next((row for row in rows if row.get("isActivePaperCandidate")), None)
+    pass_count = len([row for row in rows if row.get("status") in {"PASS", "WARN"}])
+    fail_count = len([row for row in rows if row.get("status") not in {"PASS", "WARN"}])
+    if not rows:
+        recommendation = {"action": "NO_ACTION", "reason": "No leaderboard rows were returned."}
+    elif active and best_overall and active.get("rank") == best_overall.get("rank"):
+        recommendation = {"action": "KEEP_CURRENT", "reason": "The active paper candidate is the top ranked research row. Continue paper-only observation."}
+    elif best_overall and best_overall.get("status") in {"PASS", "WARN"} and (not active or safe_float(best_overall.get("score"), 0) > safe_float(active.get("score"), 0) + 10):
+        recommendation = {
+            "action": "REVIEW_NEW_CANDIDATE",
+            "reason": f"{best_overall.get('strategy')} {best_overall.get('symbol')} {best_overall.get('timeframe')} ranks above the active paper candidate for research review only.",
+        }
+    elif pass_count:
+        recommendation = {"action": "KEEP_CURRENT", "reason": "Passing rows exist, but no alternative clearly beats the active candidate enough for this read-only leaderboard."}
+    else:
+        recommendation = {"action": "RESEARCH_MORE", "reason": "No candidate rows passed the leaderboard gate. Widen research intentionally."}
+    return {
+        "bestOverall": best_overall,
+        "bestByTimeframe": best_by_timeframe,
+        "bestBySymbol": best_by_symbol,
+        "activeCandidateRank": active.get("rank") if active else None,
+        "activeCandidate": active,
+        "passCount": pass_count,
+        "failCount": fail_count,
         "recommendation": recommendation,
     }
 
