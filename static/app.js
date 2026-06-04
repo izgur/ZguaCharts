@@ -2713,6 +2713,7 @@ function setupLearningControls() {
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
+  document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -3803,6 +3804,85 @@ function renderResearchFeeSlippageStress(payload) {
     <table class="trade-table">
       <thead><tr><th>Scenario</th><th>Status</th><th>Taker fee</th><th>Slip bps</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Return diff</th><th>PF diff</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="11">No fee/slippage stress rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchWalkForwardReview() {
+  const host = document.querySelector("#research-walk-forward-review-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading walk-forward review...</p>`;
+    const payload = await apiGet("/api/research/walk-forward-review");
+    host.innerHTML = renderResearchWalkForwardReview(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Walk-forward review could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchWalkForwardReview(payload) {
+  const search = payload.search || {};
+  const full = payload.full || {};
+  const stability = payload.stability || {};
+  const rec = stability.recommendation || {};
+  const worst = stability.worstFold || {};
+  const best = stability.bestFold || {};
+  const tone = stability.status === "STABLE" ? "positive" : stability.status === "FAIL" || stability.status === "FRAGILE" ? "negative" : "neutral";
+  const windowRows = (payload.recentWindows || []).map((row) => {
+    const rowTone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${escapeHtml(row.label || "-")}</td>
+        <td class="${rowTone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.winRate)}%</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const foldRows = (payload.folds || []).map((row) => {
+    const rowTone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${row.fold ?? "-"}</td>
+        <td class="${rowTone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${escapeHtml((row.startTime || "").slice(0, 10))}</td>
+        <td>${escapeHtml((row.endTime || "").slice(0, 10))}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Walk-Forward Review <span class="${tone}">${escapeHtml(stability.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Full</span><strong>${escapeHtml(full.status || "-")} PF ${formatNumber(full.profitFactor)}</strong></div>
+      <div class="metric"><span>Full return</span><strong>${formatSigned(full.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Pass/fail folds</span><strong>${stability.passFoldCount ?? 0}/${stability.failFoldCount ?? 0}</strong></div>
+      <div class="metric"><span>Negative folds</span><strong>${stability.negativeFoldCount ?? 0}</strong></div>
+      <div class="metric"><span>Median fold PF</span><strong>${formatNumber(stability.medianFoldProfitFactor)}</strong></div>
+      <div class="metric"><span>Worst fold</span><strong>${worst.fold ? `#${worst.fold} ${formatSigned(worst.totalReturnPct || 0)}%` : "-"}</strong></div>
+      <div class="metric"><span>Best fold</span><strong>${best.fold ? `#${best.fold} ${formatSigned(best.totalReturnPct || 0)}%` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Window</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Reason</th></tr></thead>
+      <tbody>${windowRows || `<tr><td colspan="8">No recent windows returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Fold</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Start</th><th>End</th><th>Reason</th></tr></thead>
+      <tbody>${foldRows || `<tr><td colspan="9">No folds returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

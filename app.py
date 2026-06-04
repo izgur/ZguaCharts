@@ -1273,6 +1273,15 @@ def research_fee_slippage_stress():
         return jsonify({"error": f"Could not build fee/slippage stress lab: {exc}"}), 502
 
 
+@app.get("/api/research/walk-forward-review")
+def research_walk_forward_review():
+    try:
+        payload, status_code = build_research_walk_forward_review(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build walk-forward review: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6691,6 +6700,85 @@ def build_research_fee_slippage_stress(args) -> tuple[dict, int]:
         "baseCostModel": payload.get("baseCostModel") or {"makerFeePct": maker_fee, "takerFeePct": taker_fee, "slippageBps": slippage_bps},
         "rows": payload.get("rows") or [],
         "stress": payload.get("stress") or {},
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def build_research_walk_forward_review(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    folds = max(1, min(int(safe_float(args.get("folds", 4), 4)), 12))
+    recent_windows = args.get("recentWindows", args.get("recent_windows", "90,180,365"))
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    maker_fee = safe_float(candidate.get("makerFeePct"), 0)
+    taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
+    slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    command = package_node_script_args("research:walk-forward-review")
+    command.extend([
+        "--symbol", symbol,
+        "--timeframe", timeframe,
+        "--strategy", strategy,
+        "--period", period,
+        "--folds", str(folds),
+        "--recentWindows", str(recent_windows),
+        "--baseParams", json.dumps(params),
+        "--makerFeePct", str(maker_fee),
+        "--takerFeePct", str(taker_fee),
+        "--slippageBps", str(slippage_bps),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 240), 240)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Walk-forward review timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Walk-forward review timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Walk-forward review returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Walk-forward review returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Walk-forward review command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "folds": folds, "recentWindows": recent_windows},
+        "full": payload.get("full") or {},
+        "recentWindows": payload.get("recentWindows") or [],
+        "folds": payload.get("folds") or [],
+        "stability": payload.get("stability") or {},
         "warnings": warnings,
         "command": " ".join(command),
     }
