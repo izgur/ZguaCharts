@@ -1309,6 +1309,15 @@ def research_candidate_deep_compare():
         return jsonify({"error": f"Could not build candidate deep compare: {exc}"}), 502
 
 
+@app.get("/api/research/multi-strategy-matrix")
+def research_multi_strategy_matrix():
+    try:
+        payload, status_code = build_research_multi_strategy_matrix(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build multi-strategy matrix: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -7053,6 +7062,92 @@ def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 400 if payload.get("error") == "Unknown challengerPreset." else 502
+
+
+def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = (active.get("symbol") or "ETHUSDT").strip()
+    active_timeframe = (active.get("interval") or active.get("timeframe") or "1h").strip()
+    active_strategy = (candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    symbols = args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")
+    timeframes = args.get("timeframes", "1h,4h")
+    strategies = args.get("strategies", "auto")
+    period = args.get("period", "365d")
+    mode = args.get("mode", "current_or_default_params")
+    max_rows = max(1, min(int(safe_float(args.get("maxRows", args.get("max_rows", 100)), 100)), 100))
+    include_stress = str(args.get("includeStress", args.get("include_stress", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    command = package_node_script_args("research:multi-strategy-matrix")
+    command.extend([
+        "--symbols", str(symbols),
+        "--timeframes", str(timeframes),
+        "--strategies", str(strategies),
+        "--period", period,
+        "--mode", mode,
+        "--maxRows", str(max_rows),
+        "--includeStress", "true" if include_stress else "false",
+        "--includeWalkForward", "true" if include_walk else "false",
+        "--activeSymbol", active_symbol,
+        "--activeTimeframe", active_timeframe,
+        "--activeStrategy", active_strategy,
+        "--activeParams", json.dumps(params),
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 420), 420)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Multi-strategy matrix timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activeCandidate": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Multi-strategy matrix timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Multi-strategy matrix returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Multi-strategy matrix returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Multi-strategy matrix command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activeCandidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "mode": mode, "maxRows": max_rows},
+        "discoveredStrategies": payload.get("discoveredStrategies") or [],
+        "rows": payload.get("rows") or [],
+        "summary": payload.get("summary") or {},
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
 
 
 def build_research_blocker_analytics(args) -> tuple[dict, int]:
