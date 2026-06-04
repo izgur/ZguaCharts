@@ -2703,6 +2703,7 @@ function setupLearningControls() {
   document.querySelector("#learning-audit-summary-button")?.addEventListener("click", loadLearningAuditSummary);
   document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
+  document.querySelector("#research-candidate-review-report-refresh")?.addEventListener("click", loadResearchCandidateReviewReport);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
@@ -3036,6 +3037,73 @@ async function previewCandidatePromotion() {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Promotion preview failed: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadResearchCandidateReviewReport() {
+  const host = document.querySelector("#research-candidate-review-report-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading candidate review report...</p>`;
+    const payload = await apiGet("/api/research/candidate-review-report?includeDetails=false");
+    host.innerHTML = renderResearchCandidateReviewReport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate review report could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchCandidateReviewReport(payload) {
+  const verdict = payload.verdict || {};
+  const scores = payload.scores || {};
+  const evidence = payload.evidence || {};
+  const activity = evidence.activity || {};
+  const robust = evidence.robustness || {};
+  const blockers = evidence.blockers || {};
+  const variants = evidence.variants || {};
+  const paper = evidence.paper || {};
+  const paperEvidence = paper.evidence || {};
+  const signal = evidence.signalDiagnostics || {};
+  const next = verdict.nextAction || {};
+  const tone = verdict.status === "READY_FOR_LONGER_PAPER" || verdict.status === "KEEP_OBSERVING" ? "positive" : verdict.status === "RESEARCH_ALTERNATIVES" ? "neutral" : "negative";
+  const list = (items) => (items || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const topBlockers = (blockers.topBlockers || []).map((item) => `${item.name}:${item.count}`).join(", ");
+  const bestTradeoff = variants.bestTradeoff || {};
+  const mostActive = variants.mostActivePassing || {};
+  return `
+    <h3 class="modal-section-title">Candidate Review Report <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(verdict.title || "-")}</strong> ${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Overall score</span><strong>${formatNumber(scores.overallScore)}</strong></div>
+      <div class="metric"><span>Activity</span><strong>${formatNumber(scores.activityScore)}</strong></div>
+      <div class="metric"><span>Robustness</span><strong>${formatNumber(scores.robustnessScore)}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${formatNumber(scores.paperScore)}</strong></div>
+      <div class="metric"><span>Variant</span><strong>${formatNumber(scores.variantScore)}</strong></div>
+      <div class="metric"><span>Blocker</span><strong>${formatNumber(scores.blockerScore)}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+        <tr><th>Activity</th><td>${escapeHtml(activity.status || "-")} &middot; ${activity.trades ?? 0} trades &middot; PF ${formatNumber(activity.profitFactor)} &middot; Return ${formatSigned(activity.totalReturnPct || 0)}% &middot; ${formatNumber(activity.tradesPerMonth)}/mo</td></tr>
+        <tr><th>Robustness</th><td>${escapeHtml(robust.status || "-")} &middot; Pass ${formatNumber((robust.passRate || 0) * 100)}% &middot; Median PF ${formatNumber(robust.medianProfitFactor)} &middot; Median return ${formatSigned(robust.medianReturnPct || 0)}%</td></tr>
+        <tr><th>Blockers</th><td>Main ${escapeHtml(blockers.mainBlocker || "-")} &middot; ${escapeHtml(topBlockers || "-")}</td></tr>
+        <tr><th>Variants</th><td>Best tradeoff ${escapeHtml(bestTradeoff.variantName || "-")} &middot; Most active ${escapeHtml(mostActive.variantName || "-")} ${formatNumber(mostActive.tradesPerMonth)}/mo</td></tr>
+        <tr><th>Paper evidence</th><td>${paperEvidence.runnerTicksRun ?? paperEvidence.ticksObserved ?? 0} useful tick(s) &middot; ${paperEvidence.signalsObserved ?? 0} signal(s) &middot; ${paperEvidence.closedTrades ?? 0} closed trade(s)</td></tr>
+        <tr><th>Latest signal</th><td>${escapeHtml(signal.signal || "-")} &middot; ${escapeHtml(signal.reason || "")}</td></tr>
+      </tbody>
+    </table>
+    <div class="metric-grid">
+      <div class="metric"><span>Strengths</span><strong>${(payload.strengths || []).length}</strong></div>
+      <div class="metric"><span>Weaknesses</span><strong>${(payload.weaknesses || []).length}</strong></div>
+      <div class="metric"><span>Risks</span><strong>${(payload.risks || []).length}</strong></div>
+      <div class="metric"><span>Recommendations</span><strong>${(payload.recommendations || []).length}</strong></div>
+    </div>
+    ${payload.strengths?.length ? `<p class="modal-note"><strong>Strengths</strong></p><ul class="modal-note-list">${list(payload.strengths)}</ul>` : ""}
+    ${payload.weaknesses?.length ? `<p class="modal-note"><strong>Weaknesses</strong></p><ul class="backtest-warnings">${list(payload.weaknesses)}</ul>` : ""}
+    ${payload.risks?.length ? `<p class="modal-note"><strong>Risks</strong></p><ul class="backtest-warnings">${list(payload.risks)}</ul>` : ""}
+    ${payload.recommendations?.length ? `<p class="modal-note"><strong>Recommendations</strong></p><ul class="modal-note-list">${list(payload.recommendations)}</ul>` : ""}
+    ${payload.warnings?.length ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${list(payload.warnings)}</ul>` : ""}
+  `;
 }
 
 function renderDiffRows(rows, emptyText) {

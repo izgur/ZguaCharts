@@ -1246,6 +1246,15 @@ def research_strategy_variant_lab():
         return jsonify({"error": f"Could not build strategy variant lab: {exc}"}), 502
 
 
+@app.get("/api/research/candidate-review-report")
+def research_candidate_review_report():
+    try:
+        payload, status_code = build_research_candidate_review_report(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build candidate review report: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6527,6 +6536,331 @@ def build_research_strategy_variant_lab(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def build_research_candidate_review_report(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    include_details = str(args.get("includeDetails", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    lab_args = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+    }
+    activity, activity_status = build_research_activity_lab({
+        "symbols": symbol,
+        "timeframes": timeframe,
+        "strategies": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+        "optimize": "false",
+    })
+    robustness, robustness_status = build_research_parameter_robustness({
+        **lab_args,
+        "maxVariants": args.get("robustnessMaxVariants", "100"),
+        "includeBase": "true",
+    })
+    blockers, blockers_status = build_research_blocker_analytics({
+        **lab_args,
+        "includeRecentCandles": "true",
+        "recentLimit": args.get("recentLimit", "30"),
+    })
+    variants, variants_status = build_research_strategy_variant_lab({
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "baseStrategy": strategy,
+        "period": period,
+        "variants": args.get("variants", "default"),
+        "maxVariants": args.get("maxVariants", "20"),
+        "limit": args.get("limit", "auto"),
+    })
+    paper_args = {**dict(args), "symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period}
+    paper = build_paper_observation_report(paper_args)
+    signal_diagnostics, signal_status = build_paper_active_signal_diagnostics({"limit": args.get("signalLimit", "20")})
+    activity_row = (activity.get("rows") or [None])[0] or {}
+    robustness_summary = robustness.get("robustness") or {}
+    blocker_summary = blockers.get("summary") or {}
+    variant_summary = variants.get("summary") or {}
+    paper_verdict = paper.get("verdict") or {}
+    scores = candidate_review_scores(activity_row, robustness_summary, blocker_summary, variant_summary, paper)
+    strengths, weaknesses, risks, recommendations = candidate_review_lists(
+        activity_row,
+        robustness_summary,
+        blocker_summary,
+        variant_summary,
+        paper,
+        signal_diagnostics,
+        real_enabled,
+    )
+    verdict = candidate_review_verdict(activity_row, robustness_summary, variant_summary, paper, scores, real_enabled, real_detail)
+    warnings = []
+    for payload, status_code, label in [
+        (activity, activity_status, "activity lab"),
+        (robustness, robustness_status, "parameter robustness"),
+        (blockers, blockers_status, "blocker analytics"),
+        (variants, variants_status, "strategy variant lab"),
+        (signal_diagnostics, signal_status, "active signal diagnostics"),
+    ]:
+        if status_code >= 400 or payload.get("ok") is False:
+            warnings.append(f"{label} returned status {status_code}.")
+        warnings.extend(payload.get("warnings") or [])
+    warnings.extend(paper.get("warnings") or [])
+    if real_enabled:
+        warnings.append(real_detail)
+    evidence = {
+        "activity": compact_candidate_activity_evidence(activity_row, activity),
+        "robustness": compact_candidate_robustness_evidence(robustness),
+        "blockers": compact_candidate_blocker_evidence(blockers),
+        "variants": compact_candidate_variant_evidence(variants),
+        "paper": compact_candidate_paper_evidence(paper),
+        "signalDiagnostics": compact_candidate_signal_evidence(signal_diagnostics),
+    }
+    if include_details:
+        evidence["details"] = {
+            "activity": activity,
+            "robustness": robustness,
+            "blockers": blockers,
+            "variants": variants,
+            "paper": paper,
+            "signalDiagnostics": signal_diagnostics,
+        }
+    return {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "verdict": verdict,
+        "scores": scores,
+        "evidence": evidence,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "risks": risks,
+        "recommendations": recommendations,
+        "warnings": dedupe_list([warning for warning in warnings if warning]),
+    }, 200
+
+
+def candidate_review_scores(activity: dict, robustness: dict, blockers: dict, variants: dict, paper: dict) -> dict:
+    trades = safe_float(activity.get("trades"), 0)
+    pf = safe_float(activity.get("profitFactor"), 0)
+    total_return = safe_float(activity.get("totalReturnPct"), 0)
+    drawdown = safe_float(activity.get("maxDrawdownPct"), 999)
+    activity_score = min(100, max(0, trades * 0.55 + pf * 25 + total_return * 3 - drawdown * 1.5))
+    robust_status = str(robustness.get("status") or "").upper()
+    robustness_score = 35 if robust_status in {"FAIL", "FRAGILE"} else 70 if robust_status == "WATCH" else 88 if robust_status == "ROBUST" else 50
+    robustness_score += safe_float(robustness.get("passRate"), 0) * 12
+    baseline = variants.get("baseline") or {}
+    best_tradeoff = variants.get("bestTradeoff") or {}
+    variant_score = 78
+    if best_tradeoff and baseline and best_tradeoff.get("variantName") != baseline.get("variantName"):
+        if safe_float(best_tradeoff.get("tradesPerMonth"), 0) > safe_float(baseline.get("tradesPerMonth"), 0) and safe_float(best_tradeoff.get("profitFactor"), 0) >= 1.1:
+            variant_score = 58
+    blocker_name = str(blockers.get("mainBlocker") or "")
+    blocker_score = 70 if blocker_name else 50
+    if blocker_name in {"emaTrendFailed", "pullbackReclaimFailed", "positionBlocked"}:
+        blocker_score = 62
+    paper_evidence = paper.get("evidence") or {}
+    paper_status = str((paper.get("verdict") or {}).get("status") or "").upper()
+    closed_trades = safe_float(paper_evidence.get("closedTrades"), 0)
+    ticks = safe_float(paper_evidence.get("runnerTicksRun", paper_evidence.get("ticksObserved")), 0)
+    paper_score = 25 if closed_trades <= 0 else min(85, 35 + closed_trades * 5)
+    if ticks >= 20:
+        paper_score += 10
+    if paper_status in {"PAUSE_RECOMMENDED", "WATCH"}:
+        paper_score -= 20
+    overall = round((activity_score * 0.25 + robustness_score * 0.25 + variant_score * 0.15 + blocker_score * 0.1 + paper_score * 0.25), 2)
+    return {
+        "activityScore": round(activity_score, 2),
+        "robustnessScore": round(min(100, robustness_score), 2),
+        "variantScore": round(variant_score, 2),
+        "paperScore": round(max(0, min(100, paper_score)), 2),
+        "blockerScore": round(blocker_score, 2),
+        "overallScore": overall,
+    }
+
+
+def candidate_review_verdict(activity: dict, robustness: dict, variants: dict, paper: dict, scores: dict, real_enabled: bool, real_detail: str) -> dict:
+    activity_status = str(activity.get("status") or "").upper()
+    robust_status = str(robustness.get("status") or "").upper()
+    baseline = variants.get("baseline") or {}
+    best_tradeoff = variants.get("bestTradeoff") or {}
+    paper_evidence = paper.get("evidence") or {}
+    closed_trades = safe_float(paper_evidence.get("closedTrades"), 0)
+    ticks = safe_float(paper_evidence.get("runnerTicksRun", paper_evidence.get("ticksObserved")), 0)
+    if real_enabled:
+        return {
+            "status": "NOT_READY",
+            "title": "Safety Review Required",
+            "summary": "Real trading appears enabled, so this candidate cannot be reviewed for paper-only observation until safety is restored.",
+            "nextAction": {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail},
+        }
+    if activity_status not in {"PASS", "WARN"}:
+        return {
+            "status": "RESEARCH_ALTERNATIVES",
+            "title": "Research Alternatives",
+            "summary": "The selected candidate does not pass the read-only activity review.",
+            "nextAction": {"action": "RESEARCH_ALTERNATIVES", "reason": "Use activity/variant labs to inspect other candidates. No promotion is automatic."},
+        }
+    if robust_status in {"FAIL", "FRAGILE"}:
+        return {
+            "status": "RESEARCH_ALTERNATIVES",
+            "title": "Robustness Is Weak",
+            "summary": "The base backtest is not robust enough across nearby parameter variants.",
+            "nextAction": {"action": "RESEARCH_ALTERNATIVES", "reason": "Review robustness before collecting more paper evidence."},
+        }
+    if best_tradeoff and baseline and best_tradeoff.get("variantName") != baseline.get("variantName"):
+        better_activity = safe_float(best_tradeoff.get("tradesPerMonth"), 0) > safe_float(baseline.get("tradesPerMonth"), 0)
+        acceptable = safe_float(best_tradeoff.get("profitFactor"), 0) >= 1.1 and safe_float(best_tradeoff.get("totalReturnPct"), 0) > 0
+        if better_activity and acceptable:
+            return {
+                "status": "RESEARCH_ALTERNATIVES",
+                "title": "Review Variant Before More Paper",
+                "summary": f"{best_tradeoff.get('variantName')} may offer a better activity tradeoff, but it is research-only and not promoted.",
+                "nextAction": {"action": "REVIEW_VARIANT_LAB", "reason": "Compare the variant manually before changing any candidate config."},
+            }
+    if closed_trades <= 0 and ticks >= 20:
+        return {
+            "status": "READY_FOR_LONGER_PAPER",
+            "title": "Promising But Needs Longer Paper",
+            "summary": "Backtest and robustness evidence are favorable, but forward paper has no closed trades yet.",
+            "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Keep observing in paper only until closed trades accumulate. Never treat this as real-trading readiness."},
+        }
+    if closed_trades <= 0:
+        return {
+            "status": "KEEP_OBSERVING",
+            "title": "Keep Observing",
+            "summary": "Research evidence is favorable, but paper evidence is too early for a final candidate judgment.",
+            "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Collect more useful paper ticks and closed trades."},
+        }
+    return {
+        "status": "KEEP_OBSERVING" if scores.get("overallScore", 0) < 80 else "READY_FOR_LONGER_PAPER",
+        "title": "Continue Paper Review",
+        "summary": "The candidate remains suitable for paper-only observation based on the consolidated evidence.",
+        "nextAction": {"action": "REVIEW_PAPER_RESULTS", "reason": "Review paper-only outcomes manually. This report never recommends real trading."},
+    }
+
+
+def candidate_review_lists(activity: dict, robustness: dict, blockers: dict, variants: dict, paper: dict, signal: dict, real_enabled: bool) -> tuple[list, list, list, list]:
+    strengths = []
+    weaknesses = []
+    risks = []
+    recommendations = []
+    if activity.get("status") in {"PASS", "WARN"}:
+        strengths.append(f"Activity lab passes with {activity.get('trades')} trades, PF {activity.get('profitFactor')}, and return {activity.get('totalReturnPct')}%.")
+    else:
+        weaknesses.append("Activity lab does not pass for the selected candidate.")
+    robust = robustness.get("status")
+    if robust == "ROBUST":
+        strengths.append(f"Parameter robustness is ROBUST with pass rate {round(safe_float(robustness.get('passRate'), 0) * 100, 2)}%.")
+    elif robust:
+        weaknesses.append(f"Parameter robustness is {robust}.")
+    baseline = variants.get("baseline") or {}
+    best_tradeoff = variants.get("bestTradeoff") or {}
+    if baseline and best_tradeoff and best_tradeoff.get("variantName") == baseline.get("variantName"):
+        strengths.append("Strategy Variant Lab keeps the baseline as the best tradeoff.")
+    elif best_tradeoff:
+        risks.append(f"Variant Lab found {best_tradeoff.get('variantName')} as a possible tradeoff; review before more promotion work.")
+    main_blocker = blockers.get("mainBlocker")
+    if main_blocker:
+        weaknesses.append(f"Dominant blocker is {main_blocker}; the strategy is selective by design.")
+    paper_evidence = paper.get("evidence") or {}
+    ticks = safe_float(paper_evidence.get("runnerTicksRun", paper_evidence.get("ticksObserved")), 0)
+    closed = safe_float(paper_evidence.get("closedTrades"), 0)
+    if ticks >= 20:
+        strengths.append(f"Paper observation has {int(ticks)} useful runner tick(s) recorded.")
+    if closed <= 0:
+        weaknesses.append("Forward paper has 0 closed trades, so paper evidence is not yet decisive.")
+        recommendations.append("Continue paper-only observation until closed trades and target duration accumulate.")
+    latest_signal = ((signal.get("diagnostics") or {}).get("signal") or "UNKNOWN")
+    latest_reason = (signal.get("diagnostics") or {}).get("reason")
+    if latest_signal == "HOLD" and latest_reason:
+        risks.append(f"Latest active diagnostic is HOLD: {latest_reason}")
+    if real_enabled:
+        risks.append("Real trading appears enabled; this must be treated as a safety issue.")
+    recommendations.append("Keep real trading disabled; this report is research and paper-review only.")
+    return dedupe_list(strengths), dedupe_list(weaknesses), dedupe_list(risks), dedupe_list(recommendations)
+
+
+def compact_candidate_activity_evidence(row: dict, payload: dict) -> dict:
+    return {
+        "status": row.get("status"),
+        "trades": row.get("trades"),
+        "tradesPerMonth": row.get("tradesPerMonth"),
+        "profitFactor": row.get("profitFactor"),
+        "totalReturnPct": row.get("totalReturnPct"),
+        "maxDrawdownPct": row.get("maxDrawdownPct"),
+        "expectancyPctPerTrade": row.get("expectancyPctPerTrade"),
+        "summaryRecommendation": ((payload.get("summary") or {}).get("recommendation") or {}),
+    }
+
+
+def compact_candidate_robustness_evidence(payload: dict) -> dict:
+    robust = payload.get("robustness") or {}
+    base = payload.get("baseResult") or {}
+    return {
+        "status": robust.get("status"),
+        "passRate": robust.get("passRate"),
+        "medianProfitFactor": robust.get("medianProfitFactor"),
+        "medianReturnPct": robust.get("medianReturnPct"),
+        "medianMaxDrawdownPct": robust.get("medianMaxDrawdownPct"),
+        "medianTrades": robust.get("medianTrades"),
+        "baseStatus": base.get("status"),
+        "baseProfitFactor": base.get("profitFactor"),
+    }
+
+
+def compact_candidate_blocker_evidence(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "mainBlocker": summary.get("mainBlocker"),
+        "candlesAnalyzed": summary.get("candlesAnalyzed"),
+        "tradeCount": summary.get("tradeCount"),
+        "signalRatePct": summary.get("signalRatePct"),
+        "approximateSignalsPerMonth": summary.get("approximateSignalsPerMonth"),
+        "topBlockers": (payload.get("blockers") or [])[:3],
+    }
+
+
+def compact_candidate_variant_evidence(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "baseline": summary.get("baseline"),
+        "bestOverall": summary.get("bestOverall"),
+        "mostActivePassing": summary.get("mostActivePassing"),
+        "bestTradeoff": summary.get("bestTradeoff"),
+        "recommendation": summary.get("recommendation"),
+    }
+
+
+def compact_candidate_paper_evidence(payload: dict) -> dict:
+    return {
+        "verdict": payload.get("verdict"),
+        "evidence": payload.get("evidence"),
+        "progress": payload.get("progress"),
+        "performance": payload.get("performance"),
+        "runnerTicksRun": payload.get("runnerTicksRun"),
+        "runnerTicksSkipped": payload.get("runnerTicksSkipped"),
+        "processedCandleDeltaTotal": payload.get("processedCandleDeltaTotal"),
+    }
+
+
+def compact_candidate_signal_evidence(payload: dict) -> dict:
+    diagnostics = payload.get("diagnostics") or {}
+    return {
+        "signal": diagnostics.get("signal"),
+        "reason": diagnostics.get("reason"),
+        "primaryBlocker": diagnostics.get("primaryBlocker"),
+        "nextAction": payload.get("nextAction"),
+    }
 
 
 def build_research_parameter_robustness(args) -> tuple[dict, int]:
