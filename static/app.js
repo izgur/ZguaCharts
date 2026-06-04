@@ -2707,6 +2707,7 @@ function setupLearningControls() {
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
+  document.querySelector("#research-blocker-analytics-refresh")?.addEventListener("click", loadResearchBlockerAnalytics);
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
@@ -3418,6 +3419,87 @@ function renderPaperSignalDiagnostics(payload) {
     <table class="trade-table">
       <thead><tr><th>Check</th><th>Status</th><th>Value</th><th>Threshold</th></tr></thead>
       <tbody>${checks || `<tr><td colspan="4">No checks returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchBlockerAnalytics() {
+  const host = document.querySelector("#research-blocker-analytics-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading strategy blocker analytics...</p>`;
+    const payload = await apiGet("/api/research/blocker-analytics");
+    host.innerHTML = renderResearchBlockerAnalytics(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Strategy blocker analytics could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchBlockerAnalytics(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const recommendation = summary.recommendation || {};
+  const candidate = payload.candidate || {};
+  const active = (candidate.activeSymbols || [])[0] || {};
+  const blockers = (payload.blockers || []).slice(0, 10).map((row) => {
+    const tone = row.severity === "HIGH" ? "negative" : row.severity === "MEDIUM" ? "neutral" : "positive";
+    return `
+      <tr>
+        <td>${escapeHtml(row.name || "-")}</td>
+        <td>${row.count ?? 0}</td>
+        <td>${formatNumber(row.pctOfCandles)}%</td>
+        <td>${formatNumber(row.pctOfHoldCandles)}%</td>
+        <td>${row.recentCount ?? 0}</td>
+        <td class="${tone}">${escapeHtml(row.severity || "-")}</td>
+        <td>${escapeHtml(row.detail || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const recent = (payload.recentCandles || []).slice(-10).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.time || "-")}</td>
+      <td>${formatNumber(row.close)}</td>
+      <td>${escapeHtml(row.signal || "-")}</td>
+      <td>${escapeHtml((row.blockers || []).join(", ") || "-")}</td>
+      <td>${escapeHtml(row.reason || "-")}</td>
+    </tr>
+  `).join("");
+  const nearMisses = (payload.nearMisses || []).slice(-8).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.time || "-")}</td>
+      <td>${formatNumber(row.close)}</td>
+      <td>${formatNumber(row.nearMissScore)}</td>
+      <td>${escapeHtml((row.failedBlockers || []).join(", ") || "-")}</td>
+      <td>${escapeHtml(row.detail || "-")}</td>
+    </tr>
+  `).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Strategy Blocker Analytics <span class="neutral">${escapeHtml(recommendation.action || "OBSERVE")}</span></h3>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(candidate.strategy || "-")} ${escapeHtml(active.symbol || search.symbol || "-")} ${escapeHtml(active.interval || search.timeframe || "")}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(search.strategy || "-")}</strong></div>
+      <div class="metric"><span>Candles</span><strong>${summary.candlesAnalyzed ?? 0}</strong></div>
+      <div class="metric"><span>Trades</span><strong>${summary.tradeCount ?? 0}</strong></div>
+      <div class="metric"><span>Signal rate</span><strong>${formatNumber(summary.signalRatePct)}%</strong></div>
+      <div class="metric"><span>Signals/month</span><strong>${formatNumber(summary.approximateSignalsPerMonth)}</strong></div>
+      <div class="metric"><span>Main blocker</span><strong>${escapeHtml(summary.mainBlocker || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Blocker</th><th>Count</th><th>% Candles</th><th>% Holds</th><th>Recent</th><th>Severity</th><th>Detail</th></tr></thead>
+      <tbody>${blockers || `<tr><td colspan="7">No blocker rows returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Recent candle</th><th>Close</th><th>Signal</th><th>Blockers</th><th>Reason</th></tr></thead>
+      <tbody>${recent || `<tr><td colspan="5">No recent candle diagnostics returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Near miss</th><th>Close</th><th>Score</th><th>Failed blockers</th><th>Detail</th></tr></thead>
+      <tbody>${nearMisses || `<tr><td colspan="5">No near misses returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

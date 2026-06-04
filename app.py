@@ -1228,6 +1228,15 @@ def research_parameter_robustness():
         return jsonify({"error": f"Could not build parameter robustness lab: {exc}"}), 502
 
 
+@app.get("/api/research/blocker-analytics")
+def research_blocker_analytics():
+    try:
+        payload, status_code = build_research_blocker_analytics(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build strategy blocker analytics: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6362,6 +6371,79 @@ def activity_lab_summary(rows: list[dict]) -> dict:
         "fastestViable": fastest_viable,
         "recommendation": recommendation,
     }
+
+
+def build_research_blocker_analytics(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    limit_raw = args.get("limit", "auto")
+    recent_limit = max(1, min(int(safe_float(args.get("recentLimit", args.get("recent_limit", 50)), 50)), 200))
+    include_recent = str(args.get("includeRecentCandles", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    command = package_node_script_args("research:blocker-analytics")
+    command.extend([
+        "--symbol", symbol,
+        "--timeframe", timeframe,
+        "--strategy", strategy,
+        "--period", period,
+        "--limit", str(limit_raw),
+        "--includeRecentCandles", "true" if include_recent else "false",
+        "--recentLimit", str(recent_limit),
+    ])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 240), 240)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Strategy blocker analytics timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "limit": limit_raw, "includeRecentCandles": include_recent, "recentLimit": recent_limit},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Strategy blocker analytics timed out before returning diagnostics."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Strategy blocker analytics returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Strategy blocker analytics returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Strategy blocker analytics command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "realTradingEnabled": real_enabled,
+        "paperEnabled": paper_enabled,
+        "candidate": payload.get("candidate") or candidate_summary(candidate),
+        "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "limit": limit_raw, "includeRecentCandles": include_recent, "recentLimit": recent_limit},
+        "activeMarket": payload.get("activeMarket") or {},
+        "summary": payload.get("summary") or {},
+        "blockers": payload.get("blockers") or [],
+        "nearMisses": payload.get("nearMisses") or [],
+        "recentCandles": payload.get("recentCandles") or [],
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
 
 
 def build_research_parameter_robustness(args) -> tuple[dict, int]:

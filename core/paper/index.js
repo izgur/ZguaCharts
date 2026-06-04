@@ -322,6 +322,253 @@ function activeSignalDiagnostics(options) {
   });
 }
 
+const CANONICAL_BLOCKERS = [
+  "emaTrendFailed",
+  "pullbackReclaimFailed",
+  "rsiBlocked",
+  "regimeBlocked",
+  "cooldownBlocked",
+  "volumeBlocked",
+  "atrBlocked",
+  "noSetup",
+  "positionBlocked",
+  "unknown"
+];
+
+function blockerAnalytics(options) {
+  options = options || {};
+  const configPath = resolveConfigPath(options.configPath);
+  const config = loadConfig(configPath);
+  const statePath = options.statePath || DEFAULT_STATE_PATH;
+  const state = loadState(statePath, config);
+  const active = normalizeMarkets(config).find((market) => market.mode !== "watch") || {};
+  const symbol = options.symbol || active.symbol || "ETHUSDT";
+  const interval = options.timeframe || options.interval || active.interval || "1h";
+  const strategy = options.strategy || config.strategy || "SimpleAtrTrendV2";
+  const includeRecentCandles = options.includeRecentCandles !== false;
+  const recentLimit = Math.max(1, Math.min(Number(options.recentLimit || 50), 200));
+  const limit = options.limit && options.limit !== "auto" ? Number(options.limit) : autoCandleLimit(options.period || "365d", interval);
+  const market = Object.assign({}, active, { symbol, interval, mode: "active", limit });
+  const warnings = [];
+  if (active.symbol && (active.symbol !== symbol || active.interval !== interval)) {
+    warnings.push("Selected market differs from the active promoted paper market; this report is read-only research only.");
+  }
+  if (strategy !== config.strategy) {
+    warnings.push("Selected strategy differs from the active promoted paper strategy; this report is read-only research only.");
+  }
+  return Promise.all([
+    fetchMarketCandles(config, market, { forceRefresh: options.refresh === true }),
+    data.fetchCandles({
+      source: config.source || "bybit",
+      symbol: "BTCUSDT",
+      interval: "4h",
+      limit: 3000,
+      forceRefresh: options.refresh === true
+    })
+  ]).then(([payload, regimeCandles]) => {
+    let candles = payload.candles || [];
+    if (candles.length) candles = candles.slice(0, -1);
+    const freshness = freshnessForMarket(market, candles, payload.metadata);
+    if (!candles.length) warnings.push("No closed candles were available for blocker analytics.");
+    if (freshness.isStale) warnings.push("Selected market candle data is stale; blocker analytics may not reflect the latest closed candle.");
+    const params = Object.assign({}, config.params || {}, {
+      regimeMode: canonicalRegimeMode(config),
+      fillModel: config.fillModel || "next-open",
+      makerFeePct: Number(config.makerFeePct || 0),
+      takerFeePct: Number(config.takerFeePct || 0),
+      slippageBps: Number(config.slippageBps || 0),
+      accountEquity: Number(config.accountEquity || 10000),
+      riskPct: Number(config.riskPct || 0.005),
+      maxOpenTrades: Number(config.maxOpenTrades || 1),
+      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000)
+    });
+    const result = backtest.runBacktestOnCandles({
+      symbol,
+      interval,
+      strategy,
+      candles,
+      regimeCandles,
+      params
+    });
+    const diagnostics = result.diagnostics || {};
+    const rawCounts = diagnostics.blockerCounts || {};
+    const candlesAnalyzed = Number(diagnostics.candlesEvaluated || candles.length || 0);
+    const frame = buildDiagnosticFrame(candles, regimeCandles, result.params || params);
+    const trades = result.tradeList || [];
+    const firstPreview = diagnostics.firstSignalsPreview || [];
+    const lastPreview = diagnostics.lastSignalsPreview || [];
+    const previewByTime = {};
+    firstPreview.concat(lastPreview).forEach((item) => { previewByTime[Number(item.time)] = item; });
+    const recentFrame = frame.slice(-recentLimit);
+    const recentRows = includeRecentCandles
+      ? recentFrame.map((row) => blockerAnalyticsCandle(row, previewByTime[Number(row.time)], result.params || params, trades))
+      : [];
+    const recentBlockerCounts = {};
+    recentRows.forEach((row) => {
+      (row.blockers || []).forEach((blocker) => {
+        recentBlockerCounts[blocker] = (recentBlockerCounts[blocker] || 0) + 1;
+      });
+    });
+    const nearMisses = buildNearMisses(diagnostics.nearMissCandles || [], result.params || params);
+    const tradeCount = Number(result.trades || trades.length || 0);
+    const entrySignals = tradeCount;
+    const exitSignals = trades.filter((trade) => trade.exitReason && trade.exitReason !== "End of data").length || tradeCount;
+    const signalCandles = entrySignals + exitSignals;
+    const holdCandles = Math.max(0, candlesAnalyzed - signalCandles);
+    const blockers = canonicalBlockerRows(rawCounts, recentBlockerCounts, candlesAnalyzed, holdCandles);
+    const days = candles.length > 1 ? Math.max(1, (candles[candles.length - 1].time - candles[0].time) / 86400) : 365;
+    const mainBlockerRow = blockers.slice().sort((a, b) => b.count - a.count)[0] || null;
+    const summary = {
+      candlesAnalyzed,
+      holdCandles,
+      signalCandles,
+      entrySignals,
+      exitSignals,
+      tradeCount,
+      signalRatePct: round(candlesAnalyzed ? signalCandles / candlesAnalyzed * 100 : 0, 4),
+      approximateSignalsPerMonth: round(signalCandles / days * 30, 2),
+      mainBlocker: mainBlockerRow && mainBlockerRow.count ? mainBlockerRow.name : (diagnostics.primaryBlocker || "unknown"),
+      recommendation: blockerAnalyticsRecommendation(mainBlockerRow, signalCandles, tradeCount, days, freshness)
+    };
+    return {
+      ok: true,
+      realTradingEnabled: false,
+      paperEnabled: !!config.enabled,
+      candidate: Object.assign(configSummary(config), {
+        activeSymbols: normalizeMarkets(config).filter((item) => item.mode !== "watch"),
+        watchSymbols: normalizeMarkets(config).filter((item) => item.mode === "watch")
+      }),
+      search: {
+        symbol,
+        timeframe: interval,
+        strategy,
+        period: options.period || "365d",
+        limit: options.limit || "auto",
+        includeRecentCandles,
+        recentLimit,
+        source: config.source || "bybit"
+      },
+      activeMarket: {
+        symbol,
+        timeframe: interval,
+        marketKey: marketKey(market),
+        freshness
+      },
+      summary,
+      blockers,
+      nearMisses,
+      recentCandles: recentRows,
+      warnings
+    };
+  });
+}
+
+function canonicalBlockerName(raw) {
+  const name = String(raw || "").trim();
+  if (CANONICAL_BLOCKERS.indexOf(name) >= 0) return name;
+  if (name === "regimeNotBullish" || name === "regimeNotBearish" || name === "neutralRegime") return "regimeBlocked";
+  if (name === "volumeTooLow") return "volumeBlocked";
+  if (name === "atrMissing" || name === "stopTooClose") return "atrBlocked";
+  if (name === "maxOpenTradesReached" || name === "alreadyInPosition") return "positionBlocked";
+  if (name === "donchianBreakoutFailed" || name === "retestFailed" || name === "squeezeFailed" || name === "rangeBreakoutFailed" || name === "meanReversionFailed" || name === "momentumStrengthFailed" || name === "relativeStrengthFailed" || name === "adxTooLow" || name === "adxNotRising") return "noSetup";
+  return "unknown";
+}
+
+function canonicalBlockerRows(rawCounts, recentCounts, candlesAnalyzed, holdCandles) {
+  const counts = {};
+  CANONICAL_BLOCKERS.forEach((name) => { counts[name] = 0; });
+  Object.keys(rawCounts || {}).forEach((raw) => {
+    const canonical = canonicalBlockerName(raw);
+    counts[canonical] = (counts[canonical] || 0) + Number(rawCounts[raw] || 0);
+  });
+  return CANONICAL_BLOCKERS.map((name) => {
+    const count = Number(counts[name] || 0);
+    const pctOfCandles = candlesAnalyzed ? Math.min(100, count / candlesAnalyzed * 100) : 0;
+    const pctOfHoldCandles = holdCandles ? Math.min(100, count / holdCandles * 100) : 0;
+    return {
+      name,
+      count,
+      pctOfCandles: round(pctOfCandles, 4),
+      pctOfHoldCandles: round(pctOfHoldCandles, 4),
+      recentCount: Number(recentCounts[name] || 0),
+      severity: pctOfCandles >= 30 || pctOfHoldCandles >= 60 ? "HIGH" : pctOfCandles >= 10 || pctOfHoldCandles >= 25 ? "MEDIUM" : "LOW",
+      detail: blockerDetail(name)
+    };
+  }).sort((a, b) => b.count - a.count || CANONICAL_BLOCKERS.indexOf(a.name) - CANONICAL_BLOCKERS.indexOf(b.name));
+}
+
+function blockerDetail(name) {
+  const details = {
+    emaTrendFailed: "EMA trend alignment blocked an entry.",
+    pullbackReclaimFailed: "Pullback/reclaim gate did not complete.",
+    rsiBlocked: "RSI filter blocked the setup.",
+    regimeBlocked: "Regime filter blocked the setup.",
+    cooldownBlocked: "Cooldown prevented a fresh entry.",
+    volumeBlocked: "Volume filter blocked the setup.",
+    atrBlocked: "ATR/stop-distance requirements blocked the setup.",
+    noSetup: "No qualifying setup pattern was present.",
+    positionBlocked: "Position or max-open-trade state blocked a new entry.",
+    unknown: "Unmapped strategy diagnostic blocker."
+  };
+  return details[name] || details.unknown;
+}
+
+function blockerAnalyticsCandle(row, preview, params, trades) {
+  const candle = diagnosticCandle(row, preview, params, trades);
+  const blockers = uniqueList((preview && preview.blockedBy || []).map(canonicalBlockerName));
+  const checks = checksForSimpleAtrTrendV2(row, params, {}, {}, preview);
+  return {
+    time: candle.time,
+    close: candle.close,
+    signal: candle.signal,
+    reason: candle.reason,
+    blockers,
+    passedChecks: checks.filter((check) => check.pass === true).map((check) => check.name)
+  };
+}
+
+function buildNearMisses(items, params) {
+  return (items || []).slice(-20).map((item) => {
+    const failed = uniqueList((item.blockedBy || []).map(canonicalBlockerName));
+    return {
+      time: new Date(Number(item.time) * 1000).toISOString(),
+      close: item.close,
+      failedBlockers: failed,
+      passedChecks: CANONICAL_BLOCKERS.filter((name) => failed.indexOf(name) < 0),
+      nearMissScore: Math.max(0, round((CANONICAL_BLOCKERS.length - failed.length) / CANONICAL_BLOCKERS.length * 100, 2)),
+      detail: failed.length ? "Near miss blocked by " + failed.join(", ") + "." : "Near miss with no mapped blockers.",
+      regimeMode: params.regimeMode
+    };
+  });
+}
+
+function blockerAnalyticsRecommendation(mainBlocker, signalCandles, tradeCount, days, freshness) {
+  if (freshness && freshness.isStale) {
+    return { action: "REFRESH_MARKET_DATA", reason: "Market data is stale; refresh before reading recent blocker behavior." };
+  }
+  if (!tradeCount) {
+    return { action: "REVIEW_BLOCKERS", reason: "No historical trades were produced by this read-only blocker run. Inspect the dominant blocker before considering any candidate change." };
+  }
+  const tradesPerMonth = tradeCount / Math.max(1, days) * 30;
+  if (tradesPerMonth < 3) {
+    return { action: "EXPECT_SLOW_FORWARD_TEST", reason: "The strategy trades infrequently in this market/timeframe, so 1h paper observation may need more time." };
+  }
+  if (mainBlocker && mainBlocker.severity === "HIGH") {
+    return { action: "MONITOR_DOMINANT_BLOCKER", reason: mainBlocker.name + " is the dominant historical blocker. This is diagnostic only; no strategy rule changed." };
+  }
+  if (signalCandles > 0) {
+    return { action: "CONTINUE_OBSERVING", reason: "Historical diagnostics produced signals. Continue paper observation without enabling real trading." };
+  }
+  return { action: "OBSERVE_MORE", reason: "Blocker analytics is diagnostic only and does not recommend promotion or real trading." };
+}
+
+function autoCandleLimit(period, interval) {
+  const days = Number(String(period || "365d").replace(/d$/i, "")) || 365;
+  const seconds = data.intervalToMs(interval || "1h") / 1000;
+  const candles = Math.ceil(days * 86400 / Math.max(60, seconds)) + 300;
+  return Math.max(600, Math.min(candles, 50000));
+}
+
 function buildDiagnosticFrame(candles, regimeCandles, params) {
   const normalized = data.normalizeCandles(candles || []);
   const mapped = regime.mapRegimeToCandles(normalized, data.normalizeCandles(regimeCandles || []));
@@ -967,6 +1214,7 @@ module.exports = {
   initializePaper,
   refreshPaperCandles,
   activeSignalDiagnostics,
+  blockerAnalytics,
   setPaperEnabled,
   getPaperStatus,
   rebuildStateFromJournal,
