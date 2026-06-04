@@ -2712,6 +2712,7 @@ function setupLearningControls() {
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
+  document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3741,6 +3742,68 @@ function renderResearchParameterRobustness(payload) {
     <table class="trade-table">
       <thead><tr><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Expectancy</th><th>Score</th><th>Reason</th><th>Changed Params</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="10">No robustness variants returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchStrategyVariantLab() {
+  const host = document.querySelector("#research-strategy-variant-lab-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading strategy variant lab...</p>`;
+    const payload = await apiGet("/api/research/strategy-variant-lab");
+    host.innerHTML = renderResearchStrategyVariantLab(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Strategy variant lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchStrategyVariantLab(payload) {
+  const search = payload.search || {};
+  const base = payload.baseCandidate || {};
+  const active = (base.activeSymbols || [])[0] || {};
+  const summary = payload.summary || {};
+  const recommendation = summary.recommendation || {};
+  const baseline = summary.baseline || {};
+  const bestTradeoff = summary.bestTradeoff || {};
+  const mostActive = summary.mostActivePassing || {};
+  const rows = (payload.rows || []).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" || row.status === "SKIPPED" ? "neutral" : "negative";
+    const blockers = (row.blockerSummary || []).map((item) => `${item.name}:${item.count}`).join(", ");
+    return `
+      <tr>
+        <td>${escapeHtml(row.variantName || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.experimental ? "yes" : "no"}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.expectancyPctPerTrade)}%</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+        <td>${escapeHtml(blockers || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Strategy Variant Lab <span class="neutral">${escapeHtml(recommendation.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Active:</strong> ${escapeHtml(base.strategy || search.baseStrategy || "-")} ${escapeHtml(active.symbol || search.symbol || "-")} ${escapeHtml(active.interval || search.timeframe || "")}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Variants</span><strong>${payload.rows?.length || 0}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${baseline.variantName ? `${baseline.trades ?? 0} trades PF ${formatNumber(baseline.profitFactor)}` : "-"}</strong></div>
+      <div class="metric"><span>Best tradeoff</span><strong>${bestTradeoff.variantName ? `${escapeHtml(bestTradeoff.variantName)} PF ${formatNumber(bestTradeoff.profitFactor)}` : "-"}</strong></div>
+      <div class="metric"><span>Most active pass</span><strong>${mostActive.variantName ? `${escapeHtml(mostActive.variantName)} ${formatNumber(mostActive.tradesPerMonth)}/mo` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Variant</th><th>Status</th><th>Experimental</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Expectancy</th><th>Score</th><th>Reason</th><th>Top Blockers</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="12">No strategy variant rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
