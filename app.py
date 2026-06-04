@@ -1291,6 +1291,15 @@ def research_regime_breakdown():
         return jsonify({"error": f"Could not build regime breakdown lab: {exc}"}), 502
 
 
+@app.get("/api/research/timeframe-preset-search")
+def research_timeframe_preset_search():
+    try:
+        payload, status_code = build_research_timeframe_preset_search(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build timeframe preset search lab: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6867,6 +6876,81 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
         "summary": payload.get("summary") or {},
         "regimes": payload.get("regimes") or [],
         "tradeSamples": payload.get("tradeSamples") or [],
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def build_research_timeframe_preset_search(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframes = args.get("timeframes", "15m,1h,4h")
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    presets = args.get("presets", "default")
+    max_rows = max(1, min(int(safe_float(args.get("maxRows", args.get("max_rows", 100)), 100)), 100))
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    command = package_node_script_args("research:timeframe-preset-search")
+    command.extend([
+        "--symbol", symbol,
+        "--timeframes", str(timeframes),
+        "--strategy", strategy,
+        "--period", period,
+        "--presets", presets,
+        "--maxRows", str(max_rows),
+        "--baseParams", json.dumps(params),
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 360), 360)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Timeframe preset search lab timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activeCandidate": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Timeframe preset search lab timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Timeframe preset search lab returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Timeframe preset search lab returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Timeframe preset search lab command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activeCandidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"symbol": symbol, "timeframes": timeframes, "strategy": strategy, "period": period, "presets": presets, "maxRows": max_rows},
+        "rows": payload.get("rows") or [],
+        "summary": payload.get("summary") or {},
         "warnings": warnings,
         "command": " ".join(command),
     }

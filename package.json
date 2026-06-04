@@ -22,6 +22,7 @@
     "research:fee-slippage-stress": "node cli/research_fee_slippage_stress.js",
     "research:walk-forward-review": "node cli/research_walk_forward_review.js",
     "research:regime-breakdown": "node cli/research_regime_breakdown.js",
+    "research:timeframe-preset-search": "node cli/research_timeframe_preset_search.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",
     "optimize:v2": "node cli/optimize_v2.js",

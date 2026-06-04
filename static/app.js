@@ -2715,6 +2715,7 @@ function setupLearningControls() {
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
+  document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -3944,6 +3945,72 @@ function renderResearchRegimeBreakdown(payload) {
     <table class="trade-table">
       <thead><tr><th>Regime</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>Win</th><th>DD</th><th>Bars</th><th>Contribution</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="10">No regime rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchTimeframePresetSearch() {
+  const host = document.querySelector("#research-timeframe-preset-search-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading timeframe preset search...</p>`;
+    const payload = await apiGet("/api/research/timeframe-preset-search");
+    host.innerHTML = renderResearchTimeframePresetSearch(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Timeframe preset search could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function presetSummaryText(row) {
+  if (!row) return "-";
+  return `${escapeHtml(row.timeframe || "-")} ${escapeHtml(row.presetFamily || "-")} PF ${formatNumber(row.profitFactor)} Ret ${formatSigned(row.totalReturnPct || 0)}%`;
+}
+
+function renderResearchTimeframePresetSearch(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const rec = summary.recommendation || {};
+  const rows = (payload.rows || []).slice(0, 30).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    const horizon = row.timeHorizon || {};
+    return `
+      <tr>
+        <td>${escapeHtml(row.presetFamily || "-")}</td>
+        <td>${escapeHtml(row.presetName || "-")}</td>
+        <td>${escapeHtml(row.timeframe || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(horizon.emaTrendHours)}h</td>
+        <td>${formatNumber(horizon.cooldownHours)}h</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Timeframe Preset Search Lab <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Symbol</span><strong>${escapeHtml(search.symbol || "-")}</strong></div>
+      <div class="metric"><span>Timeframes</span><strong>${escapeHtml((search.timeframes || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${presetSummaryText(summary.baseline)}</strong></div>
+      <div class="metric"><span>Best 15m</span><strong>${presetSummaryText(summary.best15m)}</strong></div>
+      <div class="metric"><span>Best 1h</span><strong>${presetSummaryText(summary.best1h)}</strong></div>
+      <div class="metric"><span>Best 4h</span><strong>${presetSummaryText(summary.best4h)}</strong></div>
+      <div class="metric"><span>Best normalized</span><strong>${presetSummaryText(summary.bestTimeNormalized)}</strong></div>
+      <div class="metric"><span>Rows</span><strong>${payload.rows?.length || 0}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Family</th><th>Preset</th><th>TF</th><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Trend hrs</th><th>Cooldown hrs</th><th>Score</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="13">No preset rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
