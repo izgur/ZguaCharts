@@ -19,6 +19,7 @@
     "research:parameter-robustness": "node cli/research_parameter_robustness.js",
     "research:blocker-analytics": "node cli/research_blocker_analytics.js",
     "research:strategy-variant-lab": "node cli/research_strategy_variant_lab.js",
+    "research:fee-slippage-stress": "node cli/research_fee_slippage_stress.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",
     "optimize:v2": "node cli/optimize_v2.js",

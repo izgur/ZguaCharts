@@ -2712,6 +2712,7 @@ function setupLearningControls() {
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
+  document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -3741,6 +3742,67 @@ function renderResearchCandidateLeaderboard(payload) {
     <table class="trade-table">
       <thead><tr><th>Rank</th><th>Strategy</th><th>Market</th><th>Status</th><th>Active</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="12">No leaderboard rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchFeeSlippageStress() {
+  const host = document.querySelector("#research-fee-slippage-stress-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading fee/slippage stress lab...</p>`;
+    const payload = await apiGet("/api/research/fee-slippage-stress");
+    host.innerHTML = renderResearchFeeSlippageStress(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Fee/slippage stress lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchFeeSlippageStress(payload) {
+  const search = payload.search || {};
+  const stress = payload.stress || {};
+  const rec = stress.recommendation || {};
+  const base = (payload.rows || []).find((row) => row.scenario === "baseline") || {};
+  const worst = stress.worstPassingScenario || {};
+  const firstFail = stress.firstFailureScenario || {};
+  const tone = stress.status === "RESILIENT" ? "positive" : stress.status === "FAIL" || stress.status === "FRAGILE" ? "negative" : "neutral";
+  const rows = (payload.rows || []).map((row) => {
+    const rowTone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    const degrade = row.degradationVsBaseline || {};
+    return `
+      <tr>
+        <td>${escapeHtml(row.scenario || "-")}</td>
+        <td class="${rowTone}">${escapeHtml(row.status || "-")}</td>
+        <td>${formatNumber(row.takerFeePct)}%</td>
+        <td>${formatNumber(row.slippageBps)}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatSigned(degrade.returnDiffPct || 0)}%</td>
+        <td>${formatSigned(degrade.profitFactorDiff || 0)}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Fee/Slippage Stress Lab <span class="${tone}">${escapeHtml(stress.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${base.status ? `${escapeHtml(base.status)} PF ${formatNumber(base.profitFactor)}` : "-"}</strong></div>
+      <div class="metric"><span>Worst pass</span><strong>${worst.scenario ? `${escapeHtml(worst.scenario)} PF ${formatNumber(worst.profitFactor)}` : "-"}</strong></div>
+      <div class="metric"><span>First failure</span><strong>${firstFail.scenario ? `${escapeHtml(firstFail.scenario)} ${escapeHtml(firstFail.mainFailureReason || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Survived</span><strong>${(stress.survivingScenarios || []).length}</strong></div>
+      <div class="metric"><span>Failed</span><strong>${(stress.failedScenarios || []).length}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Scenario</th><th>Status</th><th>Taker fee</th><th>Slip bps</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Return diff</th><th>PF diff</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="11">No fee/slippage stress rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
