@@ -2714,6 +2714,7 @@ function setupLearningControls() {
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
+  document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -3883,6 +3884,66 @@ function renderResearchWalkForwardReview(payload) {
     <table class="trade-table">
       <thead><tr><th>Fold</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Start</th><th>End</th><th>Reason</th></tr></thead>
       <tbody>${foldRows || `<tr><td colspan="9">No folds returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchRegimeBreakdown() {
+  const host = document.querySelector("#research-regime-breakdown-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading regime breakdown lab...</p>`;
+    const payload = await apiGet("/api/research/regime-breakdown");
+    host.innerHTML = renderResearchRegimeBreakdown(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Regime breakdown lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchRegimeBreakdown(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const rec = summary.recommendation || {};
+  const full = payload.full || {};
+  const best = summary.bestRegime || {};
+  const worst = summary.worstRegime || {};
+  const active = summary.highestTradeCountRegime || {};
+  const tone = summary.regimeDependencyStatus === "LOW" ? "positive" : summary.regimeDependencyStatus === "HIGH" ? "negative" : "neutral";
+  const rows = (payload.regimes || []).map((row) => {
+    const rowTone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${escapeHtml(row.regime || "-")}</td>
+        <td class="${rowTone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.winRate)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.avgBarsHeld)}</td>
+        <td>${formatSigned(row.contributionPct || 0)}%</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Regime Breakdown Lab <span class="${tone}">${escapeHtml(summary.regimeDependencyStatus || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Basis</span><strong>${escapeHtml(search.regimeBasis || "-")}</strong></div>
+      <div class="metric"><span>Full</span><strong>${full.trades ?? 0} trades PF ${formatNumber(full.profitFactor)}</strong></div>
+      <div class="metric"><span>Best regime</span><strong>${best.regime ? `${escapeHtml(best.regime)} ${formatSigned(best.totalReturnPct || 0)}%` : "-"}</strong></div>
+      <div class="metric"><span>Worst regime</span><strong>${worst.regime ? `${escapeHtml(worst.regime)} ${formatSigned(worst.totalReturnPct || 0)}%` : "-"}</strong></div>
+      <div class="metric"><span>Most trades</span><strong>${active.regime ? `${escapeHtml(active.regime)} ${active.trades || 0}` : "-"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Regime</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>Win</th><th>DD</th><th>Bars</th><th>Contribution</th><th>Reason</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="10">No regime rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
