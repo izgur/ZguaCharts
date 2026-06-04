@@ -1219,6 +1219,15 @@ def research_activity_lab():
         return jsonify({"error": f"Could not build research activity lab: {exc}"}), 502
 
 
+@app.get("/api/research/parameter-robustness")
+def research_parameter_robustness():
+    try:
+        payload, status_code = build_research_parameter_robustness(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build parameter robustness lab: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -6353,6 +6362,85 @@ def activity_lab_summary(rows: list[dict]) -> dict:
         "fastestViable": fastest_viable,
         "recommendation": recommendation,
     }
+
+
+def build_research_parameter_robustness(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    mode = args.get("mode", "local-grid")
+    max_variants = max(1, min(int(safe_float(args.get("maxVariants", args.get("max_variants", 100)), 100)), 250))
+    include_base = str(args.get("includeBase", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    fee_pct = safe_float(args.get("feePct", args.get("fee_pct", candidate.get("takerFeePct", 0.055))), 0.055)
+    slippage_pct = safe_float(args.get("slippagePct", args.get("slippage_pct", safe_float(candidate.get("slippageBps", 2), 2) / 100)), 0.02)
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    command = package_node_script_args("research:parameter-robustness")
+    command.extend([
+        "--symbol", symbol,
+        "--timeframe", timeframe,
+        "--strategy", strategy,
+        "--period", period,
+        "--mode", mode,
+        "--maxVariants", str(max_variants),
+        "--includeBase", "true" if include_base else "false",
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+        "--baseParams", json.dumps(params),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 240), 240)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Parameter robustness lab timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "baseCandidate": candidate_summary(candidate),
+            "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "mode": mode, "maxVariants": max_variants, "includeBase": include_base},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Parameter robustness lab timed out before returning variants."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Parameter robustness lab returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Parameter robustness lab returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Parameter robustness lab command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "realTradingEnabled": real_enabled,
+        "paperEnabled": paper_enabled,
+        "baseCandidate": candidate_summary(candidate),
+        "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "mode": mode, "maxVariants": max_variants, "includeBase": include_base},
+        "baseResult": payload.get("baseResult"),
+        "robustness": payload.get("robustness") or {},
+        "variants": payload.get("variants") or [],
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
 
 
 def compare_candidate_market_row(candidate: dict, symbol: str, timeframe: str, strategy: str, period: str, rules: dict, params: dict, fee_pct: float, slippage_pct: float, active_symbol: str | None, active_timeframe: str | None) -> dict:

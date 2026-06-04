@@ -2710,6 +2710,7 @@ function setupLearningControls() {
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
+  document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#paper-control-refresh")?.addEventListener("click", loadPaperSimulationControl);
   document.querySelector("#paper-enable-preview")?.addEventListener("click", previewPaperEnable);
   document.querySelector("#paper-enable-run")?.addEventListener("click", enablePaperSimulation);
@@ -3588,6 +3589,76 @@ function renderResearchActivityLab(payload) {
     <table class="trade-table">
       <thead><tr><th>Strategy</th><th>Market</th><th>Mode</th><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Expectancy</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="11">No activity lab rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchParameterRobustness() {
+  const host = document.querySelector("#research-parameter-robustness-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading parameter robustness lab...</p>`;
+    const payload = await apiGet("/api/research/parameter-robustness");
+    host.innerHTML = renderResearchParameterRobustness(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Parameter robustness lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderChangedParams(params) {
+  const keys = Object.keys(params || {});
+  if (!keys.length) return "base";
+  return keys.map((key) => `${key}=${params[key]}`).join(", ");
+}
+
+function renderResearchParameterRobustness(payload) {
+  const search = payload.search || {};
+  const base = payload.baseResult || {};
+  const robust = payload.robustness || {};
+  const recommendation = robust.recommendation || {};
+  const best = robust.bestVariant || {};
+  const worst = robust.worstVariant || {};
+  const tone = robust.status === "ROBUST" ? "positive" : robust.status === "FAIL" || robust.status === "FRAGILE" ? "negative" : "neutral";
+  const rows = (payload.variants || []).slice(0, 30).map((row) => {
+    const rowTone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td class="${rowTone}">${escapeHtml(row.status || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.expectancyPctPerTrade)}%</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${escapeHtml(row.mainFailureReason || "-")}</td>
+        <td>${escapeHtml(renderChangedParams(row.changedParams || {}))}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Parameter Robustness Lab <span class="${tone}">${escapeHtml(robust.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(recommendation.action || "-")}</strong> ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Strategy</span><strong>${escapeHtml(search.strategy || "-")}</strong></div>
+      <div class="metric"><span>Variants</span><strong>${robust.testedVariants ?? 0}</strong></div>
+      <div class="metric"><span>Pass rate</span><strong>${formatNumber((robust.passRate || 0) * 100)}%</strong></div>
+      <div class="metric"><span>Median PF</span><strong>${formatNumber(robust.medianProfitFactor)}</strong></div>
+      <div class="metric"><span>Median return</span><strong>${formatSigned(robust.medianReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Median DD</span><strong>${formatNumber(robust.medianMaxDrawdownPct)}%</strong></div>
+      <div class="metric"><span>Median trades</span><strong>${formatNumber(robust.medianTrades)}</strong></div>
+      <div class="metric"><span>Base</span><strong>${escapeHtml(base.status || "-")} PF ${formatNumber(base.profitFactor)}</strong></div>
+      <div class="metric"><span>Best</span><strong>${escapeHtml(best.status || "-")} PF ${formatNumber(best.profitFactor)}</strong></div>
+      <div class="metric"><span>Worst</span><strong>${escapeHtml(worst.status || "-")} PF ${formatNumber(worst.profitFactor)}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Status</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Expectancy</th><th>Score</th><th>Reason</th><th>Changed Params</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="10">No robustness variants returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
