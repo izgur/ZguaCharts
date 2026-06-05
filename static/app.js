@@ -149,6 +149,9 @@ async function boot() {
   }
 
   setupNavigation();
+  organizeWorkflowPages();
+  setupWorkflowTabs();
+  setupDashboardControls();
   setupSidebar();
   backtestClose.addEventListener("click", closeBacktestModal);
   backtestHistoryButton?.addEventListener("click", openBacktestHistory);
@@ -228,9 +231,12 @@ function setupNavigation() {
 }
 
 function pathToPage(pathname) {
+  if (pathname === "/" || pathname === "/dashboard") return "dashboard";
   if (pathname === "/backtest") return "backtest";
-  if (pathname === "/analysis") return "analysis";
-  if (pathname === "/learning") return "learning";
+  if (pathname === "/analysis" || pathname === "/research") return "research";
+  if (pathname === "/candidate") return "candidate";
+  if (pathname === "/paper") return "paper";
+  if (pathname === "/learning") return "research";
   if (pathname === "/ops") return "ops";
   if (pathname === "/settings") return "settings";
   return "charts";
@@ -243,12 +249,329 @@ function showPage(page) {
   navLinks.forEach((link) => {
     link.classList.toggle("active", link.dataset.route === page);
   });
+  if (page === "dashboard") renderDashboardPage();
   if (page === "charts") initChartsPage();
   if (page === "backtest") initBacktestPage();
   if (page === "analysis") renderAnalysisPage();
+  if (page === "research" || page === "candidate" || page === "paper") renderWorkflowPage(page);
   if (page === "learning") renderLearningPage();
   if (page === "ops") renderOpsPage();
   if (page === "settings") renderSettingsPage();
+}
+
+function setupDashboardControls() {
+  document.querySelector("#dashboard-refresh")?.addEventListener("click", () => loadWorkflowDashboard(true));
+}
+
+function setupWorkflowTabs() {
+  document.querySelectorAll("[data-workflow-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.workflowTab;
+      const group = button.closest(".workflow-page");
+      if (!target || !group) return;
+      group.querySelectorAll("[data-workflow-tab]").forEach((item) => item.classList.toggle("active", item === button));
+      group.querySelectorAll(".workflow-tab-panel").forEach((panel) => {
+        panel.hidden = panel.id !== target;
+      });
+    });
+  });
+}
+
+function panelBlockFor(panelId) {
+  const panel = document.querySelector(`#${panelId}`);
+  if (!panel) return null;
+  const heading = panel.previousElementSibling?.classList?.contains("page-heading") ? panel.previousElementSibling : null;
+  const card = document.createElement("section");
+  card.className = "status-card workflow-panel-card";
+  if (heading) {
+    heading.classList.add("status-card-header");
+    card.appendChild(heading);
+  }
+  card.appendChild(panel);
+  return card;
+}
+
+function moveWorkflowPanel(panelId, targetId) {
+  const target = document.querySelector(`#${targetId}`);
+  const card = panelBlockFor(panelId);
+  if (target && card) target.appendChild(card);
+}
+
+function organizeWorkflowPages() {
+  const moves = [
+    ["research-candidate-leaderboard-panel", "research-overview"],
+    ["research-snapshot-export-panel", "research-overview"],
+    ["paper-candidate-comparison-panel", "research-search"],
+    ["paper-fast-discovery-panel", "research-search"],
+    ["research-multi-strategy-matrix-panel", "research-search"],
+    ["research-multi-strategy-optimizer-batch-panel", "research-search"],
+    ["research-timeframe-preset-search-panel", "research-search"],
+    ["research-parameter-robustness-panel", "research-validation"],
+    ["research-fee-slippage-stress-panel", "research-validation"],
+    ["research-walk-forward-review-panel", "research-validation"],
+    ["research-regime-breakdown-panel", "research-validation"],
+    ["research-optimizer-reproducibility-audit-panel", "research-validation"],
+    ["research-reproducible-candidate-drilldown-panel", "research-validation"],
+    ["research-blocker-analytics-panel", "research-diagnostics"],
+    ["paper-signal-diagnostics-panel", "research-diagnostics"],
+    ["research-strategy-variant-lab-panel", "research-diagnostics"],
+    ["research-candidate-deep-compare-panel", "research-diagnostics"],
+    ["research-lead-review-panel", "research-diagnostics"],
+    ["candidate-review-panel", "candidate-workflow-panels"],
+    ["research-candidate-review-report-panel", "candidate-workflow-panels"],
+    ["candidate-stability-panel", "candidate-workflow-panels"],
+    ["research-activity-lab-panel", "candidate-workflow-panels"],
+    ["paper-control-panel", "paper-workflow-panels"],
+    ["paper-readiness-panel", "paper-workflow-panels"],
+    ["paper-runtime-panel", "paper-workflow-panels"],
+    ["paper-tick-readiness-panel", "paper-workflow-panels"],
+    ["paper-active-observation-panel", "paper-workflow-panels"],
+    ["paper-session-panel", "paper-workflow-panels"],
+    ["paper-observation-report-panel", "paper-workflow-panels"],
+    ["paper-observation-counters-panel", "paper-workflow-panels"],
+    ["paper-observation-targets-panel", "paper-workflow-panels"],
+    ["paper-observation-panel", "paper-workflow-panels"],
+    ["paper-runner-instructions-panel", "paper-workflow-panels"],
+    ["paper-runner-summary-panel", "paper-workflow-panels"],
+    ["paper-run-quality-report-panel", "paper-workflow-panels"],
+    ["paper-session-events-panel", "paper-workflow-panels"],
+    ["paper-session-events-detail-panel", "paper-workflow-panels"],
+    ["paper-session-trades-panel", "paper-workflow-panels"],
+  ];
+  moves.forEach(([panelId, targetId]) => moveWorkflowPanel(panelId, targetId));
+  const exportTarget = document.querySelector("#research-export");
+  if (exportTarget) {
+    exportTarget.innerHTML = `
+      <section class="status-card">
+        <div class="status-card-header">
+          <div>
+            <h2>Research Snapshot Export</h2>
+            <p>Use the Overview tab to refresh or export the consolidated research snapshot.</p>
+          </div>
+          <span class="status-badge badge-raw">READ_ONLY</span>
+        </div>
+        <p class="muted-note">The export panel is shared with Research Overview so the same buttons and IDs keep working.</p>
+      </section>
+    `;
+  }
+}
+
+function ensureWorkflowControls() {
+  if (!learningInitialized) {
+    setupLearningControls();
+    learningInitialized = true;
+  }
+}
+
+function renderWorkflowPage(page) {
+  ensureWorkflowControls();
+  if (page === "candidate") loadCandidateWorkflowSummary();
+  if (page === "paper") loadPaperWorkflowSummary();
+  if (page === "research") loadResearchWorkflowSummary();
+}
+
+function statusBadgeClass(status) {
+  const value = String(status || "").toUpperCase();
+  if (["PASS", "READY", "GOOD", "OK", "HIGH"].includes(value)) return "badge-pass";
+  if (["WATCH", "TOO_EARLY", "MEDIUM", "RESEARCH_MORE", "READY_FOR_LONGER_PAPER"].includes(value)) return "badge-watch";
+  if (["FAIL", "BLOCKED", "DEGRADED", "INVALID", "LOW", "KEEP_BASELINE"].includes(value)) return "badge-fail";
+  if (["RUNNING", "PAPER_ENABLED", "ENABLED"].includes(value)) return "badge-running";
+  return "badge-raw";
+}
+
+function statusBadge(status) {
+  const label = status || "NOT_CHECKED";
+  return `<span class="status-badge ${statusBadgeClass(label)}">${escapeHtml(label)}</span>`;
+}
+
+function workflowCard(title, status, summary, metrics = [], action = "") {
+  const metricHtml = metrics.map((item) => `
+    <div class="metric-item"><span>${escapeHtml(item.label)}</span><strong>${escapeHtml(String(item.value ?? "-"))}</strong></div>
+  `).join("");
+  return `
+    <section class="status-card">
+      <div class="status-card-header">
+        <div>
+          <h2>${escapeHtml(title)}</h2>
+          <p>${escapeHtml(summary || "")}</p>
+        </div>
+        ${statusBadge(status)}
+      </div>
+      ${metricHtml ? `<div class="metric-strip">${metricHtml}</div>` : ""}
+      ${action ? `<div class="action-row">${action}</div>` : ""}
+    </section>
+  `;
+}
+
+async function safeDashboardGet(url) {
+  try {
+    return { ok: true, payload: await apiGet(url) };
+  } catch (error) {
+    return { ok: false, error: error.message, payload: null };
+  }
+}
+
+function primaryCandidateMarket(candidate) {
+  const active = (candidate?.activeSymbols || candidate?.activeMarkets || [])[0] || {};
+  return {
+    symbol: active.symbol || candidate?.symbol || "-",
+    timeframe: active.interval || active.timeframe || candidate?.timeframe || candidate?.interval || "-",
+  };
+}
+
+function dashboardNextAction(results) {
+  const paperStatus = results.paperStatus?.payload || {};
+  const quality = results.quality?.payload?.quality || {};
+  const review = results.review?.payload || {};
+  const report = results.observation?.payload || {};
+  if (paperStatus.realTradingEnabled) return { action: "Do not enable real trading", status: "BLOCKED", reason: "Real trading safety flag is not false." };
+  if (quality.status === "DEGRADED" || quality.status === "INVALID") return { action: "Investigate paper run quality", status: quality.status, reason: quality.recommendation?.reason || "Paper evidence reliability needs review." };
+  if (report.verdict?.status === "READY_FOR_REVIEW" || review.verdict?.action === "READY_FOR_LONGER_PAPER") return { action: "Review longer paper observation", status: "READY", reason: "Paper/research evidence is ready for review, not automatic action." };
+  if (review.verdict?.action === "RESEARCH_MORE") return { action: "Research more candidates", status: "WATCH", reason: review.verdict.reason || "No replacement is ready." };
+  if (paperStatus.paperEnabled) return { action: "Continue paper observation", status: "RUNNING", reason: "Paper is enabled in the selected runtime context." };
+  return { action: "Keep baseline", status: "DISABLED", reason: "Paper is disabled here and no replacement is eligible." };
+}
+
+async function renderDashboardPage() {
+  loadWorkflowDashboard(false);
+}
+
+async function loadWorkflowDashboard(force = false) {
+  const host = document.querySelector("#dashboard-status-cards");
+  if (!host) return;
+  if (force || !host.dataset.loaded) host.innerHTML = `<div class="status-card"><p class="pane-status">Loading dashboard workflow...</p></div>`;
+  const entries = await Promise.all([
+    safeDashboardGet("/api/candidate/current"),
+    safeDashboardGet("/api/paper/status"),
+    safeDashboardGet("/api/paper/runtime-status"),
+    safeDashboardGet("/api/paper/observation-report"),
+    safeDashboardGet("/api/paper/run-quality-report"),
+    safeDashboardGet("/api/research/candidate-review-report"),
+    safeDashboardGet("/api/paper/active-signal-diagnostics"),
+  ]);
+  const results = {
+    candidate: entries[0],
+    paperStatus: entries[1],
+    runtime: entries[2],
+    observation: entries[3],
+    quality: entries[4],
+    review: entries[5],
+    signal: entries[6],
+  };
+  const candidatePayload = results.candidate.payload || {};
+  const candidate = candidatePayload.candidate || candidatePayload.current || candidatePayload;
+  const market = primaryCandidateMarket(candidate);
+  const paperStatus = results.paperStatus.payload || {};
+  const runtime = results.runtime.payload || {};
+  const observation = results.observation.payload || {};
+  const quality = results.quality.payload || {};
+  const review = results.review.payload || {};
+  const signal = results.signal.payload || {};
+  const signalDiag = signal.diagnostics || signal;
+  const next = dashboardNextAction(results);
+  const failures = Object.entries(results).filter(([, result]) => !result.ok).map(([key, result]) => `${key}: ${result.error}`);
+  host.dataset.loaded = "true";
+  host.innerHTML = `
+    ${workflowCard("Current Candidate", review.verdict?.action || candidatePayload.status || "ACTIVE", `${candidate.strategy || "-"} ${market.symbol} ${market.timeframe}`, [
+      { label: "Strategy", value: candidate.strategy || "-" },
+      { label: "Market", value: `${market.symbol} ${market.timeframe}` },
+      { label: "Config warnings", value: (candidate.configWarnings || []).length || 0 },
+    ], `<a class="small-action-button" href="/candidate" data-route="candidate">Open Candidate</a>`)}
+    ${workflowCard("Paper Status", paperStatus.paperEnabled ? "PAPER_ENABLED" : "DISABLED", runtime.initialized ? "Runtime initialized for active market." : "Runtime may need review before paper actions.", [
+      { label: "Paper", value: paperStatus.paperEnabled ? "enabled" : "disabled" },
+      { label: "Initialized", value: runtime.initialized ? "yes" : "no" },
+      { label: "Last tick", value: runtime.lastTick?.updatedAt || "-" },
+    ], `<a class="small-action-button" href="/paper" data-route="paper">Open Paper</a>`)}
+    ${workflowCard("Real Trading Safety", paperStatus.realTradingEnabled ? "BLOCKED" : "DISABLED", paperStatus.realTradingEnabled ? "Real trading flag is not false." : "Real trading is disabled.", [
+      { label: "realTradingEnabled", value: String(Boolean(paperStatus.realTradingEnabled)) },
+      { label: "Paper clone", value: "separate" },
+    ])}
+    ${workflowCard("Latest Signal", signalDiag.signal || signalDiag.action || "HOLD", signalDiag.reason || signalDiag.primaryBlocker || "No actionable active-market signal returned.", [
+      { label: "Primary blocker", value: signalDiag.primaryBlocker || "-" },
+      { label: "Signal", value: signalDiag.signal || signalDiag.action || "HOLD" },
+    ])}
+    ${workflowCard("Research Decision", review.verdict?.action || review.recommendation?.action || "KEEP_BASELINE", review.verdict?.reason || review.recommendation?.reason || "No replacement candidate is currently promoted from research.", [
+      { label: "Winner", value: review.comparison?.winner || "-" },
+      { label: "Eligible", value: String(Boolean(review.replacementEligibility?.eligible)) },
+    ], `<a class="small-action-button" href="/research" data-route="research">Open Research</a>`)}
+    ${workflowCard("Paper Progress", quality.quality?.status || observation.verdict?.status || "NOT_CHECKED", quality.quality?.recommendation?.reason || observation.verdict?.summary || "Refresh paper quality after a run finishes.", [
+      { label: "Ticks", value: observation.evidence?.ticksObserved ?? observation.runnerTicksRun ?? "-" },
+      { label: "Signals", value: observation.evidence?.signalsObserved ?? "-" },
+      { label: "Closed", value: observation.evidence?.closedTrades ?? "-" },
+      { label: "Trust", value: quality.quality?.evidenceTrust || "-" },
+    ], `<a class="small-action-button" href="/paper" data-route="paper">Review Evidence</a>`)}
+    ${workflowCard("Next Action", next.status, next.action, [
+      { label: "Reason", value: next.reason },
+    ])}
+    ${failures.length ? workflowCard("Dashboard Fetch Notes", "WATCH", "Some dashboard cards could not refresh.", failures.slice(0, 4).map((failure, index) => ({ label: `Issue ${index + 1}`, value: failure }))) : ""}
+  `;
+}
+
+async function loadResearchWorkflowSummary() {
+  const host = document.querySelector("#research-next-action");
+  if (!host) return;
+  const review = await safeDashboardGet("/api/research/candidate-review-report");
+  const action = review.payload?.verdict?.action || review.payload?.recommendation?.action || "KEEP_BASELINE";
+  host.innerHTML = `Next action: <strong>${escapeHtml(action)}</strong>`;
+}
+
+async function loadCandidateWorkflowSummary() {
+  const host = document.querySelector("#candidate-summary-cards");
+  if (!host) return;
+  host.innerHTML = `<section class="status-card"><p class="pane-status">Loading candidate summary...</p></section>`;
+  const [current, review, quality] = await Promise.all([
+    safeDashboardGet("/api/candidate/current"),
+    safeDashboardGet("/api/research/candidate-review-report"),
+    safeDashboardGet("/api/paper/run-quality-report"),
+  ]);
+  const candidatePayload = current.payload || {};
+  const candidate = candidatePayload.candidate || candidatePayload.current || candidatePayload;
+  const market = primaryCandidateMarket(candidate);
+  const verdict = review.payload?.verdict || review.payload?.recommendation || {};
+  document.querySelector("#candidate-next-action").innerHTML = `Next action: <strong>${escapeHtml(verdict.action || "KEEP_BASELINE")}</strong>`;
+  host.innerHTML = `
+    ${workflowCard("Active Candidate", verdict.action || "ACTIVE", `${candidate.strategy || "-"} ${market.symbol} ${market.timeframe}`, [
+      { label: "Strategy", value: candidate.strategy || "-" },
+      { label: "Symbol", value: market.symbol },
+      { label: "Timeframe", value: market.timeframe },
+    ])}
+    ${workflowCard("Replacement Status", review.payload?.replacementEligibility?.eligible ? "READY" : "WATCH", verdict.reason || "No replacement is currently eligible.", [
+      { label: "Eligible", value: String(Boolean(review.payload?.replacementEligibility?.eligible)) },
+      { label: "Winner", value: review.payload?.comparison?.winner || "-" },
+    ])}
+    ${workflowCard("Paper Evidence Trust", quality.payload?.quality?.status || "NOT_CHECKED", quality.payload?.quality?.recommendation?.reason || "Run quality is read-only evidence.", [
+      { label: "Trust", value: quality.payload?.quality?.evidenceTrust || "-" },
+      { label: "Score", value: quality.payload?.quality?.score ?? "-" },
+    ])}
+  `;
+}
+
+async function loadPaperWorkflowSummary() {
+  const host = document.querySelector("#paper-safety-strip");
+  if (!host) return;
+  host.innerHTML = `<section class="status-card"><p class="pane-status">Loading paper safety summary...</p></section>`;
+  const [status, runtime, quality] = await Promise.all([
+    safeDashboardGet("/api/paper/status"),
+    safeDashboardGet("/api/paper/runtime-status"),
+    safeDashboardGet("/api/paper/run-quality-report"),
+  ]);
+  const paper = status.payload || {};
+  const runQuality = quality.payload?.quality || {};
+  document.querySelector("#paper-next-action").innerHTML = `Real trading disabled. Next action: <strong>${escapeHtml(runQuality.recommendation?.action || (paper.paperEnabled ? "MONITOR_PAPER" : "REVIEW_STATUS"))}</strong>`;
+  host.innerHTML = `
+    ${workflowCard("Simulation", paper.paperEnabled ? "PAPER_ENABLED" : "DISABLED", paper.paperEnabled ? "Paper is enabled in this runtime." : "Paper is disabled in this working repo.", [
+      { label: "paperEnabled", value: String(Boolean(paper.paperEnabled)) },
+      { label: "realTradingEnabled", value: String(Boolean(paper.realTradingEnabled)) },
+    ])}
+    ${workflowCard("Runtime", runtime.payload?.health?.status || runtime.payload?.initializationStatus || "NOT_CHECKED", runtime.payload?.health?.reasons?.[0] || "Runtime status is read-only.", [
+      { label: "Initialized", value: runtime.payload?.initialized ? "yes" : "no" },
+      { label: "Active market", value: runtime.payload?.lastTick?.activeMarket || "-" },
+    ])}
+    ${workflowCard("Run Quality", runQuality.status || "NOT_CHECKED", runQuality.recommendation?.reason || "Refresh after a paper runner session.", [
+      { label: "Trust", value: runQuality.evidenceTrust || "-" },
+      { label: "Score", value: runQuality.score ?? "-" },
+    ])}
+  `;
 }
 
 function initChartsPage() {

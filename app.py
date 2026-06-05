@@ -88,7 +88,11 @@ LEARNING_OPTIMIZER_STRATEGY_OPTIONS = [
 
 
 @app.get("/")
+@app.get("/dashboard")
 @app.get("/charts")
+@app.get("/research")
+@app.get("/candidate")
+@app.get("/paper")
 @app.get("/backtest")
 @app.get("/analysis")
 @app.get("/learning")

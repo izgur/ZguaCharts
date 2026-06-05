@@ -8,16 +8,17 @@
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="/charts" data-route="charts">
+      <a class="brand" href="/dashboard" data-route="dashboard">
         <span class="brand-mark"></span>
         <h1>ZguaCharts</h1>
       </a>
       <nav class="app-nav" aria-label="Main navigation">
+        <a href="/dashboard" data-route="dashboard">Dashboard</a>
         <a href="/charts" data-route="charts">Charts</a>
-        <button id="paper-tab-button" class="paper-tab-button nav-button" type="button">Paper Simulation</button>
+        <a href="/research" data-route="research">Research</a>
+        <a href="/candidate" data-route="candidate">Candidate</a>
+        <a href="/paper" data-route="paper">Paper</a>
         <a href="/backtest" data-route="backtest">Backtest</a>
-        <a href="/analysis" data-route="analysis">Analysis</a>
-        <a href="/learning" data-route="learning">Learning</a>
         <a href="/ops" data-route="ops">Ops</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
@@ -35,6 +36,65 @@
     </header>
 
     <main class="app-shell">
+      <section id="dashboard-page" class="route-page workflow-page" data-page="dashboard">
+        <div class="workflow-hero">
+          <div>
+            <h2>Dashboard</h2>
+            <p>Current candidate, paper safety, research verdict, and the next useful action.</p>
+          </div>
+          <button id="dashboard-refresh" type="button">Refresh Dashboard</button>
+        </div>
+        <div id="dashboard-status-cards" class="workflow-card-grid">
+          <div class="status-card"><p class="pane-status">Dashboard has not loaded yet.</p></div>
+        </div>
+      </section>
+
+      <section id="research-page" class="route-page workflow-page" data-page="research" hidden>
+        <div class="workflow-hero">
+          <div>
+            <h2>Research</h2>
+            <p>Search, validate, diagnose, and export research evidence without changing paper state.</p>
+          </div>
+          <div id="research-next-action" class="workflow-next-action">Next action: refresh overview.</div>
+        </div>
+        <div class="workflow-tabs" role="tablist" aria-label="Research workflow tabs">
+          <button class="workflow-tab active" type="button" data-workflow-tab="research-overview">Overview</button>
+          <button class="workflow-tab" type="button" data-workflow-tab="research-search">Search</button>
+          <button class="workflow-tab" type="button" data-workflow-tab="research-validation">Validation</button>
+          <button class="workflow-tab" type="button" data-workflow-tab="research-diagnostics">Diagnostics</button>
+          <button class="workflow-tab" type="button" data-workflow-tab="research-export">Export</button>
+        </div>
+        <div id="research-overview" class="workflow-tab-panel"></div>
+        <div id="research-search" class="workflow-tab-panel" hidden></div>
+        <div id="research-validation" class="workflow-tab-panel" hidden></div>
+        <div id="research-diagnostics" class="workflow-tab-panel" hidden></div>
+        <div id="research-export" class="workflow-tab-panel" hidden></div>
+      </section>
+
+      <section id="candidate-page" class="route-page workflow-page" data-page="candidate" hidden>
+        <div class="workflow-hero">
+          <div>
+            <h2>Candidate</h2>
+            <p>Evidence for keeping, replacing, or researching around the active candidate.</p>
+          </div>
+          <div id="candidate-next-action" class="workflow-next-action">Next action: keep baseline unless evidence changes.</div>
+        </div>
+        <div id="candidate-summary-cards" class="workflow-card-grid"></div>
+        <div id="candidate-workflow-panels" class="workflow-panel-grid"></div>
+      </section>
+
+      <section id="paper-page" class="route-page workflow-page" data-page="paper" hidden>
+        <div class="workflow-hero">
+          <div>
+            <h2>Paper</h2>
+            <p>Paper simulation controls, safety gates, runtime state, and evidence quality.</p>
+          </div>
+          <div id="paper-next-action" class="workflow-next-action">Real trading disabled. Refresh paper status before acting.</div>
+        </div>
+        <div id="paper-safety-strip" class="workflow-card-grid"></div>
+        <div id="paper-workflow-panels" class="workflow-panel-grid"></div>
+      </section>
+
       <section id="charts-page" class="route-page charts-page" data-page="charts">
         <div class="charts-workspace">
           <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>

@@ -67,13 +67,209 @@ body {
 .app-nav .nav-button {
   display: grid;
   place-items: center;
-  min-width: 66px;
+  min-width: 58px;
   height: 26px;
-  padding: 0 8px;
+  padding: 0 7px;
   border-radius: 6px;
   color: var(--muted);
   font-size: 12px;
   text-decoration: none;
+}
+
+.workflow-page {
+  overflow: auto;
+  padding: 16px;
+  background: #0b0d10;
+}
+
+.workflow-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 0 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0e1217;
+}
+
+.workflow-hero h2,
+.status-card h2 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0;
+}
+
+.workflow-hero p,
+.status-card p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.workflow-next-action {
+  max-width: 360px;
+  padding: 8px 10px;
+  border: 1px solid rgba(245, 184, 75, 0.28);
+  border-radius: 8px;
+  background: rgba(245, 184, 75, 0.08);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.workflow-tabs {
+  display: flex;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0e1217;
+}
+
+.workflow-tab {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  color: var(--muted);
+}
+
+.workflow-tab.active {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.workflow-tab-panel,
+.workflow-panel-grid,
+.workflow-card-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.workflow-card-grid {
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.workflow-panel-grid,
+.workflow-tab-panel {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.status-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.status-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 10px;
+}
+
+.status-card-header.compact-heading {
+  padding: 0;
+}
+
+.status-card-header .button-row,
+.status-card-header .inline-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.status-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(156, 168, 183, 0.14);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.badge-pass {
+  background: rgba(18, 184, 134, 0.16);
+  color: var(--green);
+}
+
+.badge-watch {
+  background: rgba(245, 184, 75, 0.16);
+  color: var(--amber);
+}
+
+.badge-fail {
+  background: rgba(255, 92, 122, 0.16);
+  color: var(--red);
+}
+
+.badge-running {
+  background: rgba(87, 166, 255, 0.16);
+  color: #57a6ff;
+}
+
+.badge-raw {
+  background: rgba(156, 168, 183, 0.14);
+  color: var(--muted);
+}
+
+.metric-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.metric-item {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.metric-item span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.metric-item strong {
+  display: block;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.action-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.details-collapsed,
+.muted-note,
+.warning-note,
+.danger-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.warning-note {
+  color: var(--amber);
+}
+
+.danger-note {
+  color: var(--red);
 }
 
 .app-nav a.active,
