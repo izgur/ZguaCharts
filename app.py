@@ -1327,6 +1327,15 @@ def research_multi_strategy_optimizer_batch():
         return jsonify({"error": f"Could not build multi-strategy optimizer batch: {exc}"}), 502
 
 
+@app.get("/api/research/optimizer-reproducibility-audit")
+def research_optimizer_reproducibility_audit():
+    try:
+        payload, status_code = build_research_optimizer_reproducibility_audit(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build optimizer reproducibility audit: {exc}"}), 502
+
+
 @app.get("/api/research/snapshot-export")
 def research_snapshot_export():
     try:
@@ -7454,6 +7463,166 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
         "savedPath": payload.get("savedPath"),
         "command": " ".join(command),
     }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def _optimizer_audit_candidates_from_batch(batch_payload: dict, top_n: int) -> list[dict]:
+    rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict) and not row.get("isActiveBaseline")]
+    rows = sorted(rows, key=lambda row: int(safe_float(row.get("rank"), 999999)))
+    candidates = []
+    for row in rows[:top_n]:
+        candidates.append({
+            "strategy": row.get("strategy"),
+            "symbol": row.get("symbol"),
+            "timeframe": row.get("timeframe") or row.get("interval"),
+            "params": row.get("params") if isinstance(row.get("params"), dict) else {},
+            "status": row.get("status") or row.get("qualityStatus"),
+            "trades": row.get("trades"),
+            "totalReturnPct": row.get("totalReturnPct") or row.get("totalReturn"),
+            "profitFactor": row.get("profitFactor"),
+            "maxDrawdownPct": row.get("maxDrawdownPct") or row.get("maxDrawdown"),
+            "winRate": row.get("winRate"),
+            "score": row.get("score") or row.get("practicalScore"),
+            "mainFailureReason": row.get("mainFailureReason"),
+        })
+    return [candidate for candidate in candidates if candidate.get("strategy") and candidate.get("symbol") and candidate.get("timeframe")]
+
+
+def _save_optimizer_reproducibility_audit(payload: dict) -> str:
+    reports_dir = Path(app.root_path) / "reports" / "research-audits"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = reports_dir / f"optimizer-reproducibility-audit-{stamp}.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+
+
+def build_research_optimizer_reproducibility_audit(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    symbols = args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")
+    timeframes = args.get("timeframes", "1h,4h")
+    strategies = args.get("strategies", "auto")
+    period = args.get("period", "365d")
+    top_n = max(1, min(int(safe_float(args.get("topN", args.get("top_n", 10)), 10)), 25))
+    max_combos = max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 25)), 25)), 250))
+    reruns = max(1, min(int(safe_float(args.get("reruns", 2), 2)), 5))
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    warnings = []
+    batch_payload = None
+    generated_batch = False
+    batch_file = args.get("batchFile")
+    if batch_file:
+        batch_payload, batch_error = _load_candidate_deep_compare_batch_file(str(batch_file))
+        if batch_error:
+            return {"ok": False, "error": batch_error, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+        resolved_batch_file = batch_payload.get("_resolvedBatchFile")
+    else:
+        generated_batch = True
+        batch_args = {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": strategies,
+            "period": period,
+            "maxCandidates": args.get("maxCandidates") or args.get("max_candidates") or "60",
+            "maxCombosPerStrategy": str(max_combos),
+            "topN": str(max(top_n, 10)),
+            "includeWalkForward": "false",
+            "includeStress": "false",
+            "save": "false",
+            "limit": args.get("limit", "auto"),
+            "timeout_seconds": args.get("optimizer_timeout_seconds", args.get("timeout_seconds", "900")),
+        }
+        batch_payload, batch_status = build_research_multi_strategy_optimizer_batch(batch_args)
+        if not batch_payload.get("ok"):
+            return {
+                "ok": False,
+                "error": batch_payload.get("error") or "Could not generate optimizer batch for reproducibility audit.",
+                "paperEnabled": paper_enabled,
+                "realTradingEnabled": real_enabled,
+                "optimizerBatch": batch_payload,
+            }, batch_status
+        resolved_batch_file = None
+    candidates = _optimizer_audit_candidates_from_batch(batch_payload or {}, top_n)
+    if not candidates:
+        return {
+            "ok": False,
+            "error": "No optimizer candidates were available for reproducibility audit.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "source": {"batchFile": resolved_batch_file, "generatedBatch": generated_batch, "topN": top_n, "reruns": reruns},
+        }, 400
+    command = package_node_script_args("research:optimizer-reproducibility-audit")
+    command.extend([
+        "--candidates", json.dumps(candidates),
+        "--period", period,
+        "--reruns", str(reruns),
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("audit_timeout_seconds", args.get("timeout_seconds", 600)), 600)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Optimizer reproducibility audit timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "source": {"batchFile": resolved_batch_file, "generatedBatch": generated_batch, "topN": top_n, "reruns": reruns},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Optimizer reproducibility audit timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Optimizer reproducibility audit returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Optimizer reproducibility audit returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Optimizer reproducibility audit command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "source": {
+            "batchFile": resolved_batch_file,
+            "generatedBatch": generated_batch,
+            "topN": top_n,
+            "reruns": reruns,
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": strategies,
+            "period": period,
+            "maxCombosPerStrategy": max_combos,
+        },
+        "tolerances": payload.get("tolerances") or {},
+        "rows": payload.get("rows") or [],
+        "summary": payload.get("summary") or {},
+        "warnings": warnings,
+        "error": payload.get("error"),
+        "command": " ".join(command[:1] + ["cli/research_optimizer_reproducibility_audit.js", "--candidates", "[selected-candidates-json]", "--period", period, "--reruns", str(reruns)]),
+    }
+    if save and response["ok"]:
+        response["savedPath"] = _save_optimizer_reproducibility_audit(response)
     if completed.returncode != 0:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()

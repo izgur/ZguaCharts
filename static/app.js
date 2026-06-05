@@ -2719,6 +2719,7 @@ function setupLearningControls() {
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
   document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
   document.querySelector("#research-candidate-deep-compare-refresh")?.addEventListener("click", loadResearchCandidateDeepCompare);
+  document.querySelector("#research-optimizer-reproducibility-audit-refresh")?.addEventListener("click", loadResearchOptimizerReproducibilityAudit);
   document.querySelector("#research-multi-strategy-matrix-refresh")?.addEventListener("click", loadResearchMultiStrategyMatrix);
   document.querySelector("#research-multi-strategy-optimizer-batch-refresh")?.addEventListener("click", loadResearchMultiStrategyOptimizerBatch);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
@@ -4186,6 +4187,67 @@ function renderResearchCandidateDeepCompare(payload) {
     <table class="trade-table">
       <thead><tr><th>Metric</th><th>Baseline</th><th>Challenger</th></tr></thead>
       <tbody>${metricRows}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchOptimizerReproducibilityAudit() {
+  const host = document.querySelector("#research-optimizer-reproducibility-audit-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running optimizer reproducibility audit...</p>`;
+    const payload = await apiGet("/api/research/optimizer-reproducibility-audit");
+    host.innerHTML = renderResearchOptimizerReproducibilityAudit(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Optimizer reproducibility audit could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchOptimizerReproducibilityAudit(payload) {
+  const source = payload.source || {};
+  const summary = payload.summary || {};
+  const rec = summary.recommendation || {};
+  const worst = summary.worstMismatch || {};
+  const rows = (payload.rows || []).slice(0, 20).map((row) => {
+    const rerun = (row.reruns || [])[0] || {};
+    const diffs = row.diffs || {};
+    const tone = row.reproducibilityStatus === "REPRODUCIBLE" ? "positive" : row.reproducibilityStatus === "WATCH" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.reproducibilityStatus || "-")}</td>
+        <td>${escapeHtml(row.original?.status || "-")} -> ${escapeHtml(rerun.status || "-")}</td>
+        <td>${row.original?.trades ?? 0} -> ${rerun.trades ?? 0}</td>
+        <td>${formatNumber(row.original?.profitFactor)} -> ${formatNumber(rerun.profitFactor)}</td>
+        <td>${formatSigned(row.original?.totalReturnPct || 0)}% -> ${formatSigned(rerun.totalReturnPct || 0)}%</td>
+        <td>${formatNumber(diffs.returnDiffMax)}%</td>
+        <td>${formatNumber(diffs.profitFactorDiffMax)}</td>
+        <td>${escapeHtml((row.rejectionReasons || []).join(", ") || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const worstText = worst.strategy ? `${worst.strategy} ${worst.symbol} ${worst.timeframe} ${worst.reproducibilityStatus}` : "-";
+  return `
+    <h3 class="modal-section-title">Optimizer Reproducibility Audit <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Worst mismatch:</strong> ${escapeHtml(worstText)}. ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Source</span><strong>${source.generatedBatch ? "generated batch" : "batch file"}</strong></div>
+      <div class="metric"><span>Top N</span><strong>${source.topN ?? "-"}</strong></div>
+      <div class="metric"><span>Reruns</span><strong>${source.reruns ?? "-"}</strong></div>
+      <div class="metric"><span>Reproducible</span><strong>${summary.reproducibleCount ?? 0}</strong></div>
+      <div class="metric"><span>Watch</span><strong>${summary.watchCount ?? 0}</strong></div>
+      <div class="metric"><span>Unstable</span><strong>${summary.unstableCount ?? 0}</strong></div>
+      <div class="metric"><span>Fail</span><strong>${summary.failCount ?? 0}</strong></div>
+      <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Market</th><th>Audit</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>Ret diff</th><th>PF diff</th><th>Reasons</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="10">No audit rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
