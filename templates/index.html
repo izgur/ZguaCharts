@@ -125,19 +125,29 @@
       <section id="backtest-page" class="route-page backtest-page" data-page="backtest" hidden>
         <div class="page-heading">
           <div>
-            <h2>Strategy Lab</h2>
-            <p>Backtests call `/api/backtest`; the browser only renders returned metrics, diagnostics, trades, overlays, and markers.</p>
+            <h2>Manual Strategy Builder</h2>
+            <p>Build a read-only manual backtest by selecting a strategy, preset, market, and editable parameters.</p>
           </div>
         </div>
         <div class="lab-layout">
-          <aside class="lab-controls">
+          <aside class="lab-controls strategy-builder-card">
             <label><span>Source</span><select id="lab-source-select"></select></label>
-            <label><span>Strategy preset</span><select id="lab-preset-select"></select></label>
             <label><span>Symbol</span><select id="lab-symbol-select"></select></label>
-            <label><span>Timeframe</span><select id="lab-timeframe-select"></select></label>
-            <label><span>Period</span><input id="lab-period-input" value="60d"></label>
-            <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.01" value="0"></label>
-            <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.01" value="0"></label>
+            <label><span>Timeframe</span><select id="lab-timeframe-select">
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+            </select></label>
+            <label><span>Period</span><select id="lab-period-input">
+              <option value="30d">30d</option>
+              <option value="90d">90d</option>
+              <option value="180d">180d</option>
+              <option value="365d" selected>365d</option>
+            </select></label>
+            <label><span>Strategy</span><select id="lab-strategy-select"></select></label>
+            <label><span>Preset</span><select id="lab-preset-select"></select></label>
+            <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.001" value="0"></label>
+            <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.001" value="0"></label>
             <label><span>Candle limit</span><select id="lab-limit-input">
               <option value="auto">Auto</option>
               <option value="1000">1000</option>
@@ -151,12 +161,18 @@
               <input id="lab-allow-shorts" type="checkbox">
               <span>Allow shorts when strategy supports them</span>
             </label>
-            <button id="lab-run-backtest" type="button">Run Backtest</button>
+            <div id="strategy-builder-summary" class="builder-summary">Loading strategy metadata...</div>
+            <div id="strategy-param-editor" class="param-editor"></div>
+            <div class="button-row">
+              <button id="lab-reset-preset" type="button">Reset to Preset</button>
+              <button id="lab-run-backtest" type="button">Run Backtest</button>
+            </div>
+            <p class="modal-note">Manual backtests are read-only: no promotion, no paper tick, no config write, and no real trading.</p>
           </aside>
           <section class="lab-main">
-            <div id="backtest-chart-host" class="backtest-chart-host"></div>
+            <div id="backtest-chart-host" class="backtest-chart-host" hidden></div>
             <div id="backtest-results" class="lab-results">
-              <p class="pane-status">Choose settings and run a backtest.</p>
+              <p class="pane-status">Choose a strategy preset, adjust parameters, and run a manual backtest.</p>
             </div>
           </section>
         </div>

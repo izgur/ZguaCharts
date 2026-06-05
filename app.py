@@ -299,6 +299,92 @@ def backtest():
     return jsonify(payload)
 
 
+@app.get("/api/backtest/strategy-metadata")
+def backtest_strategy_metadata():
+    try:
+        candidate = load_paper_candidate_config()
+        payload = load_backtest_strategy_metadata(candidate)
+        payload["activeCandidate"] = candidate_summary(candidate)
+        payload["paperEnabled"] = canonical_paper_enabled(candidate)
+        payload["realTradingEnabled"] = False
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": f"Could not load strategy metadata: {exc}"}), 502
+
+
+@app.post("/api/backtest/run-custom")
+def backtest_run_custom():
+    stage = "argument parsing"
+    context = {}
+    try:
+        payload = request.get_json(silent=True) or {}
+        source = str(payload.get("source") or "bybit")
+        symbol = str(payload.get("symbol") or "ETHUSDT").upper()
+        timeframe = str(payload.get("timeframe") or payload.get("interval") or "1h")
+        period = str(payload.get("period") or "365d")
+        strategy = str(payload.get("strategy") or payload.get("preset") or "SimpleAtrTrendV2")
+        limit_arg = payload.get("limit", "auto")
+        limit = research_limit_for(source, timeframe, period, limit_arg)
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        fee_pct = safe_float(payload.get("feePct", payload.get("fee_pct", params.get("feePct", 0))), 0)
+        slippage_pct = safe_float(payload.get("slippagePct", payload.get("slippage_pct", params.get("slippagePct", 0))), 0)
+        allow_shorts = bool(payload.get("allowShorts", params.get("shortMode", False)))
+        context = {
+            "source": source,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "period": period,
+            "preset": strategy,
+            "limit_arg": limit_arg,
+        }
+        metadata = load_backtest_strategy_metadata(load_paper_candidate_config())
+        supported = {item.get("name") for item in metadata.get("strategies", []) if item.get("supported")}
+        if strategy not in supported:
+            raise ValueError(f"Strategy is not available for manual backtesting: {strategy}")
+
+        stage = "node custom backtest execution"
+        result_payload = run_shared_backtest_engine(
+            source,
+            symbol,
+            timeframe,
+            period,
+            strategy,
+            fee_pct,
+            slippage_pct,
+            limit,
+            debug=False,
+            allow_shorts=allow_shorts,
+            strategy_params=params,
+        )
+        stage = "custom response normalization"
+        result_payload = normalize_backtest_response(result_payload, source, symbol, timeframe, period, strategy, fee_pct, slippage_pct)
+        metrics = manual_backtest_result_summary(result_payload, period)
+        trades = result_payload.get("trade_list") or result_payload.get("tradeList") or []
+        warnings = dedupe_list(list(result_payload.get("warnings") or []) + list((result_payload.get("diagnostics") or {}).get("warnings") or []))
+        return jsonify({
+            "ok": True,
+            "readOnly": True,
+            "paperEnabled": canonical_paper_enabled(),
+            "realTradingEnabled": False,
+            "strategy": result_payload.get("strategy") or strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "period": period,
+            "paramsUsed": (result_payload.get("diagnostics") or {}).get("params") or params,
+            "result": {
+                **metrics,
+                "warnings": warnings,
+            },
+            "diagnostics": result_payload.get("diagnostics") or {},
+            "trades": trades[:75],
+            "warnings": warnings,
+        })
+    except ValueError as exc:
+        return jsonify(backtest_error_payload(exc, stage, context)), 400
+    except Exception as exc:
+        return jsonify(backtest_error_payload(exc, stage, context)), 502
+
+
 @app.get("/api/backtest/debug")
 def backtest_debug():
     stages = []
@@ -11723,6 +11809,20 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     return payload
 
 
+def load_backtest_strategy_metadata(active_candidate: dict | None = None) -> dict:
+    completed = subprocess.run(
+        [node_executable(), "cli/backtest_strategy_metadata.js"],
+        input=json.dumps({"activeCandidate": active_candidate or {}}, allow_nan=False),
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Strategy metadata command failed")
+    return json.loads(completed.stdout)
+
+
 def normalize_backtest_response(
     payload: dict,
     source: str,
@@ -11829,6 +11929,49 @@ def normalize_backtest_response(
         "diagnostics": diagnostics,
     })
     return payload
+
+
+def manual_backtest_result_summary(payload: dict, period: str) -> dict:
+    metrics = ranking_metrics_from_backtest(payload)
+    trades = metrics["trades"]
+    days = parse_period_to_days(period) or safe_float(payload.get("actualDays"), 0) or 365
+    trades_per_month = round(trades / max(days, 1) * 30.4375, 4)
+    expectancy = round(metrics["totalReturn"] / trades, 4) if trades else 0
+    reasons = []
+    if trades == 0:
+        status = "NO_TRADES"
+        reasons.append("NO_TRADES")
+    elif trades < 20:
+        status = "WARN"
+        reasons.append("TOO_FEW_TRADES")
+    elif metrics["totalReturn"] < 0:
+        status = "FAIL"
+        reasons.append("NEGATIVE_RETURN")
+    elif metrics["profitFactor"] < 1.05:
+        status = "FAIL"
+        reasons.append("WEAK_PROFIT_FACTOR")
+    elif metrics["maxDrawdown"] > 25:
+        status = "FAIL"
+        reasons.append("HIGH_DRAWDOWN")
+    elif metrics["profitFactor"] < 1.15:
+        status = "WARN"
+        reasons.append("LOW_PROFIT_FACTOR_BUFFER")
+    else:
+        status = "PASS"
+        reasons.append("OK")
+    return {
+        "trades": trades,
+        "tradesPerMonth": trades_per_month,
+        "totalReturnPct": round(metrics["totalReturn"], 4),
+        "profitFactor": round(metrics["profitFactor"], 4),
+        "maxDrawdownPct": round(metrics["maxDrawdown"], 4),
+        "winRate": round(metrics["winRate"], 4),
+        "avgBarsHeld": round(metrics["averageBarsHeld"], 4),
+        "expectancyPctPerTrade": expectancy,
+        "score": round(ranking_score(metrics, min_trades=20), 5),
+        "status": status,
+        "reasons": reasons,
+    }
 
 
 def dedupe_list(items: list) -> list:

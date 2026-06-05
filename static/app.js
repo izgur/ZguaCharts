@@ -58,6 +58,9 @@ let analysisInitialized = false;
 let learningInitialized = false;
 let opsInitialized = false;
 let backtestPane = null;
+let backtestStrategyMetadata = null;
+let strategyBuilderParams = {};
+let strategyBuilderCurrentPreset = "default";
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
@@ -1900,31 +1903,35 @@ function initBacktestPage() {
   if (backtestInitialized) return;
   backtestInitialized = true;
   populateLabControls();
-  const node = template.content.firstElementChild.cloneNode(true);
-  node.classList.add("lab-chart-pane");
-  backtestChartHost.appendChild(node);
-  backtestPane = createPane(node, 0);
-  backtestPane.backtestButton.hidden = true;
   document.querySelector("#lab-run-backtest")?.addEventListener("click", runLabBacktest);
-  ["#lab-source-select", "#lab-symbol-select", "#lab-timeframe-select", "#lab-preset-select"].forEach((selector) => {
-    document.querySelector(selector)?.addEventListener("change", applyLabControlsToPane);
-  });
+  document.querySelector("#lab-reset-preset")?.addEventListener("click", resetStrategyBuilderPreset);
+  document.querySelector("#lab-source-select")?.addEventListener("change", populateLabSymbolAndTimeframe);
+  document.querySelector("#lab-strategy-select")?.addEventListener("change", onStrategyBuilderStrategyChange);
+  document.querySelector("#lab-preset-select")?.addEventListener("change", onStrategyBuilderPresetChange);
 }
 
-function populateLabControls() {
+async function populateLabControls() {
   const sourceSelect = document.querySelector("#lab-source-select");
-  const presetSelect = document.querySelector("#lab-preset-select");
-  if (!hasElement(sourceSelect, presetSelect)) return;
+  const strategySelect = document.querySelector("#lab-strategy-select");
+  if (!hasElement(sourceSelect, strategySelect)) return;
   sourceSelect.innerHTML = Object.entries(config.sources)
     .map(([value, item]) => `<option value="${value}">${item.label}</option>`)
     .join("");
   sourceSelect.value = "bybit";
-  presetSelect.innerHTML = (config.strategy_presets || [])
-    .map((preset) => `<option value="${preset.id}">${preset.label}</option>`)
-    .join("");
-  presetSelect.value = config.default_strategy_preset;
   populateLabSymbolAndTimeframe();
-  sourceSelect.addEventListener("change", populateLabSymbolAndTimeframe);
+  try {
+    backtestStrategyMetadata = await apiGet("/api/backtest/strategy-metadata");
+    const strategies = (backtestStrategyMetadata.strategies || []).filter((strategy) => strategy.supported);
+    strategySelect.innerHTML = strategies
+      .map((strategy) => `<option value="${escapeHtml(strategy.name)}">${escapeHtml(strategy.label || strategy.name)}</option>`)
+      .join("");
+    const active = backtestStrategyMetadata.activeCandidate || {};
+    strategySelect.value = strategies.some((strategy) => strategy.name === active.strategy) ? active.strategy : (strategies[0]?.name || "SimpleAtrTrendV2");
+    applyActiveCandidateMarketDefaults();
+    onStrategyBuilderStrategyChange();
+  } catch (error) {
+    document.querySelector("#strategy-builder-summary").innerHTML = `<span class="danger-note">${escapeHtml(error.message)}</span>`;
+  }
 }
 
 function populateLabSymbolAndTimeframe() {
@@ -1934,26 +1941,158 @@ function populateLabSymbolAndTimeframe() {
   if (!hasElement(symbolSelect, timeframeSelect)) return;
   const sourceConfig = config.sources[source];
   symbolSelect.innerHTML = sourceConfig.symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
-  timeframeSelect.innerHTML = sourceConfig.timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`).join("");
-  symbolSelect.value = sourceConfig.symbols.includes("BTCUSDT") ? "BTCUSDT" : sourceConfig.symbols[0];
-  timeframeSelect.value = sourceConfig.timeframes.includes("1h") ? "1h" : sourceConfig.timeframes[0];
+  const allowedTimeframes = ["15m", "1h", "4h"].filter((timeframe) => sourceConfig.timeframes.includes(timeframe));
+  timeframeSelect.innerHTML = allowedTimeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`).join("");
+  symbolSelect.value = sourceConfig.symbols.includes("ETHUSDT") ? "ETHUSDT" : sourceConfig.symbols[0];
+  timeframeSelect.value = allowedTimeframes.includes("1h") ? "1h" : allowedTimeframes[0];
 }
 
-function applyLabControlsToPane() {
-  if (!backtestPane) return;
-  backtestPane.sourceSelect.value = document.querySelector("#lab-source-select")?.value || "bybit";
-  populateSymbolAndTimeframe(backtestPane, {
-    symbol: document.querySelector("#lab-symbol-select")?.value,
-    timeframe: document.querySelector("#lab-timeframe-select")?.value,
+function activeCandidateMarketFromMetadata() {
+  const candidate = backtestStrategyMetadata?.activeCandidate || {};
+  const active = (candidate.activeSymbols || candidate.symbols || [])[0] || {};
+  return {
+    symbol: active.symbol || candidate.symbol || "ETHUSDT",
+    timeframe: active.interval || active.timeframe || candidate.timeframe || "1h",
+  };
+}
+
+function applyActiveCandidateMarketDefaults() {
+  const market = activeCandidateMarketFromMetadata();
+  const symbolSelect = document.querySelector("#lab-symbol-select");
+  const timeframeSelect = document.querySelector("#lab-timeframe-select");
+  if (symbolSelect && Array.from(symbolSelect.options).some((option) => option.value === market.symbol)) symbolSelect.value = market.symbol;
+  if (timeframeSelect && Array.from(timeframeSelect.options).some((option) => option.value === market.timeframe)) timeframeSelect.value = market.timeframe;
+}
+
+function currentStrategyMetadata() {
+  const name = document.querySelector("#lab-strategy-select")?.value;
+  return (backtestStrategyMetadata?.strategies || []).find((strategy) => strategy.name === name) || null;
+}
+
+function onStrategyBuilderStrategyChange() {
+  const strategy = currentStrategyMetadata();
+  const presetSelect = document.querySelector("#lab-preset-select");
+  if (!strategy || !presetSelect) return;
+  const presets = [...(strategy.presets || []), { name: "custom", label: "Custom", params: strategyBuilderParams }];
+  presetSelect.innerHTML = presets
+    .map((preset) => `<option value="${escapeHtml(preset.name)}">${escapeHtml(preset.label || preset.name)}</option>`)
+    .join("");
+  const defaultPreset = (strategy.presets || []).some((preset) => preset.name === "activeCandidate") ? "activeCandidate" : "default";
+  presetSelect.value = defaultPreset;
+  applyStrategyPreset(defaultPreset);
+}
+
+function onStrategyBuilderPresetChange() {
+  applyStrategyPreset(document.querySelector("#lab-preset-select")?.value || "default");
+}
+
+function resetStrategyBuilderPreset() {
+  const preset = document.querySelector("#lab-preset-select")?.value || strategyBuilderCurrentPreset || "default";
+  applyStrategyPreset(preset === "custom" ? strategyBuilderCurrentPreset : preset);
+}
+
+function applyStrategyPreset(presetName) {
+  const strategy = currentStrategyMetadata();
+  if (!strategy) return;
+  const preset = (strategy.presets || []).find((item) => item.name === presetName) || strategy.presets?.[0] || { name: "default", params: {} };
+  strategyBuilderCurrentPreset = preset.name;
+  strategyBuilderParams = structuredCloneSafe(preset.params || strategy.defaultParams || {});
+  const presetSelect = document.querySelector("#lab-preset-select");
+  if (presetSelect && presetSelect.value !== preset.name) presetSelect.value = preset.name;
+  renderStrategyBuilderSummary(strategy, preset);
+  renderStrategyParamEditor(strategy);
+}
+
+function structuredCloneSafe(value) {
+  return JSON.parse(JSON.stringify(value || {}));
+}
+
+function renderStrategyBuilderSummary(strategy, preset) {
+  const host = document.querySelector("#strategy-builder-summary");
+  if (!host) return;
+  const active = backtestStrategyMetadata?.activeCandidate || {};
+  const activeText = active.strategy ? `${active.strategy} ${activeCandidateMarketFromMetadata().symbol} ${activeCandidateMarketFromMetadata().timeframe}` : "-";
+  host.innerHTML = `
+    <strong>${escapeHtml(strategy.label || strategy.name)}</strong>
+    <span>${escapeHtml(strategy.description || "Manual backtest strategy.")}</span>
+    <span>Preset: ${escapeHtml(preset.label || preset.name)}. Active candidate: ${escapeHtml(activeText)}.</span>
+    ${(strategy.warnings || []).length ? `<ul class="backtest-warnings">${strategy.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+  `;
+}
+
+function renderStrategyParamEditor(strategy) {
+  const host = document.querySelector("#strategy-param-editor");
+  if (!host) return;
+  const schema = strategy.paramSchema || {};
+  const keys = Object.keys(schema);
+  host.innerHTML = `
+    <h3>Parameters</h3>
+    ${keys.map((key) => renderStrategyParamField(key, schema[key], strategyBuilderParams[key])).join("")}
+    <details class="details-collapsed">
+      <summary>Params Used JSON</summary>
+      <pre>${escapeHtml(JSON.stringify(strategyBuilderParams, null, 2))}</pre>
+    </details>
+  `;
+  host.querySelectorAll("[data-param-key]").forEach((input) => {
+    input.addEventListener("input", onStrategyParamEdit);
+    input.addEventListener("change", onStrategyParamEdit);
   });
-  backtestPane.presetSelect.value = document.querySelector("#lab-preset-select")?.value || config.default_strategy_preset;
-  return startPane(backtestPane);
+}
+
+function renderStrategyParamField(key, schema, value) {
+  const label = schema.label || key;
+  const common = `data-param-key="${escapeHtml(key)}"`;
+  if (schema.type === "boolean") {
+    return `
+      <label class="param-field param-boolean">
+        <input ${common} type="checkbox" ${value ? "checked" : ""}>
+        <span>${escapeHtml(label)}</span>
+      </label>
+    `;
+  }
+  if (schema.type === "select") {
+    const options = schema.options || [];
+    return `
+      <label class="param-field"><span>${escapeHtml(label)}</span>
+        <select ${common}>${options.map((option) => `<option value="${escapeHtml(String(option))}" ${String(option) === String(value) ? "selected" : ""}>${escapeHtml(String(option))}</option>`).join("")}</select>
+      </label>
+    `;
+  }
+  if (schema.type === "number") {
+    const min = schema.min !== undefined ? ` min="${escapeHtml(String(schema.min))}"` : "";
+    const max = schema.max !== undefined ? ` max="${escapeHtml(String(schema.max))}"` : "";
+    const step = schema.step !== undefined ? ` step="${escapeHtml(String(schema.step))}"` : ` step="0.01"`;
+    return `<label class="param-field"><span>${escapeHtml(label)}</span><input ${common} type="number"${min}${max}${step} value="${escapeHtml(String(value ?? ""))}"></label>`;
+  }
+  return `<label class="param-field"><span>${escapeHtml(label)}</span><input ${common} type="text" value="${escapeHtml(String(value ?? ""))}"></label>`;
+}
+
+function onStrategyParamEdit(event) {
+  const input = event.target;
+  const key = input.dataset.paramKey;
+  const strategy = currentStrategyMetadata();
+  if (!key || !strategy) return;
+  const schema = strategy.paramSchema?.[key] || {};
+  if (schema.type === "boolean") {
+    strategyBuilderParams[key] = input.checked;
+  } else if (schema.type === "number") {
+    strategyBuilderParams[key] = Number(input.value);
+  } else {
+    strategyBuilderParams[key] = input.value;
+  }
+  const presetSelect = document.querySelector("#lab-preset-select");
+  if (presetSelect && presetSelect.value !== "custom") {
+    presetSelect.value = "custom";
+  }
+  const json = document.querySelector("#strategy-param-editor pre");
+  if (json) json.textContent = JSON.stringify(strategyBuilderParams, null, 2);
 }
 
 function labBacktestSettings() {
   return {
-    preset: document.querySelector("#lab-preset-select")?.value || config.default_strategy_preset,
-    period: document.querySelector("#lab-period-input")?.value || "60d",
+    strategy: document.querySelector("#lab-strategy-select")?.value || "SimpleAtrTrendV2",
+    preset: document.querySelector("#lab-preset-select")?.value || "default",
+    period: document.querySelector("#lab-period-input")?.value || "365d",
     limit: document.querySelector("#lab-limit-input")?.value || "auto",
     fee_pct: document.querySelector("#lab-fee-input")?.value || "0",
     slippage_pct: document.querySelector("#lab-slippage-input")?.value || "0",
@@ -1962,34 +2101,24 @@ function labBacktestSettings() {
 }
 
 async function runLabBacktest() {
-  if (!backtestPane) return;
   const button = document.querySelector("#lab-run-backtest");
   button.disabled = true;
   backtestResults.innerHTML = `<p class="pane-status">Running strategy test...</p>`;
   const settings = labBacktestSettings();
   try {
-    await applyLabControlsToPane();
-    const params = new URLSearchParams({
+    const payload = await apiPost("/api/backtest/run-custom", {
       source: document.querySelector("#lab-source-select")?.value || "bybit",
-      symbol: document.querySelector("#lab-symbol-select")?.value || "BTCUSDT",
+      symbol: document.querySelector("#lab-symbol-select")?.value || "ETHUSDT",
       timeframe: document.querySelector("#lab-timeframe-select")?.value || "1h",
       period: settings.period,
-      preset: settings.preset,
+      strategy: settings.strategy,
       limit: settings.limit,
-      fee_pct: settings.fee_pct,
-      slippage_pct: settings.slippage_pct,
-      allowShorts: settings.allowShorts,
-      chart_candles_count: String(backtestPane.candles.length),
-      first_chart_candle_time: String(backtestPane.candles[0]?.time || ""),
-      last_chart_candle_time: String(backtestPane.candles[backtestPane.candles.length - 1]?.time || ""),
+      feePct: Number(settings.fee_pct || 0),
+      slippagePct: Number(settings.slippage_pct || 0),
+      allowShorts: settings.allowShorts === "true",
+      params: strategyBuilderParams,
     });
-    const payload = await apiGet(`/api/backtest?${params}`);
-    backtestPane.backtestMarkers = markersFromBacktestPayload(payload);
-    renderBacktestOverlays(backtestPane, payload);
-    backtestPane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
-    updateChartMarkers(backtestPane);
-    renderDataDiagnostics(backtestPane);
-    backtestResults.innerHTML = renderBacktestResults(payload);
+    backtestResults.innerHTML = renderCustomBacktestResult(payload);
   } catch (error) {
     backtestResults.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
   } finally {
@@ -2384,6 +2513,76 @@ function renderTimeframeSignalMatrix(payload) {
 
 function closeBacktestModal() {
   backtestModal.hidden = true;
+}
+
+function renderCustomBacktestResult(payload) {
+  const result = payload.result || {};
+  const diagnostics = payload.diagnostics || {};
+  const params = payload.paramsUsed || {};
+  const warnings = [...(result.warnings || []), ...(payload.warnings || [])]
+    .filter(Boolean)
+    .filter((item, index, list) => list.indexOf(item) === index);
+  const reasons = result.reasons || [];
+  const trades = payload.trades || [];
+  const metrics = [
+    ["Status", result.status || "-"],
+    ["Trades", result.trades ?? 0],
+    ["Trades/month", formatNumber(result.tradesPerMonth, 2)],
+    ["PF", formatNumber(result.profitFactor, 4)],
+    ["Return", `${formatSigned(result.totalReturnPct)}%`],
+    ["Max DD", `${formatNumber(result.maxDrawdownPct, 4)}%`],
+    ["Win rate", `${formatNumber(result.winRate, 2)}%`],
+    ["Avg bars held", formatNumber(result.avgBarsHeld, 2)],
+    ["Expectancy/trade", `${formatSigned(result.expectancyPctPerTrade)}%`],
+    ["Score", formatNumber(result.score, 2)],
+  ];
+  const context = [
+    ["Strategy", payload.strategy],
+    ["Symbol", payload.symbol],
+    ["Timeframe", payload.timeframe],
+    ["Period", payload.period],
+    ["Read-only", payload.readOnly ? "yes" : "no"],
+    ["Paper enabled", String(Boolean(payload.paperEnabled))],
+    ["Real trading", String(Boolean(payload.realTradingEnabled))],
+    ["Candles", diagnostics.candlesLoaded],
+  ];
+  const tradeRows = trades.slice(0, 20).map((trade) => `
+    <tr>
+      <td>${formatDateTime(trade.entry_time || trade.entryTime)}</td>
+      <td>${formatDateTime(trade.exit_time || trade.exitTime)}</td>
+      <td>${formatPrice(trade.entry_price || trade.entryPrice)}</td>
+      <td>${formatPrice(trade.exit_price || trade.exitPrice)}</td>
+      <td class="${Number(trade.return_pct ?? trade.returnPct ?? 0) >= 0 ? "positive" : "negative"}">${formatSigned(trade.return_pct ?? trade.returnPct)}%</td>
+      <td>${escapeHtml(trade.exit_reason || trade.exitReason || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <div class="status-card">
+      <div class="status-card-header">
+        <div>
+          <h2>Manual Backtest Result</h2>
+          <p>${escapeHtml(payload.strategy || "-")} ${escapeHtml(payload.symbol || "-")} ${escapeHtml(payload.timeframe || "-")} using editable params.</p>
+        </div>
+        ${statusBadge(result.status || "NOT_CHECKED")}
+      </div>
+      <div class="metric-grid">
+        ${metrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
+      </div>
+      <h3 class="modal-section-title">Context</h3>
+      <div class="metric-grid diagnostics-grid">
+        ${context.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
+      </div>
+      ${reasons.length ? `<h3 class="modal-section-title">Reasons</h3><ul class="backtest-warnings">${reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}
+      ${warnings.length ? `<h3 class="modal-section-title">Warnings</h3><ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+      <h3 class="modal-section-title">Params Used</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(params, null, 2))}</pre>
+      <h3 class="modal-section-title">Recent Trades</h3>
+      <table class="trade-table">
+        <thead><tr><th>Entry</th><th>Exit</th><th>Entry Price</th><th>Exit Price</th><th>Return</th><th>Reason</th></tr></thead>
+        <tbody>${tradeRows || `<tr><td colspan="6">No closed trades returned for this manual run.</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 function renderBacktestResults(payload) {
