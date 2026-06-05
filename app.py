@@ -7387,6 +7387,10 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
     top_n = max(1, min(int(safe_float(args.get("topN", args.get("top_n", 20)), 20)), 100))
     include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "false"))).strip().lower() in {"1", "true", "yes", "on"}
     include_stress = str(args.get("includeStress", args.get("include_stress", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    include_repro = str(args.get("includeReproAudit", args.get("include_repro_audit", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    repro_top_n = max(1, min(int(safe_float(args.get("reproTopN", args.get("repro_top_n", 5)), 5)), 20))
+    repro_reruns = max(1, min(int(safe_float(args.get("reproReruns", args.get("repro_reruns", 1)), 1)), 5))
+    require_repro = str(args.get("requireReproducible", args.get("require_reproducible", "false"))).strip().lower() in {"1", "true", "yes", "on"}
     save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
     params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
     fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
@@ -7405,6 +7409,10 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
         "--topN", str(top_n),
         "--includeWalkForward", "true" if include_walk else "false",
         "--includeStress", "true" if include_stress else "false",
+        "--includeReproAudit", "true" if include_repro else "false",
+        "--reproTopN", str(repro_top_n),
+        "--reproReruns", str(repro_reruns),
+        "--requireReproducible", "true" if require_repro else "false",
         "--save", "true" if save else "false",
         "--activeSymbol", active_symbol,
         "--activeTimeframe", active_timeframe,
@@ -7454,7 +7462,7 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "activeBaseline": payload.get("activeBaseline") or candidate_summary(candidate),
-        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "maxCandidates": max_candidates, "maxCombosPerStrategy": max_combos, "topN": top_n},
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "maxCandidates": max_candidates, "maxCombosPerStrategy": max_combos, "topN": top_n, "includeReproAudit": include_repro, "reproTopN": repro_top_n, "reproReruns": repro_reruns, "requireReproducible": require_repro},
         "discoveredStrategies": payload.get("discoveredStrategies") or [],
         "skippedStrategies": payload.get("skippedStrategies") or [],
         "rows": payload.get("rows") or [],

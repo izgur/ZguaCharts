@@ -4341,22 +4341,28 @@ function renderResearchMultiStrategyOptimizerBatch(payload) {
   const search = payload.search || {};
   const summary = payload.summary || {};
   const rec = summary.recommendation || {};
-  const best = summary.bestOverall || {};
+  const best = summary.bestRawCandidate || summary.bestOverall || {};
+  const bestRepro = summary.bestReproducibleCandidate || {};
   const replacement = summary.bestReplacementCandidate || {};
   const active = payload.activeBaseline || {};
   const skipped = (payload.skippedStrategies || []).map((item) => `${item.strategy}: ${item.reason}`).join(", ");
   const rows = (payload.rows || []).slice(0, 25).map((row) => {
     const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
     const eligibleTone = row.replacementEligible ? "positive" : row.isActiveBaseline ? "neutral" : "negative";
+    const reproTone = row.reproducibilityStatus === "REPRODUCIBLE" ? "positive" : row.reproducibilityStatus === "WATCH" || row.reproducibilityStatus === "NOT_CHECKED" ? "neutral" : "negative";
+    const gateTone = row.qualityGateStatus === "REPRODUCIBLE" ? "positive" : row.qualityGateStatus === "WATCH" || row.qualityGateStatus === "RAW_ONLY" ? "neutral" : "negative";
     const rejection = (row.replacementRejectionReasons || []).join(", ") || "-";
     return `
       <tr>
-        <td>${row.rank ?? "-"}</td>
+        <td>${row.rawRank ?? row.rank ?? "-"}</td>
         <td>${row.practicalRank ?? "-"}</td>
         <td>${escapeHtml(row.strategy || "-")}</td>
         <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
         <td>${row.isActiveBaseline ? "yes" : ""}</td>
         <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td class="${reproTone}">${escapeHtml(row.reproducibilityStatus || "NOT_CHECKED")}</td>
+        <td class="${gateTone}">${escapeHtml(row.qualityGateStatus || "RAW_ONLY")}</td>
+        <td>${escapeHtml(row.finalCandidateTier || "RAW")}</td>
         <td class="${eligibleTone}">${row.replacementEligible ? "yes" : "no"}</td>
         <td>${escapeHtml(row.evidenceTier || "-")}</td>
         <td>${row.trades ?? 0}</td>
@@ -4373,15 +4379,21 @@ function renderResearchMultiStrategyOptimizerBatch(payload) {
   }).join("");
   const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
   const bestText = best.strategy ? `${best.strategy} ${best.symbol} ${best.timeframe} PF ${best.profitFactor} Ret ${best.totalReturnPct}%` : "-";
+  const reproText = bestRepro.strategy ? `${bestRepro.strategy} ${bestRepro.symbol} ${bestRepro.timeframe} ${bestRepro.reproducibilityStatus} PF ${bestRepro.profitFactor} Ret ${bestRepro.totalReturnPct}%` : "none";
   const replacementText = replacement.strategy ? `${replacement.strategy} ${replacement.symbol} ${replacement.timeframe} PF ${replacement.profitFactor} Ret ${replacement.totalReturnPct}%` : "none";
   return `
     <h3 class="modal-section-title">Multi-Strategy Optimizer Batch <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
-    <p class="modal-note"><strong>Best optimized:</strong> ${escapeHtml(bestText)}. <strong>Best replacement:</strong> ${escapeHtml(replacementText)}. ${escapeHtml(rec.reason || "")}</p>
+    <p class="modal-note"><strong>Best raw:</strong> ${escapeHtml(bestText)}. <strong>Best reproducible/watch:</strong> ${escapeHtml(reproText)}. <strong>Best replacement:</strong> ${escapeHtml(replacementText)}. ${escapeHtml(rec.reason || "")}</p>
     <div class="metric-grid">
       <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
       <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
       <div class="metric"><span>Active practical rank</span><strong>${summary.activeBaselinePracticalRank ?? "-"}</strong></div>
       <div class="metric"><span>Eligible replacements</span><strong>${summary.replacementEligibleCount ?? 0}</strong></div>
+      <div class="metric"><span>Raw candidates</span><strong>${summary.rawCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Reproducible</span><strong>${summary.reproducibleCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Watch</span><strong>${summary.watchCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Unstable</span><strong>${summary.unstableCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Gate rejected</span><strong>${summary.rejectedByQualityGateCount ?? 0}</strong></div>
       <div class="metric"><span>PASS/WARN</span><strong>${summary.passCount ?? 0}</strong></div>
       <div class="metric"><span>FAIL</span><strong>${summary.failCount ?? 0}</strong></div>
       <div class="metric"><span>Skipped</span><strong>${summary.skippedCount ?? 0}</strong></div>
@@ -4391,11 +4403,12 @@ function renderResearchMultiStrategyOptimizerBatch(payload) {
       <div class="metric"><span>Active</span><strong>${active.strategy ? `${escapeHtml(active.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.timeframe || "")}` : "-"}</strong></div>
       <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
     </div>
+    <p class="modal-note">${escapeHtml(summary.qualityGateExplanation || "")}</p>
     <p class="modal-note"><strong>Discovered:</strong> ${escapeHtml((payload.discoveredStrategies || []).join(", ") || "-")}</p>
     ${skipped ? `<p class="modal-note"><strong>Skipped:</strong> ${escapeHtml(skipped)}</p>` : ""}
     <table class="trade-table">
-      <thead><tr><th>Rank</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Eligible</th><th>Tier</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Practical</th><th>Source</th><th>Rejection</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="17">No optimizer batch rows returned.</td></tr>`}</tbody>
+      <thead><tr><th>Raw</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Repro</th><th>Gate</th><th>Final tier</th><th>Eligible</th><th>Evidence</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Practical</th><th>Source</th><th>Rejection</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="20">No optimizer batch rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

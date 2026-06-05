@@ -43,6 +43,13 @@ const REPLACEMENT_RULES = {
   strongImprovementProfitFactor: 0.2
 };
 
+const REPRO_TOLERANCES = {
+  tradeTolerance: 1,
+  returnPctTolerance: 0.5,
+  profitFactorTolerance: 0.15,
+  drawdownPctTolerance: 0.5
+};
+
 function parseCsv(value, fallback) {
   if (!value || value === "auto") return fallback;
   return String(value).split(",").map((item) => item.trim()).filter(Boolean);
@@ -124,6 +131,14 @@ function compactResult(result, context) {
     timeframe: context.timeframe,
     params: context.params,
     paramsSource: context.paramsSource,
+    rawRank: null,
+    rawCandidate: !context.isActiveBaseline,
+    reproducibilityStatus: "NOT_CHECKED",
+    reproducibilityReasons: [],
+    reproducibilityDiffs: {},
+    qualityGateStatus: "RAW_ONLY",
+    qualityGateReasons: [],
+    finalCandidateTier: context.isActiveBaseline ? "BASELINE" : "RAW",
     status: "FAIL",
     replacementEligible: false,
     replacementRejectionReasons: [],
@@ -157,6 +172,14 @@ function errorRow(context, message) {
     timeframe: context.timeframe,
     params: {},
     paramsSource: "error",
+    rawRank: null,
+    rawCandidate: !context.isActiveBaseline,
+    reproducibilityStatus: "FAIL",
+    reproducibilityReasons: ["error"],
+    reproducibilityDiffs: {},
+    qualityGateStatus: "REJECTED",
+    qualityGateReasons: ["error"],
+    finalCandidateTier: "REJECTED",
     status: "ERROR",
     replacementEligible: false,
     replacementRejectionReasons: ["error"],
@@ -223,6 +246,149 @@ function replacementRejectionReasons(row, baseline, rules, activeEvidence) {
   return reasons;
 }
 
+function maxAbs(values) {
+  return values.reduce((max, value) => Math.max(max, Math.abs(Number(value || 0))), 0);
+}
+
+function statusBand(status) {
+  if (status === "PASS" || status === "WARN") return "PASSING";
+  if (status === "NO_TRADES") return "NO_TRADES";
+  return "FAILING";
+}
+
+function compactRerunResult(result) {
+  const row = {
+    status: "FAIL",
+    trades: Number(result.trades || 0),
+    totalReturnPct: round(result.totalReturn || 0, 4),
+    profitFactor: round(result.profitFactor || 0, 4),
+    maxDrawdownPct: round(result.maxDrawdown || 0, 4),
+    winRate: round(result.winRate || 0, 4),
+    mainFailureReason: null
+  };
+  row.mainFailureReason = classify(row);
+  row.status = statusFor(row);
+  return row;
+}
+
+function reproDiffSummary(original, reruns) {
+  return {
+    tradesDiffMax: maxAbs(reruns.map((row) => Number(row.trades || 0) - Number(original.trades || 0))),
+    returnDiffMax: round(maxAbs(reruns.map((row) => Number(row.totalReturnPct || 0) - Number(original.totalReturnPct || 0))), 4),
+    profitFactorDiffMax: round(maxAbs(reruns.map((row) => Number(row.profitFactor || 0) - Number(original.profitFactor || 0))), 4),
+    drawdownDiffMax: round(maxAbs(reruns.map((row) => Number(row.maxDrawdownPct || 0) - Number(original.maxDrawdownPct || 0))), 4),
+    statusChanged: reruns.some((rerun) => rerun.status !== original.status)
+  };
+}
+
+function reproStatus(original, reruns, diffs) {
+  if (!reruns.length || reruns.some((row) => row.status === "ERROR")) return "FAIL";
+  const materiallyDifferent = diffs.tradesDiffMax > REPRO_TOLERANCES.tradeTolerance
+    || diffs.returnDiffMax > REPRO_TOLERANCES.returnPctTolerance
+    || diffs.profitFactorDiffMax > REPRO_TOLERANCES.profitFactorTolerance
+    || diffs.drawdownDiffMax > REPRO_TOLERANCES.drawdownPctTolerance;
+  const bandChanged = reruns.some((row) => statusBand(row.status) !== statusBand(original.status));
+  if (original.status === "PASS" && reruns.some((row) => row.status === "FAIL")) return "UNSTABLE";
+  if (diffs.statusChanged || bandChanged || materiallyDifferent) return "UNSTABLE";
+  const modest = diffs.tradesDiffMax > 0
+    || diffs.returnDiffMax > REPRO_TOLERANCES.returnPctTolerance / 2
+    || diffs.profitFactorDiffMax > REPRO_TOLERANCES.profitFactorTolerance / 2
+    || diffs.drawdownDiffMax > REPRO_TOLERANCES.drawdownPctTolerance / 2;
+  return modest ? "WATCH" : "REPRODUCIBLE";
+}
+
+function reproReasons(original, status, diffs, reruns) {
+  const reasons = [];
+  if (original.status === "PASS" && reruns.some((row) => row.status === "FAIL")) reasons.push("original_pass_rerun_fail");
+  if (diffs.statusChanged) reasons.push("status_changed");
+  if (diffs.tradesDiffMax > REPRO_TOLERANCES.tradeTolerance) reasons.push("trades_mismatch");
+  if (diffs.returnDiffMax > REPRO_TOLERANCES.returnPctTolerance) reasons.push("return_mismatch");
+  if (diffs.profitFactorDiffMax > REPRO_TOLERANCES.profitFactorTolerance) reasons.push("profit_factor_mismatch");
+  if (diffs.drawdownDiffMax > REPRO_TOLERANCES.drawdownPctTolerance) reasons.push("drawdown_mismatch");
+  if (status === "FAIL") reasons.push("rerun_failed");
+  return reasons;
+}
+
+function auditRowReproducibility(row, candles, regimeCandles, context, reruns) {
+  if (row.isActiveBaseline) return;
+  const rerunRows = [];
+  for (let index = 0; index < reruns; index += 1) {
+    try {
+      rerunRows.push(compactRerunResult(backtest.runBacktestOnCandles({
+        source: context.source,
+        symbol: row.symbol,
+        interval: row.timeframe,
+        strategy: row.strategy,
+        candles,
+        regimeCandles,
+        params: Object.assign({}, row.params, context.costs),
+        feePct: context.costs.feePct,
+        slippagePct: context.costs.slippagePct
+      })));
+    } catch (error) {
+      rerunRows.push({
+        status: "ERROR",
+        trades: 0,
+        totalReturnPct: 0,
+        profitFactor: 0,
+        maxDrawdownPct: 0,
+        winRate: 0,
+        mainFailureReason: "ERROR",
+        error: error.message
+      });
+    }
+  }
+  const original = {
+    status: row.status,
+    trades: row.trades,
+    totalReturnPct: row.totalReturnPct,
+    profitFactor: row.profitFactor,
+    maxDrawdownPct: row.maxDrawdownPct,
+    winRate: row.winRate
+  };
+  row.reproducibilityReruns = rerunRows;
+  row.reproducibilityDiffs = reproDiffSummary(original, rerunRows);
+  row.reproducibilityStatus = reproStatus(original, rerunRows, row.reproducibilityDiffs);
+  row.reproducibilityReasons = reproReasons(original, row.reproducibilityStatus, row.reproducibilityDiffs, rerunRows);
+}
+
+function applyQualityGate(row, includeReproAudit, requireReproducible) {
+  row.qualityGateReasons = [];
+  if (row.isActiveBaseline) {
+    row.qualityGateStatus = "RAW_ONLY";
+    row.finalCandidateTier = "BASELINE";
+    return;
+  }
+  if (!includeReproAudit) {
+    row.reproducibilityStatus = row.reproducibilityStatus || "NOT_CHECKED";
+    row.qualityGateStatus = "RAW_ONLY";
+    row.finalCandidateTier = "RAW";
+    if (requireReproducible) row.qualityGateReasons.push("reproducibility_not_checked");
+    return;
+  }
+  if (!row.reproducibilityStatus || row.reproducibilityStatus === "NOT_CHECKED") {
+    row.reproducibilityStatus = "NOT_CHECKED";
+    row.qualityGateStatus = "RAW_ONLY";
+    row.finalCandidateTier = "RAW";
+    row.qualityGateReasons.push("reproducibility_not_checked");
+    return;
+  }
+  if (row.reproducibilityStatus === "REPRODUCIBLE") {
+    row.qualityGateStatus = "REPRODUCIBLE";
+    row.finalCandidateTier = "REPRODUCIBLE";
+  } else if (row.reproducibilityStatus === "WATCH") {
+    row.qualityGateStatus = "WATCH";
+    row.finalCandidateTier = "REPRODUCIBLE";
+  } else {
+    row.qualityGateStatus = "REJECTED";
+    row.finalCandidateTier = "REJECTED";
+    row.qualityGateReasons.push("reproducibility_" + String(row.reproducibilityStatus || "not_checked").toLowerCase());
+  }
+  (row.reproducibilityReasons || []).forEach((reason) => {
+    if (row.qualityGateReasons.indexOf(reason) === -1) row.qualityGateReasons.push(reason);
+  });
+}
+
 function annotateReplacementSemantics(rows, activeEvidence, rules) {
   const baseline = rows.find((row) => row.isActiveBaseline) || null;
   rows.forEach((row) => {
@@ -234,7 +400,12 @@ function annotateReplacementSemantics(rows, activeEvidence, rules) {
   if (baseline) baseline.practicalScore = practicalScoreRow(baseline, baseline, rules, activeEvidence);
   rows.forEach((row) => {
     row.replacementRejectionReasons = replacementRejectionReasons(row, baseline, rules, activeEvidence);
+    if (row.qualityGateStatus === "REJECTED" && !row.isActiveBaseline) row.replacementRejectionReasons.push("quality_gate_rejected");
+    if (row.qualityGateStatus === "RAW_ONLY" && !row.isActiveBaseline && row.qualityGateReasons.includes("reproducibility_not_checked")) {
+      row.replacementRejectionReasons.push("reproducibility_not_checked");
+    }
     row.replacementEligible = row.replacementRejectionReasons.length === 0;
+    if (row.replacementEligible) row.finalCandidateTier = "REPLACEMENT_ELIGIBLE";
     row.practicalRank = null;
   });
   const practicalRows = rows
@@ -379,14 +550,27 @@ function walkForwardSummary(row, candles, regimeCandles, context) {
   };
 }
 
-function buildSummary(rows, skippedStrategies, activeEvidence, rules) {
+function buildSummary(rows, skippedStrategies, activeEvidence, rules, options) {
+  options = options || {};
   const active = rows.find((row) => row.isActiveBaseline) || null;
   const ranked = rows.slice().sort(sortRows);
   const eligible = rows.filter((row) => row.replacementEligible).sort((a, b) => Number(b.practicalScore || 0) - Number(a.practicalScore || 0));
   const bestOverall = ranked[0] || null;
+  const rawRows = rows.filter((row) => !row.isActiveBaseline && row.rawCandidate);
+  const bestRawCandidate = rawRows.slice().sort(sortRows)[0] || null;
+  const reproducibleRows = rawRows.filter((row) => row.reproducibilityStatus === "REPRODUCIBLE" || row.reproducibilityStatus === "WATCH");
+  const bestReproducibleCandidate = reproducibleRows.slice().sort((a, b) => Number(b.practicalScore || b.score || 0) - Number(a.practicalScore || a.score || 0))[0] || null;
   const bestReplacementCandidate = eligible[0] || null;
   const passCount = rows.filter((row) => row.status === "PASS" || row.status === "WARN").length;
   const failCount = rows.length - passCount;
+  const rawCandidateCount = rawRows.length;
+  const reproducibleCandidateCount = rawRows.filter((row) => row.reproducibilityStatus === "REPRODUCIBLE").length;
+  const watchCandidateCount = rawRows.filter((row) => row.reproducibilityStatus === "WATCH").length;
+  const unstableCandidateCount = rawRows.filter((row) => row.reproducibilityStatus === "UNSTABLE").length;
+  const rejectedByQualityGateCount = rawRows.filter((row) => row.qualityGateStatus === "REJECTED").length;
+  const qualityGateExplanation = options.includeReproAudit
+    ? `Reproducibility audit checked the top ${options.reproTopN} raw optimizer row(s) with ${options.reproReruns} rerun(s); unstable or failed rows are rejected before replacement review.`
+    : "Reproducibility audit was not requested; optimizer rows are raw research leads only.";
   let recommendation = { action: "NO_ACTION", reason: "No optimizer batch rows were evaluated." };
   if (active && bestReplacementCandidate && Number(bestReplacementCandidate.practicalScore || 0) > Number(active.practicalScore || 0) + rules.minPracticalScoreMargin) {
     recommendation = {
@@ -396,8 +580,8 @@ function buildSummary(rows, skippedStrategies, activeEvidence, rules) {
   } else if (active) {
     recommendation = {
       action: "KEEP_BASELINE",
-      reason: bestOverall && !bestOverall.isActiveBaseline
-        ? `Best optimized row ${bestOverall.strategy} ${bestOverall.symbol} ${bestOverall.timeframe} is not a replacement: ${(bestOverall.replacementRejectionReasons || []).join(", ") || "did not beat practical gates"}.`
+      reason: bestRawCandidate
+        ? `Best raw optimizer row ${bestRawCandidate.strategy} ${bestRawCandidate.symbol} ${bestRawCandidate.timeframe} is not a replacement: ${(bestRawCandidate.replacementRejectionReasons || bestRawCandidate.qualityGateReasons || []).join(", ") || "did not beat practical gates"}.`
         : "The active promoted candidate remains the best practical decision after this bounded research batch."
     };
   } else if (rows.length) {
@@ -405,14 +589,22 @@ function buildSummary(rows, skippedStrategies, activeEvidence, rules) {
   }
   return {
     bestOverall,
+    bestRawCandidate,
+    bestReproducibleCandidate,
     bestReplacementCandidate,
     activeBaselineRank: active ? active.rank : null,
     activeBaselinePracticalRank: active ? active.practicalRank : null,
+    rawCandidateCount,
+    reproducibleCandidateCount,
+    watchCandidateCount,
+    unstableCandidateCount,
+    rejectedByQualityGateCount,
     replacementEligibleCount: eligible.length,
     replacementRules: rules,
     passCount,
     failCount,
     skippedCount: skippedStrategies.length,
+    qualityGateExplanation,
     recommendation
   };
 }
@@ -452,6 +644,10 @@ const costs = {
 };
 const includeStress = String(args.includeStress || "false").toLowerCase() === "true";
 const includeWalkForward = String(args.includeWalkForward || "false").toLowerCase() === "true";
+const includeReproAudit = String(args.includeReproAudit || args.include_repro_audit || "false").toLowerCase() === "true";
+const reproTopN = Math.max(1, Math.min(Number(args.reproTopN || args.repro_top_n || 5), 20));
+const reproReruns = Math.max(1, Math.min(Number(args.reproReruns || args.repro_reruns || 1), 5));
+const requireReproducible = String(args.requireReproducible || args.require_reproducible || "false").toLowerCase() === "true";
 const save = String(args.save || "false").toLowerCase() === "true";
 const from = args.from || argsUtil.daysToFrom(days);
 const to = args.to || new Date().toISOString();
@@ -497,7 +693,7 @@ cappedCombos.concat([{ symbol: active.symbol, timeframe: active.timeframe, strat
 Promise.all([
   Promise.all(Object.keys(candleJobs).map((key) => candleJobs[key].then((candles) => [key, candles]))),
   data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: limit || autoLimitFor("4h", days, 1000) }).then((candles) => data.normalizeCandles(candles || []))
-]).then(([entries, regimeCandles]) => {
+]).then(async ([entries, regimeCandles]) => {
   const candlesByKey = {};
   entries.forEach(([key, candles]) => { candlesByKey[key] = candles; });
   const warnings = [];
@@ -572,7 +768,30 @@ Promise.all([
   });
 
   rows.sort(sortRows);
-  rows.forEach((row, index) => { row.rank = index + 1; });
+  rows.forEach((row, index) => {
+    row.rank = index + 1;
+    row.rawRank = row.isActiveBaseline ? null : index + 1;
+  });
+  if (includeReproAudit) {
+    for (const row of rows.filter((item) => !item.isActiveBaseline).slice(0, reproTopN)) {
+      const fallbackCandles = candlesByKey[row.symbol + ":" + row.timeframe] || [];
+      let candles = fallbackCandles;
+      try {
+        candles = await data.fetchCandles({
+          source,
+          symbol: row.symbol,
+          interval: row.timeframe,
+          from,
+          to,
+          limit: limit || autoLimitFor(row.timeframe, days, 5000)
+        }).then((raw) => data.normalizeCandles(raw || []));
+      } catch (error) {
+        warnings.push(`Reproducibility audit used optimizer-window candles for ${row.strategy} ${row.symbol} ${row.timeframe} because full-window refresh failed: ${error.message}`);
+      }
+      auditRowReproducibility(row, candles, regimeCandles, { source, costs }, reproReruns);
+    }
+  }
+  rows.forEach((row) => applyQualityGate(row, includeReproAudit, requireReproducible));
   annotateReplacementSemantics(rows, activeEvidence, REPLACEMENT_RULES);
   const enriched = new Set(rows.slice(0, 3).map((row) => row.rank));
   const activeRow = rows.find((row) => row.isActiveBaseline);
@@ -586,7 +805,7 @@ Promise.all([
   });
   const outputRows = rows.slice(0, topN);
   if (activeRow && !outputRows.some((row) => row.isActiveBaseline)) outputRows.push(activeRow);
-  const summary = buildSummary(rows, skippedStrategies, activeEvidence, REPLACEMENT_RULES);
+  const summary = buildSummary(rows, skippedStrategies, activeEvidence, REPLACEMENT_RULES, { includeReproAudit, reproTopN, reproReruns, requireReproducible });
   const payload = {
     ok: true,
     paperEnabled: null,
@@ -603,6 +822,11 @@ Promise.all([
       topN,
       includeWalkForward,
       includeStress,
+      includeReproAudit,
+      reproTopN,
+      reproReruns,
+      requireReproducible,
+      reproducibilityTolerances: REPRO_TOLERANCES,
       save
     },
     discoveredStrategies,
