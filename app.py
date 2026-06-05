@@ -1345,6 +1345,15 @@ def research_reproducible_candidate_drilldown():
         return jsonify({"error": f"Could not build reproducible candidate drilldown: {exc}"}), 502
 
 
+@app.get("/api/research/lead-review")
+def research_lead_review():
+    try:
+        payload, status_code = build_research_lead_review(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research lead review: {exc}"}), 502
+
+
 @app.get("/api/research/snapshot-export")
 def research_snapshot_export():
     try:
@@ -7860,6 +7869,180 @@ def build_research_reproducible_candidate_drilldown(args) -> tuple[dict, int]:
     }
     if save and response["ok"]:
         response["savedPath"] = _save_reproducible_candidate_drilldown(response)
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def _save_research_lead_review(payload: dict) -> str:
+    reports_dir = Path(app.root_path) / "reports" / "research-leads"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = reports_dir / f"research-lead-review-{stamp}.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+
+
+def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, lead_timeframe: str, period: str) -> tuple[dict | None, str, dict | None, list[str], int]:
+    raw_params = args.get("leadParams")
+    if raw_params:
+        try:
+            params = json.loads(raw_params)
+        except Exception as exc:
+            return None, "inline", {"ok": False, "error": f"Could not parse leadParams JSON: {exc}"}, [], 400
+        if not isinstance(params, dict):
+            return None, "inline", {"ok": False, "error": "leadParams must decode to a JSON object."}, [], 400
+        return params, "inline", None, [], 200
+    drilldown_args = {
+        "symbols": lead_symbol,
+        "timeframes": lead_timeframe,
+        "strategies": lead_strategy,
+        "period": period,
+        "maxCombosPerStrategy": args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 25)),
+        "reproTopN": args.get("reproTopN", args.get("repro_top_n", 5)),
+        "reproReruns": args.get("reproReruns", args.get("repro_reruns", 1)),
+        "topN": args.get("topN", args.get("top_n", 5)),
+        "includeStress": "false",
+        "includeWalkForward": "false",
+        "includeRegime": "false",
+        "save": "false",
+        "limit": args.get("limit", "auto"),
+        "timeout_seconds": args.get("resolve_timeout_seconds", args.get("timeout_seconds", 900)),
+    }
+    if args.get("batchFile"):
+        drilldown_args["batchFile"] = args.get("batchFile")
+    drilldown_payload, drilldown_status = build_research_reproducible_candidate_drilldown(drilldown_args)
+    warnings = drilldown_payload.get("warnings") or []
+    if not drilldown_payload.get("ok"):
+        return None, "unresolved", drilldown_payload, warnings, drilldown_status
+    for row in drilldown_payload.get("candidates") or []:
+        if (
+            str(row.get("strategy")) == lead_strategy
+            and str(row.get("symbol")) == lead_symbol
+            and str(row.get("timeframe")) == lead_timeframe
+            and isinstance(row.get("params"), dict)
+            and row.get("params")
+        ):
+            return dict(row.get("params")), "optimizerDrilldown", drilldown_payload, warnings, 200
+    return None, "unresolved", drilldown_payload, warnings, 400
+
+
+def build_research_lead_review(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    lead_strategy = (args.get("leadStrategy") or args.get("lead_strategy") or "RelativeStrengthV2").strip()
+    lead_symbol = (args.get("leadSymbol") or args.get("lead_symbol") or "ETHUSDT").strip()
+    lead_timeframe = (args.get("leadTimeframe") or args.get("lead_timeframe") or args.get("leadInterval") or "4h").strip()
+    baseline_strategy = (args.get("baselineStrategy") or args.get("baseline_strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    baseline_symbol = (args.get("baselineSymbol") or args.get("baseline_symbol") or active.get("symbol") or "ETHUSDT").strip()
+    baseline_timeframe = (args.get("baselineTimeframe") or args.get("baseline_timeframe") or args.get("baselineInterval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    period = args.get("period", "365d")
+    include_robustness = str(args.get("includeRobustness", args.get("include_robustness", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_stress = str(args.get("includeStress", args.get("include_stress", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_regime = str(args.get("includeRegime", args.get("include_regime", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_deep = str(args.get("includeDeepCompare", args.get("include_deep_compare", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    baseline_params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    lead_params, params_source, resolver_payload, resolver_warnings, resolver_status = _resolve_research_lead_params(args, lead_strategy, lead_symbol, lead_timeframe, period)
+    if lead_params is None:
+        return {
+            "ok": False,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "baseline": {"strategy": baseline_strategy, "symbol": baseline_symbol, "timeframe": baseline_timeframe, "params": baseline_params},
+            "lead": {"strategy": lead_strategy, "symbol": lead_symbol, "timeframe": lead_timeframe, "params": None, "paramsSource": params_source},
+            "error": "Could not resolve lead params. Pass leadParams as a JSON query parameter or provide a batchFile containing the lead row.",
+            "resolver": {"summary": (resolver_payload or {}).get("summary"), "source": (resolver_payload or {}).get("source")},
+            "warnings": dedupe_list(resolver_warnings + ([real_detail] if real_enabled else [])),
+        }, resolver_status
+    command = package_node_script_args("research:lead-review")
+    command.extend([
+        "--leadStrategy", lead_strategy,
+        "--leadSymbol", lead_symbol,
+        "--leadTimeframe", lead_timeframe,
+        "--leadParams", json.dumps(lead_params),
+        "--baselineStrategy", baseline_strategy,
+        "--baselineSymbol", baseline_symbol,
+        "--baselineTimeframe", baseline_timeframe,
+        "--baselineParams", json.dumps(baseline_params),
+        "--period", period,
+        "--includeRobustness", "true" if include_robustness else "false",
+        "--includeStress", "true" if include_stress else "false",
+        "--includeWalkForward", "true" if include_walk else "false",
+        "--includeRegime", "true" if include_regime else "false",
+        "--includeDeepCompare", "true" if include_deep else "false",
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("review_timeout_seconds", args.get("timeout_seconds", 720)), 720)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Research lead review timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "baseline": {"strategy": baseline_strategy, "symbol": baseline_symbol, "timeframe": baseline_timeframe},
+            "lead": {"strategy": lead_strategy, "symbol": lead_symbol, "timeframe": lead_timeframe, "paramsSource": params_source},
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Research lead review timed out before returning evidence."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        payload = _load_research_drilldown_stdout(completed.stdout)
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Research lead review returned no output."}
+    warnings = dedupe_list(resolver_warnings + (payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Research lead review command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "baseline": payload.get("baseline") or {"strategy": baseline_strategy, "symbol": baseline_symbol, "timeframe": baseline_timeframe, "params": baseline_params},
+        "lead": dict(payload.get("lead") or {"strategy": lead_strategy, "symbol": lead_symbol, "timeframe": lead_timeframe, "params": lead_params}),
+        "evidence": payload.get("evidence") or {},
+        "comparison": payload.get("comparison") or {},
+        "replacementEligibility": payload.get("replacementEligibility") or {},
+        "verdict": payload.get("verdict") or {},
+        "warnings": warnings,
+        "error": payload.get("error"),
+        "search": {
+            "leadStrategy": lead_strategy,
+            "leadSymbol": lead_symbol,
+            "leadTimeframe": lead_timeframe,
+            "baselineStrategy": baseline_strategy,
+            "baselineSymbol": baseline_symbol,
+            "baselineTimeframe": baseline_timeframe,
+            "period": period,
+            "includeRobustness": include_robustness,
+            "includeStress": include_stress,
+            "includeWalkForward": include_walk,
+            "includeRegime": include_regime,
+            "includeDeepCompare": include_deep,
+        },
+        "resolver": {"source": (resolver_payload or {}).get("source"), "summary": (resolver_payload or {}).get("summary")},
+        "command": " ".join(command[:1] + ["cli/research_lead_review.js", "--leadParams", "[lead-params-json]", "--period", period]),
+    }
+    response["lead"]["paramsSource"] = params_source
+    if save and response["ok"]:
+        response["savedPath"] = _save_research_lead_review(response)
     if completed.returncode != 0:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()

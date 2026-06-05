@@ -2723,6 +2723,7 @@ function setupLearningControls() {
   document.querySelector("#research-multi-strategy-matrix-refresh")?.addEventListener("click", loadResearchMultiStrategyMatrix);
   document.querySelector("#research-multi-strategy-optimizer-batch-refresh")?.addEventListener("click", loadResearchMultiStrategyOptimizerBatch);
   document.querySelector("#research-reproducible-candidate-drilldown-refresh")?.addEventListener("click", loadResearchReproducibleCandidateDrilldown);
+  document.querySelector("#research-lead-review-refresh")?.addEventListener("click", loadResearchLeadReview);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -4477,6 +4478,86 @@ function renderResearchReproducibleCandidateDrilldown(payload) {
       <tbody>${rows || `<tr><td colspan="13">No reproducible/watch candidates selected.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchLeadReview() {
+  const host = document.querySelector("#research-lead-review-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running research lead review...</p>`;
+    const payload = await apiGet("/api/research/lead-review");
+    host.innerHTML = renderResearchLeadReview(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research lead review could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchLeadReview(payload) {
+  const baseline = payload.baseline || {};
+  const lead = payload.lead || {};
+  const evidence = payload.evidence || {};
+  const activity = evidence.activity || {};
+  const baselineActivity = activity.baseline || {};
+  const leadActivity = activity.lead || {};
+  const comparison = payload.comparison || {};
+  const eligibility = payload.replacementEligibility || {};
+  const verdict = payload.verdict || {};
+  const statuses = [
+    ["Activity", leadActivity.status || "-"],
+    ["Robustness", evidence.robustness?.status || "-"],
+    ["Cost stress", evidence.feeSlippageStress?.status || "-"],
+    ["Walk-forward", evidence.walkForward?.status || "-"],
+    ["Regime", evidence.regimeBreakdown?.regimeDependencyStatus || "-"],
+    ["Deep compare", evidence.deepCompare?.status || "-"]
+  ].map(([label, value]) => `
+    <div class="metric"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>
+  `).join("");
+  const warningItems = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const reasonItems = (eligibility.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  const tone = verdict.action === "REVIEW_FOR_PROMOTION" ? "positive" : verdict.action === "RESEARCH_MORE" ? "neutral" : "negative";
+  return `
+    <h3 class="modal-section-title">Research Lead Review <span class="${tone}">${escapeHtml(verdict.action || "NO_DECISION")}</span></h3>
+    <p class="modal-note">${escapeHtml(verdict.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Lead</span><strong>${escapeHtml(lead.strategy || "-")} ${escapeHtml(lead.symbol || "-")} ${escapeHtml(lead.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Lead params</span><strong>${escapeHtml(lead.paramsSource || "-")}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${escapeHtml(baseline.strategy || "-")} ${escapeHtml(baseline.symbol || "-")} ${escapeHtml(baseline.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Winner</span><strong>${escapeHtml(comparison.winner || "-")}</strong></div>
+      <div class="metric"><span>Eligible</span><strong>${eligibility.eligible ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+      ${statuses}
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Candidate</th><th>Trades</th><th>Trades/mo</th><th>PF</th><th>Return</th><th>Drawdown</th><th>Win rate</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Baseline</td>
+          <td>${baselineActivity.trades ?? 0}</td>
+          <td>${formatNumber(baselineActivity.tradesPerMonth)}</td>
+          <td>${formatNumber(baselineActivity.profitFactor)}</td>
+          <td class="${(baselineActivity.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(baselineActivity.totalReturnPct || 0)}%</td>
+          <td>${formatNumber(baselineActivity.maxDrawdownPct)}%</td>
+          <td>${formatNumber(baselineActivity.winRate)}%</td>
+          <td>${escapeHtml(baselineActivity.status || "-")}</td>
+        </tr>
+        <tr>
+          <td>Lead</td>
+          <td>${leadActivity.trades ?? 0}</td>
+          <td>${formatNumber(leadActivity.tradesPerMonth)}</td>
+          <td>${formatNumber(leadActivity.profitFactor)}</td>
+          <td class="${(leadActivity.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(leadActivity.totalReturnPct || 0)}%</td>
+          <td>${formatNumber(leadActivity.maxDrawdownPct)}%</td>
+          <td>${formatNumber(leadActivity.winRate)}%</td>
+          <td>${escapeHtml(leadActivity.status || "-")}</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="modal-note"><strong>Tradeoff:</strong> ${escapeHtml(comparison.tradeoffSummary || "")}</p>
+    ${reasonItems ? `<p class="modal-note"><strong>Eligibility blockers</strong></p><ul class="backtest-warnings">${reasonItems}</ul>` : ""}
+    ${warningItems ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${warningItems}</ul>` : ""}
   `;
 }
 

@@ -28,6 +28,7 @@
     "research:multi-strategy-optimizer-batch": "node cli/research_multi_strategy_optimizer_batch.js",
     "research:optimizer-reproducibility-audit": "node cli/research_optimizer_reproducibility_audit.js",
     "research:reproducible-candidate-drilldown": "node cli/research_reproducible_candidate_drilldown.js",
+    "research:lead-review": "node cli/research_lead_review.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",
     "optimize:v2": "node cli/optimize_v2.js",
