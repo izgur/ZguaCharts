@@ -2722,6 +2722,7 @@ function setupLearningControls() {
   document.querySelector("#research-optimizer-reproducibility-audit-refresh")?.addEventListener("click", loadResearchOptimizerReproducibilityAudit);
   document.querySelector("#research-multi-strategy-matrix-refresh")?.addEventListener("click", loadResearchMultiStrategyMatrix);
   document.querySelector("#research-multi-strategy-optimizer-batch-refresh")?.addEventListener("click", loadResearchMultiStrategyOptimizerBatch);
+  document.querySelector("#research-reproducible-candidate-drilldown-refresh")?.addEventListener("click", loadResearchReproducibleCandidateDrilldown);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -4409,6 +4410,71 @@ function renderResearchMultiStrategyOptimizerBatch(payload) {
     <table class="trade-table">
       <thead><tr><th>Raw</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Repro</th><th>Gate</th><th>Final tier</th><th>Eligible</th><th>Evidence</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Practical</th><th>Source</th><th>Rejection</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="20">No optimizer batch rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchReproducibleCandidateDrilldown() {
+  const host = document.querySelector("#research-reproducible-candidate-drilldown-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running reproducible candidate drilldown...</p>`;
+    const payload = await apiGet("/api/research/reproducible-candidate-drilldown");
+    host.innerHTML = renderResearchReproducibleCandidateDrilldown(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Reproducible candidate drilldown could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchReproducibleCandidateDrilldown(payload) {
+  const summary = payload.summary || {};
+  const source = payload.source || {};
+  const rec = summary.recommendation || {};
+  const best = summary.bestCandidate || {};
+  const rows = (payload.candidates || []).slice(0, 20).map((row) => {
+    const verdict = row.verdict || {};
+    const eligibility = row.replacementEligibility || {};
+    const scorecard = row.scorecard || {};
+    const tone = verdict.action === "REVIEW_FOR_PROMOTION" ? "positive" : verdict.action === "RESEARCH_MORE" || verdict.action === "WATCH" ? "neutral" : "negative";
+    const reasons = (eligibility.reasons || []).join(", ") || "-";
+    return `
+      <tr>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td>${escapeHtml(row.reproducibilityStatus || "-")}</td>
+        <td>${escapeHtml(row.activity?.status || "-")}</td>
+        <td>${escapeHtml(row.stress?.status || "-")}</td>
+        <td>${escapeHtml(row.walkForward?.status || "-")}</td>
+        <td>${escapeHtml(row.regime?.regimeDependencyStatus || "-")}</td>
+        <td>${row.activity?.trades ?? 0}</td>
+        <td>${formatNumber(row.activity?.profitFactor)}</td>
+        <td class="${(row.activity?.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.activity?.totalReturnPct || 0)}%</td>
+        <td>${formatNumber(scorecard.overallScore)}</td>
+        <td class="${tone}">${escapeHtml(verdict.action || "-")}</td>
+        <td>${escapeHtml(reasons)}</td>
+      </tr>
+    `;
+  }).join("");
+  const bestText = best.strategy ? `${best.strategy} ${best.symbol} ${best.timeframe} ${best.verdict?.action || ""} score ${best.scorecard?.overallScore ?? "-"}` : "none";
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Reproducible Candidate Drilldown <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Best:</strong> ${escapeHtml(bestText)}. ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Selected</span><strong>${summary.selectedCount ?? source.selectedCount ?? 0}</strong></div>
+      <div class="metric"><span>Review</span><strong>${summary.reviewForPromotionCount ?? 0}</strong></div>
+      <div class="metric"><span>Research more</span><strong>${summary.researchMoreCount ?? 0}</strong></div>
+      <div class="metric"><span>Watch</span><strong>${summary.watchCount ?? 0}</strong></div>
+      <div class="metric"><span>Discard</span><strong>${summary.discardCount ?? 0}</strong></div>
+      <div class="metric"><span>Source</span><strong>${source.generatedBatch ? "generated batch" : source.batchFile ? "batch file" : "-"}</strong></div>
+      <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Market</th><th>Repro</th><th>Activity</th><th>Stress</th><th>Walk</th><th>Regime</th><th>Trades</th><th>PF</th><th>Return</th><th>Score</th><th>Verdict</th><th>Reasons</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="13">No reproducible/watch candidates selected.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

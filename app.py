@@ -1336,6 +1336,15 @@ def research_optimizer_reproducibility_audit():
         return jsonify({"error": f"Could not build optimizer reproducibility audit: {exc}"}), 502
 
 
+@app.get("/api/research/reproducible-candidate-drilldown")
+def research_reproducible_candidate_drilldown():
+    try:
+        payload, status_code = build_research_reproducible_candidate_drilldown(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build reproducible candidate drilldown: {exc}"}), 502
+
+
 @app.get("/api/research/snapshot-export")
 def research_snapshot_export():
     try:
@@ -7631,6 +7640,226 @@ def build_research_optimizer_reproducibility_audit(args) -> tuple[dict, int]:
     }
     if save and response["ok"]:
         response["savedPath"] = _save_optimizer_reproducibility_audit(response)
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def _drilldown_candidates_from_batch(batch_payload: dict, top_n: int) -> list[dict]:
+    rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict) and not row.get("isActiveBaseline")]
+    selected = [
+        row for row in rows
+        if row.get("finalCandidateTier") == "REPRODUCIBLE"
+        or row.get("qualityGateStatus") in {"REPRODUCIBLE", "WATCH"}
+        or row.get("reproducibilityStatus") in {"REPRODUCIBLE", "WATCH"}
+    ]
+    selected = sorted(selected, key=lambda row: (
+        0 if row.get("finalCandidateTier") == "REPLACEMENT_ELIGIBLE" else 1,
+        int(safe_float(row.get("rawRank") or row.get("rank"), 999999)),
+    ))
+    candidates = []
+    for row in selected[:top_n]:
+        candidates.append({
+            "strategy": row.get("strategy"),
+            "symbol": row.get("symbol"),
+            "timeframe": row.get("timeframe") or row.get("interval"),
+            "params": row.get("params") if isinstance(row.get("params"), dict) else {},
+            "reproducibilityStatus": row.get("reproducibilityStatus") or "NOT_CHECKED",
+            "qualityGateStatus": row.get("qualityGateStatus") or "RAW_ONLY",
+            "finalCandidateTier": row.get("finalCandidateTier") or "RAW",
+            "rawRank": row.get("rawRank") or row.get("rank"),
+            "practicalRank": row.get("practicalRank"),
+            "score": row.get("score"),
+            "practicalScore": row.get("practicalScore"),
+        })
+    return [candidate for candidate in candidates if candidate.get("strategy") and candidate.get("symbol") and candidate.get("timeframe")]
+
+
+def _save_reproducible_candidate_drilldown(payload: dict) -> str:
+    reports_dir = Path(app.root_path) / "reports" / "research-drilldowns"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = reports_dir / f"reproducible-candidate-drilldown-{stamp}.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+
+
+def _load_research_drilldown_stdout(stdout: str) -> dict:
+    text = (stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except Exception:
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                payload, end = decoder.raw_decode(text[index:])
+            except Exception:
+                continue
+            if text[index + end:].strip():
+                continue
+            if isinstance(payload, dict):
+                return payload
+    return {"ok": False, "error": "Reproducible candidate drilldown returned non-JSON output.", "stdout": text}
+
+
+def build_research_reproducible_candidate_drilldown(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = (active.get("symbol") or "ETHUSDT").strip()
+    active_timeframe = (active.get("interval") or active.get("timeframe") or "1h").strip()
+    active_strategy = (candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    active_params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    symbols = args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")
+    timeframes = args.get("timeframes", "1h,4h")
+    strategies = args.get("strategies", "auto")
+    period = args.get("period", "365d")
+    max_combos = max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 25)), 25)), 250))
+    repro_top_n = max(1, min(int(safe_float(args.get("reproTopN", args.get("repro_top_n", 5)), 5)), 20))
+    repro_reruns = max(1, min(int(safe_float(args.get("reproReruns", args.get("repro_reruns", 1)), 1)), 5))
+    top_n = max(1, min(int(safe_float(args.get("topN", args.get("top_n", 5)), 5)), 20))
+    include_stress = str(args.get("includeStress", args.get("include_stress", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    include_regime = str(args.get("includeRegime", args.get("include_regime", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    batch_payload = None
+    generated_batch = False
+    batch_file = args.get("batchFile")
+    warnings = []
+    if batch_file:
+        batch_payload, batch_error = _load_candidate_deep_compare_batch_file(str(batch_file))
+        if batch_error:
+            return {"ok": False, "error": batch_error, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+        resolved_batch_file = batch_payload.get("_resolvedBatchFile")
+    else:
+        generated_batch = True
+        batch_args = {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": strategies,
+            "period": period,
+            "maxCandidates": args.get("maxCandidates") or args.get("max_candidates") or "100",
+            "maxCombosPerStrategy": str(max_combos),
+            "topN": str(max(top_n, repro_top_n, 10)),
+            "includeReproAudit": "true",
+            "reproTopN": str(repro_top_n),
+            "reproReruns": str(repro_reruns),
+            "includeWalkForward": "false",
+            "includeStress": "false",
+            "save": "false",
+            "limit": args.get("limit", "auto"),
+            "timeout_seconds": args.get("optimizer_timeout_seconds", args.get("timeout_seconds", "900")),
+        }
+        batch_payload, batch_status = build_research_multi_strategy_optimizer_batch(batch_args)
+        if not batch_payload.get("ok"):
+            return {
+                "ok": False,
+                "error": batch_payload.get("error") or "Could not generate optimizer batch for reproducible candidate drilldown.",
+                "paperEnabled": paper_enabled,
+                "realTradingEnabled": real_enabled,
+                "optimizerBatch": batch_payload,
+            }, batch_status
+        warnings.extend(batch_payload.get("warnings") or [])
+        resolved_batch_file = None
+    selected = _drilldown_candidates_from_batch(batch_payload or {}, top_n)
+    source = {
+        "batchFile": resolved_batch_file,
+        "generatedBatch": generated_batch,
+        "selectedCount": len(selected),
+        "symbols": symbols,
+        "timeframes": timeframes,
+        "strategies": strategies,
+        "period": period,
+        "maxCombosPerStrategy": max_combos,
+        "reproTopN": repro_top_n,
+        "reproReruns": repro_reruns,
+        "topN": top_n,
+    }
+    if not selected:
+        response = {
+            "ok": True,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "source": source,
+            "activeBaseline": candidate_summary(candidate),
+            "candidates": [],
+            "summary": {
+                "selectedCount": 0,
+                "reviewForPromotionCount": 0,
+                "researchMoreCount": 0,
+                "watchCount": 0,
+                "discardCount": 0,
+                "bestCandidate": None,
+                "recommendation": {"action": "NO_ACTION", "reason": "No reproducible/watch optimizer candidates were available for drilldown."},
+            },
+            "warnings": dedupe_list(warnings + ["No promotion, paper tick, config write, or real trading action was performed."] + ([real_detail] if real_enabled else [])),
+        }
+        if save:
+            response["savedPath"] = _save_reproducible_candidate_drilldown(response)
+        return response, 200
+    command = package_node_script_args("research:reproducible-candidate-drilldown")
+    command.extend([
+        "--candidates", json.dumps(selected),
+        "--activeBaseline", json.dumps({"strategy": active_strategy, "symbol": active_symbol, "timeframe": active_timeframe, "params": active_params}),
+        "--period", period,
+        "--includeStress", "true" if include_stress else "false",
+        "--includeWalkForward", "true" if include_walk else "false",
+        "--includeRegime", "true" if include_regime else "false",
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("drilldown_timeout_seconds", args.get("timeout_seconds", 720)), 720)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Reproducible candidate drilldown timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "source": source,
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Reproducible candidate drilldown timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        payload = _load_research_drilldown_stdout(completed.stdout)
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Reproducible candidate drilldown returned no output."}
+    combined_warnings = dedupe_list(warnings + (payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        combined_warnings.append(completed.stderr.strip() or "Reproducible candidate drilldown command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "source": source,
+        "activeBaseline": payload.get("activeBaseline") or candidate_summary(candidate),
+        "candidates": payload.get("candidates") or [],
+        "summary": payload.get("summary") or {},
+        "warnings": combined_warnings,
+        "error": payload.get("error"),
+        "command": " ".join(command[:1] + ["cli/research_reproducible_candidate_drilldown.js", "--candidates", "[selected-candidates-json]", "--period", period]),
+    }
+    if save and response["ok"]:
+        response["savedPath"] = _save_reproducible_candidate_drilldown(response)
     if completed.returncode != 0:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
