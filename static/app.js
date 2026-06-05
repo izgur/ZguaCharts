@@ -2720,6 +2720,7 @@ function setupLearningControls() {
   document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
   document.querySelector("#research-candidate-deep-compare-refresh")?.addEventListener("click", loadResearchCandidateDeepCompare);
   document.querySelector("#research-multi-strategy-matrix-refresh")?.addEventListener("click", loadResearchMultiStrategyMatrix);
+  document.querySelector("#research-multi-strategy-optimizer-batch-refresh")?.addEventListener("click", loadResearchMultiStrategyOptimizerBatch);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
   document.querySelector("#research-parameter-robustness-refresh")?.addEventListener("click", loadResearchParameterRobustness);
   document.querySelector("#research-strategy-variant-lab-refresh")?.addEventListener("click", loadResearchStrategyVariantLab);
@@ -4245,6 +4246,82 @@ function renderResearchMultiStrategyMatrix(payload) {
     <table class="trade-table">
       <thead><tr><th>Raw</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Eligible</th><th>Tier</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Practical Score</th><th>Replacement Rejection</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="15">No matrix rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchMultiStrategyOptimizerBatch() {
+  const host = document.querySelector("#research-multi-strategy-optimizer-batch-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running bounded optimizer batch...</p>`;
+    const payload = await apiGet("/api/research/multi-strategy-optimizer-batch");
+    host.innerHTML = renderResearchMultiStrategyOptimizerBatch(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Multi-strategy optimizer batch could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchMultiStrategyOptimizerBatch(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const rec = summary.recommendation || {};
+  const best = summary.bestOverall || {};
+  const replacement = summary.bestReplacementCandidate || {};
+  const active = payload.activeBaseline || {};
+  const skipped = (payload.skippedStrategies || []).map((item) => `${item.strategy}: ${item.reason}`).join(", ");
+  const rows = (payload.rows || []).slice(0, 25).map((row) => {
+    const tone = row.status === "PASS" ? "positive" : row.status === "WARN" ? "neutral" : "negative";
+    const eligibleTone = row.replacementEligible ? "positive" : row.isActiveBaseline ? "neutral" : "negative";
+    const rejection = (row.replacementRejectionReasons || []).join(", ") || "-";
+    return `
+      <tr>
+        <td>${row.rank ?? "-"}</td>
+        <td>${row.practicalRank ?? "-"}</td>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td>${row.isActiveBaseline ? "yes" : ""}</td>
+        <td class="${tone}">${escapeHtml(row.status || "-")}</td>
+        <td class="${eligibleTone}">${row.replacementEligible ? "yes" : "no"}</td>
+        <td>${escapeHtml(row.evidenceTier || "-")}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.tradesPerMonth)}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${row.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+        <td>${formatNumber(row.maxDrawdownPct)}%</td>
+        <td>${formatNumber(row.score)}</td>
+        <td>${formatNumber(row.practicalScore)}</td>
+        <td>${escapeHtml(row.paramsSource || "-")}</td>
+        <td>${escapeHtml(rejection)}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const bestText = best.strategy ? `${best.strategy} ${best.symbol} ${best.timeframe} PF ${best.profitFactor} Ret ${best.totalReturnPct}%` : "-";
+  const replacementText = replacement.strategy ? `${replacement.strategy} ${replacement.symbol} ${replacement.timeframe} PF ${replacement.profitFactor} Ret ${replacement.totalReturnPct}%` : "none";
+  return `
+    <h3 class="modal-section-title">Multi-Strategy Optimizer Batch <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Best optimized:</strong> ${escapeHtml(bestText)}. <strong>Best replacement:</strong> ${escapeHtml(replacementText)}. ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Active practical rank</span><strong>${summary.activeBaselinePracticalRank ?? "-"}</strong></div>
+      <div class="metric"><span>Eligible replacements</span><strong>${summary.replacementEligibleCount ?? 0}</strong></div>
+      <div class="metric"><span>PASS/WARN</span><strong>${summary.passCount ?? 0}</strong></div>
+      <div class="metric"><span>FAIL</span><strong>${summary.failCount ?? 0}</strong></div>
+      <div class="metric"><span>Skipped</span><strong>${summary.skippedCount ?? 0}</strong></div>
+      <div class="metric"><span>Rows</span><strong>${payload.rows?.length || 0}</strong></div>
+      <div class="metric"><span>Evaluated combos</span><strong>${search.evaluatedCombos ?? "-"}</strong></div>
+      <div class="metric"><span>Grid cap</span><strong>${search.maxCombosPerStrategy ?? "-"}</strong></div>
+      <div class="metric"><span>Active</span><strong>${active.strategy ? `${escapeHtml(active.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Discovered:</strong> ${escapeHtml((payload.discoveredStrategies || []).join(", ") || "-")}</p>
+    ${skipped ? `<p class="modal-note"><strong>Skipped:</strong> ${escapeHtml(skipped)}</p>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Rank</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Eligible</th><th>Tier</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Practical</th><th>Source</th><th>Rejection</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="17">No optimizer batch rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;

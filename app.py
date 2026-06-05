@@ -1318,6 +1318,15 @@ def research_multi_strategy_matrix():
         return jsonify({"error": f"Could not build multi-strategy matrix: {exc}"}), 502
 
 
+@app.get("/api/research/multi-strategy-optimizer-batch")
+def research_multi_strategy_optimizer_batch():
+    try:
+        payload, status_code = build_research_multi_strategy_optimizer_batch(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build multi-strategy optimizer batch: {exc}"}), 502
+
+
 @app.get("/api/research/snapshot-export")
 def research_snapshot_export():
     try:
@@ -7158,6 +7167,105 @@ def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
         "rows": payload.get("rows") or [],
         "summary": payload.get("summary") or {},
         "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = (active.get("symbol") or "ETHUSDT").strip()
+    active_timeframe = (active.get("interval") or active.get("timeframe") or "1h").strip()
+    active_strategy = (candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    symbols = args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")
+    timeframes = args.get("timeframes", "1h,4h")
+    strategies = args.get("strategies", "auto")
+    period = args.get("period", "365d")
+    max_candidates = max(1, min(int(safe_float(args.get("maxCandidates", args.get("max_candidates", 100)), 100)), 200))
+    max_combos = max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 50)), 50)), 250))
+    top_n = max(1, min(int(safe_float(args.get("topN", args.get("top_n", 20)), 20)), 100))
+    include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    include_stress = str(args.get("includeStress", args.get("include_stress", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    promoted = candidate.get("promotedFromOptimization") if isinstance(candidate.get("promotedFromOptimization"), dict) else {}
+    quality = promoted.get("qualityMetrics") if isinstance(promoted.get("qualityMetrics"), dict) else {}
+    ranking = candidate.get("promotedFromRanking") if isinstance(candidate.get("promotedFromRanking"), dict) else {}
+    command = package_node_script_args("research:multi-strategy-optimizer-batch")
+    command.extend([
+        "--symbols", str(symbols),
+        "--timeframes", str(timeframes),
+        "--strategies", str(strategies),
+        "--period", period,
+        "--maxCandidates", str(max_candidates),
+        "--maxCombosPerStrategy", str(max_combos),
+        "--topN", str(top_n),
+        "--includeWalkForward", "true" if include_walk else "false",
+        "--includeStress", "true" if include_stress else "false",
+        "--save", "true" if save else "false",
+        "--activeSymbol", active_symbol,
+        "--activeTimeframe", active_timeframe,
+        "--activeStrategy", active_strategy,
+        "--activeParams", json.dumps(params),
+        "--activeBaselineTrades", str(quality.get("fullTrades") or ranking.get("trades") or 0),
+        "--activeBaselineReturnPct", str(quality.get("fullReturnPct") or ranking.get("totalReturnPct") or 0),
+        "--activeBaselineProfitFactor", str(quality.get("fullProfitFactor") or ranking.get("profitFactor") or 0),
+        "--activeBaselineMaxDrawdownPct", str(quality.get("fullMaxDrawdownPct") or ranking.get("maxDrawdownPct") or ranking.get("maxDrawdown") or 0),
+        "--feePct", str(fee_pct),
+        "--slippagePct", str(slippage_pct),
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 900), 900)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Multi-strategy optimizer batch timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "activeBaseline": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Multi-strategy optimizer batch timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Multi-strategy optimizer batch returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Multi-strategy optimizer batch returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Multi-strategy optimizer batch command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activeBaseline": payload.get("activeBaseline") or candidate_summary(candidate),
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "maxCandidates": max_candidates, "maxCombosPerStrategy": max_combos, "topN": top_n},
+        "discoveredStrategies": payload.get("discoveredStrategies") or [],
+        "skippedStrategies": payload.get("skippedStrategies") or [],
+        "rows": payload.get("rows") or [],
+        "summary": payload.get("summary") or {},
+        "warnings": warnings,
+        "savedPath": payload.get("savedPath"),
         "command": " ".join(command),
     }
     if completed.returncode != 0:
