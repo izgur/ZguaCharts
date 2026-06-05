@@ -1588,6 +1588,14 @@ def paper_runner_summary():
         return jsonify({"error": f"Could not build paper runner summary: {exc}"}), 502
 
 
+@app.get("/api/paper/run-quality-report")
+def paper_run_quality_report():
+    try:
+        return jsonify(build_paper_run_quality_report(request.args))
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper run quality report: {exc}"}), 502
+
+
 @app.get("/api/paper/session-events-summary")
 def paper_session_events_summary():
     try:
@@ -5815,6 +5823,375 @@ def build_paper_runner_summary(args) -> dict:
         "nextAction": next_action,
         "warnings": dedupe_list(warnings),
     }
+
+
+def resolve_app_file_arg(raw: str | None, default_relative: str) -> tuple[Path, list[str]]:
+    warnings = []
+    root = Path(app.root_path).resolve()
+    path = Path(str(raw or default_relative).strip())
+    if not path.is_absolute():
+        path = root / path
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        warnings.append(f"Requested file is outside the app root; using {default_relative}.")
+        resolved = (root / default_relative).resolve()
+    return resolved, warnings
+
+
+def resolve_paper_quality_log_selection(args) -> dict:
+    warnings = []
+    root = Path(app.root_path).resolve()
+    explicit = bool(args.get("logFile"))
+    if explicit:
+        path, path_warnings = resolve_app_file_arg(args.get("logFile"), "reports/paper-runner-session.jsonl")
+        warnings.extend(path_warnings)
+        selected_by = "query"
+    else:
+        candidates = sorted((root / "reports").glob("paper-runner-session*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)
+        if candidates:
+            path = candidates[0].resolve()
+            selected_by = "latest"
+        else:
+            path = (root / "reports" / "paper-runner-session.jsonl").resolve()
+            selected_by = "default"
+            warnings.append("No paper-runner-session*.jsonl files were found.")
+    return {
+        "path": path,
+        "selectedBy": selected_by,
+        "availableLogs": [relative_app_path(item.resolve()) for item in sorted((root / "reports").glob("paper-runner-session*.jsonl"), key=lambda item: item.stat().st_mtime, reverse=True)[:10]],
+        "warnings": warnings,
+    }
+
+
+def stringify_for_error_scan(value) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def classify_network_error_text(text: str) -> str | None:
+    upper = (text or "").upper()
+    if not upper or upper in {"NULL", "NONE"}:
+        return None
+    if "ENOTFOUND" in upper or "GETADDRINFO" in upper or "DNS" in upper:
+        return "DNS_ENOTFOUND"
+    if "ECONNRESET" in upper or "CONNECTION RESET" in upper:
+        return "ECONNRESET"
+    if "ETIMEDOUT" in upper:
+        return "ETIMEDOUT"
+    if "HTTPSCONNECTIONPOOL" in upper or "HTTPSCONNECTION" in upper:
+        return "HTTPS_CONNECTION_POOL"
+    if "READ TIMED OUT" in upper or "TIMEOUT" in upper or "TIMED OUT" in upper:
+        return "HTTP_TIMEOUT"
+    if "BYBIT" in upper or "/V5/MARKET/KLINE" in upper:
+        return "BYBIT_ERROR"
+    if "ERROR" in upper or "EXCEPTION" in upper or "FAILED" in upper:
+        return "UNKNOWN_ERROR"
+    return None
+
+
+def paper_quality_network_errors(entries: list[dict]) -> dict:
+    buckets = {
+        "DNS_ENOTFOUND": 0,
+        "ECONNRESET": 0,
+        "ETIMEDOUT": 0,
+        "HTTP_TIMEOUT": 0,
+        "BYBIT_ERROR": 0,
+        "HTTPS_CONNECTION_POOL": 0,
+        "UNKNOWN_ERROR": 0,
+    }
+    examples = []
+    for entry in entries:
+        fragments = [
+            entry.get("error"),
+            entry.get("stderr"),
+            entry.get("message"),
+            entry.get("warning"),
+            entry.get("warnings"),
+            entry.get("tickResult"),
+            entry.get("refresh"),
+        ]
+        text = " ".join(stringify_for_error_scan(fragment) for fragment in fragments if fragment is not None and fragment != "" and fragment != [])
+        bucket = classify_network_error_text(text)
+        if bucket:
+            buckets[bucket] += 1
+            if len(examples) < 8:
+                examples.append({
+                    "type": bucket,
+                    "iteration": entry.get("iteration"),
+                    "timestamp": entry.get("timestamp"),
+                    "text": text[:500],
+                })
+    return {"total": sum(buckets.values()), "byType": buckets, "examples": examples}
+
+
+def paper_quality_timestamp(entry: dict):
+    return parse_iso_timestamp(entry.get("timestamp") or entry.get("processedAt") or entry.get("generatedAt"))
+
+
+def paper_quality_summary(entries: list[dict]) -> tuple[dict, dict, list[dict], list[dict]]:
+    iterations = [entry for entry in entries if entry.get("type") == "iteration" or entry.get("iteration") is not None]
+    summaries = [entry for entry in entries if entry.get("type") == "summary" or entry.get("iterationsAttempted") is not None]
+    iteration_times = [paper_quality_timestamp(entry) for entry in iterations]
+    iteration_times = [stamp for stamp in iteration_times if stamp]
+    first = min(iteration_times) if iteration_times else None
+    last = max(iteration_times) if iteration_times else None
+    elapsed_hours = round(((last - first).total_seconds() / 3600) if first and last else 0, 4)
+    deltas = [int(safe_float(entry.get("processedCandlesDelta"), 0)) for entry in iterations if entry.get("processedCandlesDelta") is not None]
+    timestamps_sorted = sorted(iteration_times)
+    gaps = []
+    for prev, cur in zip(timestamps_sorted, timestamps_sorted[1:]):
+        gap_minutes = (cur - prev).total_seconds() / 60
+        if gap_minutes > 45:
+            gaps.append({"from": prev.isoformat(), "to": cur.isoformat(), "gapMinutes": round(gap_minutes, 2)})
+    inferred_interval_minutes = None
+    if len(timestamps_sorted) >= 3:
+        diffs = sorted([(cur - prev).total_seconds() / 60 for prev, cur in zip(timestamps_sorted, timestamps_sorted[1:]) if (cur - prev).total_seconds() > 0])
+        if diffs:
+            inferred_interval_minutes = round(diffs[len(diffs) // 2], 2)
+    expected_iterations = None
+    missing_iterations = None
+    if inferred_interval_minutes and elapsed_hours:
+        expected_iterations = int(max(1, round(elapsed_hours * 60 / inferred_interval_minutes) + 1))
+        missing_iterations = max(0, expected_iterations - len(iterations))
+    summary_errors = int(sum(safe_float(entry.get("errors"), 0) for entry in summaries if entry.get("errors") is not None))
+    iteration_errors = len([entry for entry in iterations if entry.get("ok") is False or str(entry.get("runStatus", "")).upper() == "ERROR" or entry.get("error")])
+    errors = max(iteration_errors, summary_errors)
+    refresh_errors = len([entry for entry in iterations if str(entry.get("refreshStatus", "")).upper() in {"ERROR", "FAIL", "FAILED"} or (entry.get("refreshOk") is False)])
+    tick_errors = len([entry for entry in iterations if str(entry.get("tickStatus", "")).upper() in {"ERROR", "FAIL", "FAILED"} or str((entry.get("tickResult") or {}).get("status", "")).upper() == "ERROR"])
+    counts = {
+        "iterationsTotal": len(iterations),
+        "summaries": len(summaries),
+        "ticksRun": len([entry for entry in iterations if entry.get("tickRan")]),
+        "ticksSkipped": len([entry for entry in iterations if not entry.get("tickRan")]),
+        "errors": errors,
+        "okCount": len([entry for entry in iterations if entry.get("ok") is not False and str(entry.get("runStatus", "")).upper() != "ERROR"]),
+        "errorRatePct": round((errors / len(iterations) * 100) if iterations else 0, 4),
+        "refreshOkCount": len([entry for entry in iterations if entry.get("refreshStatus") == "OK" or entry.get("refreshOk") is True]),
+        "refreshErrorCount": refresh_errors,
+        "tickOkCount": len([entry for entry in iterations if entry.get("tickRan") and entry.get("ok") is not False]),
+        "tickErrorCount": tick_errors,
+        "stopRulesOkCount": len([entry for entry in iterations if entry.get("stopRulesStatus") == "OK"]),
+        "stopRulesNonOkCount": len([entry for entry in iterations if entry.get("stopRulesStatus") and entry.get("stopRulesStatus") != "OK"]),
+        "realTradingFalseCount": len([entry for entry in iterations if entry.get("realTradingEnabled") is False]),
+        "realTradingTrueCount": len([entry for entry in iterations if entry.get("realTradingEnabled") is True]),
+        "paperEnabledTrueCount": len([entry for entry in iterations if entry.get("paperEnabled") is True]),
+        "paperEnabledFalseCount": len([entry for entry in iterations if entry.get("paperEnabled") is False]),
+        "processedCandleDeltaTotal": int(sum(deltas)),
+        "maxProcessedCandlesDelta": max(deltas) if deltas else 0,
+        "newSignalsTotal": int(sum(safe_float(entry.get("newSignals"), 0) for entry in iterations if entry.get("newSignals") is not None)),
+        "closedTradesLatest": next((entry.get("closedTrades") for entry in reversed(iterations) if entry.get("closedTrades") is not None), None),
+        "expectedIterations": expected_iterations,
+        "missingIterations": missing_iterations,
+        "inferredIntervalMinutes": inferred_interval_minutes,
+    }
+    run_window = {
+        "firstTimestamp": first.isoformat() if first else None,
+        "lastTimestamp": last.isoformat() if last else None,
+        "elapsedHours": elapsed_hours,
+        "longGaps": gaps[:10],
+        "longGapCount": len(gaps),
+    }
+    return counts, run_window, iterations, summaries
+
+
+def paper_quality_journal_summary(journal_path: Path, first, last, candidate: dict, active_only: bool) -> dict:
+    journal = read_jsonl_tail(str(journal_path), 5000) if journal_path.exists() else []
+    active_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)}
+    watch_keys = {paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "watch") if paper_market_key(market)}
+    session = {
+        "started": first,
+        "ended": last,
+        "startedAt": first.isoformat() if first else None,
+        "endedAt": last.isoformat() if last else None,
+    }
+    normalized = [normalized_paper_event(event, session) for event in journal]
+    window_events = [event for event in normalized if event.get("currentSession")]
+    if active_only:
+        window_events = [event for event in window_events if event.get("marketKey") in active_keys]
+    stale_events = [event for event in normalized if event.get("stale")]
+    event_types = [str(event.get("eventType", "")).upper() for event in window_events]
+    warning_events = [event for event in window_events if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR"}]
+    state_warning_events = [event for event in window_events if str(event.get("eventType", "")).upper() == "STATE_WARNING"]
+    return {
+        "exists": journal_path.exists(),
+        "path": relative_app_path(journal_path),
+        "eventsInRunWindow": len(window_events),
+        "signals": event_types.count("SIGNAL"),
+        "stateWarnings": len(state_warning_events),
+        "warnings": len(warning_events),
+        "openedTrades": event_types.count("ENTRY"),
+        "closedTrades": event_types.count("EXIT"),
+        "activeMarketEvents": len([event for event in window_events if event.get("marketKey") in active_keys]),
+        "watchOnlyEvents": len([event for event in window_events if event.get("marketKey") in watch_keys]),
+        "journalWarnings": len(warning_events) + len(state_warning_events),
+        "staleOldWarnings": len([event for event in stale_events if str(event.get("eventType", "")).upper() in {"WARNING", "ERROR", "STATE_WARNING"}]),
+        "recentWarnings": dedupe_list([(event.get("reason") or event.get("message") or "") for event in warning_events[-10:] if event.get("reason") or event.get("message")]),
+    }
+
+
+def paper_quality_state_summary(state_path: Path, candidate: dict) -> dict:
+    state = read_json_file(str(state_path), {}) if state_path.exists() else {}
+    active = primary_active_market(candidate)
+    active_key = paper_market_key(active)
+    last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
+    freshness = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
+    initialized = sorted(last_processed.keys())
+    required = [paper_market_key(market) for market in candidate_symbols_by_mode(candidate, "active") if paper_market_key(market)]
+    return {
+        "exists": state_path.exists(),
+        "path": relative_app_path(state_path),
+        "activeMarketKey": active_key,
+        "lastProcessedCandleTime": last_processed.get(active_key),
+        "latestCandleTime": (freshness.get(active_key) or {}).get("latestCandleTime") if active_key else None,
+        "freshness": freshness.get(active_key) if active_key else None,
+        "initializedMarkets": initialized,
+        "missingMarkets": [key for key in required if key not in last_processed],
+        "openPositions": len(state.get("openPositions") or []),
+        "closedTrades": len(state.get("closedTrades") or []),
+        "warnings": state.get("warnings") if isinstance(state.get("warnings"), list) else [],
+    }
+
+
+def paper_quality_verdict(summary: dict, network: dict, journal: dict, state: dict, log_exists: bool) -> dict:
+    reasons = []
+    score = 100
+    if not log_exists:
+        return {
+            "status": "INVALID",
+            "score": 0,
+            "reasons": ["Runner log file could not be found."],
+            "evidenceTrust": "INVALID",
+            "recommendation": {"action": "IGNORE_RUN", "reason": "No runner log is available to audit."},
+        }
+    if summary["realTradingTrueCount"] > 0:
+        reasons.append("realTradingEnabled was true in at least one runner entry.")
+        score -= 100
+    if summary["stopRulesNonOkCount"] > 0:
+        reasons.append(f"{summary['stopRulesNonOkCount']} runner entrie(s) reported non-OK stop rules.")
+        score -= 50
+    if summary["errors"] > 0:
+        reasons.append(f"{summary['errors']} runner error(s) were reported.")
+        score -= min(35, summary["errors"] * 2)
+    if summary["errorRatePct"] >= 20:
+        reasons.append(f"High runner error rate: {summary['errorRatePct']}%.")
+        score -= 25
+    elif summary["errorRatePct"] > 0:
+        reasons.append(f"Runner error rate is non-zero: {summary['errorRatePct']}%.")
+        score -= 10
+    if network["total"] > 0:
+        reasons.append(f"{network['total']} network/data-source error signal(s) detected in runner log.")
+        score -= min(30, network["total"] * 4)
+    if summary["maxProcessedCandlesDelta"] > 5:
+        reasons.append(f"Suspicious processed candle jump detected: max delta {summary['maxProcessedCandlesDelta']}.")
+        score -= 15
+    if summary.get("missingIterations") and summary["missingIterations"] > max(2, summary["iterationsTotal"] * 0.1):
+        reasons.append(f"Estimated missing runner iterations: {summary['missingIterations']}.")
+        score -= 15
+    if summary.get("longGapCount", 0) > 0:
+        reasons.append(f"{summary['longGapCount']} long runner time gap(s) detected.")
+        score -= min(15, summary["longGapCount"] * 3)
+    if summary["paperEnabledFalseCount"] > 0 and summary["paperEnabledTrueCount"] > 0:
+        reasons.append("Paper was disabled during part of the selected run log.")
+        score -= 10
+    if summary["ticksRun"] <= 0 and (summary.get("elapsedHours") or 0) >= 3:
+        reasons.append("No useful paper ticks were run despite a multi-hour run window.")
+        score -= 20
+    if journal.get("journalWarnings", 0) > 0:
+        reasons.append(f"{journal['journalWarnings']} journal warning event(s) occurred in the run window.")
+        score -= min(15, journal["journalWarnings"] * 3)
+    if state.get("missingMarkets"):
+        reasons.append(f"State is missing active market(s): {', '.join(state.get('missingMarkets') or [])}.")
+        score -= 15
+    score = max(0, min(100, int(round(score))))
+    if summary["realTradingTrueCount"] > 0 or summary["stopRulesNonOkCount"] >= 3:
+        status = "INVALID"
+        trust = "INVALID"
+        action = "IGNORE_RUN"
+    elif score < 55 or summary["errorRatePct"] >= 20 or network["total"] >= 5:
+        status = "DEGRADED"
+        trust = "LOW"
+        action = "INVESTIGATE_NETWORK" if network["total"] else "RERUN_OBSERVATION"
+    elif score < 85 or summary["errors"] or network["total"] or journal.get("journalWarnings", 0):
+        status = "WATCH"
+        trust = "MEDIUM"
+        action = "EXTEND_RUN"
+    else:
+        status = "GOOD"
+        trust = "HIGH"
+        action = "ACCEPT_EVIDENCE"
+    if not reasons:
+        reasons.append("Runner log shows low errors, stop rules OK, real trading false, and useful ticks collected.")
+    recommendation_reasons = {
+        "ACCEPT_EVIDENCE": "Paper run evidence appears technically reliable for paper-only review.",
+        "EXTEND_RUN": "Some reliability warnings exist; extend observation before judging the candidate.",
+        "RERUN_OBSERVATION": "Run quality is degraded enough that a cleaner observation run is preferable.",
+        "IGNORE_RUN": "Safety or parse issues make this run unsuitable as evidence.",
+        "INVESTIGATE_NETWORK": "Network/data-source failures degraded the run; investigate before relying on the evidence.",
+    }
+    return {
+        "status": status,
+        "score": score,
+        "reasons": dedupe_list(reasons),
+        "evidenceTrust": trust,
+        "recommendation": {"action": action, "reason": recommendation_reasons[action]},
+    }
+
+
+def _save_paper_run_quality_report(payload: dict) -> str:
+    reports_dir = Path(app.root_path) / "reports" / "paper-quality"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = reports_dir / f"paper-run-quality-report-{stamp}.json"
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+
+
+def build_paper_run_quality_report(args) -> dict:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active_only = str(args.get("activeOnly", args.get("active_only", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    log_selection = resolve_paper_quality_log_selection(args)
+    log_path = log_selection["path"]
+    journal_path, journal_warnings = resolve_app_file_arg(args.get("journalFile"), "reports/paper-journal.jsonl")
+    state_path, state_warnings = resolve_app_file_arg(args.get("stateFile"), "data/paper-state.json")
+    warnings = dedupe_list((log_selection.get("warnings") or []) + journal_warnings + state_warnings + ([real_detail] if real_enabled else []))
+    entries = read_jsonl_tail(str(log_path), 10000) if log_path.exists() else []
+    runner_summary, run_window, iterations, summaries = paper_quality_summary(entries)
+    first = parse_iso_timestamp(run_window.get("firstTimestamp"))
+    last = parse_iso_timestamp(run_window.get("lastTimestamp"))
+    runner_summary["elapsedHours"] = run_window.get("elapsedHours")
+    runner_summary["longGapCount"] = run_window.get("longGapCount")
+    network = paper_quality_network_errors(entries)
+    journal = paper_quality_journal_summary(journal_path, first, last, candidate, active_only)
+    state = paper_quality_state_summary(state_path, candidate)
+    quality = paper_quality_verdict(runner_summary, network, journal, state, log_path.exists())
+    response = {
+        "ok": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "selectedLogFile": relative_app_path(log_path),
+        "selectedBy": log_selection.get("selectedBy"),
+        "availableLogs": log_selection.get("availableLogs") or [],
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "runWindow": run_window,
+        "runnerSummary": runner_summary,
+        "networkErrors": network,
+        "journalSummary": journal,
+        "stateSummary": state,
+        "quality": quality,
+        "filters": {"activeOnly": active_only},
+        "warnings": warnings,
+    }
+    if save:
+        response["savedPath"] = _save_paper_run_quality_report(response)
+    return response
 
 
 def compact_session_events_summary(summary: dict) -> dict:

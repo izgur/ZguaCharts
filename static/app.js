@@ -2743,6 +2743,7 @@ function setupLearningControls() {
   document.querySelector("#paper-observation-targets-refresh")?.addEventListener("click", loadPaperObservationTargets);
   document.querySelector("#paper-runner-instructions-refresh")?.addEventListener("click", loadPaperRunnerInstructions);
   document.querySelector("#paper-runner-summary-refresh")?.addEventListener("click", loadPaperRunnerSummary);
+  document.querySelector("#paper-run-quality-report-refresh")?.addEventListener("click", loadPaperRunQualityReport);
   document.querySelector("#paper-observation-refresh")?.addEventListener("click", loadPaperObservationQuality);
   document.querySelector("#learning-evidence-refresh")?.addEventListener("click", loadLearningEvidence);
   document.querySelector("#learning-audit-button")?.addEventListener("click", loadLearningAudit);
@@ -5449,6 +5450,79 @@ function renderPaperRunnerSummary(payload) {
     <table class="trade-table">
       <thead><tr><th>Iteration</th><th>Time</th><th>Action</th><th>Reason</th></tr></thead>
       <tbody>${actionRows || `<tr><td colspan="4">No runner actions returned.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+async function loadPaperRunQualityReport() {
+  const host = document.querySelector("#paper-run-quality-report-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper run quality report...</p>`;
+    const payload = await apiGet("/api/paper/run-quality-report");
+    host.innerHTML = renderPaperRunQualityReport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Paper run quality report could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperRunQualityReport(payload) {
+  const runner = payload.runnerSummary || {};
+  const quality = payload.quality || {};
+  const recommendation = quality.recommendation || {};
+  const network = payload.networkErrors || {};
+  const byType = network.byType || {};
+  const journal = payload.journalSummary || {};
+  const state = payload.stateSummary || {};
+  const status = quality.status || "UNKNOWN";
+  const tone = status === "GOOD" ? "positive" : status === "WATCH" ? "neutral" : "negative";
+  const bucketRows = Object.keys(byType).map((key) => `
+    <tr><td>${escapeHtml(key)}</td><td>${byType[key] ?? 0}</td></tr>
+  `).join("");
+  const reasonRows = (quality.reasons || []).map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
+  const warningRows = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const examples = (network.examples || []).slice(0, 5).map((item) => `
+    <tr>
+      <td>${escapeHtml(item.type || "-")}</td>
+      <td>${item.iteration ?? "-"}</td>
+      <td>${escapeHtml(item.timestamp || "-")}</td>
+      <td>${escapeHtml(item.text || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <h3 class="modal-section-title">Paper Run Quality Report <span class="${tone}">${escapeHtml(status)}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(recommendation.action || "-")}</strong> ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Score</span><strong>${quality.score ?? 0}</strong></div>
+      <div class="metric"><span>Trust</span><strong>${escapeHtml(quality.evidenceTrust || "-")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Iterations</span><strong>${runner.iterationsTotal ?? 0}</strong></div>
+      <div class="metric"><span>Ticks run</span><strong>${runner.ticksRun ?? 0}</strong></div>
+      <div class="metric"><span>Ticks skipped</span><strong>${runner.ticksSkipped ?? 0}</strong></div>
+      <div class="metric"><span>Errors</span><strong>${runner.errors ?? 0}</strong></div>
+      <div class="metric"><span>Error rate</span><strong>${formatMaybeNumber(runner.errorRatePct)}%</strong></div>
+      <div class="metric"><span>Network errors</span><strong>${network.total ?? 0}</strong></div>
+      <div class="metric"><span>Stop non-OK</span><strong>${runner.stopRulesNonOkCount ?? 0}</strong></div>
+      <div class="metric"><span>Real true</span><strong>${runner.realTradingTrueCount ?? 0}</strong></div>
+      <div class="metric"><span>Processed delta</span><strong>${runner.processedCandleDeltaTotal ?? 0}</strong></div>
+      <div class="metric"><span>Max delta</span><strong>${runner.maxProcessedCandlesDelta ?? 0}</strong></div>
+      <div class="metric"><span>Signals</span><strong>${runner.newSignalsTotal ?? 0}</strong></div>
+      <div class="metric"><span>Elapsed</span><strong>${formatMaybeNumber(payload.runWindow?.elapsedHours)}h</strong></div>
+      <div class="metric"><span>Journal warnings</span><strong>${journal.journalWarnings ?? 0}</strong></div>
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(state.activeMarketKey || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Log:</strong> ${escapeHtml(payload.selectedLogFile || "-")}</p>
+    <p class="modal-note"><strong>Window:</strong> ${escapeHtml(payload.runWindow?.firstTimestamp || "-")} to ${escapeHtml(payload.runWindow?.lastTimestamp || "-")}</p>
+    ${reasonRows ? `<p class="modal-note"><strong>Suspicious findings</strong></p><ul class="backtest-warnings">${reasonRows}</ul>` : ""}
+    ${warningRows ? `<ul class="backtest-warnings">${warningRows}</ul>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Network bucket</th><th>Count</th></tr></thead>
+      <tbody>${bucketRows || `<tr><td colspan="2">No network buckets returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Type</th><th>Iteration</th><th>Time</th><th>Example</th></tr></thead>
+      <tbody>${examples || `<tr><td colspan="4">No network error examples.</td></tr>`}</tbody>
     </table>
   `;
 }
