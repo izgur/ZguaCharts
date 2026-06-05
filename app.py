@@ -7092,6 +7092,9 @@ def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
     params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
     fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
     slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    promoted = candidate.get("promotedFromOptimization") if isinstance(candidate.get("promotedFromOptimization"), dict) else {}
+    quality = promoted.get("qualityMetrics") if isinstance(promoted.get("qualityMetrics"), dict) else {}
+    ranking = candidate.get("promotedFromRanking") if isinstance(candidate.get("promotedFromRanking"), dict) else {}
     command = package_node_script_args("research:multi-strategy-matrix")
     command.extend([
         "--symbols", str(symbols),
@@ -7106,6 +7109,10 @@ def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
         "--activeTimeframe", active_timeframe,
         "--activeStrategy", active_strategy,
         "--activeParams", json.dumps(params),
+        "--activeBaselineTrades", str(quality.get("fullTrades") or ranking.get("trades") or 0),
+        "--activeBaselineReturnPct", str(quality.get("fullReturnPct") or ranking.get("totalReturnPct") or 0),
+        "--activeBaselineProfitFactor", str(quality.get("fullProfitFactor") or ranking.get("profitFactor") or 0),
+        "--activeBaselineMaxDrawdownPct", str(quality.get("fullMaxDrawdownPct") or ranking.get("maxDrawdownPct") or ranking.get("maxDrawdown") or 0),
         "--feePct", str(fee_pct),
         "--slippagePct", str(slippage_pct),
     ])
@@ -7479,8 +7486,17 @@ def compact_snapshot_multi_strategy_matrix(payload: dict) -> dict:
     summary = payload.get("summary") or {}
     return {
         "activeBaselineRank": summary.get("activeBaselineRank"),
+        "activeBaselineRawRank": summary.get("activeBaselineRawRank"),
+        "activeBaselinePracticalRank": summary.get("activeBaselinePracticalRank"),
         "bestOverall": compact_snapshot_row(summary.get("bestOverall") or {}),
+        "bestRawCandidate": compact_snapshot_row(summary.get("bestRawCandidate") or summary.get("bestOverall") or {}),
+        "bestPracticalCandidate": compact_snapshot_row(summary.get("bestPracticalCandidate") or {}),
+        "bestReplacementCandidate": compact_snapshot_row(summary.get("bestReplacementCandidate") or {}),
         "bestNonBaseline": compact_snapshot_row(summary.get("bestNonBaseline") or {}),
+        "replacementEligibleCount": summary.get("replacementEligibleCount"),
+        "rankingExplanation": summary.get("rankingExplanation"),
+        "recommendationExplanation": summary.get("recommendationExplanation"),
+        "replacementRules": summary.get("replacementRules") or {},
         "passCount": summary.get("passCount"),
         "failCount": summary.get("failCount"),
         "unsupportedCount": summary.get("unsupportedCount"),
@@ -7528,6 +7544,12 @@ def compact_snapshot_row(row: dict | None, extra: tuple = ()) -> dict:
         "maxDrawdownPct": row.get("maxDrawdownPct") if row.get("maxDrawdownPct") is not None else row.get("maxDrawdown"),
         "winRate": row.get("winRate"),
         "score": row.get("score"),
+        "rawRank": row.get("rawRank"),
+        "practicalRank": row.get("practicalRank"),
+        "replacementEligible": row.get("replacementEligible"),
+        "evidenceTier": row.get("evidenceTier"),
+        "practicalScore": row.get("practicalScore"),
+        "replacementRejectionReasons": row.get("replacementRejectionReasons"),
         "mainFailureReason": row.get("mainFailureReason"),
     })
     return {key: value for key, value in compact.items() if value is not None}

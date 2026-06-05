@@ -28,6 +28,17 @@ const AUTO_STRATEGIES = [
   "PullbackTrend"
 ];
 
+const REPLACEMENT_RULES = {
+  minTrades: 40,
+  minProfitFactor: 1.1,
+  maxDrawdownPct: 25,
+  minReturnPct: 0,
+  minPracticalScoreMargin: 10,
+  maxTradesPerMonthDropRatio: 0.5,
+  strongImprovementReturnPct: 2,
+  strongImprovementProfitFactor: 0.2
+};
+
 function parseCsv(value, fallback) {
   if (!value || value === "auto") return fallback;
   return String(value).split(",").map((item) => item.trim()).filter(Boolean);
@@ -98,6 +109,77 @@ function scoreRow(row) {
   return round(score, 5);
 }
 
+function evidenceTier(row, rules) {
+  if (row.status === "UNSUPPORTED" || row.status === "ERROR") return "INSUFFICIENT";
+  if (row.trades < 20 || row.profitFactor <= 0) return "INSUFFICIENT";
+  if (row.trades >= rules.minTrades && row.profitFactor >= 1.2 && row.totalReturnPct > 2 && row.maxDrawdownPct <= rules.maxDrawdownPct) return "STRONG";
+  if (row.trades >= rules.minTrades && row.profitFactor >= rules.minProfitFactor && row.totalReturnPct > 0) return "MEDIUM";
+  return "WEAK";
+}
+
+function practicalScoreRow(row, baseline, rules, activeEvidence) {
+  let score = Number(row.score || 0);
+  const baselineReturn = Number(activeEvidence.totalReturnPct ?? (baseline ? baseline.totalReturnPct : 0) ?? 0);
+  const baselinePf = Number(activeEvidence.profitFactor ?? (baseline ? baseline.profitFactor : 0) ?? 0);
+  score += Math.min(Number(row.trades || 0), 100) * 0.04;
+  score += (Number(row.totalReturnPct || 0) - baselineReturn) * 1.8;
+  score += (Number(row.profitFactor || 0) - baselinePf) * 10;
+  if (row.trades < rules.minTrades) score -= (rules.minTrades - Number(row.trades || 0)) * 0.8;
+  if (row.totalReturnPct <= baselineReturn) score -= Math.min(30, (baselineReturn - Number(row.totalReturnPct || 0)) * 2);
+  if (row.isActiveBaseline) score += 5;
+  return round(score, 5);
+}
+
+function replacementRejectionReasons(row, baseline, rules, activeEvidence) {
+  const reasons = [];
+  const baselineReturn = Number(activeEvidence.totalReturnPct ?? (baseline ? baseline.totalReturnPct : 0) ?? 0);
+  const baselinePf = Number(activeEvidence.profitFactor ?? (baseline ? baseline.profitFactor : 0) ?? 0);
+  const baselineTradesPerMonth = Number((baseline ? baseline.tradesPerMonth : 0) || 0);
+  const practicalMargin = Number(row.practicalScore || 0) - Number(baseline ? baseline.practicalScore : 0);
+  if (row.isActiveBaseline) reasons.push("active_baseline_not_replacement");
+  if (!["PASS", "WARN"].includes(row.status)) reasons.push("status_not_pass_or_warn");
+  if (Number(row.trades || 0) < rules.minTrades) reasons.push(`trades_below_${rules.minTrades}`);
+  if (Number(row.profitFactor || 0) < rules.minProfitFactor) reasons.push(`profit_factor_below_${rules.minProfitFactor}`);
+  if (Number(row.totalReturnPct || 0) <= rules.minReturnPct) reasons.push("non_positive_return");
+  if (Number(row.maxDrawdownPct || 0) > rules.maxDrawdownPct) reasons.push(`drawdown_above_${rules.maxDrawdownPct}`);
+  const beatsReturn = Number(row.totalReturnPct || 0) > baselineReturn;
+  const beatsPractical = practicalMargin >= rules.minPracticalScoreMargin;
+  if (!beatsReturn && !beatsPractical) reasons.push("weak_return_vs_baseline");
+  else if (!beatsReturn) reasons.push("return_below_promoted_baseline");
+  const tradesPerMonth = Number(row.tradesPerMonth || 0);
+  const strongImprovement = Number(row.totalReturnPct || 0) >= baselineReturn + rules.strongImprovementReturnPct
+    && Number(row.profitFactor || 0) >= baselinePf + rules.strongImprovementProfitFactor;
+  if (baselineTradesPerMonth > 0 && tradesPerMonth < baselineTradesPerMonth * rules.maxTradesPerMonthDropRatio && !strongImprovement) {
+    reasons.push("trade_frequency_worse_than_baseline");
+  }
+  return reasons;
+}
+
+function annotateReplacementSemantics(rows, activeEvidence, rules) {
+  const baseline = rows.find((row) => row.isActiveBaseline) || null;
+  rows.forEach((row) => {
+    row.rawRank = row.rank;
+    row.evidenceTier = evidenceTier(row, rules);
+  });
+  rows.forEach((row) => {
+    row.practicalScore = practicalScoreRow(row, baseline, rules, activeEvidence);
+  });
+  if (baseline) baseline.practicalScore = practicalScoreRow(baseline, baseline, rules, activeEvidence);
+  rows.forEach((row) => {
+    row.replacementRejectionReasons = replacementRejectionReasons(row, baseline, rules, activeEvidence);
+    row.replacementEligible = row.replacementRejectionReasons.length === 0;
+    row.practicalRank = null;
+  });
+  const practicalRows = rows
+    .filter((row) => row.isActiveBaseline || row.replacementEligible)
+    .sort((a, b) => Number(b.practicalScore || 0) - Number(a.practicalScore || 0));
+  practicalRows.forEach((row, index) => {
+    row.practicalRank = index + 1;
+  });
+  rows.sort((a, b) => Number(a.rawRank || 9999) - Number(b.rawRank || 9999));
+  return rows;
+}
+
 function compactResult(result, context) {
   const trades = Number(result.trades || 0);
   const row = {
@@ -119,7 +201,13 @@ function compactResult(result, context) {
     qualityStatus: "FAIL",
     mainFailureReason: null,
     warnings: result.warnings || [],
-    isActiveBaseline: !!context.isActiveBaseline
+    isActiveBaseline: !!context.isActiveBaseline,
+    rawRank: null,
+    practicalRank: null,
+    replacementEligible: false,
+    replacementRejectionReasons: [],
+    evidenceTier: "INSUFFICIENT",
+    practicalScore: 0
   };
   row.mainFailureReason = classify(row);
   row.status = statusFor(row);
@@ -148,14 +236,26 @@ function unsupportedRow(context, reason) {
     qualityStatus: "FAIL",
     mainFailureReason: "UNSUPPORTED",
     warnings: [reason],
-    isActiveBaseline: false
+    isActiveBaseline: false,
+    rawRank: null,
+    practicalRank: null,
+    replacementEligible: false,
+    replacementRejectionReasons: ["unsupported_strategy"],
+    evidenceTier: "INSUFFICIENT",
+    practicalScore: -999
   };
 }
 
-function buildSummary(rows) {
+function buildSummary(rows, activeEvidence, rules) {
   const ranked = rows.filter((row) => row.status !== "UNSUPPORTED").sort(sortRows);
   const active = rows.find((row) => row.isActiveBaseline) || null;
   const bestOverall = ranked[0] || null;
+  const eligible = rows.filter((row) => row.replacementEligible).sort((a, b) => Number(b.practicalScore || 0) - Number(a.practicalScore || 0));
+  const practicalRanked = rows
+    .filter((row) => row.isActiveBaseline || row.replacementEligible)
+    .sort((a, b) => Number(b.practicalScore || 0) - Number(a.practicalScore || 0));
+  const bestPracticalCandidate = practicalRanked[0] || null;
+  const bestReplacementCandidate = eligible[0] || null;
   const bestByStrategy = {};
   const bestBySymbol = {};
   const bestByTimeframe = {};
@@ -169,25 +269,43 @@ function buildSummary(rows) {
   const failCount = rows.length - passCount - unsupportedCount;
   const bestNonBaseline = ranked.find((row) => !row.isActiveBaseline) || null;
   let recommendation = { action: "NO_ACTION", reason: "No candidate rows were evaluated." };
-  if (active && bestOverall && bestOverall.isActiveBaseline) {
-    recommendation = { action: "KEEP_BASELINE", reason: "The active promoted candidate remains the top row in this read-only matrix." };
-  } else if (active && bestNonBaseline && ["PASS", "WARN"].includes(bestNonBaseline.status) && bestNonBaseline.score > active.score + 10 && bestNonBaseline.trades >= 40) {
+  if (active && bestReplacementCandidate && Number(bestReplacementCandidate.practicalScore || 0) > Number(active.practicalScore || 0) + rules.minPracticalScoreMargin) {
     recommendation = {
       action: "REVIEW_NEW_STRATEGY",
-      reason: `${bestNonBaseline.strategy} ${bestNonBaseline.symbol} ${bestNonBaseline.timeframe} ranks meaningfully above the active baseline for research review only.`
+      reason: `${bestReplacementCandidate.strategy} ${bestReplacementCandidate.symbol} ${bestReplacementCandidate.timeframe} passed replacement eligibility and beats the active baseline practical score for research review only.`
+    };
+  } else if (active) {
+    recommendation = {
+      action: "KEEP_BASELINE",
+      reason: bestOverall && !bestOverall.isActiveBaseline
+        ? `Best raw row ${bestOverall.strategy} ${bestOverall.symbol} ${bestOverall.timeframe} is not replacement eligible: ${(bestOverall.replacementRejectionReasons || []).join(", ") || "did not beat practical gates"}.`
+        : "The active promoted candidate remains the best practical decision in this read-only matrix."
     };
   } else if (passCount) {
-    recommendation = { action: "KEEP_BASELINE", reason: "Other rows passed, but none beats the active baseline enough for review." };
+    recommendation = { action: "KEEP_BASELINE", reason: "Other rows passed, but no active baseline row was available for replacement review." };
   } else {
     recommendation = { action: "RESEARCH_MORE", reason: "No viable matrix row beat the baseline gates." };
   }
+  const rankingExplanation = "rawRank is the ordinary matrix ranking by status, score, PF, and return. practicalRank only includes the active baseline plus rows that pass conservative replacement eligibility gates.";
+  const recommendationExplanation = recommendation.action === "KEEP_BASELINE"
+    ? "KEEP_BASELINE means no replacement-eligible candidate beat the active baseline. A high raw rank alone is not enough when trades, return, drawdown, or baseline comparison are weak."
+    : "REVIEW_NEW_STRATEGY is research-only and requires replacement eligibility plus a meaningful practical-score edge over the baseline.";
   return {
     activeBaselineRank: active ? active.rank : null,
+    activeBaselineRawRank: active ? active.rawRank : null,
+    activeBaselinePracticalRank: active ? active.practicalRank : null,
     bestOverall,
+    bestRawCandidate: bestOverall,
+    bestPracticalCandidate,
+    bestReplacementCandidate,
     bestByStrategy,
     bestBySymbol,
     bestByTimeframe,
     bestNonBaseline,
+    replacementEligibleCount: eligible.length,
+    replacementRules: rules,
+    rankingExplanation,
+    recommendationExplanation,
     passCount,
     failCount,
     unsupportedCount,
@@ -289,6 +407,12 @@ const active = {
   timeframe: args.activeTimeframe || "1h",
   strategy: args.activeStrategy || "SimpleAtrTrendV2"
 };
+const activeEvidence = {
+  trades: args.activeBaselineTrades !== undefined ? Number(args.activeBaselineTrades) : null,
+  totalReturnPct: args.activeBaselineReturnPct !== undefined ? Number(args.activeBaselineReturnPct) : null,
+  profitFactor: args.activeBaselineProfitFactor !== undefined ? Number(args.activeBaselineProfitFactor) : null,
+  maxDrawdownPct: args.activeBaselineMaxDrawdownPct !== undefined ? Number(args.activeBaselineMaxDrawdownPct) : null
+};
 const costs = {
   feePct: Number(args.feePct || args["fee-pct"] || 0.055),
   slippagePct: Number(args.slippagePct || args["slippage-pct"] || 0.02)
@@ -363,6 +487,7 @@ Promise.all([
     }
   }).sort(sortRows);
   rows.forEach((row, index) => { row.rank = index + 1; });
+  annotateReplacementSemantics(rows, activeEvidence, REPLACEMENT_RULES);
   const enriched = new Set(rows.slice(0, 3).map((row) => row.rank));
   const activeRow = rows.find((row) => row.isActiveBaseline);
   if (activeRow) enriched.add(activeRow.rank);
@@ -388,7 +513,7 @@ Promise.all([
     },
     discoveredStrategies: strategiesRegistry.listStrategies().map((strategy) => strategy.name).filter((name) => name !== "AlwaysLongTest"),
     rows,
-    summary: buildSummary(rows),
+    summary: buildSummary(rows, activeEvidence, REPLACEMENT_RULES),
     warnings
   }, null, 2));
   runtime.finishCli({ debugHandles: args["debug-handles"] === true, forceExit: args["force-exit"] === true, exitCode: 0 });
