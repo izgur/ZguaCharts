@@ -1318,6 +1318,15 @@ def research_multi_strategy_matrix():
         return jsonify({"error": f"Could not build multi-strategy matrix: {exc}"}), 502
 
 
+@app.get("/api/research/snapshot-export")
+def research_snapshot_export():
+    try:
+        payload, status_code = build_research_snapshot_export(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research snapshot export: {exc}"}), 502
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -7148,6 +7157,538 @@ def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def build_research_snapshot_export(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    output_format = str(args.get("format", "json")).strip().lower()
+    if output_format not in {"json", "markdown"}:
+        return {"ok": False, "error": "format must be json or markdown."}, 400
+    save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    include_details = str(args.get("includeDetails", args.get("include_details", "true"))).strip().lower() not in {"0", "false", "no", "off"}
+    log_file = args.get("logFile")
+    base_args = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+        "timeout_seconds": args.get("timeout_seconds", "240"),
+    }
+    evidence = {}
+    warnings = []
+
+    def capture(name: str, builder, section_args: dict, compact):
+        try:
+            payload, status_code = builder(section_args)
+            section = compact(payload)
+            section["ok"] = payload.get("ok", True) is not False and status_code < 400
+            if status_code >= 400 or payload.get("ok") is False:
+                warnings.append(f"{name} returned status {status_code}; snapshot includes partial evidence.")
+            warnings.extend(payload.get("warnings") or [])
+            return section
+        except Exception as exc:
+            warnings.append(f"{name} failed: {exc}")
+            return {"ok": False, "error": str(exc)}
+
+    evidence["candidateCurrent"] = compact_snapshot_candidate(candidate, symbol, timeframe, strategy)
+    evidence["candidateReview"] = capture(
+        "candidate review report",
+        build_research_candidate_review_report,
+        {**base_args, "logFile": log_file} if log_file else dict(base_args),
+        compact_snapshot_candidate_review,
+    )
+    evidence["leaderboard"] = capture(
+        "research candidate leaderboard",
+        build_research_candidate_leaderboard,
+        {
+            "symbols": args.get("leaderboardSymbols", args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")),
+            "timeframes": args.get("leaderboardTimeframes", args.get("timeframes", "1h,4h")),
+            "strategies": strategy,
+            "period": period,
+            "maxCombos": args.get("leaderboardMaxCombos", args.get("maxCombos", "auto")),
+            "timeout_seconds": args.get("timeout_seconds", "240"),
+        },
+        compact_snapshot_leaderboard,
+    )
+    evidence["activity"] = capture(
+        "backtest activity lab",
+        build_research_activity_lab,
+        {**base_args, "symbols": symbol, "timeframes": timeframe, "strategies": strategy, "maxCombos": "1", "optimize": "false"},
+        compact_snapshot_activity,
+    )
+    evidence["robustness"] = capture(
+        "parameter robustness lab",
+        build_research_parameter_robustness,
+        {**base_args, "maxVariants": args.get("robustnessMaxVariants", "24"), "includeBase": "true"},
+        compact_snapshot_robustness,
+    )
+    evidence["feeSlippageStress"] = capture(
+        "fee/slippage stress lab",
+        build_research_fee_slippage_stress,
+        dict(base_args),
+        compact_snapshot_fee_stress,
+    )
+    evidence["walkForward"] = capture(
+        "walk-forward review",
+        build_research_walk_forward_review,
+        {**base_args, "folds": args.get("folds", "4")},
+        compact_snapshot_walk_forward,
+    )
+    evidence["regimeBreakdown"] = capture(
+        "regime breakdown lab",
+        build_research_regime_breakdown,
+        {**base_args, "includeTrades": "false"},
+        compact_snapshot_regime_breakdown,
+    )
+    evidence["variants"] = capture(
+        "strategy variant lab",
+        build_research_strategy_variant_lab,
+        {**base_args, "baseStrategy": strategy, "maxVariants": args.get("variantMaxVariants", "12")},
+        compact_snapshot_variants,
+    )
+    evidence["blockers"] = capture(
+        "strategy blocker analytics",
+        build_research_blocker_analytics,
+        {**base_args, "recentLimit": "20", "includeRecentCandles": "false"},
+        compact_snapshot_blockers,
+    )
+    evidence["multiStrategyMatrix"] = capture(
+        "multi-strategy matrix",
+        build_research_multi_strategy_matrix,
+        {
+            "symbols": args.get("matrixSymbols", args.get("symbols", "ETHUSDT,BTCUSDT,SOLUSDT")),
+            "timeframes": args.get("matrixTimeframes", args.get("timeframes", "1h,4h")),
+            "strategies": args.get("matrixStrategies", "auto"),
+            "period": period,
+            "maxRows": args.get("matrixMaxRows", "100"),
+            "timeout_seconds": args.get("matrixTimeoutSeconds", args.get("timeout_seconds", "420")),
+        },
+        compact_snapshot_multi_strategy_matrix,
+    )
+    if log_file:
+        evidence["paperObservation"] = compact_snapshot_paper_observation(build_paper_observation_report({"logFile": log_file}))
+    else:
+        evidence["paperObservation"] = {"included": False, "reason": "Pass logFile to include paper observation evidence."}
+    evidence["signalDiagnostics"] = capture(
+        "active signal diagnostics",
+        build_paper_active_signal_diagnostics,
+        {"limit": args.get("signalLimit", "20"), "timeout_seconds": args.get("signalTimeoutSeconds", "90")},
+        compact_snapshot_signal_diagnostics,
+    )
+
+    strengths, weaknesses, risks, recommendations = research_snapshot_findings(evidence, paper_enabled, real_enabled)
+    verdict = research_snapshot_verdict(evidence, paper_enabled, real_enabled, strengths, weaknesses, risks)
+    executive = {
+        "baseline": f"{strategy} {symbol} {timeframe}",
+        "currentDecision": verdict.get("status"),
+        "strongestEvidence": strengths[:3],
+        "weakestEvidence": weaknesses[:3],
+        "realTradingReadiness": "NOT_READY",
+        "paperRecommendation": verdict.get("nextAction", {}).get("action"),
+    }
+    generated_at = datetime.now(timezone.utc).isoformat()
+    snapshot = {
+        "ok": True,
+        "generatedAt": generated_at,
+        "format": "json",
+        "savedPath": None,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": {
+            **candidate_summary(candidate),
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy": strategy,
+        },
+        "verdict": verdict,
+        "executiveSummary": executive,
+        "evidence": evidence if include_details else compact_snapshot_evidence_headers(evidence),
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "risks": risks,
+        "recommendations": recommendations,
+        "warnings": dedupe_list(([real_detail] if real_enabled else []) + [warning for warning in warnings if warning]),
+    }
+    if output_format == "markdown":
+        markdown = render_research_snapshot_markdown(snapshot)
+        saved_path = save_research_snapshot(markdown, "md") if save else None
+        return {
+            "ok": True,
+            "format": "markdown",
+            "markdown": markdown,
+            "savedPath": saved_path,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "warnings": snapshot["warnings"],
+        }, 200
+    if save:
+        snapshot["savedPath"] = save_research_snapshot(snapshot, "json")
+    return snapshot, 200
+
+
+def compact_snapshot_candidate(candidate: dict, symbol: str, timeframe: str, strategy: str) -> dict:
+    promoted = candidate.get("promotedFromOptimization") or {}
+    ranking = candidate.get("promotedFromRanking") or {}
+    quality = promoted.get("qualityMetrics") or {}
+    return {
+        "strategy": strategy,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "source": candidate.get("source"),
+        "enabled": canonical_paper_enabled(candidate),
+        "paramsRegimeMode": (candidate.get("params") or {}).get("regimeMode"),
+        "fillModel": candidate.get("fillModel"),
+        "riskPct": candidate.get("riskPct"),
+        "promotedAt": candidate.get("promotedAt"),
+        "qualityStatus": promoted.get("qualityStatus"),
+        "ranking": {
+            "rank": ranking.get("rank"),
+            "score": ranking.get("score"),
+            "trades": ranking.get("trades"),
+            "profitFactor": ranking.get("profitFactor"),
+            "totalReturnPct": ranking.get("totalReturnPct"),
+            "maxDrawdownPct": ranking.get("maxDrawdown") or ranking.get("maxDrawdownPct"),
+        },
+        "baseline": {
+            "fullTrades": quality.get("fullTrades"),
+            "fullReturnPct": quality.get("fullReturnPct"),
+            "fullProfitFactor": quality.get("fullProfitFactor"),
+            "fullMaxDrawdownPct": quality.get("fullMaxDrawdownPct"),
+            "testTrades": quality.get("testTrades"),
+            "testReturnPct": quality.get("testReturnPct"),
+            "testProfitFactor": quality.get("testProfitFactor"),
+        },
+        "configWarnings": candidate.get("configWarnings") or candidate.get("consistencyWarnings") or [],
+    }
+
+
+def compact_snapshot_candidate_review(payload: dict) -> dict:
+    return {
+        "verdict": payload.get("verdict") or payload.get("review") or {},
+        "readiness": payload.get("readiness") or {},
+        "evidence": payload.get("evidence") or {},
+        "summary": payload.get("summary") or {},
+        "warnings": payload.get("warnings") or [],
+    }
+
+
+def compact_snapshot_leaderboard(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    active = summary.get("activeCandidate") or {}
+    best = summary.get("bestOverall") or {}
+    return {
+        "activeCandidateRank": summary.get("activeCandidateRank"),
+        "bestOverall": compact_snapshot_row(best),
+        "activeCandidate": compact_snapshot_row(active),
+        "passCount": summary.get("passCount"),
+        "failCount": summary.get("failCount"),
+        "recommendation": summary.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_activity(payload: dict) -> dict:
+    rows = payload.get("rows") or []
+    active = rows[0] if rows else {}
+    summary = payload.get("summary") or {}
+    return {
+        "activeRow": compact_snapshot_row(active),
+        "bestOverall": compact_snapshot_row(summary.get("bestOverall") or {}),
+        "recommendation": summary.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_robustness(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "status": summary.get("status") or payload.get("status"),
+        "base": compact_snapshot_row(payload.get("base") or summary.get("base") or {}),
+        "bestVariant": compact_snapshot_row(summary.get("bestVariant") or {}),
+        "passingVariants": summary.get("passingVariants"),
+        "testedVariants": summary.get("testedVariants") or len(payload.get("variants") or []),
+        "recommendation": summary.get("recommendation") or payload.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_fee_stress(payload: dict) -> dict:
+    stress = payload.get("stress") or {}
+    baseline = next((row for row in payload.get("rows") or [] if row.get("scenario") == "baseline"), (payload.get("rows") or [{}])[0] if payload.get("rows") else {})
+    return {
+        "status": stress.get("status"),
+        "baseline": compact_snapshot_row(baseline),
+        "worstPassingScenario": stress.get("worstPassingScenario"),
+        "firstFailureScenario": stress.get("firstFailureScenario"),
+        "survivingScenarios": stress.get("survivingScenarios"),
+        "failedScenarios": stress.get("failedScenarios"),
+        "recommendation": stress.get("recommendation"),
+    }
+
+
+def compact_snapshot_walk_forward(payload: dict) -> dict:
+    stability = payload.get("stability") or {}
+    return {
+        "full": compact_snapshot_row(payload.get("full") or {}),
+        "recentWindows": [compact_snapshot_row(row, extra=("label",)) for row in (payload.get("recentWindows") or [])[:5]],
+        "folds": [compact_snapshot_row(row, extra=("fold", "startTime", "endTime")) for row in (payload.get("folds") or [])[:8]],
+        "stability": stability,
+    }
+
+
+def compact_snapshot_regime_breakdown(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "dependencyStatus": summary.get("regimeDependencyStatus"),
+        "bestRegime": summary.get("bestRegime"),
+        "worstRegime": summary.get("worstRegime"),
+        "highestTradeCountRegime": summary.get("highestTradeCountRegime"),
+        "recommendation": summary.get("recommendation"),
+        "topRegimes": [compact_snapshot_row(row, extra=("regime", "contributionPct")) for row in (payload.get("regimes") or [])[:8]],
+    }
+
+
+def compact_snapshot_variants(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "status": summary.get("status"),
+        "baseline": compact_snapshot_row(summary.get("baseline") or payload.get("baseline") or {}),
+        "bestVariant": compact_snapshot_row(summary.get("bestVariant") or {}),
+        "variantCount": summary.get("variantCount") or len(payload.get("variants") or []),
+        "recommendation": summary.get("recommendation") or payload.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_blockers(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "status": summary.get("status"),
+        "primaryBlocker": summary.get("primaryBlocker"),
+        "topBlockers": (payload.get("blockers") or [])[:8],
+        "nearMisses": (payload.get("nearMisses") or [])[:5],
+        "recommendation": summary.get("recommendation") or payload.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_multi_strategy_matrix(payload: dict) -> dict:
+    summary = payload.get("summary") or {}
+    return {
+        "activeBaselineRank": summary.get("activeBaselineRank"),
+        "bestOverall": compact_snapshot_row(summary.get("bestOverall") or {}),
+        "bestNonBaseline": compact_snapshot_row(summary.get("bestNonBaseline") or {}),
+        "passCount": summary.get("passCount"),
+        "failCount": summary.get("failCount"),
+        "unsupportedCount": summary.get("unsupportedCount"),
+        "recommendation": summary.get("recommendation") or {},
+    }
+
+
+def compact_snapshot_paper_observation(payload: dict) -> dict:
+    return {
+        "included": True,
+        "verdict": payload.get("verdict") or {},
+        "evidence": payload.get("evidence") or {},
+        "progress": payload.get("progress") or {},
+        "performance": payload.get("performance") or {},
+        "baseline": payload.get("baseline") or {},
+        "warnings": payload.get("warnings") or [],
+        "informationalWarnings": payload.get("informationalWarnings") or [],
+    }
+
+
+def compact_snapshot_signal_diagnostics(payload: dict) -> dict:
+    diagnostics = payload.get("diagnostics") or {}
+    return {
+        "signal": diagnostics.get("signal"),
+        "reason": diagnostics.get("reason"),
+        "primaryBlocker": diagnostics.get("primaryBlocker"),
+        "latestClosedCandleTime": diagnostics.get("latestClosedCandleTime"),
+        "nextAction": payload.get("nextAction") or {},
+        "warnings": payload.get("warnings") or [],
+    }
+
+
+def compact_snapshot_row(row: dict | None, extra: tuple = ()) -> dict:
+    row = row or {}
+    compact = {key: row.get(key) for key in extra if key in row}
+    compact.update({
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "status": row.get("status") or row.get("qualityStatus"),
+        "trades": row.get("trades"),
+        "tradesPerMonth": row.get("tradesPerMonth"),
+        "totalReturnPct": row.get("totalReturnPct") if row.get("totalReturnPct") is not None else row.get("totalReturn"),
+        "profitFactor": row.get("profitFactor"),
+        "maxDrawdownPct": row.get("maxDrawdownPct") if row.get("maxDrawdownPct") is not None else row.get("maxDrawdown"),
+        "winRate": row.get("winRate"),
+        "score": row.get("score"),
+        "mainFailureReason": row.get("mainFailureReason"),
+    })
+    return {key: value for key, value in compact.items() if value is not None}
+
+
+def compact_snapshot_evidence_headers(evidence: dict) -> dict:
+    return {
+        key: {
+            "ok": value.get("ok"),
+            "status": value.get("status") or (value.get("stability") or {}).get("status") or (value.get("verdict") or {}).get("status"),
+            "recommendation": value.get("recommendation") or (value.get("summary") or {}).get("recommendation"),
+        }
+        for key, value in evidence.items()
+        if isinstance(value, dict)
+    }
+
+
+def research_snapshot_findings(evidence: dict, paper_enabled: bool, real_enabled: bool) -> tuple[list[str], list[str], list[str], list[str]]:
+    strengths = []
+    weaknesses = []
+    risks = []
+    recommendations = []
+    candidate = evidence.get("candidateCurrent") or {}
+    baseline = candidate.get("baseline") or {}
+    if baseline.get("fullProfitFactor") and safe_float(baseline.get("fullProfitFactor"), 0) >= 1.2:
+        strengths.append(f"Promoted baseline PF is {baseline.get('fullProfitFactor')} with {baseline.get('fullTrades')} full-window trades.")
+    leaderboard = evidence.get("leaderboard") or {}
+    if leaderboard.get("activeCandidateRank") == 1:
+        strengths.append("Active candidate ranks first in the research leaderboard.")
+    matrix = evidence.get("multiStrategyMatrix") or {}
+    if (matrix.get("recommendation") or {}).get("action") in {"KEEP_BASELINE", "KEEP_CURRENT"}:
+        strengths.append("Multi-strategy matrix did not find a stronger practical replacement.")
+    robustness = evidence.get("robustness") or {}
+    if str(robustness.get("status") or "").upper() in {"ROBUST", "PASS"}:
+        strengths.append("Parameter robustness lab supports the current parameter neighborhood.")
+    fee = evidence.get("feeSlippageStress") or {}
+    if str(fee.get("status") or "").upper() in {"WATCH", "FRAGILE"}:
+        weaknesses.append(f"Fee/slippage stress is {fee.get('status')}; execution costs can reduce the edge.")
+    walk = evidence.get("walkForward") or {}
+    if str((walk.get("stability") or {}).get("status") or "").upper() in {"WATCH", "FRAGILE"}:
+        weaknesses.append(f"Walk-forward stability is {(walk.get('stability') or {}).get('status')}, suggesting regime dependence.")
+    regime = evidence.get("regimeBreakdown") or {}
+    if str(regime.get("dependencyStatus") or "").upper() in {"MEDIUM", "HIGH"}:
+        weaknesses.append(f"Regime dependency is {regime.get('dependencyStatus')}; some regimes may hurt the candidate.")
+    paper = evidence.get("paperObservation") or {}
+    paper_evidence = paper.get("evidence") or {}
+    if paper.get("included") and safe_float(paper_evidence.get("closedTrades"), 0) <= 0:
+        weaknesses.append("Paper observation has not produced closed trades yet.")
+    signal = evidence.get("signalDiagnostics") or {}
+    if signal.get("signal") == "HOLD":
+        risks.append(f"Latest active signal diagnostic is HOLD: {signal.get('reason') or signal.get('primaryBlocker') or 'no entry signal'}")
+    if real_enabled:
+        risks.append("Real trading flag appears enabled; this snapshot is not safe for execution decisions.")
+    else:
+        strengths.append("Real trading is disabled.")
+    if not paper_enabled:
+        recommendations.append("Keep paper/manual research review separate; paper is disabled in this working repo.")
+    recommendations.append("Use this snapshot for research comparison only; do not treat it as a real-trading approval.")
+    if weaknesses:
+        recommendations.append("Continue paper-only observation before changing promotion or execution posture.")
+    return dedupe_list(strengths), dedupe_list(weaknesses), dedupe_list(risks), dedupe_list(recommendations)
+
+
+def research_snapshot_verdict(evidence: dict, paper_enabled: bool, real_enabled: bool, strengths: list[str], weaknesses: list[str], risks: list[str]) -> dict:
+    if real_enabled:
+        return {
+            "status": "NOT_READY",
+            "summary": "Real trading appears enabled; stop and review safety flags before using research evidence.",
+            "nextAction": {"action": "DISABLE_REAL_TRADING_FLAG", "reason": "Research snapshots never approve real trading."},
+        }
+    paper = evidence.get("paperObservation") or {}
+    paper_verdict = paper.get("verdict") or {}
+    if str(paper_verdict.get("status") or "").upper() in {"READY_FOR_LONGER_PAPER", "READY_FOR_PAPER_REVIEW", "READY_FOR_REVIEW"}:
+        status = "READY_FOR_LONGER_PAPER"
+        summary = "Backtest evidence is usable, but forward evidence should continue before any candidate judgment changes."
+        action = "CONTINUE_PAPER_OBSERVATION"
+    elif weaknesses or risks:
+        status = "WATCH"
+        summary = "The candidate remains research-worthy, but stress, walk-forward, regime, or live signal evidence needs more review."
+        action = "REVIEW_WEAKNESSES"
+    else:
+        status = "KEEP_BASELINE"
+        summary = "The current baseline remains the best practical research candidate in this snapshot."
+        action = "KEEP_CURRENT_RESEARCH_BASELINE"
+    if not paper_enabled and action == "CONTINUE_PAPER_OBSERVATION":
+        action = "REVIEW_ENABLE_PAPER_SIMULATION"
+    return {
+        "status": status,
+        "summary": summary,
+        "nextAction": {
+            "action": action,
+            "reason": "Paper/research review only. This snapshot never promotes, enables paper, or enables real trading automatically.",
+        },
+    }
+
+
+def render_research_snapshot_markdown(snapshot: dict) -> str:
+    candidate = snapshot.get("candidate") or {}
+    verdict = snapshot.get("verdict") or {}
+    evidence = snapshot.get("evidence") or {}
+    activity = ((evidence.get("activity") or {}).get("activeRow") or {})
+    fee = evidence.get("feeSlippageStress") or {}
+    walk = evidence.get("walkForward") or {}
+    regime = evidence.get("regimeBreakdown") or {}
+    paper = evidence.get("paperObservation") or {}
+    signal = evidence.get("signalDiagnostics") or {}
+    lines = [
+        "# ZguaCharts Research Snapshot",
+        "",
+        f"Generated: {snapshot.get('generatedAt')}",
+        f"Candidate: {candidate.get('strategy')} {candidate.get('symbol')} {candidate.get('timeframe')}",
+        f"Verdict: {verdict.get('status')} - {verdict.get('summary')}",
+        "",
+        "## Key Metrics",
+        "",
+        "| Area | Status | Detail |",
+        "| --- | --- | --- |",
+        f"| Activity | {activity.get('status', '-')} | {activity.get('trades', '-')} trades, PF {activity.get('profitFactor', '-')}, return {activity.get('totalReturnPct', '-')}% |",
+        f"| Fee/slippage | {fee.get('status', '-')} | first failure {fee.get('firstFailureScenario') or '-'} |",
+        f"| Walk-forward | {(walk.get('stability') or {}).get('status', '-')} | pass folds {(walk.get('stability') or {}).get('passFoldCount', '-')} / fail folds {(walk.get('stability') or {}).get('failFoldCount', '-')} |",
+        f"| Regime | {regime.get('dependencyStatus', '-')} | best {regime.get('bestRegime') or '-'} / worst {regime.get('worstRegime') or '-'} |",
+        f"| Signal | {signal.get('signal', '-')} | {signal.get('reason') or signal.get('primaryBlocker') or '-'} |",
+        "",
+        "## Strengths",
+    ]
+    lines.extend([f"- {item}" for item in (snapshot.get("strengths") or ["No strengths recorded."])])
+    lines.extend(["", "## Weaknesses"])
+    lines.extend([f"- {item}" for item in (snapshot.get("weaknesses") or ["No weaknesses recorded."])])
+    lines.extend(["", "## Risks"])
+    lines.extend([f"- {item}" for item in (snapshot.get("risks") or ["No risks recorded."])])
+    lines.extend(["", "## Recommendations"])
+    lines.extend([f"- {item}" for item in (snapshot.get("recommendations") or ["No recommendations recorded."])])
+    lines.extend([
+        "",
+        "## Paper Evidence",
+        "",
+        f"- Included: {bool(paper.get('included'))}",
+        f"- Verdict: {(paper.get('verdict') or {}).get('status', '-')}",
+        f"- Ticks: {(paper.get('evidence') or {}).get('ticksObserved', '-')}",
+        f"- Closed trades: {(paper.get('evidence') or {}).get('closedTrades', '-')}",
+        "",
+        "## Safety",
+        "",
+        f"- Paper enabled: {snapshot.get('paperEnabled')}",
+        f"- Real trading enabled: {snapshot.get('realTradingEnabled')}",
+        "- Real trading readiness: NOT_READY",
+        "- This snapshot is read-only research evidence. It does not promote, enable paper, tick paper, or enable real trading.",
+    ])
+    return "\n".join(lines) + "\n"
+
+
+def save_research_snapshot(content, extension: str) -> str:
+    snapshot_dir = Path(app.root_path) / "reports" / "research-snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = snapshot_dir / f"research-snapshot-{stamp}.{extension}"
+    if extension == "json":
+        path.write_text(json.dumps(content, indent=2), encoding="utf-8")
+    else:
+        path.write_text(str(content), encoding="utf-8")
+    return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
 
 
 def build_research_blocker_analytics(args) -> tuple[dict, int]:

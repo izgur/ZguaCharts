@@ -2709,6 +2709,8 @@ function setupLearningControls() {
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
   document.querySelector("#research-blocker-analytics-refresh")?.addEventListener("click", loadResearchBlockerAnalytics);
+  document.querySelector("#research-snapshot-export-refresh")?.addEventListener("click", loadResearchSnapshotExport);
+  document.querySelector("#research-snapshot-export-markdown")?.addEventListener("click", exportResearchSnapshotMarkdown);
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
@@ -3577,6 +3579,96 @@ function renderResearchBlockerAnalytics(payload) {
       <thead><tr><th>Near miss</th><th>Close</th><th>Score</th><th>Failed blockers</th><th>Detail</th></tr></thead>
       <tbody>${nearMisses || `<tr><td colspan="5">No near misses returned.</td></tr>`}</tbody>
     </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchSnapshotExport() {
+  const host = document.querySelector("#research-snapshot-export-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Building research snapshot...</p>`;
+    const payload = await apiGet("/api/research/snapshot-export");
+    host.innerHTML = renderResearchSnapshotExport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research snapshot could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function exportResearchSnapshotMarkdown() {
+  const host = document.querySelector("#research-snapshot-export-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Exporting markdown snapshot...</p>`;
+    const payload = await apiGet("/api/research/snapshot-export?format=markdown&save=true");
+    host.innerHTML = renderResearchSnapshotExport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Markdown snapshot could not export: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchSnapshotExport(payload) {
+  const candidate = payload.candidate || {};
+  const verdict = payload.verdict || {};
+  const next = verdict.nextAction || {};
+  const executive = payload.executiveSummary || {};
+  const evidence = payload.evidence || {};
+  const activity = (evidence.activity || {}).activeRow || {};
+  const leaderboard = evidence.leaderboard || {};
+  const fee = evidence.feeSlippageStress || {};
+  const walk = evidence.walkForward || {};
+  const regime = evidence.regimeBreakdown || {};
+  const signal = evidence.signalDiagnostics || {};
+  const paper = evidence.paperObservation || {};
+  const strengths = (payload.strengths || []).slice(0, 6).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const weaknesses = (payload.weaknesses || []).slice(0, 6).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const risks = (payload.risks || []).slice(0, 6).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const recommendations = (payload.recommendations || []).slice(0, 6).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const warnings = (payload.warnings || []).slice(0, 8).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const markdownPreview = payload.markdown ? `<pre class="json-preview">${escapeHtml(payload.markdown.slice(0, 1600))}</pre>` : "";
+  return `
+    <h3 class="modal-section-title">Research Snapshot Export <span class="neutral">${escapeHtml(verdict.status || payload.format || "SNAPSHOT")}</span></h3>
+    <p class="modal-note"><strong>Candidate:</strong> ${escapeHtml(candidate.strategy || "-")} ${escapeHtml(candidate.symbol || "-")} ${escapeHtml(candidate.timeframe || "-")}. ${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Generated</span><strong>${escapeHtml(payload.generatedAt || "-")}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Next action</span><strong>${escapeHtml(next.action || executive.paperRecommendation || "-")}</strong></div>
+      <div class="metric"><span>Leaderboard rank</span><strong>${leaderboard.activeCandidateRank ?? "-"}</strong></div>
+      <div class="metric"><span>Activity</span><strong>${escapeHtml(activity.status || "-")} PF ${formatNumber(activity.profitFactor)}</strong></div>
+      <div class="metric"><span>Fee stress</span><strong>${escapeHtml(fee.status || "-")}</strong></div>
+      <div class="metric"><span>Walk-forward</span><strong>${escapeHtml((walk.stability || {}).status || "-")}</strong></div>
+      <div class="metric"><span>Regime</span><strong>${escapeHtml(regime.dependencyStatus || "-")}</strong></div>
+      <div class="metric"><span>Signal</span><strong>${escapeHtml(signal.signal || "-")}</strong></div>
+      <div class="metric"><span>Paper trades</span><strong>${paper.included ? ((paper.evidence || {}).closedTrades ?? 0) : "not included"}</strong></div>
+      <div class="metric"><span>Saved path</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Current decision</th><td>${escapeHtml(executive.currentDecision || verdict.status || "-")}</td></tr>
+        <tr><th>Safety</th><td>Real trading readiness: ${escapeHtml(executive.realTradingReadiness || "NOT_READY")}</td></tr>
+        <tr><th>Next reason</th><td>${escapeHtml(next.reason || "-")}</td></tr>
+      </tbody>
+    </table>
+    <div class="research-grid">
+      <div>
+        <h4>Strengths</h4>
+        <ul class="backtest-warnings">${strengths || "<li>No strengths recorded.</li>"}</ul>
+      </div>
+      <div>
+        <h4>Weaknesses</h4>
+        <ul class="backtest-warnings">${weaknesses || "<li>No weaknesses recorded.</li>"}</ul>
+      </div>
+      <div>
+        <h4>Risks</h4>
+        <ul class="backtest-warnings">${risks || "<li>No risks recorded.</li>"}</ul>
+      </div>
+      <div>
+        <h4>Recommendations</h4>
+        <ul class="backtest-warnings">${recommendations || "<li>No recommendations recorded.</li>"}</ul>
+      </div>
+    </div>
+    ${markdownPreview}
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }
