@@ -4142,11 +4142,16 @@ function renderResearchCandidateDeepCompare(payload) {
   const stress = evidence.stress || {};
   const walk = evidence.walkForward || {};
   const regime = evidence.regime || {};
+  const selectedSource = payload.selectedChallengerSource || {};
+  const eligibility = payload.replacementEligibility || {};
+  const researchVerdict = payload.researchVerdict || {};
   const baseline = payload.baseline || {};
   const challenger = payload.challenger || {};
   const ba = activity.baseline || {};
   const ca = activity.challenger || {};
   const tone = comparison.winner === "CHALLENGER" ? "positive" : comparison.winner === "BASELINE" ? "neutral" : "negative";
+  const verdictTone = researchVerdict.action === "REVIEW_CHALLENGER" ? "positive" : researchVerdict.action === "RESEARCH_CHALLENGER_MORE" ? "neutral" : "negative";
+  const eligibilityTone = eligibility.eligible ? "positive" : "negative";
   const metricRows = [
     renderCompareMetricRow("Status", ba.status, ca.status, (value) => escapeHtml(value || "-")),
     renderCompareMetricRow("Trades", ba.trades, ca.trades),
@@ -4159,17 +4164,24 @@ function renderResearchCandidateDeepCompare(payload) {
     renderCompareMetricRow("Regime", regime.baseline?.regimeDependencyStatus, regime.challenger?.regimeDependencyStatus, (value) => escapeHtml(value || "-"))
   ].join("");
   const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const eligibilityReasons = (eligibility.reasons || []).join(", ") || "none";
+  const lowTradeWarning = (eligibility.reasons || []).includes("LOW_TRADE_COUNT") || (payload.warnings || []).includes("LOW_TRADE_COUNT");
   return `
     <h3 class="modal-section-title">Candidate Deep Compare <span class="${tone}">${escapeHtml(comparison.winner || "NO_DECISION")}</span></h3>
-    <p class="modal-note"><strong>${escapeHtml(recommendation.action || "-")}</strong> ${escapeHtml(recommendation.reason || comparison.reason || "")}</p>
+    <p class="modal-note"><strong class="${verdictTone}">${escapeHtml(researchVerdict.action || recommendation.action || "-")}</strong> ${escapeHtml(researchVerdict.reason || recommendation.reason || comparison.reason || "")}</p>
     <div class="metric-grid">
       <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
       <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
       <div class="metric"><span>Baseline</span><strong>${escapeHtml(baseline.symbol || "-")} ${escapeHtml(baseline.timeframe || "-")}</strong></div>
       <div class="metric"><span>Challenger</span><strong>${escapeHtml(challenger.symbol || "-")} ${escapeHtml(challenger.timeframe || "-")}</strong></div>
+      <div class="metric"><span>Source</span><strong>${escapeHtml(selectedSource.source || "preset")}</strong></div>
+      <div class="metric"><span>Source rank</span><strong>${selectedSource.rank ?? "-"}</strong></div>
       <div class="metric"><span>Preset</span><strong>${escapeHtml(challenger.presetName || "-")}</strong></div>
+      <div class="metric"><span>Replacement eligible</span><strong class="${eligibilityTone}">${eligibility.eligible ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Low trade warning</span><strong class="${lowTradeWarning ? "negative" : "positive"}">${lowTradeWarning ? "yes" : "no"}</strong></div>
       <div class="metric"><span>Score diff</span><strong>${formatSigned(comparison.scoreDiff || 0)}</strong></div>
     </div>
+    <p class="modal-note"><strong>Eligibility:</strong> ${escapeHtml(eligibilityReasons)}. <strong>Params:</strong> ${escapeHtml(selectedSource.paramsSource || challenger.presetFamily || "-")}${selectedSource.batchFile ? `. Batch: ${escapeHtml(selectedSource.batchFile)}` : ""}</p>
     <p class="modal-note">${escapeHtml(comparison.tradeoffSummary || comparison.reason || "")}</p>
     <table class="trade-table">
       <thead><tr><th>Metric</th><th>Baseline</th><th>Challenger</th></tr></thead>

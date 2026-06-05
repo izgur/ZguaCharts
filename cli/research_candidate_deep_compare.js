@@ -301,12 +301,13 @@ const baseline = {
   presetName: "active_paper_candidate",
   params: baseParams
 };
+const explicitChallengerParams = args.challengerParams ? JSON.parse(args.challengerParams) : null;
 const challengerPreset = args.challengerPreset || "swing_native_4h_1";
 const challengerTimeframe = args.challengerTimeframe || "4h";
 const availablePresets = generatePresets(baseParams, ["15m", "1h", "4h"]);
-const preset = availablePresets.find((row) => row.presetName === challengerPreset && row.timeframe === challengerTimeframe)
+const preset = explicitChallengerParams ? null : availablePresets.find((row) => row.presetName === challengerPreset && row.timeframe === challengerTimeframe)
   || availablePresets.find((row) => row.presetName === challengerPreset);
-if (!preset) {
+if (!explicitChallengerParams && !preset) {
   process.stdout.write(JSON.stringify({
     ok: false,
     error: "Unknown challengerPreset.",
@@ -319,11 +320,11 @@ if (!preset) {
     role: "challenger",
     source,
     symbol: args.challengerSymbol || "ETHUSDT",
-    timeframe: args.challengerTimeframe || preset.timeframe,
+    timeframe: args.challengerTimeframe || (preset ? preset.timeframe : "4h"),
     strategy: args.challengerStrategy || "SimpleAtrTrendV2",
-    presetFamily: preset.presetFamily,
-    presetName: preset.presetName,
-    params: preset.params
+    presetFamily: preset ? preset.presetFamily : "inline",
+    presetName: preset ? preset.presetName : (args.challengerParamsSource || "inline_params"),
+    params: explicitChallengerParams || preset.params
   };
   const from = args.from || argsUtil.daysToFrom(days);
   const to = args.to || new Date().toISOString();

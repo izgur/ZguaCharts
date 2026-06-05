@@ -6996,6 +6996,123 @@ def build_research_timeframe_preset_search(args) -> tuple[dict, int]:
     return response, 200 if response["ok"] else 502
 
 
+def _candidate_deep_compare_batch_dir() -> Path:
+    return (Path(app.root_path) / "reports" / "research-batches").resolve()
+
+
+def _load_candidate_deep_compare_batch_file(raw_path: str) -> tuple[dict | None, str | None]:
+    if not raw_path:
+        return None, None
+    base_dir = _candidate_deep_compare_batch_dir()
+    candidate_path = Path(raw_path)
+    if not candidate_path.is_absolute():
+        candidate_path = (Path(app.root_path) / candidate_path).resolve()
+    else:
+        candidate_path = candidate_path.resolve()
+    try:
+        candidate_path.relative_to(base_dir)
+    except ValueError:
+        return None, "batchFile must point to a JSON file under reports/research-batches/."
+    if not candidate_path.exists() or not candidate_path.is_file():
+        return None, f"batchFile was not found: {raw_path}"
+    try:
+        with open(candidate_path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:
+        return None, f"Could not read optimizer batch file: {exc}"
+    payload["_resolvedBatchFile"] = str(candidate_path.relative_to(Path(app.root_path))).replace("\\", "/")
+    return payload, None
+
+
+def _select_optimizer_batch_challenger(batch_payload: dict, args, rank: int) -> tuple[dict | None, str | None]:
+    rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict) and not row.get("isActiveBaseline")]
+    if not rows:
+        return None, "Optimizer batch did not return challenger rows."
+    strategy = (args.get("challengerStrategy") or "").strip()
+    symbol = (args.get("challengerSymbol") or "").strip()
+    timeframe = (args.get("challengerTimeframe") or args.get("challengerInterval") or "").strip()
+    if strategy or symbol or timeframe:
+        for row in rows:
+            if strategy and str(row.get("strategy") or "") != strategy:
+                continue
+            if symbol and str(row.get("symbol") or "") != symbol:
+                continue
+            if timeframe and str(row.get("timeframe") or row.get("interval") or "") != timeframe:
+                continue
+            return row, None
+    sorted_rows = sorted(rows, key=lambda row: int(safe_float(row.get("rank"), 999999)))
+    index = max(0, min(rank - 1, len(sorted_rows) - 1))
+    return sorted_rows[index], None
+
+
+def _run_optimizer_batch_for_deep_compare(args, challenger_strategy: str, challenger_symbol: str, challenger_timeframe: str) -> tuple[dict | None, int, str | None]:
+    batch_args = {
+        "symbols": args.get("symbols") or challenger_symbol or "ETHUSDT,BTCUSDT,SOLUSDT",
+        "timeframes": args.get("timeframes") or challenger_timeframe or "1h,4h",
+        "strategies": args.get("strategies") or challenger_strategy or "auto",
+        "period": args.get("period", "365d"),
+        "maxCandidates": args.get("maxCandidates") or args.get("max_candidates") or "60",
+        "maxCombosPerStrategy": args.get("maxCombosPerStrategy") or args.get("max_combos_per_strategy") or "50",
+        "topN": args.get("topN") or args.get("top_n") or "20",
+        "includeWalkForward": args.get("includeWalkForward", "false"),
+        "includeStress": args.get("includeStress", "false"),
+        "save": "false",
+        "limit": args.get("limit", "auto"),
+        "timeout_seconds": args.get("optimizer_timeout_seconds", args.get("timeout_seconds", "900")),
+    }
+    payload, status = build_research_multi_strategy_optimizer_batch(batch_args)
+    if not payload.get("ok"):
+        return payload, status, payload.get("error") or "Optimizer batch did not complete for challenger selection."
+    return payload, status, None
+
+
+def _replacement_eligibility_from_deep_compare(payload: dict, selected_row: dict | None) -> dict:
+    challenger_activity = ((payload.get("evidence") or {}).get("activity") or {}).get("challenger") or {}
+    comparison = payload.get("comparison") or {}
+    rules = {
+        "minTrades": 40,
+        "minProfitFactor": 1.1,
+        "minTotalReturnPct": 0,
+        "maxDrawdownPct": 25,
+        "minScoreDiff": 10,
+    }
+    reasons = []
+    trades = safe_float(challenger_activity.get("trades"), safe_float((selected_row or {}).get("trades"), 0))
+    profit_factor = safe_float(challenger_activity.get("profitFactor"), safe_float((selected_row or {}).get("profitFactor"), 0))
+    total_return = safe_float(challenger_activity.get("totalReturnPct"), safe_float((selected_row or {}).get("totalReturnPct"), 0))
+    max_dd = safe_float(challenger_activity.get("maxDrawdownPct"), safe_float((selected_row or {}).get("maxDrawdownPct"), 0))
+    score_diff = safe_float(comparison.get("scoreDiff"), 0)
+    if trades < rules["minTrades"]:
+        reasons.append("LOW_TRADE_COUNT")
+    if profit_factor < rules["minProfitFactor"]:
+        reasons.append("WEAK_PROFIT_FACTOR")
+    if total_return <= rules["minTotalReturnPct"]:
+        reasons.append("NON_POSITIVE_RETURN")
+    if max_dd > rules["maxDrawdownPct"]:
+        reasons.append("HIGH_DRAWDOWN")
+    if score_diff < rules["minScoreDiff"]:
+        reasons.append("INSUFFICIENT_SCORE_EDGE")
+    if selected_row and selected_row.get("replacementRejectionReasons"):
+        reasons.extend(str(reason).upper() for reason in selected_row.get("replacementRejectionReasons") or [])
+    reasons = dedupe_list(reasons)
+    return {"eligible": len(reasons) == 0, "reasons": reasons, "rules": rules}
+
+
+def _candidate_deep_compare_research_verdict(payload: dict, eligibility: dict) -> dict:
+    challenger_activity = ((payload.get("evidence") or {}).get("activity") or {}).get("challenger") or {}
+    comparison = payload.get("comparison") or {}
+    if eligibility.get("eligible"):
+        return {"action": "REVIEW_CHALLENGER", "reason": "The challenger clears replacement eligibility for research review only. No promotion is performed."}
+    trades = safe_float(challenger_activity.get("trades"), 0)
+    profit_factor = safe_float(challenger_activity.get("profitFactor"), 0)
+    total_return = safe_float(challenger_activity.get("totalReturnPct"), 0)
+    if "LOW_TRADE_COUNT" in (eligibility.get("reasons") or []) and total_return > 0 and profit_factor >= 1.25:
+        return {"action": "RESEARCH_CHALLENGER_MORE", "reason": f"Challenger metrics are promising, but {int(trades)} trades is below the 40-trade replacement evidence floor."}
+    if comparison.get("winner") == "BASELINE":
+        return {"action": "KEEP_BASELINE", "reason": "The active baseline remains the safer research candidate after deep comparison and replacement gates."}
+    return {"action": "NO_ACTION", "reason": "The challenger does not clear conservative replacement research gates."}
+
+
 def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
     candidate = load_paper_candidate_config()
     paper_enabled = canonical_paper_enabled(candidate)
@@ -7008,11 +7125,71 @@ def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
     challenger_timeframe = (args.get("challengerTimeframe") or "4h").strip()
     challenger_strategy = (args.get("challengerStrategy") or "SimpleAtrTrendV2").strip()
     challenger_preset = args.get("challengerPreset", "swing_native_4h_1")
+    challenger_source = str(args.get("challengerSource", "preset")).strip() or "preset"
+    challenger_source = challenger_source if challenger_source in {"preset", "optimizerBatch", "inline"} else "preset"
+    challenger_rank = max(1, int(safe_float(args.get("challengerRank"), 1)))
     period = args.get("period", "365d")
     include_details = str(args.get("includeDetails", args.get("include_details", "true"))).strip().lower() not in {"0", "false", "no", "off"}
     params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
     fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
     slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    challenger_params = None
+    selected_row = None
+    selected_source = {
+        "source": challenger_source,
+        "batchFile": None,
+        "rank": challenger_rank,
+        "strategy": challenger_strategy,
+        "symbol": challenger_symbol,
+        "timeframe": challenger_timeframe,
+        "paramsSource": "preset" if challenger_source == "preset" else None,
+    }
+    preflight_warnings = []
+    if challenger_source == "inline":
+        raw_params = args.get("challengerParams")
+        if not raw_params:
+            return {"ok": False, "error": "challengerParams is required when challengerSource=inline.", "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+        try:
+            challenger_params = json.loads(raw_params)
+        except Exception as exc:
+            return {"ok": False, "error": f"Could not parse challengerParams JSON: {exc}", "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+        if not isinstance(challenger_params, dict):
+            return {"ok": False, "error": "challengerParams must decode to a JSON object.", "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+        selected_source["paramsSource"] = "inline"
+    elif challenger_source == "optimizerBatch":
+        batch_payload = None
+        batch_file = args.get("batchFile")
+        if batch_file:
+            batch_payload, batch_error = _load_candidate_deep_compare_batch_file(str(batch_file))
+            if batch_error:
+                return {"ok": False, "error": batch_error, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, 400
+            selected_source["batchFile"] = batch_payload.get("_resolvedBatchFile")
+        else:
+            batch_payload, batch_status, batch_error = _run_optimizer_batch_for_deep_compare(
+                args,
+                (args.get("challengerStrategy") or "").strip(),
+                (args.get("challengerSymbol") or "").strip(),
+                (args.get("challengerTimeframe") or args.get("challengerInterval") or "").strip(),
+            )
+            if batch_error:
+                return {"ok": False, "error": batch_error, "optimizerBatch": batch_payload, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled}, batch_status
+            selected_source["batchFile"] = None
+        selected_row, select_error = _select_optimizer_batch_challenger(batch_payload, args, challenger_rank)
+        if select_error:
+            return {"ok": False, "error": select_error, "paperEnabled": paper_enabled, "realTradingEnabled": real_enabled, "optimizerBatch": {"summary": (batch_payload or {}).get("summary")}}, 400
+        challenger_symbol = str(selected_row.get("symbol") or challenger_symbol)
+        challenger_timeframe = str(selected_row.get("timeframe") or selected_row.get("interval") or challenger_timeframe)
+        challenger_strategy = str(selected_row.get("strategy") or challenger_strategy)
+        challenger_params = dict(selected_row.get("params") if isinstance(selected_row.get("params"), dict) else {})
+        selected_source.update({
+            "rank": selected_row.get("rank") or challenger_rank,
+            "strategy": challenger_strategy,
+            "symbol": challenger_symbol,
+            "timeframe": challenger_timeframe,
+            "paramsSource": selected_row.get("paramsSource") or "optimizerBatch",
+        })
+        if safe_float(selected_row.get("trades"), 0) < 40:
+            preflight_warnings.append("LOW_TRADE_COUNT")
     command = package_node_script_args("research:candidate-deep-compare")
     command.extend([
         "--baselineSymbol", baseline_symbol,
@@ -7028,6 +7205,8 @@ def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
         "--feePct", str(fee_pct),
         "--slippagePct", str(slippage_pct),
     ])
+    if challenger_params is not None:
+        command.extend(["--challengerParams", json.dumps(challenger_params), "--challengerParamsSource", str(selected_source.get("paramsSource") or challenger_source)])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
     try:
@@ -7057,7 +7236,11 @@ def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
             payload = {"ok": False, "error": "Candidate deep compare returned non-JSON output.", "stdout": completed.stdout.strip()}
     if payload is None:
         payload = {"ok": False, "error": completed.stderr.strip() or "Candidate deep compare returned no output."}
-    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    eligibility = _replacement_eligibility_from_deep_compare(payload, selected_row)
+    research_verdict = _candidate_deep_compare_research_verdict(payload, eligibility)
+    if "LOW_TRADE_COUNT" in (eligibility.get("reasons") or []) and "LOW_TRADE_COUNT" not in preflight_warnings:
+        preflight_warnings.append("LOW_TRADE_COUNT")
+    warnings = dedupe_list(preflight_warnings + (payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
     if completed.returncode != 0:
         warnings.append(completed.stderr.strip() or "Candidate deep compare command failed.")
     response = {
@@ -7071,6 +7254,9 @@ def build_research_candidate_deep_compare(args) -> tuple[dict, int]:
         "comparison": payload.get("comparison") or {},
         "evidence": payload.get("evidence") or {},
         "recommendation": payload.get("recommendation") or {},
+        "selectedChallengerSource": selected_source,
+        "replacementEligibility": eligibility,
+        "researchVerdict": research_verdict,
         "warnings": warnings,
         "availablePresets": payload.get("availablePresets"),
         "error": payload.get("error"),
