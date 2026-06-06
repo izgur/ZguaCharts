@@ -2116,6 +2116,7 @@ async function runLabBacktest() {
       feePct: Number(settings.fee_pct || 0),
       slippagePct: Number(settings.slippage_pct || 0),
       allowShorts: settings.allowShorts === "true",
+      paramsSource: settings.preset,
       params: strategyBuilderParams,
     });
     backtestResults.innerHTML = renderCustomBacktestResult(payload);
@@ -2519,6 +2520,8 @@ function renderCustomBacktestResult(payload) {
   const result = payload.result || {};
   const diagnostics = payload.diagnostics || {};
   const params = payload.paramsUsed || {};
+  const runContext = payload.runContext || {};
+  const comparison = payload.activeCandidateComparison || {};
   const warnings = [...(result.warnings || []), ...(payload.warnings || [])]
     .filter(Boolean)
     .filter((item, index, list) => list.indexOf(item) === index);
@@ -2546,6 +2549,28 @@ function renderCustomBacktestResult(payload) {
     ["Real trading", String(Boolean(payload.realTradingEnabled))],
     ["Candles", diagnostics.candlesLoaded],
   ];
+  const contextMetrics = [
+    ["Period", runContext.period],
+    ["Requested limit", runContext.requestedLimit],
+    ["Effective limit", runContext.effectiveLimit],
+    ["Candles used", runContext.candlesUsed],
+    ["Expected candles", runContext.expectedCandles],
+    ["First candle", runContext.firstCandleTime],
+    ["Last candle", runContext.lastCandleTime],
+    ["Source", runContext.source],
+    ["Fill model", runContext.fillModel],
+    ["Maker fee", runContext.makerFeePct],
+    ["Taker fee", runContext.takerFeePct],
+    ["Slippage bps", runContext.slippageBps],
+    ["Params source", runContext.paramsSource],
+  ];
+  const diffRows = (comparison.diffs || []).slice(0, 12).map((diff) => `
+    <tr>
+      <td>${escapeHtml(diff.param || "-")}</td>
+      <td>${escapeHtml(JSON.stringify(diff.active ?? null))}</td>
+      <td>${escapeHtml(JSON.stringify(diff.run ?? null))}</td>
+    </tr>
+  `).join("");
   const tradeRows = trades.slice(0, 20).map((trade) => `
     <tr>
       <td>${formatDateTime(trade.entry_time || trade.entryTime)}</td>
@@ -2572,6 +2597,23 @@ function renderCustomBacktestResult(payload) {
       <div class="metric-grid diagnostics-grid">
         ${context.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
       </div>
+      <h3 class="modal-section-title">Run Context</h3>
+      <div class="metric-grid diagnostics-grid">
+        ${contextMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
+      </div>
+      <h3 class="modal-section-title">Active Candidate Comparison</h3>
+      <p class="modal-note">${escapeHtml(comparison.summary || "No active candidate comparison returned.")}</p>
+      <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Matches active params</span><strong>${comparison.matchesActiveCandidate ? "yes" : "no"}</strong></div>
+        <div class="metric"><span>Same strategy/market</span><strong>${comparison.sameStrategySymbolTimeframe ? "yes" : "no"}</strong></div>
+        <div class="metric"><span>Param diffs</span><strong>${comparison.diffCount ?? 0}</strong></div>
+      </div>
+      ${(comparison.diffs || []).length ? `
+        <table class="trade-table compact-table">
+          <thead><tr><th>Param</th><th>Active</th><th>Run</th></tr></thead>
+          <tbody>${diffRows}</tbody>
+        </table>
+      ` : ""}
       ${reasons.length ? `<h3 class="modal-section-title">Reasons</h3><ul class="backtest-warnings">${reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}
       ${warnings.length ? `<h3 class="modal-section-title">Warnings</h3><ul class="backtest-warnings">${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
       <h3 class="modal-section-title">Params Used</h3>

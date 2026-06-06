@@ -358,9 +358,36 @@ def backtest_run_custom():
         )
         stage = "custom response normalization"
         result_payload = normalize_backtest_response(result_payload, source, symbol, timeframe, period, strategy, fee_pct, slippage_pct)
+        params_used = (result_payload.get("diagnostics") or {}).get("params") or params
+        params_used = {**(params_used or {}), "feePct": fee_pct, "slippagePct": slippage_pct}
+        active_candidate = load_paper_candidate_config()
+        active_comparison = compare_manual_backtest_to_active_candidate(
+            strategy,
+            symbol,
+            timeframe,
+            params_used,
+            active_candidate,
+            str(payload.get("paramsSource") or payload.get("presetName") or payload.get("preset") or "custom"),
+            source,
+            fee_pct,
+            slippage_pct,
+        )
+        run_context, context_warnings = manual_backtest_run_context(
+            result_payload,
+            period,
+            limit_arg,
+            source,
+            strategy,
+            symbol,
+            timeframe,
+            params_used,
+            active_comparison.get("paramsSource") or "custom",
+            active_candidate,
+        )
         metrics = manual_backtest_result_summary(result_payload, period)
         trades = result_payload.get("trade_list") or result_payload.get("tradeList") or []
         warnings = dedupe_list(list(result_payload.get("warnings") or []) + list((result_payload.get("diagnostics") or {}).get("warnings") or []))
+        warnings = dedupe_list(warnings + context_warnings + active_comparison.get("warnings", []))
         return jsonify({
             "ok": True,
             "readOnly": True,
@@ -370,7 +397,9 @@ def backtest_run_custom():
             "symbol": symbol,
             "timeframe": timeframe,
             "period": period,
-            "paramsUsed": (result_payload.get("diagnostics") or {}).get("params") or params,
+            "paramsUsed": params_used,
+            "runContext": run_context,
+            "activeCandidateComparison": active_comparison,
             "result": {
                 **metrics,
                 "warnings": warnings,
@@ -11929,6 +11958,193 @@ def normalize_backtest_response(
         "diagnostics": diagnostics,
     })
     return payload
+
+
+def iso_from_backtest_time(value):
+    if value in {None, ""}:
+        return None
+    try:
+        timestamp = int(float(value))
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def backtest_timeframe_minutes(timeframe: str) -> float | None:
+    text = str(timeframe or "").strip().lower()
+    try:
+        if text.endswith("m"):
+            return float(text[:-1])
+        if text.endswith("h"):
+            return float(text[:-1]) * 60
+        if text.endswith("d"):
+            return float(text[:-1]) * 1440
+    except (TypeError, ValueError):
+        return None
+    return None
+
+
+def expected_backtest_candles(period: str, timeframe: str) -> int | None:
+    days = parse_period_to_days(period)
+    minutes = backtest_timeframe_minutes(timeframe)
+    if days is None or not minutes:
+        return None
+    return max(1, int(math.ceil(days * 1440 / minutes)))
+
+
+def normalized_compare_value(value):
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return round(float(value), 10)
+    if isinstance(value, str):
+        stripped = value.strip()
+        try:
+            return round(float(stripped), 10)
+        except ValueError:
+            return stripped
+    return value
+
+
+def manual_backtest_active_params(candidate: dict) -> dict:
+    active = normalize_promoted_candidate_config(candidate or {})
+    params = dict(active.get("params") or {})
+    for key in (
+        "accountEquity",
+        "riskPct",
+        "maxOpenTrades",
+        "maxNotionalPerTrade",
+        "makerFeePct",
+        "takerFeePct",
+        "slippageBps",
+        "fillModel",
+    ):
+        if active.get(key) is not None:
+            params[key] = active.get(key)
+    return params
+
+
+def active_candidate_primary_market(candidate: dict) -> dict:
+    active_symbols = candidate_symbols_by_mode(candidate or {}, "active")
+    return active_symbols[0] if active_symbols else {}
+
+
+def compare_manual_backtest_to_active_candidate(
+    strategy: str,
+    symbol: str,
+    timeframe: str,
+    params_used: dict,
+    active_candidate: dict,
+    params_source: str,
+    source: str,
+    fee_pct: float,
+    slippage_pct: float,
+) -> dict:
+    active = normalize_promoted_candidate_config(active_candidate or {})
+    active_market = active_candidate_primary_market(active)
+    active_params = manual_backtest_active_params(active)
+    diffs = []
+    warnings = []
+    same_identity = (
+        strategy == active.get("strategy")
+        and symbol == active_market.get("symbol")
+        and timeframe == (active_market.get("interval") or active_market.get("timeframe"))
+    )
+    keys = sorted(set(active_params.keys()) | set((params_used or {}).keys()))
+    ignored = {"feePct", "slippagePct", "shortMode", "strategyName"}
+    for key in keys:
+        if key in ignored:
+            continue
+        active_value = normalized_compare_value(active_params.get(key))
+        used_value = normalized_compare_value((params_used or {}).get(key))
+        if active_value != used_value:
+            diffs.append({
+                "param": key,
+                "active": active_params.get(key),
+                "run": (params_used or {}).get(key),
+            })
+    active_taker = safe_float(active.get("takerFeePct"), 0)
+    active_slippage_pct = safe_float(active.get("slippageBps"), 0) / 100
+    if source != active.get("source"):
+        warnings.append(f"Manual run source {source} differs from active candidate source {active.get('source')}.")
+    if abs(fee_pct - active_taker) > 1e-9:
+        warnings.append(f"Manual feePct {fee_pct} differs from active candidate takerFeePct {active_taker}.")
+    if abs(slippage_pct - active_slippage_pct) > 1e-9:
+        warnings.append(f"Manual slippagePct {slippage_pct} differs from active candidate slippageBps {active.get('slippageBps')}.")
+    if str(params_source) == "activeCandidate" and (not same_identity or diffs):
+        warnings.append("Preset is activeCandidate, but this manual run differs from the active candidate identity or params.")
+    matches = same_identity and not diffs and not any("differs from active candidate" in warning for warning in warnings)
+    return {
+        "matchesActiveCandidate": matches,
+        "sameStrategySymbolTimeframe": same_identity,
+        "paramsSource": params_source,
+        "activeCandidate": candidate_summary(active),
+        "diffs": diffs[:40],
+        "diffCount": len(diffs),
+        "warnings": warnings,
+        "summary": "Matches active candidate params." if matches else "Manual run is not directly comparable to the active candidate.",
+    }
+
+
+def manual_backtest_run_context(
+    payload: dict,
+    period: str,
+    requested_limit,
+    source: str,
+    strategy: str,
+    symbol: str,
+    timeframe: str,
+    params_used: dict,
+    params_source: str,
+    active_candidate: dict,
+) -> tuple[dict, list[str]]:
+    diagnostics = payload.get("diagnostics") or {}
+    coverage = diagnostics.get("historical_coverage") or diagnostics.get("historicalCoverage") or {}
+    candles_used = int(safe_float(payload.get("candlesLoaded") or diagnostics.get("candlesLoaded"), 0))
+    first_time = diagnostics.get("firstCandleTime") or diagnostics.get("first_candle_time") or payload.get("firstCandleTime")
+    last_time = diagnostics.get("lastCandleTime") or diagnostics.get("last_candle_time") or payload.get("lastCandleTime")
+    effective_limit = coverage.get("effective_limit") or coverage.get("effectiveLimit") or diagnostics.get("effectiveLimit") or payload.get("limit")
+    expected_candles = expected_backtest_candles(period, timeframe)
+    active = normalize_promoted_candidate_config(active_candidate or {})
+    fill_model = (params_used or {}).get("fillModel") or active.get("fillModel")
+    maker_fee = (params_used or {}).get("makerFeePct", active.get("makerFeePct"))
+    taker_fee = (params_used or {}).get("feePct", (params_used or {}).get("takerFeePct", active.get("takerFeePct")))
+    if (params_used or {}).get("slippagePct") is not None:
+        slippage_bps = safe_float((params_used or {}).get("slippagePct"), 0) * 100
+    else:
+        slippage_bps = (params_used or {}).get("slippageBps")
+    warnings = []
+    if expected_candles and candles_used:
+        lower = expected_candles * 0.75
+        upper = expected_candles * 1.25
+        if candles_used < lower or candles_used > upper:
+            warnings.append(f"candlesUsed {candles_used} differs materially from expected {expected_candles} for {period} {timeframe}.")
+    if not first_time or not last_time:
+        warnings.append("First or last candle time is missing; compare this result cautiously.")
+    if source != "bybit":
+        warnings.append(f"Manual backtest source is {source}; active paper research normally uses bybit.")
+    if fill_model and active.get("fillModel") and fill_model != active.get("fillModel"):
+        warnings.append(f"Fill model {fill_model} differs from active candidate fillModel {active.get('fillModel')}.")
+    return {
+        "period": period,
+        "requestedLimit": requested_limit,
+        "effectiveLimit": effective_limit,
+        "candlesUsed": candles_used,
+        "expectedCandles": expected_candles,
+        "firstCandleTime": iso_from_backtest_time(first_time),
+        "lastCandleTime": iso_from_backtest_time(last_time),
+        "firstCandleTimestamp": first_time,
+        "lastCandleTimestamp": last_time,
+        "source": source,
+        "fillModel": fill_model,
+        "makerFeePct": maker_fee,
+        "takerFeePct": taker_fee,
+        "slippageBps": slippage_bps,
+        "paramsSource": params_source,
+        "strategy": strategy,
+        "symbol": symbol,
+        "timeframe": timeframe,
+    }, warnings
 
 
 def manual_backtest_result_summary(payload: dict, period: str) -> dict:
