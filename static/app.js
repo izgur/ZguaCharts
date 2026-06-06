@@ -1,5 +1,6 @@
 const STORAGE_KEY = "tvk-dashboard-state";
 const UI_PREF_KEY = "zgua-ui-preferences";
+const MANUAL_BACKTEST_COMPARISON_KEY = "zgua-manual-backtest-comparisons";
 // Frontend boundary:
 // This file owns UI state, chart rendering, marker rendering, websocket candle
 // display, and API calls only. Indicator formulas, signal scoring, strategy
@@ -61,6 +62,8 @@ let backtestPane = null;
 let backtestStrategyMetadata = null;
 let strategyBuilderParams = {};
 let strategyBuilderCurrentPreset = "default";
+let lastManualBacktestPayload = null;
+let manualBacktestComparisons = loadManualBacktestComparisons();
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
@@ -1908,6 +1911,12 @@ function initBacktestPage() {
   document.querySelector("#lab-source-select")?.addEventListener("change", populateLabSymbolAndTimeframe);
   document.querySelector("#lab-strategy-select")?.addEventListener("change", onStrategyBuilderStrategyChange);
   document.querySelector("#lab-preset-select")?.addEventListener("change", onStrategyBuilderPresetChange);
+  document.querySelector("#manual-comparison-add")?.addEventListener("click", addCurrentManualBacktestComparison);
+  document.querySelector("#manual-comparison-clear")?.addEventListener("click", clearManualBacktestComparisons);
+  document.querySelector("#manual-comparison-export")?.addEventListener("click", exportManualBacktestComparisons);
+  document.querySelector("#manual-comparison-table")?.addEventListener("click", onManualComparisonClick);
+  document.querySelector("#manual-comparison-table")?.addEventListener("change", onManualComparisonChange);
+  renderManualBacktestComparisons();
 }
 
 async function populateLabControls() {
@@ -2119,7 +2128,10 @@ async function runLabBacktest() {
       paramsSource: settings.preset,
       params: strategyBuilderParams,
     });
+    lastManualBacktestPayload = payload;
     backtestResults.innerHTML = renderCustomBacktestResult(payload);
+    const addButton = document.querySelector("#manual-comparison-add");
+    if (addButton) addButton.disabled = false;
   } catch (error) {
     backtestResults.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
   } finally {
@@ -2625,6 +2637,189 @@ function renderCustomBacktestResult(payload) {
       </table>
     </div>
   `;
+}
+
+function loadManualBacktestComparisons() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(MANUAL_BACKTEST_COMPARISON_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveManualBacktestComparisons() {
+  localStorage.setItem(MANUAL_BACKTEST_COMPARISON_KEY, JSON.stringify(manualBacktestComparisons));
+}
+
+function manualComparisonDefaultLabel(payload) {
+  const context = payload.runContext || {};
+  const comparison = payload.activeCandidateComparison || {};
+  const diffs = comparison.diffs || [];
+  const preset = context.paramsSource || "custom";
+  const diffText = preset === "custom" && diffs.length
+    ? ` ${diffs.slice(0, 2).map((diff) => `${diff.param}=${diff.run}`).join(" ")}`
+    : "";
+  return `${payload.strategy || "-"} ${payload.symbol || "-"} ${payload.timeframe || "-"} ${preset}${diffText} ${payload.period || context.period || ""}`.trim();
+}
+
+function compactParamDiffs(diffs) {
+  if (!Array.isArray(diffs) || !diffs.length) return "-";
+  const shown = diffs.slice(0, 4).map((diff) => `${diff.param}: ${JSON.stringify(diff.active)} -> ${JSON.stringify(diff.run)}`);
+  return `${shown.join("; ")}${diffs.length > shown.length ? ` +${diffs.length - shown.length} more` : ""}`;
+}
+
+function manualComparisonRowFromPayload(payload) {
+  const result = payload.result || {};
+  const context = payload.runContext || {};
+  const comparison = payload.activeCandidateComparison || {};
+  return {
+    id: `manual-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    label: manualComparisonDefaultLabel(payload),
+    savedAt: new Date().toISOString(),
+    strategy: payload.strategy,
+    symbol: payload.symbol,
+    timeframe: payload.timeframe,
+    period: payload.period || context.period,
+    paramsSource: context.paramsSource || "custom",
+    trades: result.trades,
+    tradesPerMonth: result.tradesPerMonth,
+    profitFactor: result.profitFactor,
+    totalReturnPct: result.totalReturnPct,
+    maxDrawdownPct: result.maxDrawdownPct,
+    winRate: result.winRate,
+    expectancyPctPerTrade: result.expectancyPctPerTrade,
+    score: result.score,
+    status: result.status,
+    candlesUsed: context.candlesUsed,
+    firstCandleTime: context.firstCandleTime,
+    lastCandleTime: context.lastCandleTime,
+    matchesActiveCandidate: Boolean(comparison.matchesActiveCandidate),
+    keyParamDiffs: compactParamDiffs(comparison.diffs),
+    paramsUsed: payload.paramsUsed || {},
+    runContext: context,
+    activeCandidateComparison: comparison,
+  };
+}
+
+function addCurrentManualBacktestComparison() {
+  if (!lastManualBacktestPayload) return;
+  manualBacktestComparisons.push(manualComparisonRowFromPayload(lastManualBacktestPayload));
+  saveManualBacktestComparisons();
+  renderManualBacktestComparisons();
+}
+
+function clearManualBacktestComparisons() {
+  manualBacktestComparisons = [];
+  saveManualBacktestComparisons();
+  renderManualBacktestComparisons();
+}
+
+function exportManualBacktestComparisons() {
+  const blob = new Blob([JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    rows: manualBacktestComparisons,
+  }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `manual-backtest-comparisons-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function manualComparisonBaseline() {
+  return manualBacktestComparisons.find((row) => row.baseline) || manualBacktestComparisons[0] || null;
+}
+
+function deltaCell(row, baseline, key, suffix = "", invert = false) {
+  if (!baseline || row.id === baseline.id) return `<td class="muted">baseline</td>`;
+  const delta = Number(row[key] || 0) - Number(baseline[key] || 0);
+  const positive = invert ? delta <= 0 : delta >= 0;
+  return `<td class="${positive ? "positive" : "negative"}">${formatSigned(delta)}${suffix}</td>`;
+}
+
+function renderManualBacktestComparisons() {
+  const host = document.querySelector("#manual-comparison-table");
+  if (!host) return;
+  if (!manualBacktestComparisons.length) {
+    host.innerHTML = `<p class="pane-status">No manual backtests saved for comparison yet.</p>`;
+    return;
+  }
+  const baseline = manualComparisonBaseline();
+  const rows = manualBacktestComparisons.map((row) => `
+    <tr>
+      <td><input class="comparison-label-input" data-comparison-label="${escapeHtml(row.id)}" value="${escapeHtml(row.label || "")}"></td>
+      <td><button class="small-action-button" type="button" data-comparison-baseline="${escapeHtml(row.id)}">${row.id === baseline?.id ? "Baseline" : "Set baseline"}</button></td>
+      <td>${escapeHtml(row.strategy || "-")}</td>
+      <td>${escapeHtml(row.symbol || "-")}</td>
+      <td>${escapeHtml(row.timeframe || "-")}</td>
+      <td>${escapeHtml(row.period || "-")}</td>
+      <td>${escapeHtml(row.paramsSource || "-")}</td>
+      <td>${row.trades ?? "-"}</td>
+      <td>${formatNumber(row.tradesPerMonth, 2)}</td>
+      <td>${formatNumber(row.profitFactor, 4)}</td>
+      <td class="${Number(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+      <td>${formatNumber(row.maxDrawdownPct, 4)}%</td>
+      <td>${formatNumber(row.winRate, 2)}%</td>
+      <td>${formatSigned(row.expectancyPctPerTrade)}%</td>
+      <td>${formatNumber(row.score, 2)}</td>
+      <td>${statusBadge(row.status || "-")}</td>
+      <td>${row.candlesUsed ?? "-"}</td>
+      <td>${escapeHtml(row.firstCandleTime || "-")}</td>
+      <td>${escapeHtml(row.lastCandleTime || "-")}</td>
+      <td>${row.matchesActiveCandidate ? "yes" : "no"}</td>
+      <td>${escapeHtml(row.keyParamDiffs || "-")}</td>
+      ${deltaCell(row, baseline, "totalReturnPct", "%")}
+      ${deltaCell(row, baseline, "profitFactor")}
+      ${deltaCell(row, baseline, "maxDrawdownPct", "%", true)}
+      ${deltaCell(row, baseline, "trades")}
+      ${deltaCell(row, baseline, "score")}
+      <td><button class="small-action-button" type="button" data-comparison-remove="${escapeHtml(row.id)}">Remove</button></td>
+    </tr>
+  `).join("");
+  host.innerHTML = `
+    <div class="comparison-table-wrap">
+      <table class="trade-table manual-comparison-grid">
+        <thead>
+          <tr>
+            <th>Label</th><th>Baseline</th><th>Strategy</th><th>Symbol</th><th>TF</th><th>Period</th><th>Params</th>
+            <th>Trades</th><th>T/mo</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Expect</th><th>Score</th><th>Status</th>
+            <th>Candles</th><th>First</th><th>Last</th><th>Active match</th><th>Param diffs</th>
+            <th>Return Δ</th><th>PF Δ</th><th>DD Δ</th><th>Trades Δ</th><th>Score Δ</th><th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function onManualComparisonClick(event) {
+  const baselineId = event.target?.dataset?.comparisonBaseline;
+  const removeId = event.target?.dataset?.comparisonRemove;
+  if (baselineId) {
+    manualBacktestComparisons = manualBacktestComparisons.map((row) => ({ ...row, baseline: row.id === baselineId }));
+    saveManualBacktestComparisons();
+    renderManualBacktestComparisons();
+  }
+  if (removeId) {
+    manualBacktestComparisons = manualBacktestComparisons.filter((row) => row.id !== removeId);
+    if (manualBacktestComparisons.length && !manualBacktestComparisons.some((row) => row.baseline)) {
+      manualBacktestComparisons[0].baseline = true;
+    }
+    saveManualBacktestComparisons();
+    renderManualBacktestComparisons();
+  }
+}
+
+function onManualComparisonChange(event) {
+  const labelId = event.target?.dataset?.comparisonLabel;
+  if (!labelId) return;
+  manualBacktestComparisons = manualBacktestComparisons.map((row) => row.id === labelId ? { ...row, label: event.target.value } : row);
+  saveManualBacktestComparisons();
 }
 
 function renderBacktestResults(payload) {
