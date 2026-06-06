@@ -341,6 +341,21 @@ body {
   margin-top: 12px;
 }
 
+.manual-sensitivity-card {
+  margin-top: 12px;
+}
+
+.mini-lab-controls {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) minmax(240px, 1fr);
+  gap: 10px;
+  align-items: end;
+}
+
+.manual-sensitivity-table {
+  margin-top: 10px;
+}
+
 .manual-comparison-table {
   margin-top: 10px;
 }
@@ -354,8 +369,14 @@ body {
   min-width: 2100px;
 }
 
+.manual-sensitivity-grid {
+  min-width: 1650px;
+}
+
 .manual-comparison-grid th,
-.manual-comparison-grid td {
+.manual-comparison-grid td,
+.manual-sensitivity-grid th,
+.manual-sensitivity-grid td {
   white-space: nowrap;
   vertical-align: top;
 }
@@ -367,6 +388,16 @@ body {
 
 .manual-comparison-grid .status-badge {
   border-radius: 6px;
+}
+
+.manual-sensitivity-grid .status-badge {
+  border-radius: 6px;
+}
+
+@media (max-width: 760px) {
+  .mini-lab-controls {
+    grid-template-columns: 1fr;
+  }
 }
 
 .app-nav a.active,

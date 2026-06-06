@@ -174,6 +174,29 @@
             <div id="backtest-results" class="lab-results">
               <p class="pane-status">Choose a strategy preset, adjust parameters, and run a manual backtest.</p>
             </div>
+            <section class="status-card manual-sensitivity-card">
+              <div class="status-card-header">
+                <div>
+                  <h2>Param Sensitivity Mini-Lab</h2>
+                  <p>Vary one numeric parameter using the current manual builder settings.</p>
+                </div>
+                <span class="status-badge badge-raw">READ_ONLY</span>
+              </div>
+              <div class="mini-lab-controls">
+                <label><span>Parameter</span><select id="sensitivity-param-select"></select></label>
+                <label><span>Values</span><input id="sensitivity-values-input" value="20,25,30,35,40"></label>
+              </div>
+              <div class="button-row">
+                <button id="sensitivity-generate-values" type="button">Generate Around Current</button>
+                <button id="sensitivity-run" type="button">Run Sensitivity</button>
+                <button id="sensitivity-add-all" type="button" disabled>Add All Results to Comparison</button>
+              </div>
+              <p class="modal-note">Manual sensitivity is research-only. It does not promote candidates, write config, enable paper, run a paper tick, or touch real trading.</p>
+              <div id="sensitivity-progress" class="pane-status" hidden></div>
+              <div id="sensitivity-results" class="manual-sensitivity-table">
+                <p class="pane-status">No sensitivity run yet.</p>
+              </div>
+            </section>
             <section class="status-card manual-comparison-card">
               <div class="status-card-header">
                 <div>

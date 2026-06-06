@@ -64,6 +64,8 @@ let strategyBuilderParams = {};
 let strategyBuilderCurrentPreset = "default";
 let lastManualBacktestPayload = null;
 let manualBacktestComparisons = loadManualBacktestComparisons();
+let lastSensitivityResults = [];
+let sensitivityRunActive = false;
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
@@ -1911,6 +1913,10 @@ function initBacktestPage() {
   document.querySelector("#lab-source-select")?.addEventListener("change", populateLabSymbolAndTimeframe);
   document.querySelector("#lab-strategy-select")?.addEventListener("change", onStrategyBuilderStrategyChange);
   document.querySelector("#lab-preset-select")?.addEventListener("change", onStrategyBuilderPresetChange);
+  document.querySelector("#sensitivity-generate-values")?.addEventListener("click", generateSensitivityValues);
+  document.querySelector("#sensitivity-run")?.addEventListener("click", runParamSensitivityLab);
+  document.querySelector("#sensitivity-add-all")?.addEventListener("click", addAllSensitivityRowsToComparison);
+  document.querySelector("#sensitivity-results")?.addEventListener("click", onSensitivityResultClick);
   document.querySelector("#manual-comparison-add")?.addEventListener("click", addCurrentManualBacktestComparison);
   document.querySelector("#manual-comparison-clear")?.addEventListener("click", clearManualBacktestComparisons);
   document.querySelector("#manual-comparison-export")?.addEventListener("click", exportManualBacktestComparisons);
@@ -2046,6 +2052,7 @@ function renderStrategyParamEditor(strategy) {
     input.addEventListener("input", onStrategyParamEdit);
     input.addEventListener("change", onStrategyParamEdit);
   });
+  populateSensitivityParamSelect(strategy);
 }
 
 function renderStrategyParamField(key, schema, value) {
@@ -2095,6 +2102,7 @@ function onStrategyParamEdit(event) {
   }
   const json = document.querySelector("#strategy-param-editor pre");
   if (json) json.textContent = JSON.stringify(strategyBuilderParams, null, 2);
+  populateSensitivityParamSelect(strategy, key);
 }
 
 function labBacktestSettings() {
@@ -2109,25 +2117,29 @@ function labBacktestSettings() {
   };
 }
 
+function labBacktestRequest(paramsOverride = null, paramsSourceOverride = null) {
+  const settings = labBacktestSettings();
+  return {
+    source: document.querySelector("#lab-source-select")?.value || "bybit",
+    symbol: document.querySelector("#lab-symbol-select")?.value || "ETHUSDT",
+    timeframe: document.querySelector("#lab-timeframe-select")?.value || "1h",
+    period: settings.period,
+    strategy: settings.strategy,
+    limit: settings.limit,
+    feePct: Number(settings.fee_pct || 0),
+    slippagePct: Number(settings.slippage_pct || 0),
+    allowShorts: settings.allowShorts === "true",
+    paramsSource: paramsSourceOverride || settings.preset,
+    params: structuredCloneSafe(paramsOverride || strategyBuilderParams),
+  };
+}
+
 async function runLabBacktest() {
   const button = document.querySelector("#lab-run-backtest");
   button.disabled = true;
   backtestResults.innerHTML = `<p class="pane-status">Running strategy test...</p>`;
-  const settings = labBacktestSettings();
   try {
-    const payload = await apiPost("/api/backtest/run-custom", {
-      source: document.querySelector("#lab-source-select")?.value || "bybit",
-      symbol: document.querySelector("#lab-symbol-select")?.value || "ETHUSDT",
-      timeframe: document.querySelector("#lab-timeframe-select")?.value || "1h",
-      period: settings.period,
-      strategy: settings.strategy,
-      limit: settings.limit,
-      feePct: Number(settings.fee_pct || 0),
-      slippagePct: Number(settings.slippage_pct || 0),
-      allowShorts: settings.allowShorts === "true",
-      paramsSource: settings.preset,
-      params: strategyBuilderParams,
-    });
+    const payload = await apiPost("/api/backtest/run-custom", labBacktestRequest());
     lastManualBacktestPayload = payload;
     backtestResults.innerHTML = renderCustomBacktestResult(payload);
     const addButton = document.querySelector("#manual-comparison-add");
@@ -2137,6 +2149,251 @@ async function runLabBacktest() {
   } finally {
     button.disabled = false;
   }
+}
+
+function numericStrategyParams(strategy = currentStrategyMetadata()) {
+  const schema = strategy?.paramSchema || {};
+  return Object.entries(schema)
+    .filter(([, item]) => item?.type === "number")
+    .map(([key, item]) => ({ key, schema: item }));
+}
+
+function populateSensitivityParamSelect(strategy = currentStrategyMetadata(), preferredKey = null) {
+  const select = document.querySelector("#sensitivity-param-select");
+  if (!select || !strategy) return;
+  const currentValue = select.value;
+  const numericParams = numericStrategyParams(strategy);
+  select.innerHTML = numericParams
+    .map(({ key, schema }) => `<option value="${escapeHtml(key)}">${escapeHtml(schema.label || key)}</option>`)
+    .join("");
+  const nextValue = preferredKey || currentValue || numericParams[0]?.key || "";
+  if (nextValue && numericParams.some((item) => item.key === nextValue)) {
+    select.value = nextValue;
+  }
+}
+
+function selectedSensitivityParam() {
+  const key = document.querySelector("#sensitivity-param-select")?.value || "";
+  const strategy = currentStrategyMetadata();
+  const schema = strategy?.paramSchema?.[key] || {};
+  return { key, schema, value: Number(strategyBuilderParams[key]) };
+}
+
+function normalizeSensitivityNumber(value, schema = {}) {
+  let next = Number(value);
+  if (!Number.isFinite(next)) return null;
+  if (schema.min !== undefined) next = Math.max(Number(schema.min), next);
+  if (schema.max !== undefined) next = Math.min(Number(schema.max), next);
+  const step = Number(schema.step || 0);
+  const integerStep = Number.isInteger(step) && step >= 1;
+  if (integerStep || Number.isInteger(Number(schema.min)) && Number.isInteger(Number(schema.max))) {
+    next = Math.round(next);
+  } else {
+    next = Number(next.toFixed(6));
+  }
+  return next;
+}
+
+function parseSensitivityValues() {
+  const { schema } = selectedSensitivityParam();
+  const raw = document.querySelector("#sensitivity-values-input")?.value || "";
+  const seen = new Set();
+  return raw.split(",")
+    .map((item) => normalizeSensitivityNumber(item.trim(), schema))
+    .filter((value) => value !== null)
+    .filter((value) => {
+      const key = String(value);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function generateSensitivityValues() {
+  const input = document.querySelector("#sensitivity-values-input");
+  const { value, schema } = selectedSensitivityParam();
+  if (!input || !Number.isFinite(value)) return;
+  const configuredStep = Math.abs(Number(schema.step || 0));
+  const span = Math.max(configuredStep * 5, Math.abs(value) * 0.2, 1);
+  const values = [-2, -1, 0, 1, 2]
+    .map((offset) => normalizeSensitivityNumber(value + offset * span, schema))
+    .filter((item) => item !== null);
+  input.value = Array.from(new Set(values.map((item) => String(item)))).join(",");
+}
+
+function sensitivityRowFromPayload(payload, paramName, testedValue, baselineValue, baselineAutoAdded = false) {
+  const result = payload.result || {};
+  const context = payload.runContext || {};
+  const warnings = [
+    ...(result.warnings || []),
+    ...(result.reasons || []),
+    ...(payload.warnings || []),
+  ].filter(Boolean);
+  return {
+    id: `sensitivity-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    paramName,
+    testedValue,
+    baseline: Number(testedValue) === Number(baselineValue),
+    baselineAutoAdded,
+    payload,
+    status: result.status,
+    trades: result.trades,
+    tradesPerMonth: result.tradesPerMonth,
+    profitFactor: result.profitFactor,
+    totalReturnPct: result.totalReturnPct,
+    maxDrawdownPct: result.maxDrawdownPct,
+    winRate: result.winRate,
+    expectancyPctPerTrade: result.expectancyPctPerTrade,
+    score: result.score,
+    candlesUsed: context.candlesUsed,
+    warnings: warnings.slice(0, 5),
+  };
+}
+
+function sensitivityErrorRow(paramName, testedValue, baselineValue, error) {
+  return {
+    id: `sensitivity-error-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    paramName,
+    testedValue,
+    baseline: Number(testedValue) === Number(baselineValue),
+    status: "ERROR",
+    error: error.message || String(error),
+    warnings: [error.message || String(error)],
+  };
+}
+
+function sensitivityBaselineRow() {
+  return lastSensitivityResults.find((row) => row.baseline && !row.error) || null;
+}
+
+async function runParamSensitivityLab() {
+  if (sensitivityRunActive) return;
+  const button = document.querySelector("#sensitivity-run");
+  const addAllButton = document.querySelector("#sensitivity-add-all");
+  const progress = document.querySelector("#sensitivity-progress");
+  const { key, value: baselineValue } = selectedSensitivityParam();
+  const resultsHost = document.querySelector("#sensitivity-results");
+  if (!key || !Number.isFinite(baselineValue)) {
+    if (resultsHost) resultsHost.innerHTML = `<p class="pane-status">Choose a numeric parameter with a current value first.</p>`;
+    return;
+  }
+  const parsedValues = parseSensitivityValues();
+  if (!parsedValues.length) {
+    if (resultsHost) resultsHost.innerHTML = `<p class="pane-status">Enter at least one numeric value.</p>`;
+    return;
+  }
+  const hasBaseline = parsedValues.some((item) => Number(item) === Number(baselineValue));
+  const values = hasBaseline ? parsedValues : [baselineValue, ...parsedValues];
+  sensitivityRunActive = true;
+  lastSensitivityResults = [];
+  if (button) button.disabled = true;
+  if (addAllButton) addAllButton.disabled = true;
+  if (progress) {
+    progress.hidden = false;
+    progress.textContent = `Running 0/${values.length} sensitivity rows...`;
+  }
+  renderSensitivityResults();
+  for (let index = 0; index < values.length; index += 1) {
+    const testedValue = values[index];
+    if (progress) progress.textContent = `Running ${index + 1}/${values.length}: ${key}=${testedValue}`;
+    const params = structuredCloneSafe(strategyBuilderParams);
+    params[key] = testedValue;
+    try {
+      const payload = await apiPost(
+        "/api/backtest/run-custom",
+        labBacktestRequest(params, `sensitivity:${key}=${testedValue}`)
+      );
+      lastSensitivityResults.push(sensitivityRowFromPayload(payload, key, testedValue, baselineValue, !hasBaseline && index === 0));
+    } catch (error) {
+      lastSensitivityResults.push(sensitivityErrorRow(key, testedValue, baselineValue, error));
+    }
+    renderSensitivityResults();
+  }
+  sensitivityRunActive = false;
+  if (button) button.disabled = false;
+  if (addAllButton) addAllButton.disabled = !lastSensitivityResults.some((row) => row.payload);
+  if (progress) progress.textContent = `Sensitivity complete: ${lastSensitivityResults.length} rows.`;
+}
+
+function sensitivityDeltaCell(row, baseline, key, suffix = "", invert = false) {
+  if (!baseline || row.error) return `<td class="muted">-</td>`;
+  if (row.id === baseline.id) return `<td class="muted">base</td>`;
+  const delta = Number(row[key] || 0) - Number(baseline[key] || 0);
+  const positive = invert ? delta <= 0 : delta >= 0;
+  return `<td class="${positive ? "positive" : "negative"}">${formatSigned(delta)}${suffix}</td>`;
+}
+
+function renderSensitivityResults() {
+  const host = document.querySelector("#sensitivity-results");
+  if (!host) return;
+  if (!lastSensitivityResults.length) {
+    host.innerHTML = `<p class="pane-status">No sensitivity run yet.</p>`;
+    return;
+  }
+  const baseline = sensitivityBaselineRow();
+  const rows = lastSensitivityResults.map((row) => `
+    <tr>
+      <td>${escapeHtml(row.paramName || "-")}</td>
+      <td>${escapeHtml(String(row.testedValue ?? "-"))}${row.baseline ? ` <span class="status-badge badge-raw">BASE</span>` : ""}${row.baselineAutoAdded ? ` <span class="muted">auto</span>` : ""}</td>
+      <td>${statusBadge(row.status || "-")}</td>
+      <td>${row.trades ?? "-"}</td>
+      <td>${formatNumber(row.tradesPerMonth, 2)}</td>
+      <td>${formatNumber(row.profitFactor, 4)}</td>
+      <td class="${Number(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${row.totalReturnPct === undefined ? "-" : `${formatSigned(row.totalReturnPct)}%`}</td>
+      <td>${row.maxDrawdownPct === undefined ? "-" : `${formatNumber(row.maxDrawdownPct, 4)}%`}</td>
+      <td>${row.winRate === undefined ? "-" : `${formatNumber(row.winRate, 2)}%`}</td>
+      <td>${row.expectancyPctPerTrade === undefined ? "-" : `${formatSigned(row.expectancyPctPerTrade)}%`}</td>
+      <td>${formatNumber(row.score, 2)}</td>
+      ${sensitivityDeltaCell(row, baseline, "totalReturnPct", "%")}
+      ${sensitivityDeltaCell(row, baseline, "profitFactor")}
+      ${sensitivityDeltaCell(row, baseline, "maxDrawdownPct", "%", true)}
+      ${sensitivityDeltaCell(row, baseline, "trades")}
+      ${sensitivityDeltaCell(row, baseline, "score")}
+      <td>${row.candlesUsed ?? "-"}</td>
+      <td>${escapeHtml((row.warnings || []).join("; ") || "-")}</td>
+      <td>${row.payload ? `<button class="small-action-button" type="button" data-sensitivity-save="${escapeHtml(row.id)}">Save</button>` : "-"}</td>
+    </tr>
+  `).join("");
+  host.innerHTML = `
+    <div class="comparison-table-wrap">
+      <table class="trade-table manual-sensitivity-grid">
+        <thead>
+          <tr>
+            <th>Param</th><th>Value</th><th>Status</th><th>Trades</th><th>T/mo</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Expect</th><th>Score</th>
+            <th>Return Delta</th><th>PF Delta</th><th>DD Delta</th><th>Trades Delta</th><th>Score Delta</th><th>Candles</th><th>Warnings/reasons</th><th></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+    ${baseline ? "" : `<p class="modal-note">No successful baseline row is available for deltas.</p>`}
+  `;
+}
+
+function sensitivityComparisonLabel(row) {
+  const payload = row.payload || {};
+  const context = payload.runContext || {};
+  return `${payload.strategy || "-"} ${payload.symbol || "-"} ${payload.timeframe || "-"} ${row.paramName}=${row.testedValue} ${payload.period || context.period || ""}`.trim();
+}
+
+function saveSensitivityRowToComparison(row) {
+  if (!row?.payload) return;
+  manualBacktestComparisons.push(manualComparisonRowFromPayload(row.payload, {
+    label: sensitivityComparisonLabel(row),
+  }));
+  saveManualBacktestComparisons();
+  renderManualBacktestComparisons();
+}
+
+function onSensitivityResultClick(event) {
+  const rowId = event.target?.dataset?.sensitivitySave;
+  if (!rowId) return;
+  const row = lastSensitivityResults.find((item) => item.id === rowId);
+  saveSensitivityRowToComparison(row);
+}
+
+function addAllSensitivityRowsToComparison() {
+  lastSensitivityResults.filter((row) => row.payload).forEach(saveSensitivityRowToComparison);
 }
 
 async function runBacktest(pane, presetId) {
@@ -2669,13 +2926,13 @@ function compactParamDiffs(diffs) {
   return `${shown.join("; ")}${diffs.length > shown.length ? ` +${diffs.length - shown.length} more` : ""}`;
 }
 
-function manualComparisonRowFromPayload(payload) {
+function manualComparisonRowFromPayload(payload, overrides = {}) {
   const result = payload.result || {};
   const context = payload.runContext || {};
   const comparison = payload.activeCandidateComparison || {};
   return {
     id: `manual-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    label: manualComparisonDefaultLabel(payload),
+    label: overrides.label || manualComparisonDefaultLabel(payload),
     savedAt: new Date().toISOString(),
     strategy: payload.strategy,
     symbol: payload.symbol,
@@ -2699,6 +2956,7 @@ function manualComparisonRowFromPayload(payload) {
     paramsUsed: payload.paramsUsed || {},
     runContext: context,
     activeCandidateComparison: comparison,
+    ...overrides,
   };
 }
 
@@ -2788,7 +3046,7 @@ function renderManualBacktestComparisons() {
             <th>Label</th><th>Baseline</th><th>Strategy</th><th>Symbol</th><th>TF</th><th>Period</th><th>Params</th>
             <th>Trades</th><th>T/mo</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Expect</th><th>Score</th><th>Status</th>
             <th>Candles</th><th>First</th><th>Last</th><th>Active match</th><th>Param diffs</th>
-            <th>Return Δ</th><th>PF Δ</th><th>DD Δ</th><th>Trades Δ</th><th>Score Δ</th><th></th>
+            <th>Return Delta</th><th>PF Delta</th><th>DD Delta</th><th>Trades Delta</th><th>Score Delta</th><th></th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
