@@ -322,6 +322,7 @@ function organizeWorkflowPages() {
     ["research-reproducible-candidate-drilldown-panel", "research-validation"],
     ["research-blocker-analytics-panel", "research-diagnostics"],
     ["paper-signal-diagnostics-panel", "research-diagnostics"],
+    ["paper-forward-signal-diagnostics-panel", "research-diagnostics"],
     ["research-strategy-variant-lab-panel", "research-diagnostics"],
     ["research-candidate-deep-compare-panel", "research-diagnostics"],
     ["research-lead-review-panel", "research-diagnostics"],
@@ -3828,6 +3829,7 @@ function setupLearningControls() {
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
+  document.querySelector("#paper-forward-signal-diagnostics-refresh")?.addEventListener("click", loadPaperForwardSignalDiagnostics);
   document.querySelector("#research-blocker-analytics-refresh")?.addEventListener("click", loadResearchBlockerAnalytics);
   document.querySelector("#research-snapshot-export-refresh")?.addEventListener("click", loadResearchSnapshotExport);
   document.querySelector("#research-snapshot-export-markdown")?.addEventListener("click", exportResearchSnapshotMarkdown);
@@ -4680,6 +4682,52 @@ function renderPaperSignalDiagnostics(payload) {
       <tbody>${checks || `<tr><td colspan="4">No checks returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadPaperForwardSignalDiagnostics() {
+  const host = document.querySelector("#paper-forward-signal-diagnostics-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading forward signal diagnostics...</p>`;
+    const payload = await apiGet("/api/paper/forward-signal-diagnostics");
+    host.innerHTML = renderPaperForwardSignalDiagnostics(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Forward signal diagnostics could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperForwardSignalDiagnostics(payload) {
+  const verdict = payload.verdict || {};
+  const next = verdict.nextAction || {};
+  const forward = payload.forward || {};
+  const expected = payload.historicalExpectation || {};
+  const latest = payload.latestSignalDiagnostics || {};
+  const active = payload.activeMarket || {};
+  const tone = verdict.status === "NORMAL_QUIET" || verdict.status === "ACTIVE" ? "positive" : verdict.status === "SUSPICIOUSLY_QUIET" || verdict.status === "BLOCKED" ? "negative" : "neutral";
+  const blockers = Array.isArray(latest.blockers) ? latest.blockers.slice(0, 8).map((item) => `<li>${escapeHtml(typeof item === "string" ? item : compactJson(item))}</li>`).join("") : "";
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Forward Signal Diagnostics <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note">${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Active market</span><strong>${escapeHtml(active.symbol || "-")} ${escapeHtml(active.timeframe || "")}</strong></div>
+      <div class="metric"><span>Useful ticks</span><strong>${forward.usefulTicks ?? 0}</strong></div>
+      <div class="metric"><span>Signals observed</span><strong>${forward.signalsObserved ?? 0}</strong></div>
+      <div class="metric"><span>Expected events</span><strong>${formatNumber(expected.expectedEventsForObservedTicks, 2)}</strong></div>
+      <div class="metric"><span>Historical trades/mo</span><strong>${formatNumber(expected.tradesPerMonth, 2)}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+        <tr><th>Historical baseline</th><td>${expected.historicalTrades ?? 0} trade(s) over ${escapeHtml(expected.period || "-")} · ${formatNumber(expected.expectedEventsPerUsefulTick, 4)} expected event(s) per useful tick</td></tr>
+        <tr><th>Latest signal</th><td>${escapeHtml(latest.signal || "-")} · ${escapeHtml(latest.reason || "")}</td></tr>
+      </tbody>
+    </table>
+    ${blockers ? `<p class="modal-note"><strong>Current blockers</strong></p><ul class="backtest-warnings">${blockers}</ul>` : ""}
+    ${warnings ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <p class="modal-note">This panel explains paper-only signal frequency. It never runs a paper tick, changes config, or recommends real trading.</p>
   `;
 }
 

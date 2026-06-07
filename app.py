@@ -1669,6 +1669,15 @@ def paper_active_signal_diagnostics():
         return jsonify({"error": f"Could not build active signal diagnostics: {exc}"}), 502
 
 
+@app.get("/api/paper/forward-signal-diagnostics")
+def paper_forward_signal_diagnostics():
+    try:
+        payload, status_code = build_paper_forward_signal_diagnostics(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build forward signal diagnostics: {exc}"}), 502
+
+
 @app.get("/api/paper/candidate-comparison")
 def paper_candidate_comparison():
     try:
@@ -6779,6 +6788,113 @@ def build_paper_active_signal_diagnostics(args) -> tuple[dict, int]:
         if completed.stderr.strip():
             payload["stderr"] = completed.stderr.strip()
     return payload, 200 if payload.get("ok") else 502
+
+
+def timeframe_candles_per_month(timeframe: str) -> float:
+    seconds = paper_interval_seconds(timeframe) or 3600
+    return 30.4375 * 86400 / max(seconds, 1)
+
+
+def build_paper_forward_signal_diagnostics(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    report = build_paper_observation_report({**dict(args), "activeOnly": "true"})
+    evidence = report.get("evidence") or {}
+    ticks = int(safe_float(evidence.get("runnerTicksRun", evidence.get("ticksObserved")), 0))
+    signals = int(safe_float(evidence.get("signalsObserved"), 0))
+    closed_trades = int(safe_float(evidence.get("closedTrades"), 0))
+    activity, activity_status = build_research_activity_lab({
+        "symbols": symbol,
+        "timeframes": timeframe,
+        "strategies": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+        "optimize": "false",
+    })
+    activity_row = (activity.get("rows") or [None])[0] or {}
+    trades_per_month = safe_float(activity_row.get("tradesPerMonth"), 0)
+    candles_per_month = timeframe_candles_per_month(timeframe)
+    expected_per_tick = trades_per_month / max(candles_per_month, 1)
+    expected_for_ticks = ticks * expected_per_tick
+    diagnostic, diagnostic_status = build_paper_active_signal_diagnostics({"limit": args.get("signalLimit", "20")})
+    latest = diagnostic.get("diagnostics") or {}
+    blockers = latest.get("blockers") or latest.get("failedConditions") or []
+    warnings = dedupe_list(
+        (report.get("warnings") or [])
+        + (activity.get("warnings") or [])
+        + (diagnostic.get("warnings") or [])
+        + ([real_detail] if real_enabled else [])
+    )
+    if real_enabled:
+        status = "BLOCKED"
+        summary = "Real trading appears enabled; signal diagnostics are safety-blocked until reviewed."
+        next_action = {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail}
+    elif ticks <= 0:
+        status = "NO_FORWARD_DATA"
+        summary = "No useful forward paper ticks are available yet."
+        next_action = {"action": "RUN_PAPER_ONCE_WHEN_READY", "reason": "Collect useful paper ticks only when tick readiness says it is useful."}
+    elif signals > 0:
+        status = "ACTIVE"
+        summary = f"Forward paper has produced {signals} signal(s) across {ticks} useful tick(s)."
+        next_action = {"action": "REVIEW_FORWARD_SIGNALS", "reason": "Inspect signal events and paper-only trade behavior."}
+    elif expected_for_ticks < 1:
+        status = "NORMAL_QUIET"
+        summary = f"Zero signals is not surprising yet; historical activity implies only about {round(expected_for_ticks, 2)} expected trade-like event(s) across {ticks} tick(s)."
+        next_action = {"action": "OBSERVE_MORE", "reason": "Continue paper-only observation before judging signal frequency."}
+    elif expected_for_ticks < 3:
+        status = "WATCH_QUIET"
+        summary = f"Zero signals is quiet but still plausible; historical expectation is about {round(expected_for_ticks, 2)} event(s)."
+        next_action = {"action": "OBSERVE_MORE", "reason": "Collect more useful ticks and review blocker diagnostics."}
+    else:
+        status = "SUSPICIOUSLY_QUIET"
+        summary = f"Zero signals is lower than expected; historical activity implies about {round(expected_for_ticks, 2)} event(s) across this many ticks."
+        next_action = {"action": "REVIEW_SIGNAL_BLOCKERS", "reason": "Inspect active signal diagnostics and recent market state before more paper interpretation."}
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "activeMarket": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy},
+        "forward": {
+            "usefulTicks": ticks,
+            "signalsObserved": signals,
+            "closedTrades": closed_trades,
+            "observationStatus": (report.get("verdict") or {}).get("status"),
+        },
+        "historicalExpectation": {
+            "period": period,
+            "activityStatus": activity_row.get("status"),
+            "historicalTrades": activity_row.get("trades"),
+            "tradesPerMonth": trades_per_month,
+            "candlesPerMonth": round(candles_per_month, 4),
+            "expectedEventsPerUsefulTick": round(expected_per_tick, 6),
+            "expectedEventsForObservedTicks": round(expected_for_ticks, 4),
+        },
+        "latestSignalDiagnostics": {
+            "status": diagnostic.get("status"),
+            "signal": diagnostic.get("signal") or latest.get("signal"),
+            "reason": diagnostic.get("reason") or latest.get("reason"),
+            "blockers": blockers,
+            "nextAction": diagnostic.get("nextAction"),
+        },
+        "verdict": {
+            "status": status,
+            "summary": summary,
+            "nextAction": next_action,
+        },
+        "sourceStatuses": {
+            "activity": activity_status,
+            "signalDiagnostics": diagnostic_status,
+        },
+        "warnings": warnings,
+    }, 200
 
 
 def build_paper_candidate_comparison(args) -> dict:
