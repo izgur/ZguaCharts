@@ -2886,6 +2886,7 @@ function renderCustomBacktestResult(payload) {
   const params = payload.paramsUsed || {};
   const runContext = payload.runContext || {};
   const comparison = payload.activeCandidateComparison || {};
+  const comparability = payload.comparability || {};
   const warnings = [...(result.warnings || []), ...(payload.warnings || [])]
     .filter(Boolean)
     .filter((item, index, list) => list.indexOf(item) === index);
@@ -2968,10 +2969,14 @@ function renderCustomBacktestResult(payload) {
       <h3 class="modal-section-title">Active Candidate Comparison</h3>
       <p class="modal-note">${escapeHtml(comparison.summary || "No active candidate comparison returned.")}</p>
       <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Comparability</span><strong>${escapeHtml(comparability.status || "-")}</strong></div>
+        <div class="metric"><span>Candle coverage</span><strong>${comparability.candleCoverageRatio === undefined || comparability.candleCoverageRatio === null ? "-" : `${formatNumber(comparability.candleCoverageRatio * 100, 1)}%`}</strong></div>
         <div class="metric"><span>Matches active params</span><strong>${comparison.matchesActiveCandidate ? "yes" : "no"}</strong></div>
         <div class="metric"><span>Same strategy/market</span><strong>${comparison.sameStrategySymbolTimeframe ? "yes" : "no"}</strong></div>
         <div class="metric"><span>Param diffs</span><strong>${comparison.diffCount ?? 0}</strong></div>
       </div>
+      <p class="modal-note"><strong>${escapeHtml(comparability.status || "UNKNOWN")}</strong> ${escapeHtml(comparability.summary || "")}</p>
+      ${(comparability.reasons || []).length ? `<ul class="backtest-warnings">${comparability.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("")}</ul>` : ""}
       ${(comparison.diffs || []).length ? `
         <table class="trade-table compact-table">
           <thead><tr><th>Param</th><th>Active</th><th>Run</th></tr></thead>
@@ -3047,6 +3052,7 @@ function manualComparisonRowFromPayload(payload, overrides = {}) {
     firstCandleTime: context.firstCandleTime,
     lastCandleTime: context.lastCandleTime,
     matchesActiveCandidate: Boolean(comparison.matchesActiveCandidate),
+    comparabilityStatus: (payload.comparability || {}).status,
     keyParamDiffs: compactParamDiffs(comparison.diffs),
     paramsUsed: payload.paramsUsed || {},
     runContext: context,
@@ -3124,6 +3130,7 @@ function renderManualBacktestComparisons() {
       <td>${escapeHtml(row.firstCandleTime || "-")}</td>
       <td>${escapeHtml(row.lastCandleTime || "-")}</td>
       <td>${row.matchesActiveCandidate ? "yes" : "no"}</td>
+      <td>${escapeHtml(row.comparabilityStatus || "-")}</td>
       <td>${escapeHtml(row.keyParamDiffs || "-")}</td>
       ${deltaCell(row, baseline, "totalReturnPct", "%")}
       ${deltaCell(row, baseline, "profitFactor")}
@@ -3140,7 +3147,7 @@ function renderManualBacktestComparisons() {
           <tr>
             <th>Label</th><th>Baseline</th><th>Strategy</th><th>Symbol</th><th>TF</th><th>Period</th><th>Params</th>
             <th>Trades</th><th>T/mo</th><th>PF</th><th>Return</th><th>DD</th><th>Win</th><th>Expect</th><th>Score</th><th>Status</th>
-            <th>Candles</th><th>First</th><th>Last</th><th>Active match</th><th>Param diffs</th>
+            <th>Candles</th><th>First</th><th>Last</th><th>Active match</th><th>Comparable</th><th>Param diffs</th>
             <th>Return Delta</th><th>PF Delta</th><th>DD Delta</th><th>Trades Delta</th><th>Score Delta</th><th></th>
           </tr>
         </thead>

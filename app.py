@@ -384,6 +384,7 @@ def backtest_run_custom():
             active_comparison.get("paramsSource") or "custom",
             active_candidate,
         )
+        comparability = manual_backtest_comparability(run_context, active_comparison, context_warnings)
         metrics = manual_backtest_result_summary(result_payload, period)
         trades = result_payload.get("trade_list") or result_payload.get("tradeList") or []
         warnings = dedupe_list(list(result_payload.get("warnings") or []) + list((result_payload.get("diagnostics") or {}).get("warnings") or []))
@@ -400,6 +401,7 @@ def backtest_run_custom():
             "paramsUsed": params_used,
             "runContext": run_context,
             "activeCandidateComparison": active_comparison,
+            "comparability": comparability,
             "result": {
                 **metrics,
                 "warnings": warnings,
@@ -12199,7 +12201,20 @@ def compare_manual_backtest_to_active_candidate(
         and timeframe == (active_market.get("interval") or active_market.get("timeframe"))
     )
     keys = sorted(set(active_params.keys()) | set((params_used or {}).keys()))
-    ignored = {"feePct", "slippagePct", "shortMode", "strategyName"}
+    ignored = {
+        "accountEquity",
+        "feePct",
+        "fillModel",
+        "makerFeePct",
+        "maxNotionalPerTrade",
+        "maxOpenTrades",
+        "riskPct",
+        "shortMode",
+        "slippageBps",
+        "slippagePct",
+        "strategyName",
+        "takerFeePct",
+    }
     for key in keys:
         if key in ignored:
             continue
@@ -12293,6 +12308,47 @@ def manual_backtest_run_context(
         "symbol": symbol,
         "timeframe": timeframe,
     }, warnings
+
+
+def manual_backtest_comparability(run_context: dict, active_comparison: dict, context_warnings: list[str]) -> dict:
+    reasons = []
+    warnings = []
+    if not active_comparison.get("sameStrategySymbolTimeframe"):
+        reasons.append("Strategy, symbol, or timeframe differs from the active candidate.")
+    if active_comparison.get("diffCount", 0):
+        reasons.append(f"{active_comparison.get('diffCount')} parameter difference(s) versus the active candidate.")
+    if run_context.get("source") != "bybit":
+        reasons.append(f"Source is {run_context.get('source')}, not bybit.")
+    if not run_context.get("firstCandleTime") or not run_context.get("lastCandleTime"):
+        warnings.append("First/last candle time is missing.")
+    expected = safe_float(run_context.get("expectedCandles"), 0)
+    used = safe_float(run_context.get("candlesUsed"), 0)
+    candle_ratio = used / expected if expected else None
+    if candle_ratio is not None and (candle_ratio < 0.75 or candle_ratio > 1.25):
+        reasons.append(f"Candle count is {round(candle_ratio * 100, 1)}% of expected for the selected period/timeframe.")
+    cost_or_fill_warnings = [
+        warning for warning in list(active_comparison.get("warnings") or []) + list(context_warnings or [])
+        if "feePct" in warning or "slippage" in warning or "Fill model" in warning or "source" in warning
+    ]
+    warnings.extend(cost_or_fill_warnings)
+    if active_comparison.get("matchesActiveCandidate") and not reasons and not warnings:
+        status = "COMPARABLE"
+        summary = "This manual run matches the active candidate context closely enough for direct comparison."
+    elif active_comparison.get("sameStrategySymbolTimeframe") and len(reasons) <= 2:
+        status = "PARTIALLY_COMPARABLE"
+        summary = "This run shares the active candidate market/strategy, but context or params differ. Compare cautiously."
+    else:
+        status = "NOT_COMPARABLE"
+        summary = "This run differs enough from the active candidate that metrics should not be compared directly."
+    return {
+        "status": status,
+        "summary": summary,
+        "reasons": dedupe_list(reasons),
+        "warnings": dedupe_list(warnings),
+        "candleCoverageRatio": round(candle_ratio, 4) if candle_ratio is not None else None,
+        "sameStrategySymbolTimeframe": bool(active_comparison.get("sameStrategySymbolTimeframe")),
+        "matchesActiveCandidate": bool(active_comparison.get("matchesActiveCandidate")),
+    }
 
 
 def manual_backtest_result_summary(payload: dict, period: str) -> dict:
