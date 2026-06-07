@@ -2267,6 +2267,85 @@ function sensitivityBaselineRow() {
   return lastSensitivityResults.find((row) => row.baseline && !row.error) || null;
 }
 
+function sensitivitySortKey(row) {
+  const statusRank = row.status === "PASS" ? 3 : row.status === "WARN" ? 2 : row.status === "NO_TRADES" ? 1 : 0;
+  return [
+    statusRank,
+    Number(row.score || 0),
+    Number(row.profitFactor || 0),
+    Number(row.totalReturnPct || 0),
+    -Number(row.maxDrawdownPct || 999),
+  ];
+}
+
+function compareSensitivityRows(a, b) {
+  const left = sensitivitySortKey(a);
+  const right = sensitivitySortKey(b);
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return right[index] - left[index];
+  }
+  return Number(a.testedValue || 0) - Number(b.testedValue || 0);
+}
+
+function buildSensitivitySummary() {
+  const successful = lastSensitivityResults.filter((row) => row.payload && !row.error);
+  const baseline = sensitivityBaselineRow();
+  if (!successful.length) {
+    return {
+      status: "NO_RESULTS",
+      bestValue: null,
+      baselineValue: baseline?.testedValue,
+      baselineRank: null,
+      plateauValues: [],
+      summary: "No successful sensitivity rows are available yet.",
+    };
+  }
+  const ranked = [...successful].sort(compareSensitivityRows);
+  const best = ranked[0];
+  const baselineRank = baseline ? ranked.findIndex((row) => row.id === baseline.id) + 1 : null;
+  const bestScore = Number(best.score || 0);
+  const plateau = ranked.filter((row) => {
+    const scoreGap = Math.abs(Number(row.score || 0) - bestScore);
+    const returnGap = Math.abs(Number(row.totalReturnPct || 0) - Number(best.totalReturnPct || 0));
+    return scoreGap <= 5 && returnGap <= 2 && row.status !== "FAIL" && row.status !== "ERROR";
+  });
+  const failCount = successful.filter((row) => ["FAIL", "ERROR", "NO_TRADES"].includes(row.status)).length;
+  const baselineScoreGap = baseline ? bestScore - Number(baseline.score || 0) : 0;
+  const baselineReturnGap = baseline ? Number(best.totalReturnPct || 0) - Number(baseline.totalReturnPct || 0) : 0;
+  let status = "UNKNOWN";
+  let summary = "Sensitivity needs more rows before classification.";
+  if (successful.length >= 3) {
+    if (baseline && baselineRank && baselineRank <= 2 && plateau.some((row) => row.id === baseline.id) && plateau.length >= 3) {
+      status = "STABLE_PLATEAU";
+      summary = "The current value sits inside a stable-looking plateau of nearby successful values.";
+    } else if (baseline && (baselineScoreGap > 10 || baselineReturnGap > 3)) {
+      status = "REVIEW_BETTER_VALUE";
+      summary = "A tested value materially outperformed the current value. Review manually before changing anything.";
+    } else if (failCount >= Math.ceil(successful.length / 2)) {
+      status = "UNSTABLE";
+      summary = "Many tested values failed, so this parameter region looks unstable.";
+    } else if (plateau.length <= 1) {
+      status = "SENSITIVE";
+      summary = "Performance appears concentrated around a narrow value rather than a broad plateau.";
+    } else {
+      status = "WATCH";
+      summary = "Some nearby values behave similarly, but the current value is not clearly centered in the best plateau.";
+    }
+  }
+  return {
+    status,
+    bestValue: best.testedValue,
+    bestStatus: best.status,
+    bestScore: best.score,
+    baselineValue: baseline?.testedValue,
+    baselineRank,
+    rowCount: successful.length,
+    plateauValues: plateau.map((row) => row.testedValue),
+    failCount,
+    summary,
+  };
+}
+
 async function runParamSensitivityLab() {
   if (sensitivityRunActive) return;
   const button = document.querySelector("#sensitivity-run");
@@ -2332,6 +2411,8 @@ function renderSensitivityResults() {
     return;
   }
   const baseline = sensitivityBaselineRow();
+  const summary = buildSensitivitySummary();
+  const summaryTone = summary.status === "STABLE_PLATEAU" ? "positive" : summary.status === "REVIEW_BETTER_VALUE" || summary.status === "SENSITIVE" || summary.status === "UNSTABLE" ? "negative" : "neutral";
   const rows = lastSensitivityResults.map((row) => `
     <tr>
       <td>${escapeHtml(row.paramName || "-")}</td>
@@ -2356,6 +2437,19 @@ function renderSensitivityResults() {
     </tr>
   `).join("");
   host.innerHTML = `
+    <div class="status-card compact-card">
+      <h3 class="modal-section-title">Sensitivity Summary <span class="${summaryTone}">${escapeHtml(summary.status || "UNKNOWN")}</span></h3>
+      <p class="modal-note">${escapeHtml(summary.summary || "")}</p>
+      <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Best value</span><strong>${summary.bestValue ?? "-"}</strong></div>
+        <div class="metric"><span>Best score</span><strong>${formatNumber(summary.bestScore, 2)}</strong></div>
+        <div class="metric"><span>Current/base value</span><strong>${summary.baselineValue ?? "-"}</strong></div>
+        <div class="metric"><span>Base rank</span><strong>${summary.baselineRank ? `${summary.baselineRank}/${summary.rowCount}` : "-"}</strong></div>
+        <div class="metric"><span>Plateau values</span><strong>${escapeHtml((summary.plateauValues || []).join(", ") || "-")}</strong></div>
+        <div class="metric"><span>Failed rows</span><strong>${summary.failCount ?? 0}</strong></div>
+      </div>
+      <p class="modal-note">Summary is browser-session research only. It does not change candidate config or paper state.</p>
+    </div>
     <div class="comparison-table-wrap">
       <table class="trade-table manual-sensitivity-grid">
         <thead>
