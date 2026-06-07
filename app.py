@@ -1374,6 +1374,15 @@ def research_candidate_review_report():
         return jsonify({"error": f"Could not build candidate review report: {exc}"}), 502
 
 
+@app.get("/api/research/evidence-scorecard")
+def research_evidence_scorecard():
+    try:
+        payload, status_code = build_research_evidence_scorecard(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research evidence scorecard: {exc}"}), 502
+
+
 @app.get("/api/research/candidate-leaderboard")
 def research_candidate_leaderboard():
     try:
@@ -9347,6 +9356,145 @@ def build_research_candidate_review_report(args) -> tuple[dict, int]:
         "risks": risks,
         "recommendations": recommendations,
         "warnings": dedupe_list([warning for warning in warnings if warning]),
+    }, 200
+
+
+def scorecard_section(name: str, status, summary: str, detail: dict | None = None, severity: str | None = None) -> dict:
+    status_text = str(status or "UNKNOWN").upper()
+    if severity:
+        severity_text = severity
+    elif status_text in {"PASS", "ROBUST", "STABLE", "RESILIENT", "READY_FOR_LONGER_PAPER", "KEEP_OBSERVING", "READY_FOR_REVIEW", "READY_FOR_PAPER_REVIEW"}:
+        severity_text = "PASS"
+    elif status_text in {"WARN", "WATCH", "MEDIUM", "TOO_EARLY", "WAIT_FOR_NEXT_CANDLE", "OBSERVE_MORE", "READY_FOR_LONGER_PAPER"}:
+        severity_text = "WATCH"
+    elif status_text in {"FAIL", "FRAGILE", "HIGH", "PAUSE_RECOMMENDED", "RESEARCH_ALTERNATIVES", "NOT_READY"}:
+        severity_text = "FAIL"
+    else:
+        severity_text = "INFO"
+    return {
+        "name": name,
+        "status": status_text,
+        "severity": severity_text,
+        "summary": summary,
+        "detail": detail or {},
+    }
+
+
+def evidence_scorecard_verdict(sections: list[dict], review: dict, real_enabled: bool, real_detail: str) -> dict:
+    if real_enabled:
+        return {
+            "status": "PAUSE_RECOMMENDED",
+            "title": "Safety Review Required",
+            "summary": "Real trading appears enabled, so research and paper review should pause until safety is restored.",
+            "nextAction": {"action": "DISABLE_REAL_TRADING_FLAG", "reason": real_detail},
+        }
+    failed = [section for section in sections if section.get("severity") == "FAIL"]
+    watch = [section for section in sections if section.get("severity") == "WATCH"]
+    review_verdict = review.get("verdict") or {}
+    review_status = str(review_verdict.get("status") or "").upper()
+    if failed:
+        names = ", ".join(section.get("name", "-") for section in failed[:3])
+        return {
+            "status": "RESEARCH_MORE",
+            "title": "Research More Before Paper Confidence",
+            "summary": f"{names} need review before trusting this candidate further.",
+            "nextAction": {"action": "REVIEW_FAILED_EVIDENCE", "reason": "Inspect failed scorecard sections. This endpoint is research-only and never promotes or trades."},
+        }
+    if review_status == "READY_FOR_LONGER_PAPER":
+        return {
+            "status": "OBSERVE_PAPER_LONGER",
+            "title": "Ready For Longer Paper Observation",
+            "summary": "Historical evidence is favorable, but forward paper evidence still needs more time and closed trades.",
+            "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Keep paper-only observation running manually when ready. Do not infer real-trading readiness."},
+        }
+    if watch:
+        names = ", ".join(section.get("name", "-") for section in watch[:3])
+        return {
+            "status": "RESEARCH_MORE",
+            "title": "Evidence Needs Review",
+            "summary": f"{names} are in WATCH/early state. Keep research review active before changing candidate configuration.",
+            "nextAction": {"action": "REVIEW_WATCH_SECTIONS", "reason": "Review watch sections and continue paper-only evidence collection."},
+        }
+    return {
+        "status": "OBSERVE_PAPER_LONGER",
+        "title": "Candidate Remains Paper-Only",
+        "summary": "The active candidate evidence is broadly favorable. Continue paper-only observation; no real-trading action is recommended.",
+        "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Collect forward paper evidence and review closed trades manually."},
+    }
+
+
+def build_research_evidence_scorecard(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    base_args = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+        "includeDetails": "false",
+    }
+    review, review_status = build_research_candidate_review_report(base_args)
+    fee_stress, fee_status = build_research_fee_slippage_stress(base_args)
+    walk_forward, walk_status = build_research_walk_forward_review(base_args)
+    regime, regime_status = build_research_regime_breakdown({**base_args, "includeTrades": "false"})
+    review_evidence = review.get("evidence") or {}
+    activity = review_evidence.get("activity") or {}
+    robustness = review_evidence.get("robustness") or {}
+    blockers = review_evidence.get("blockers") or {}
+    variants = review_evidence.get("variants") or {}
+    paper = review_evidence.get("paper") or {}
+    signal = review_evidence.get("signalDiagnostics") or {}
+    stress = fee_stress.get("stress") or {}
+    stability = walk_forward.get("stability") or {}
+    regime_summary = regime.get("summary") or {}
+    sections = [
+        scorecard_section("Activity", activity.get("status"), f"{activity.get('trades', 0)} trades, PF {activity.get('profitFactor', '-')}, return {activity.get('totalReturnPct', '-')}%.", activity),
+        scorecard_section("Parameter robustness", robustness.get("status"), f"Pass rate {round(safe_float(robustness.get('passRate'), 0) * 100, 2)}%, median PF {robustness.get('medianProfitFactor', '-')}.", robustness),
+        scorecard_section("Variant tradeoff", variants.get("status", "INFO"), f"Baseline {((variants.get('baseline') or {}).get('variantName') or '-')}; best tradeoff {((variants.get('bestTradeoff') or {}).get('variantName') or '-')}.", variants, "INFO"),
+        scorecard_section("Blockers", "WATCH" if blockers.get("mainBlocker") else "PASS", f"Main blocker: {blockers.get('mainBlocker') or 'none'}.", blockers),
+        scorecard_section("Fee/slippage stress", stress.get("status"), stress.get("recommendation") or "Execution-cost stress result.", stress),
+        scorecard_section("Walk-forward", stability.get("status"), stability.get("recommendation") or "Chronological fold and recent-window review.", stability),
+        scorecard_section("Regime dependency", regime_summary.get("regimeDependencyStatus"), regime_summary.get("recommendation") or "Regime contribution review.", regime_summary),
+        scorecard_section("Paper evidence", (paper.get("verdict") or {}).get("status"), f"{paper.get('runnerTicksRun', paper.get('ticksObserved', 0))} useful tick(s), {paper.get('signalsObserved', 0)} signal(s), {paper.get('closedTrades', 0)} closed trade(s).", paper),
+        scorecard_section("Signal frequency", signal.get("signal", "UNKNOWN"), signal.get("reason") or "Latest active signal diagnostics.", signal, "WATCH" if signal.get("signal") in {"HOLD", "UNKNOWN", None} else "INFO"),
+    ]
+    warnings = []
+    for payload, status_code, label in [
+        (review, review_status, "candidate review report"),
+        (fee_stress, fee_status, "fee/slippage stress"),
+        (walk_forward, walk_status, "walk-forward review"),
+        (regime, regime_status, "regime breakdown"),
+    ]:
+        if status_code >= 400 or payload.get("ok") is False:
+            warnings.append(f"{label} returned status {status_code}.")
+        warnings.extend(payload.get("warnings") or [])
+    if real_enabled:
+        warnings.append(real_detail)
+    verdict = evidence_scorecard_verdict(sections, review, real_enabled, real_detail)
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period},
+        "verdict": verdict,
+        "scores": review.get("scores") or {},
+        "sections": sections,
+        "warnings": dedupe_list([warning for warning in warnings if warning]),
+        "sourceReports": {
+            "candidateReviewStatus": review_status,
+            "feeSlippageStatus": fee_status,
+            "walkForwardStatus": walk_status,
+            "regimeStatus": regime_status,
+        },
     }, 200
 
 

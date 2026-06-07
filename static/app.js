@@ -327,6 +327,7 @@ function organizeWorkflowPages() {
     ["research-lead-review-panel", "research-diagnostics"],
     ["candidate-review-panel", "candidate-workflow-panels"],
     ["research-candidate-review-report-panel", "candidate-workflow-panels"],
+    ["research-evidence-scorecard-panel", "candidate-workflow-panels"],
     ["candidate-stability-panel", "candidate-workflow-panels"],
     ["research-activity-lab-panel", "candidate-workflow-panels"],
     ["paper-control-panel", "paper-workflow-panels"],
@@ -3721,6 +3722,7 @@ function setupLearningControls() {
   document.querySelector("#candidate-review-refresh")?.addEventListener("click", loadCandidateReview);
   document.querySelector("#candidate-review-preview")?.addEventListener("click", previewCandidatePromotion);
   document.querySelector("#research-candidate-review-report-refresh")?.addEventListener("click", loadResearchCandidateReviewReport);
+  document.querySelector("#research-evidence-scorecard-refresh")?.addEventListener("click", loadResearchEvidenceScorecard);
   document.querySelector("#candidate-stability-refresh")?.addEventListener("click", loadCandidateStability);
   document.querySelector("#paper-readiness-refresh")?.addEventListener("click", loadPaperReadiness);
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
@@ -4080,6 +4082,62 @@ async function loadResearchCandidateReviewReport() {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Candidate review report could not load: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+async function loadResearchEvidenceScorecard() {
+  const host = document.querySelector("#research-evidence-scorecard-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading research evidence scorecard...</p>`;
+    const payload = await apiGet("/api/research/evidence-scorecard");
+    host.innerHTML = renderResearchEvidenceScorecard(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research evidence scorecard could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchEvidenceScorecard(payload) {
+  const verdict = payload.verdict || {};
+  const next = verdict.nextAction || {};
+  const scores = payload.scores || {};
+  const candidate = payload.candidate || {};
+  const sections = payload.sections || [];
+  const tone = verdict.status === "OBSERVE_PAPER_LONGER" ? "positive" : verdict.status === "RESEARCH_MORE" ? "neutral" : verdict.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
+  const rows = sections.map((section) => {
+    const severityTone = section.severity === "PASS" ? "positive" : section.severity === "FAIL" ? "negative" : "neutral";
+    return `
+      <tr>
+        <td>${escapeHtml(section.name || "-")}</td>
+        <td class="${severityTone}">${escapeHtml(section.status || "-")}</td>
+        <td>${escapeHtml(section.severity || "-")}</td>
+        <td>${escapeHtml(section.summary || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <h3 class="modal-section-title">Research Evidence Scorecard <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(verdict.title || "-")}</strong> ${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Overall score</span><strong>${formatNumber(scores.overallScore)}</strong></div>
+      <div class="metric"><span>Activity</span><strong>${formatNumber(scores.activityScore)}</strong></div>
+      <div class="metric"><span>Robustness</span><strong>${formatNumber(scores.robustnessScore)}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${formatNumber(scores.paperScore)}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
+        <tr><th>Search</th><td>${escapeHtml(payload.search?.strategy || "-")} ${escapeHtml(payload.search?.symbol || "-")} ${escapeHtml(payload.search?.timeframe || "-")} ${escapeHtml(payload.search?.period || "-")}</td></tr>
+      </tbody>
+    </table>
+    <table class="trade-table compact-table">
+      <thead><tr><th>Evidence</th><th>Status</th><th>Severity</th><th>Summary</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4">No scorecard sections returned.</td></tr>`}</tbody>
+    </table>
+    ${payload.warnings?.length ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
+    <p class="modal-note">This scorecard is read-only research guidance. It never promotes, enables paper, runs paper ticks, or recommends real trading.</p>
+  `;
 }
 
 function renderResearchCandidateReviewReport(payload) {
