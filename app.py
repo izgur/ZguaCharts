@@ -1421,6 +1421,15 @@ def research_regime_breakdown():
         return jsonify({"error": f"Could not build regime breakdown lab: {exc}"}), 502
 
 
+@app.get("/api/research/signal-replay-report")
+def research_signal_replay_report():
+    try:
+        payload, status_code = build_research_signal_replay_report(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build signal replay report: {exc}"}), 502
+
+
 @app.get("/api/research/timeframe-preset-search")
 def research_timeframe_preset_search():
     try:
@@ -7569,6 +7578,106 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def compact_replay_trade(trade: dict) -> dict:
+    return {
+        "entryTime": iso_from_backtest_time(trade.get("entry_time") or trade.get("entryTime")),
+        "exitTime": iso_from_backtest_time(trade.get("exit_time") or trade.get("exitTime")),
+        "side": trade.get("side") or trade.get("direction") or "long",
+        "entryPrice": trade.get("entry_price") or trade.get("entryPrice"),
+        "exitPrice": trade.get("exit_price") or trade.get("exitPrice"),
+        "returnPct": trade.get("return_pct") or trade.get("returnPct"),
+        "exitReason": trade.get("exit_reason") or trade.get("exitReason"),
+    }
+
+
+def build_research_signal_replay_report(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    limit = research_limit_for(candidate.get("source") or "bybit", timeframe, period, args.get("limit", "auto"))
+    recent_limit = max(10, min(int(safe_float(args.get("recentLimit", args.get("recent_limit", 100)), 100)), 300))
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("takerFeePct"), 0)
+    slippage_pct = safe_float(candidate.get("slippageBps"), 0) / 100
+    blockers, blocker_status = build_research_blocker_analytics({
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategy": strategy,
+        "period": period,
+        "limit": args.get("limit", "auto"),
+        "includeRecentCandles": "true",
+        "recentLimit": str(recent_limit),
+    })
+    backtest_payload = run_shared_backtest_engine(
+        candidate.get("source") or "bybit",
+        symbol,
+        timeframe,
+        period,
+        strategy,
+        fee_pct,
+        slippage_pct,
+        limit,
+        debug=True,
+        allow_shorts=False,
+        strategy_params=params,
+    )
+    backtest_payload = normalize_backtest_response(backtest_payload, candidate.get("source") or "bybit", symbol, timeframe, period, strategy, fee_pct, slippage_pct)
+    trades = backtest_payload.get("trade_list") or backtest_payload.get("tradeList") or []
+    recent_candles = (blockers.get("recentCandles") or [])[-recent_limit:]
+    signal_candles = [row for row in recent_candles if str(row.get("signal") or "").upper() not in {"", "-", "HOLD", "NONE"}]
+    hold_candles = [row for row in recent_candles if str(row.get("signal") or "").upper() in {"", "-", "HOLD", "NONE"}]
+    near_misses = blockers.get("nearMisses") or []
+    warnings = dedupe_list((blockers.get("warnings") or []) + (backtest_payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    latest = recent_candles[-1] if recent_candles else {}
+    if signal_candles:
+        verdict = {
+            "status": "SIGNALS_PRESENT",
+            "summary": f"{len(signal_candles)} signal candle(s) were found in the recent replay window.",
+            "nextAction": {"action": "REVIEW_SIGNAL_CANDLES", "reason": "Inspect signal candles and matching trade markers manually."},
+        }
+    elif near_misses:
+        verdict = {
+            "status": "NEAR_MISSES_ONLY",
+            "summary": "No recent signal candle was found, but near misses are available for review.",
+            "nextAction": {"action": "REVIEW_NEAR_MISSES", "reason": "Inspect failed blockers before changing any strategy parameters."},
+        }
+    else:
+        verdict = {
+            "status": "HOLD_ONLY",
+            "summary": "Recent candles are all HOLD/no-signal in the replay window.",
+            "nextAction": {"action": "OBSERVE_MORE", "reason": "Continue research/paper observation; this report is read-only."},
+        }
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "recentLimit": recent_limit},
+        "summary": {
+            "candlesReviewed": len(recent_candles),
+            "signalCandles": len(signal_candles),
+            "holdCandles": len(hold_candles),
+            "nearMisses": len(near_misses),
+            "tradeMarkers": len(trades),
+            "latestSignal": latest.get("signal"),
+            "latestReason": latest.get("reason"),
+            "blockerAnalyticsStatus": blocker_status,
+        },
+        "verdict": verdict,
+        "recentCandles": recent_candles,
+        "signalCandles": signal_candles[-25:],
+        "nearMisses": near_misses[-25:],
+        "recentTradeMarkers": [compact_replay_trade(trade) for trade in trades[-25:]],
+        "warnings": warnings,
+    }, 200
 
 
 def build_research_timeframe_preset_search(args) -> tuple[dict, int]:

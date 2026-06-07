@@ -323,6 +323,7 @@ function organizeWorkflowPages() {
     ["research-blocker-analytics-panel", "research-diagnostics"],
     ["paper-signal-diagnostics-panel", "research-diagnostics"],
     ["paper-forward-signal-diagnostics-panel", "research-diagnostics"],
+    ["research-signal-replay-report-panel", "research-diagnostics"],
     ["research-strategy-variant-lab-panel", "research-diagnostics"],
     ["research-candidate-deep-compare-panel", "research-diagnostics"],
     ["research-lead-review-panel", "research-diagnostics"],
@@ -3830,6 +3831,7 @@ function setupLearningControls() {
   document.querySelector("#paper-observation-report-refresh")?.addEventListener("click", loadPaperObservationReport);
   document.querySelector("#paper-signal-diagnostics-refresh")?.addEventListener("click", loadPaperSignalDiagnostics);
   document.querySelector("#paper-forward-signal-diagnostics-refresh")?.addEventListener("click", loadPaperForwardSignalDiagnostics);
+  document.querySelector("#research-signal-replay-report-refresh")?.addEventListener("click", loadResearchSignalReplayReport);
   document.querySelector("#research-blocker-analytics-refresh")?.addEventListener("click", loadResearchBlockerAnalytics);
   document.querySelector("#research-snapshot-export-refresh")?.addEventListener("click", loadResearchSnapshotExport);
   document.querySelector("#research-snapshot-export-markdown")?.addEventListener("click", exportResearchSnapshotMarkdown);
@@ -4728,6 +4730,81 @@ function renderPaperForwardSignalDiagnostics(payload) {
     ${blockers ? `<p class="modal-note"><strong>Current blockers</strong></p><ul class="backtest-warnings">${blockers}</ul>` : ""}
     ${warnings ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${warnings}</ul>` : ""}
     <p class="modal-note">This panel explains paper-only signal frequency. It never runs a paper tick, changes config, or recommends real trading.</p>
+  `;
+}
+
+async function loadResearchSignalReplayReport() {
+  const host = document.querySelector("#research-signal-replay-report-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading signal replay report...</p>`;
+    const payload = await apiGet("/api/research/signal-replay-report");
+    host.innerHTML = renderResearchSignalReplayReport(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Signal replay report could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchSignalReplayReport(payload) {
+  const summary = payload.summary || {};
+  const verdict = payload.verdict || {};
+  const next = verdict.nextAction || {};
+  const search = payload.search || {};
+  const tone = verdict.status === "SIGNALS_PRESENT" ? "positive" : verdict.status === "NEAR_MISSES_ONLY" ? "neutral" : "neutral";
+  const candleRows = (payload.recentCandles || []).slice(-12).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.time || "-")}</td>
+      <td>${formatNumber(row.close)}</td>
+      <td>${escapeHtml(row.signal || "-")}</td>
+      <td>${escapeHtml((row.blockers || []).join(", ") || "-")}</td>
+      <td>${escapeHtml(row.reason || "-")}</td>
+    </tr>
+  `).join("");
+  const nearRows = (payload.nearMisses || []).slice(-8).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.time || "-")}</td>
+      <td>${formatNumber(row.close)}</td>
+      <td>${formatNumber(row.nearMissScore)}</td>
+      <td>${escapeHtml((row.failedBlockers || []).join(", ") || "-")}</td>
+    </tr>
+  `).join("");
+  const tradeRows = (payload.recentTradeMarkers || []).slice(-8).map((trade) => `
+    <tr>
+      <td>${escapeHtml(trade.entryTime || "-")}</td>
+      <td>${escapeHtml(trade.exitTime || "-")}</td>
+      <td>${escapeHtml(trade.side || "-")}</td>
+      <td>${formatNumber(trade.entryPrice)}</td>
+      <td>${formatNumber(trade.exitPrice)}</td>
+      <td class="${Number(trade.returnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(trade.returnPct)}%</td>
+    </tr>
+  `).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Signal Replay Report <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(search.strategy || "-")} ${escapeHtml(search.symbol || "-")} ${escapeHtml(search.timeframe || "-")}</strong> ${escapeHtml(verdict.summary || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Candles reviewed</span><strong>${summary.candlesReviewed ?? 0}</strong></div>
+      <div class="metric"><span>Signal candles</span><strong>${summary.signalCandles ?? 0}</strong></div>
+      <div class="metric"><span>Hold candles</span><strong>${summary.holdCandles ?? 0}</strong></div>
+      <div class="metric"><span>Near misses</span><strong>${summary.nearMisses ?? 0}</strong></div>
+      <div class="metric"><span>Trade markers</span><strong>${summary.tradeMarkers ?? 0}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table"><tbody><tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr></tbody></table>
+    <table class="trade-table">
+      <thead><tr><th>Recent candle</th><th>Close</th><th>Signal</th><th>Blockers</th><th>Reason</th></tr></thead>
+      <tbody>${candleRows || `<tr><td colspan="5">No recent candles returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Near miss</th><th>Close</th><th>Score</th><th>Failed blockers</th></tr></thead>
+      <tbody>${nearRows || `<tr><td colspan="4">No near misses returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Entry</th><th>Exit</th><th>Side</th><th>Entry price</th><th>Exit price</th><th>Return</th></tr></thead>
+      <tbody>${tradeRows || `<tr><td colspan="6">No trade markers returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <p class="modal-note">Replay is read-only and uses existing backtest/diagnostic paths. It does not change strategy logic or paper state.</p>
   `;
 }
 
