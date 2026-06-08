@@ -15,6 +15,7 @@ const BLOCKERS = [
   "maxOpenTradesReached",
   "alreadyInPosition",
   "cooldownBlocked",
+  "researchRegimeFilterBlocked",
   "pullbackReclaimFailed",
   "retestFailed",
   "squeezeFailed",
@@ -95,7 +96,7 @@ function run(options) {
       if (state.position) updateTrailing(state.position, row, params);
     }
 
-    var entry = entrySignal(frame, i, state, params);
+    var entry = applyResearchEntryFilter(entrySignal(frame, i, state, params), frame, i, state, params, options);
     collectDiagnostics(state.diagnostics, frame, i, entry, state);
     if (!state.position && !state.pendingEntry && entry.passed) {
       if (shouldDeferEntry(params, i, frame.length)) {
@@ -136,6 +137,30 @@ function run(options) {
   }
 
   return formatResult(options, params, frame, state);
+}
+
+function applyResearchEntryFilter(entry, frame, index, state, params, options) {
+  if (!entry || !entry.passed || typeof options.entryFilter !== "function") return entry;
+  var decision = options.entryFilter({
+    frame: frame,
+    index: index,
+    row: frame[index],
+    state: state,
+    params: params,
+    entry: entry
+  });
+  if (decision === true || (decision && decision.allow === true)) return entry;
+  var reason = decision && decision.reason ? String(decision.reason) : "researchRegimeFilterBlocked";
+  return {
+    passed: false,
+    side: entry.side || "long",
+    blockers: ["researchRegimeFilterBlocked"],
+    researchFilter: {
+      blocked: true,
+      reason: reason,
+      regime: decision && decision.regime ? decision.regime : null
+    }
+  };
 }
 
 function defaultParams(strategyName) {

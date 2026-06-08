@@ -318,6 +318,7 @@ function organizeWorkflowPages() {
     ["research-fee-slippage-stress-panel", "research-validation"],
     ["research-walk-forward-review-panel", "research-validation"],
     ["research-regime-breakdown-panel", "research-validation"],
+    ["research-regime-filter-counterfactual-panel", "research-validation"],
     ["research-data-cost-audit-panel", "research-validation"],
     ["research-optimizer-reproducibility-audit-panel", "research-validation"],
     ["research-reproducible-candidate-drilldown-panel", "research-validation"],
@@ -3842,6 +3843,7 @@ function setupLearningControls() {
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
+  document.querySelector("#research-regime-filter-counterfactual-refresh")?.addEventListener("click", loadResearchRegimeFilterCounterfactual);
   document.querySelector("#research-data-cost-audit-refresh")?.addEventListener("click", loadResearchDataCostAudit);
   document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
   document.querySelector("#research-candidate-deep-compare-refresh")?.addEventListener("click", loadResearchCandidateDeepCompare);
@@ -5391,6 +5393,103 @@ function renderResearchRegimeBreakdown(payload) {
       <tbody>${rows || `<tr><td colspan="10">No regime rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchRegimeFilterCounterfactual() {
+  const host = document.querySelector("#research-regime-filter-counterfactual-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading regime filter counterfactual lab...</p>`;
+    const payload = await apiGet("/api/research/regime-filter-counterfactual?includeRecentWindows=true");
+    host.innerHTML = renderResearchRegimeFilterCounterfactual(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Regime filter counterfactual lab could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchRegimeFilterCounterfactual(payload) {
+  const verdict = payload.verdict || {};
+  const audit = payload.antiLookaheadAudit || {};
+  const comparison = payload.comparison || {};
+  const context = payload.runContext || {};
+  const baseline = payload.baseline || {};
+  const baselineFull = baseline.fullPeriod || {};
+  const baselineWf = (baseline.walkForward || {}).summary || {};
+  const tone = verdict.action === "REVIEW_REGIME_FILTER" ? "positive" : verdict.action === "RESEARCH_MORE" ? "neutral" : "negative";
+  const rows = (payload.variants || []).map((variant) => {
+    const full = variant.fullPeriod || {};
+    const wf = (variant.walkForward || {}).summary || {};
+    const retention = variant.tradeRetention || {};
+    const eligibility = variant.eligibility || {};
+    const rowTone = eligibility.status === "REVIEWABLE" ? "positive" : variant.id === "baseline" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${escapeHtml(variant.id || "-")}</td>
+        <td class="${rowTone}">${escapeHtml(eligibility.status || variant.stabilityStatus || "-")}</td>
+        <td>${escapeHtml(variant.stabilityStatus || "-")}</td>
+        <td>${full.trades ?? "-"}</td>
+        <td>${formatNumber(retention.retainedPct)}%</td>
+        <td>${formatNumber(full.profitFactor)}</td>
+        <td class="${Number(full.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(full.totalReturnPct || 0)}%</td>
+        <td>${formatNumber(full.maxDrawdownPct)}%</td>
+        <td>${wf.passFoldCount ?? 0}/${(variant.walkForward?.folds || []).length || "-"}</td>
+        <td>${wf.negativeFoldCount ?? 0}</td>
+        <td class="${Number(wf.worstFoldReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(wf.worstFoldReturnPct || 0)}%</td>
+        <td>${escapeHtml(wf.returnConcentrationStatus || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const foldDetails = (payload.variants || []).map((variant) => {
+    const foldRows = ((variant.walkForward || {}).folds || []).map((fold) => `
+      <tr>
+        <td>${escapeHtml(variant.id || "-")}</td>
+        <td>${fold.fold ?? "-"}</td>
+        <td class="${fold.status === "PASS" ? "positive" : fold.status === "WATCH" ? "neutral" : "negative"}">${escapeHtml(fold.status || "-")}</td>
+        <td>${fold.trades ?? 0}</td>
+        <td>${formatNumber(fold.profitFactor)}</td>
+        <td class="${Number(fold.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(fold.totalReturnPct || 0)}%</td>
+        <td>${formatNumber(fold.maxDrawdownPct)}%</td>
+        <td>${escapeHtml(fold.startTime || "-")}</td>
+        <td>${escapeHtml(fold.endTime || "-")}</td>
+      </tr>
+    `).join("");
+    return foldRows;
+  }).join("");
+  const auditItems = (audit.details || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const warnings = (payload.warnings || []).concat(audit.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Regime Filter Counterfactual <span class="${tone}">${escapeHtml(verdict.action || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(verdict.reason || "-")}</strong> ${escapeHtml(verdict.nextAction || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Market</span><strong>${escapeHtml((payload.candidate || {}).symbol || "-")} ${escapeHtml((payload.candidate || {}).timeframe || "-")}</strong></div>
+      <div class="metric"><span>Baseline</span><strong>${baselineFull.trades ?? 0} trades PF ${formatNumber(baselineFull.profitFactor)}</strong></div>
+      <div class="metric"><span>Baseline folds</span><strong>${baselineWf.passFoldCount ?? 0} pass / ${baselineWf.negativeFoldCount ?? 0} negative</strong></div>
+      <div class="metric"><span>Best stability</span><strong>${escapeHtml(comparison.bestStabilityVariant || "-")}</strong></div>
+      <div class="metric"><span>Best conservative</span><strong>${escapeHtml(comparison.bestConservativeVariant || "-")}</strong></div>
+      <div class="metric"><span>Anti-lookahead</span><strong>${escapeHtml(audit.status || "-")}</strong></div>
+      <div class="metric"><span>Candles</span><strong>${context.candlesUsed ?? "-"} ${escapeHtml(context.firstCandleTime || "")}</strong></div>
+      <div class="metric"><span>Costs</span><strong>${formatNumber(context.takerFeePct, 4)}% / ${formatNumber(context.slippageBps, 2)} bps</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Variant</th><th>Eligibility</th><th>Stability</th><th>Trades</th><th>Retained</th><th>PF</th><th>Return</th><th>DD</th><th>Pass folds</th><th>Neg</th><th>Worst</th><th>Concentration</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="12">No counterfactual variants returned.</td></tr>`}</tbody>
+    </table>
+    <details>
+      <summary>Fold details</summary>
+      <table class="trade-table">
+        <thead><tr><th>Variant</th><th>Fold</th><th>Status</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Start</th><th>End</th></tr></thead>
+        <tbody>${foldDetails || `<tr><td colspan="9">No fold rows returned.</td></tr>`}</tbody>
+      </table>
+    </details>
+    <details>
+      <summary>Anti-lookahead audit</summary>
+      <ul class="backtest-warnings">${auditItems || `<li>No audit details returned.</li>`}</ul>
+    </details>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <p class="modal-note">Research-only counterfactual. It does not promote, write config, enable paper, run paper ticks, or touch real trading.</p>
   `;
 }
 
