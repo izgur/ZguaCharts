@@ -9705,7 +9705,21 @@ def build_research_candidate_review_report(args) -> tuple[dict, int]:
     }, 200
 
 
-def scorecard_section(name: str, status, summary: str, detail: dict | None = None, severity: str | None = None) -> dict:
+def scorecard_summary_text(summary) -> str:
+    if isinstance(summary, dict):
+        action = summary.get("action")
+        reason = summary.get("reason")
+        if action and reason:
+            return f"{action}: {reason}"
+        if reason:
+            return str(reason)
+        if action:
+            return str(action)
+        return json.dumps(summary, sort_keys=True)
+    return str(summary or "")
+
+
+def scorecard_section(name: str, status, summary, detail: dict | None = None, severity: str | None = None) -> dict:
     status_text = str(status or "UNKNOWN").upper()
     if severity:
         severity_text = severity
@@ -9721,7 +9735,7 @@ def scorecard_section(name: str, status, summary: str, detail: dict | None = Non
         "name": name,
         "status": status_text,
         "severity": severity_text,
-        "summary": summary,
+        "summary": scorecard_summary_text(summary),
         "detail": detail or {},
     }
 
@@ -9738,12 +9752,43 @@ def evidence_scorecard_verdict(sections: list[dict], review: dict, real_enabled:
     watch = [section for section in sections if section.get("severity") == "WATCH"]
     review_verdict = review.get("verdict") or {}
     review_status = str(review_verdict.get("status") or "").upper()
+    failed_names = {section.get("name") for section in failed}
+    watch_names = {section.get("name") for section in watch}
+    walk_forward = next((section for section in sections if section.get("name") == "Walk-forward"), {})
+    regime = next((section for section in sections if section.get("name") == "Regime dependency"), {})
+    cost = next((section for section in sections if section.get("name") == "Fee/slippage stress"), {})
+    paper = next((section for section in sections if section.get("name") == "Paper evidence"), {})
+    if "Walk-forward" in failed_names:
+        detail = walk_forward.get("detail") or {}
+        pass_folds = detail.get("passFoldCount")
+        fail_folds = detail.get("failFoldCount")
+        negative_folds = detail.get("negativeFoldCount")
+        regime_status = regime.get("status")
+        return {
+            "status": "RESEARCH_REGIME_ROBUSTNESS",
+            "title": "Walk-Forward Fragility Needs Review",
+            "summary": f"Activity and parameter robustness are favorable, but walk-forward is {walk_forward.get('status')} with {pass_folds} passing fold(s), {fail_folds} failed fold(s), and {negative_folds} negative fold(s). Regime dependency is {regime_status}.",
+            "primaryIssues": [walk_forward, regime],
+            "watchSections": watch,
+            "nextAction": {"action": "REVIEW_WALK_FORWARD_AND_REGIME", "reason": "Inspect failed folds and regime breakdown before treating this candidate as paper-confident. No promotion or trading action is implied."},
+        }
+    if "Fee/slippage stress" in failed_names:
+        return {
+            "status": "RESEARCH_EXECUTION_COSTS",
+            "title": "Execution Cost Fragility Needs Review",
+            "summary": "The active candidate has at least one failed execution-cost evidence section. Review fee/slippage assumptions before longer paper confidence.",
+            "primaryIssues": [cost],
+            "watchSections": watch,
+            "nextAction": {"action": "REVIEW_FEE_SLIPPAGE_STRESS", "reason": "Review stress scenarios and keep the candidate paper-only."},
+        }
     if failed:
         names = ", ".join(section.get("name", "-") for section in failed[:3])
         return {
             "status": "RESEARCH_MORE",
             "title": "Research More Before Paper Confidence",
             "summary": f"{names} need review before trusting this candidate further.",
+            "primaryIssues": failed,
+            "watchSections": watch,
             "nextAction": {"action": "REVIEW_FAILED_EVIDENCE", "reason": "Inspect failed scorecard sections. This endpoint is research-only and never promotes or trades."},
         }
     if review_status == "READY_FOR_LONGER_PAPER":
@@ -9751,7 +9796,18 @@ def evidence_scorecard_verdict(sections: list[dict], review: dict, real_enabled:
             "status": "OBSERVE_PAPER_LONGER",
             "title": "Ready For Longer Paper Observation",
             "summary": "Historical evidence is favorable, but forward paper evidence still needs more time and closed trades.",
+            "primaryIssues": [paper] if paper else [],
+            "watchSections": watch,
             "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Keep paper-only observation running manually when ready. Do not infer real-trading readiness."},
+        }
+    if "Fee/slippage stress" in watch_names and len(watch_names) <= 2:
+        return {
+            "status": "WATCH_EXECUTION_COSTS",
+            "title": "Execution Costs Need Watching",
+            "summary": "The candidate is not blocked, but execution-cost stress is a WATCH item. Paper observation should stay cost-aware.",
+            "primaryIssues": [cost],
+            "watchSections": watch,
+            "nextAction": {"action": "WATCH_EXECUTION_COSTS", "reason": "Continue paper-only observation and review cost assumptions before any candidate change."},
         }
     if watch:
         names = ", ".join(section.get("name", "-") for section in watch[:3])
@@ -9759,12 +9815,16 @@ def evidence_scorecard_verdict(sections: list[dict], review: dict, real_enabled:
             "status": "RESEARCH_MORE",
             "title": "Evidence Needs Review",
             "summary": f"{names} are in WATCH/early state. Keep research review active before changing candidate configuration.",
+            "primaryIssues": watch[:3],
+            "watchSections": watch,
             "nextAction": {"action": "REVIEW_WATCH_SECTIONS", "reason": "Review watch sections and continue paper-only evidence collection."},
         }
     return {
         "status": "OBSERVE_PAPER_LONGER",
         "title": "Candidate Remains Paper-Only",
         "summary": "The active candidate evidence is broadly favorable. Continue paper-only observation; no real-trading action is recommended.",
+        "primaryIssues": [],
+        "watchSections": [],
         "nextAction": {"action": "CONTINUE_PAPER_OBSERVATION", "reason": "Collect forward paper evidence and review closed trades manually."},
     }
 

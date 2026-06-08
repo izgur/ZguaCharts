@@ -4209,7 +4209,9 @@ function renderResearchEvidenceScorecard(payload) {
   const scores = payload.scores || {};
   const candidate = payload.candidate || {};
   const sections = payload.sections || [];
-  const tone = verdict.status === "OBSERVE_PAPER_LONGER" ? "positive" : verdict.status === "RESEARCH_MORE" ? "neutral" : verdict.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
+  const primaryIssues = verdict.primaryIssues || [];
+  const watchSections = verdict.watchSections || [];
+  const tone = verdict.status === "OBSERVE_PAPER_LONGER" ? "positive" : verdict.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
   const rows = sections.map((section) => {
     const severityTone = section.severity === "PASS" ? "positive" : section.severity === "FAIL" ? "negative" : "neutral";
     return `
@@ -4230,6 +4232,8 @@ function renderResearchEvidenceScorecard(payload) {
       <div class="metric"><span>Activity</span><strong>${formatNumber(scores.activityScore)}</strong></div>
       <div class="metric"><span>Robustness</span><strong>${formatNumber(scores.robustnessScore)}</strong></div>
       <div class="metric"><span>Paper</span><strong>${formatNumber(scores.paperScore)}</strong></div>
+      <div class="metric"><span>Primary issues</span><strong>${primaryIssues.length}</strong></div>
+      <div class="metric"><span>Watch sections</span><strong>${watchSections.length}</strong></div>
       <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
     </div>
     <table class="trade-table">
@@ -4242,6 +4246,7 @@ function renderResearchEvidenceScorecard(payload) {
       <thead><tr><th>Evidence</th><th>Status</th><th>Severity</th><th>Summary</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="4">No scorecard sections returned.</td></tr>`}</tbody>
     </table>
+    ${primaryIssues.length ? `<p class="modal-note"><strong>Primary issues</strong></p><ul class="backtest-warnings">${primaryIssues.map((issue) => `<li>${escapeHtml(issue.name || "-")}: ${escapeHtml(issue.summary || issue.status || "-")}</li>`).join("")}</ul>` : ""}
     ${payload.warnings?.length ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <p class="modal-note">This scorecard is read-only research guidance. It never promotes, enables paper, runs paper ticks, or recommends real trading.</p>
   `;
