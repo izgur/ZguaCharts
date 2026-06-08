@@ -4211,6 +4211,7 @@ function renderResearchEvidenceScorecard(payload) {
   const sections = payload.sections || [];
   const primaryIssues = verdict.primaryIssues || [];
   const watchSections = verdict.watchSections || [];
+  const walkDrill = (payload.drilldowns || {}).walkForwardRegime || {};
   const tone = verdict.status === "OBSERVE_PAPER_LONGER" ? "positive" : verdict.status === "PAUSE_RECOMMENDED" ? "negative" : "neutral";
   const rows = sections.map((section) => {
     const severityTone = section.severity === "PASS" ? "positive" : section.severity === "FAIL" ? "negative" : "neutral";
@@ -4223,6 +4224,24 @@ function renderResearchEvidenceScorecard(payload) {
       </tr>
     `;
   }).join("");
+  const foldSummary = walkDrill.foldSummary || {};
+  const latestFold = walkDrill.latestFold || {};
+  const bestFold = walkDrill.bestFold || {};
+  const worstFold = walkDrill.worstFold || {};
+  const bestRegime = walkDrill.bestRegime || {};
+  const worstRegime = walkDrill.worstRegime || {};
+  const failedFoldRows = (walkDrill.failedFolds || []).map((fold) => `
+    <tr>
+      <td>${fold.fold ?? "-"}</td>
+      <td>${escapeHtml(fold.status || "-")}</td>
+      <td>${escapeHtml(fold.startTime || "-")}</td>
+      <td>${escapeHtml(fold.endTime || "-")}</td>
+      <td>${fold.trades ?? 0}</td>
+      <td class="${Number(fold.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(fold.totalReturnPct)}%</td>
+      <td>${formatNumber(fold.profitFactor)}</td>
+      <td>${escapeHtml(fold.mainFailureReason || "-")}</td>
+    </tr>
+  `).join("");
   return `
     <h3 class="modal-section-title">Research Evidence Scorecard <span class="${tone}">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
     <p class="modal-note"><strong>${escapeHtml(verdict.title || "-")}</strong> ${escapeHtml(verdict.summary || "")}</p>
@@ -4247,6 +4266,24 @@ function renderResearchEvidenceScorecard(payload) {
       <tbody>${rows || `<tr><td colspan="4">No scorecard sections returned.</td></tr>`}</tbody>
     </table>
     ${primaryIssues.length ? `<p class="modal-note"><strong>Primary issues</strong></p><ul class="backtest-warnings">${primaryIssues.map((issue) => `<li>${escapeHtml(issue.name || "-")}: ${escapeHtml(issue.summary || issue.status || "-")}</li>`).join("")}</ul>` : ""}
+    <h3 class="modal-section-title">Why This Verdict?</h3>
+    <p class="modal-note"><strong>${escapeHtml(walkDrill.currentMarketRead || "-")}</strong> ${escapeHtml(walkDrill.currentMarketReason || "")}</p>
+    <div class="metric-grid diagnostics-grid">
+      <div class="metric"><span>Passing folds</span><strong>${foldSummary.passingFolds ?? 0}/${foldSummary.totalFolds ?? 0}</strong></div>
+      <div class="metric"><span>Failed folds</span><strong>${foldSummary.failedFolds ?? 0}</strong></div>
+      <div class="metric"><span>Negative folds</span><strong>${foldSummary.negativeFolds ?? "-"}</strong></div>
+      <div class="metric"><span>Pass/fail return</span><strong>${formatSigned(foldSummary.passingReturnPct || 0)}% / ${formatSigned(foldSummary.failedReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Latest fold</span><strong>#${latestFold.fold ?? "-"} ${escapeHtml(latestFold.status || "-")} ${formatSigned(latestFold.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Best fold</span><strong>#${bestFold.fold ?? "-"} ${formatSigned(bestFold.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Worst fold</span><strong>#${worstFold.fold ?? "-"} ${formatSigned(worstFold.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Regime dependency</span><strong>${escapeHtml(walkDrill.regimeDependencyStatus || "-")}</strong></div>
+      <div class="metric"><span>Best regime</span><strong>${escapeHtml(bestRegime.regime || "-")} ${formatSigned(bestRegime.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Worst regime</span><strong>${escapeHtml(worstRegime.regime || "-")} ${formatSigned(worstRegime.totalReturnPct || 0)}%</strong></div>
+    </div>
+    <table class="trade-table compact-table">
+      <thead><tr><th>Failed fold</th><th>Status</th><th>Start</th><th>End</th><th>Trades</th><th>Return</th><th>PF</th><th>Reason</th></tr></thead>
+      <tbody>${failedFoldRows || `<tr><td colspan="8">No failed folds returned.</td></tr>`}</tbody>
+    </table>
     ${payload.warnings?.length ? `<p class="modal-note"><strong>Warnings</strong></p><ul class="backtest-warnings">${payload.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>` : ""}
     <p class="modal-note">This scorecard is read-only research guidance. It never promotes, enables paper, runs paper ticks, or recommends real trading.</p>
   `;

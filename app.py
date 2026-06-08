@@ -9829,6 +9829,81 @@ def evidence_scorecard_verdict(sections: list[dict], review: dict, real_enabled:
     }
 
 
+def compact_scorecard_fold(fold: dict | None) -> dict:
+    fold = fold or {}
+    return {
+        "fold": fold.get("fold"),
+        "status": fold.get("status"),
+        "startTime": fold.get("startTime"),
+        "endTime": fold.get("endTime"),
+        "trades": fold.get("trades"),
+        "totalReturnPct": fold.get("totalReturnPct"),
+        "profitFactor": fold.get("profitFactor"),
+        "maxDrawdownPct": fold.get("maxDrawdownPct"),
+        "mainFailureReason": fold.get("mainFailureReason"),
+    }
+
+
+def compact_scorecard_regime(regime: dict | None) -> dict:
+    regime = regime or {}
+    return {
+        "regime": regime.get("regime"),
+        "status": regime.get("status"),
+        "trades": regime.get("trades"),
+        "totalReturnPct": regime.get("totalReturnPct"),
+        "profitFactor": regime.get("profitFactor"),
+        "contributionPct": regime.get("contributionPct"),
+        "mainFailureReason": regime.get("mainFailureReason"),
+        "trend": regime.get("trend"),
+        "volatility": regime.get("volatility"),
+        "momentum": regime.get("momentum"),
+    }
+
+
+def build_walk_regime_drilldown(walk_forward: dict, regime: dict) -> dict:
+    folds = walk_forward.get("folds") or []
+    failed_folds = [fold for fold in folds if str(fold.get("status") or "").upper() != "PASS"]
+    passing_folds = [fold for fold in folds if str(fold.get("status") or "").upper() == "PASS"]
+    latest_fold = sorted(folds, key=lambda fold: str(fold.get("endTime") or ""))[-1] if folds else {}
+    stability = walk_forward.get("stability") or {}
+    regime_summary = regime.get("summary") or {}
+    latest_status = str(latest_fold.get("status") or "UNKNOWN").upper()
+    if latest_status == "PASS":
+        current_read = "CURRENT_FOLD_RESEMBLES_STRONG_PERIOD"
+        current_reason = "The latest chronological fold is passing, so recent history currently resembles a stronger walk-forward period."
+    elif latest_fold:
+        current_read = "CURRENT_FOLD_RESEMBLES_WEAK_PERIOD"
+        current_reason = "The latest chronological fold is failing, so recent history currently resembles the weak side of the walk-forward evidence."
+    else:
+        current_read = "CURRENT_FOLD_UNKNOWN"
+        current_reason = "No chronological fold data was available."
+    failed_return = round(sum(safe_float(fold.get("totalReturnPct"), 0) for fold in failed_folds), 4)
+    passing_return = round(sum(safe_float(fold.get("totalReturnPct"), 0) for fold in passing_folds), 4)
+    return {
+        "status": "WALK_FORWARD_REGIME_REVIEW",
+        "currentMarketRead": current_read,
+        "currentMarketReason": current_reason,
+        "foldSummary": {
+            "totalFolds": len(folds),
+            "passingFolds": len(passing_folds),
+            "failedFolds": len(failed_folds),
+            "negativeFolds": stability.get("negativeFoldCount"),
+            "passingReturnPct": passing_return,
+            "failedReturnPct": failed_return,
+        },
+        "latestFold": compact_scorecard_fold(latest_fold),
+        "bestFold": compact_scorecard_fold(stability.get("bestFold")),
+        "worstFold": compact_scorecard_fold(stability.get("worstFold")),
+        "failedFolds": [compact_scorecard_fold(fold) for fold in failed_folds],
+        "passingFolds": [compact_scorecard_fold(fold) for fold in passing_folds],
+        "regimeDependencyStatus": regime_summary.get("regimeDependencyStatus"),
+        "bestRegime": compact_scorecard_regime(regime_summary.get("bestRegime")),
+        "worstRegime": compact_scorecard_regime(regime_summary.get("worstRegime")),
+        "highestTradeCountRegime": compact_scorecard_regime(regime_summary.get("highestTradeCountRegime")),
+        "regimeRecommendation": regime_summary.get("recommendation"),
+    }
+
+
 def build_research_evidence_scorecard(args) -> tuple[dict, int]:
     candidate = load_paper_candidate_config()
     paper_enabled = canonical_paper_enabled(candidate)
@@ -9884,6 +9959,9 @@ def build_research_evidence_scorecard(args) -> tuple[dict, int]:
     if real_enabled:
         warnings.append(real_detail)
     verdict = evidence_scorecard_verdict(sections, review, real_enabled, real_detail)
+    drilldowns = {
+        "walkForwardRegime": build_walk_regime_drilldown(walk_forward, regime),
+    }
     return {
         "ok": True,
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -9894,6 +9972,7 @@ def build_research_evidence_scorecard(args) -> tuple[dict, int]:
         "verdict": verdict,
         "scores": review.get("scores") or {},
         "sections": sections,
+        "drilldowns": drilldowns,
         "warnings": dedupe_list([warning for warning in warnings if warning]),
         "sourceReports": {
             "candidateReviewStatus": review_status,
