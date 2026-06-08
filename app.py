@@ -1430,6 +1430,15 @@ def research_signal_replay_report():
         return jsonify({"error": f"Could not build signal replay report: {exc}"}), 502
 
 
+@app.get("/api/research/data-cost-consistency-audit")
+def research_data_cost_consistency_audit():
+    try:
+        payload, status_code = build_research_data_cost_consistency_audit(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build data/cost consistency audit: {exc}"}), 502
+
+
 @app.get("/api/research/timeframe-preset-search")
 def research_timeframe_preset_search():
     try:
@@ -7677,6 +7686,116 @@ def build_research_signal_replay_report(args) -> tuple[dict, int]:
         "nearMisses": near_misses[-25:],
         "recentTradeMarkers": [compact_replay_trade(trade) for trade in trades[-25:]],
         "warnings": warnings,
+    }, 200
+
+
+def consistency_check(name: str, passed: bool, severity: str, detail: str) -> dict:
+    return {
+        "name": name,
+        "pass": bool(passed),
+        "severity": severity,
+        "detail": detail,
+    }
+
+
+def build_research_data_cost_consistency_audit(args) -> tuple[dict, int]:
+    candidate = normalize_promoted_candidate_config(load_paper_candidate_config())
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = active_candidate_primary_market(candidate)
+    symbol = (args.get("symbol") or active.get("symbol") or "ETHUSDT").strip()
+    timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
+    strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
+    period = args.get("period", "365d")
+    source = args.get("source", candidate.get("source") or "bybit")
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    fee_pct = safe_float(candidate.get("takerFeePct"), 0)
+    slippage_pct = safe_float(candidate.get("slippageBps"), 0) / 100
+    limit_arg = args.get("limit", "auto")
+    limit = research_limit_for(source, timeframe, period, limit_arg)
+    result_payload = run_shared_backtest_engine(
+        source,
+        symbol,
+        timeframe,
+        period,
+        strategy,
+        fee_pct,
+        slippage_pct,
+        limit,
+        debug=False,
+        allow_shorts=False,
+        strategy_params=params,
+    )
+    result_payload = normalize_backtest_response(result_payload, source, symbol, timeframe, period, strategy, fee_pct, slippage_pct)
+    params_used = (result_payload.get("diagnostics") or {}).get("params") or params
+    params_used = {**(params_used or {}), "feePct": fee_pct, "slippagePct": slippage_pct}
+    active_comparison = compare_manual_backtest_to_active_candidate(
+        strategy,
+        symbol,
+        timeframe,
+        params_used,
+        candidate,
+        "activeCandidate",
+        source,
+        fee_pct,
+        slippage_pct,
+    )
+    run_context, context_warnings = manual_backtest_run_context(
+        result_payload,
+        period,
+        limit_arg,
+        source,
+        strategy,
+        symbol,
+        timeframe,
+        params_used,
+        "activeCandidate",
+        candidate,
+    )
+    comparability = manual_backtest_comparability(run_context, active_comparison, context_warnings)
+    expected = safe_float(run_context.get("expectedCandles"), 0)
+    used = safe_float(run_context.get("candlesUsed"), 0)
+    candle_ok = expected <= 0 or (used >= expected * 0.75 and used <= expected * 1.25)
+    checks = [
+        consistency_check("Real trading disabled", not real_enabled, "FAIL", "Real trading flag is disabled." if not real_enabled else real_detail),
+        consistency_check("Source is bybit", source == "bybit", "WARN", f"Source: {source}."),
+        consistency_check("Fill model is next-open", run_context.get("fillModel") == "next-open", "WARN", f"Fill model: {run_context.get('fillModel')}."),
+        consistency_check("Taker fee matches active candidate", abs(safe_float(run_context.get("takerFeePct"), 0) - fee_pct) < 1e-9, "WARN", f"Run taker fee {run_context.get('takerFeePct')} vs active {fee_pct}."),
+        consistency_check("Slippage matches active candidate", abs(safe_float(run_context.get("slippageBps"), 0) - safe_float(candidate.get("slippageBps"), 0)) < 1e-9, "WARN", f"Run slippage bps {run_context.get('slippageBps')} vs active {candidate.get('slippageBps')}."),
+        consistency_check("Candle coverage is expected", candle_ok, "WARN", f"Used {int(used)} candle(s), expected about {int(expected) if expected else 'unknown'}."),
+        consistency_check("First/last candle times present", bool(run_context.get("firstCandleTime") and run_context.get("lastCandleTime")), "WARN", f"{run_context.get('firstCandleTime')} to {run_context.get('lastCandleTime')}."),
+        consistency_check("Active candidate comparable", comparability.get("status") == "COMPARABLE", "WARN", comparability.get("summary") or "Comparability check completed."),
+    ]
+    blocking = [check for check in checks if not check.get("pass") and check.get("severity") == "FAIL"]
+    warnings = [check for check in checks if not check.get("pass") and check.get("severity") == "WARN"]
+    if blocking:
+        status = "FAIL"
+        recommendation = {"action": "FIX_SAFETY_BLOCKERS", "reason": "One or more consistency checks failed with blocking severity."}
+    elif warnings:
+        status = "WATCH"
+        recommendation = {"action": "REVIEW_CONTEXT_DIFFERENCES", "reason": "Some context assumptions differ. Compare backtests cautiously."}
+    else:
+        status = "CONSISTENT"
+        recommendation = {"action": "USE_FOR_COMPARISON", "reason": "Data and cost context looks consistent for active-candidate manual/research comparison."}
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "search": {"source": source, "symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "limit": limit_arg},
+        "status": status,
+        "summary": {
+            "checks": len(checks),
+            "passing": len([check for check in checks if check.get("pass")]),
+            "warnings": len(warnings),
+            "blocking": len(blocking),
+        },
+        "runContext": run_context,
+        "comparability": comparability,
+        "checks": checks,
+        "recommendation": recommendation,
+        "warnings": dedupe_list(context_warnings + active_comparison.get("warnings", []) + ([real_detail] if real_enabled else [])),
     }, 200
 
 

@@ -318,6 +318,7 @@ function organizeWorkflowPages() {
     ["research-fee-slippage-stress-panel", "research-validation"],
     ["research-walk-forward-review-panel", "research-validation"],
     ["research-regime-breakdown-panel", "research-validation"],
+    ["research-data-cost-audit-panel", "research-validation"],
     ["research-optimizer-reproducibility-audit-panel", "research-validation"],
     ["research-reproducible-candidate-drilldown-panel", "research-validation"],
     ["research-blocker-analytics-panel", "research-diagnostics"],
@@ -3841,6 +3842,7 @@ function setupLearningControls() {
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
+  document.querySelector("#research-data-cost-audit-refresh")?.addEventListener("click", loadResearchDataCostAudit);
   document.querySelector("#research-timeframe-preset-search-refresh")?.addEventListener("click", loadResearchTimeframePresetSearch);
   document.querySelector("#research-candidate-deep-compare-refresh")?.addEventListener("click", loadResearchCandidateDeepCompare);
   document.querySelector("#research-optimizer-reproducibility-audit-refresh")?.addEventListener("click", loadResearchOptimizerReproducibilityAudit);
@@ -5347,6 +5349,66 @@ function renderResearchRegimeBreakdown(payload) {
       <tbody>${rows || `<tr><td colspan="10">No regime rows returned.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchDataCostAudit() {
+  const host = document.querySelector("#research-data-cost-audit-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading data/cost consistency audit...</p>`;
+    const payload = await apiGet("/api/research/data-cost-consistency-audit");
+    host.innerHTML = renderResearchDataCostAudit(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Data/cost consistency audit could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchDataCostAudit(payload) {
+  const summary = payload.summary || {};
+  const rec = payload.recommendation || {};
+  const context = payload.runContext || {};
+  const comparable = payload.comparability || {};
+  const tone = payload.status === "CONSISTENT" ? "positive" : payload.status === "FAIL" ? "negative" : "neutral";
+  const rows = (payload.checks || []).map((check) => {
+    const rowTone = check.pass ? "positive" : check.severity === "FAIL" ? "negative" : "neutral";
+    return `
+      <tr>
+        <td>${escapeHtml(check.name || "-")}</td>
+        <td class="${rowTone}">${check.pass ? "pass" : "review"}</td>
+        <td>${escapeHtml(check.severity || "-")}</td>
+        <td>${escapeHtml(check.detail || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Data/Cost Consistency Audit <span class="${tone}">${escapeHtml(payload.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(rec.action || "-")}</strong> ${escapeHtml(rec.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Passing</span><strong>${summary.passing ?? 0}/${summary.checks ?? 0}</strong></div>
+      <div class="metric"><span>Warnings</span><strong>${summary.warnings ?? 0}</strong></div>
+      <div class="metric"><span>Blocking</span><strong>${summary.blocking ?? 0}</strong></div>
+      <div class="metric"><span>Comparable</span><strong>${escapeHtml(comparable.status || "-")}</strong></div>
+      <div class="metric"><span>Source</span><strong>${escapeHtml(context.source || "-")}</strong></div>
+      <div class="metric"><span>Fill model</span><strong>${escapeHtml(context.fillModel || "-")}</strong></div>
+      <div class="metric"><span>Fees/slip</span><strong>${formatNumber(context.takerFeePct, 4)}% / ${formatNumber(context.slippageBps, 2)} bps</strong></div>
+      <div class="metric"><span>Candles</span><strong>${context.candlesUsed ?? "-"} / ${context.expectedCandles ?? "-"}</strong></div>
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Detail</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4">No consistency checks returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <tbody>
+        <tr><th>Run window</th><td>${escapeHtml(context.firstCandleTime || "-")} to ${escapeHtml(context.lastCandleTime || "-")}</td></tr>
+        <tr><th>Comparability</th><td><strong>${escapeHtml(comparable.status || "-")}</strong> ${escapeHtml(comparable.summary || "")}</td></tr>
+      </tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+    <p class="modal-note">Audit is read-only. It does not promote, write config, enable paper, run paper ticks, or touch real trading.</p>
   `;
 }
 
