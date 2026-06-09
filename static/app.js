@@ -316,6 +316,7 @@ function organizeWorkflowPages() {
     ["research-stability-first-challenger-search-panel", "research-search"],
     ["research-campaign-runner-panel", "research-overview"],
     ["research-candidate-evidence-ledger-panel", "research-overview"],
+    ["research-result-diff-panel", "research-overview"],
     ["research-timeframe-preset-search-panel", "research-search"],
     ["research-parameter-robustness-panel", "research-validation"],
     ["research-fee-slippage-stress-panel", "research-validation"],
@@ -3845,6 +3846,7 @@ function setupLearningControls() {
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-campaign-runner-refresh")?.addEventListener("click", loadResearchCampaignRunner);
   document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
+  document.querySelector("#research-result-diff-refresh")?.addEventListener("click", loadResearchResultDiff);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
@@ -5349,6 +5351,63 @@ function renderResearchCandidateEvidenceLedger(payload) {
       <tbody>${rows || `<tr><td colspan="16">No saved candidate evidence found yet. Run campaign-runner with save=true after meaningful scans.</td></tr>`}</tbody>
     </table>
     <p class="modal-note">Read-only memory. This ledger reads ignored reports and does not run backtests, write config, change paper, or touch real trading.</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchResultDiff() {
+  const host = document.querySelector("#research-result-diff-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading research result diff...</p>`;
+    const payload = await apiGet("/api/research/result-diff");
+    host.innerHTML = renderResearchResultDiff(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research result diff could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchResultDiff(payload) {
+  const rec = payload.recommendation || {};
+  const counts = payload.counts || {};
+  const verdict = payload.verdict || {};
+  const changedRows = (payload.changedCandidates || []).slice(0, 16).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.strategy || "-")}</td>
+      <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+      <td>${row.previousRank ?? "-"} -> ${row.currentRank ?? "-"}</td>
+      <td>${formatSigned(row.rankDelta || 0)}</td>
+      <td>${formatNumber(row.previousStabilityScore)}</td>
+      <td>${formatNumber(row.currentStabilityScore)}</td>
+      <td>${formatSigned(row.stabilityScoreDelta || 0)}</td>
+      <td>${escapeHtml(row.previousEligibilityStatus || "-")} -> ${escapeHtml(row.currentEligibilityStatus || "-")}</td>
+    </tr>
+  `).join("");
+  const addedRows = (payload.addedCandidates || []).slice(0, 8).map((row) => `${row.strategy} ${row.symbol} ${row.timeframe}`).join(", ");
+  const removedRows = (payload.removedCandidates || []).slice(0, 8).map((row) => `${row.strategy} ${row.symbol} ${row.timeframe}`).join(", ");
+  const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const currentVerdict = verdict.current?.action || verdict.current?.status || "-";
+  const previousVerdict = verdict.previous?.action || verdict.previous?.status || "-";
+  return `
+    <h3 class="modal-section-title">Research Result Diff <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note">${escapeHtml(rec.reason || "Latest saved reports are compared read-only.")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Current</span><strong>${escapeHtml(payload.currentFile || "-")}</strong></div>
+      <div class="metric"><span>Previous</span><strong>${escapeHtml(payload.previousFile || "-")}</strong></div>
+      <div class="metric"><span>Verdict</span><strong>${escapeHtml(previousVerdict)} -> ${escapeHtml(currentVerdict)}</strong></div>
+      <div class="metric"><span>Verdict changed</span><strong>${verdict.changed ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Added</span><strong>${counts.added ?? 0}</strong></div>
+      <div class="metric"><span>Removed</span><strong>${counts.removed ?? 0}</strong></div>
+      <div class="metric"><span>Changed</span><strong>${counts.changed ?? 0}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Added:</strong> ${escapeHtml(addedRows || "none")} <strong>Removed:</strong> ${escapeHtml(removedRows || "none")}</p>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Market</th><th>Rank</th><th>Rank Delta</th><th>Prev Stability</th><th>Current Stability</th><th>Score Delta</th><th>Eligibility</th></tr></thead>
+      <tbody>${changedRows || `<tr><td colspan="8">No material candidate rank, stability, or eligibility changes.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Read-only report comparison. This does not run backtests, write config, change paper, or touch real trading.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }

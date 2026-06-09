@@ -1457,6 +1457,15 @@ def research_candidate_evidence_ledger():
         return jsonify({"error": f"Could not build candidate evidence ledger: {exc}"}), 502
 
 
+@app.get("/api/research/result-diff")
+def research_result_diff():
+    try:
+        payload, status_code = build_research_result_diff(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research result diff: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -8212,6 +8221,131 @@ def build_research_candidate_evidence_ledger(args) -> tuple[dict, int]:
             "stableResearchCandidateCount": sum(1 for row in rows if row.get("stableResearchSightings")),
             "topCandidate": top,
         },
+        "recommendation": recommendation,
+        "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
+    }, 200
+
+
+def research_result_diff_files(args) -> tuple[Path | None, Path | None, list[str]]:
+    warnings = []
+    root = Path(app.root_path)
+    current_arg = args.get("current")
+    previous_arg = args.get("previous")
+    if current_arg and previous_arg:
+        current = root / str(current_arg)
+        previous = root / str(previous_arg)
+        return current, previous, warnings
+    files = candidate_ledger_source_files(campaign_int(args, "fileLimit", 20, 2, 250))
+    if len(files) < 2:
+        warnings.append("Need at least two saved research JSON reports to build a result diff.")
+        return (files[0] if files else None), None, warnings
+    return files[0], files[1], warnings
+
+
+def read_research_json(path: Path | None) -> dict:
+    if not path or not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def candidate_rows_by_key(payload: dict, source: str) -> dict[str, dict]:
+    rows = candidate_ledger_rows_from_payload(payload, source)
+    by_key = {}
+    for row in rows:
+        key = candidate_ledger_key(row)
+        if key not in by_key or safe_float(row.get("rank"), 999999) < safe_float(by_key[key].get("rank"), 999999):
+            by_key[key] = row
+    return by_key
+
+
+def compact_diff_row(key: str, current: dict | None, previous: dict | None) -> dict:
+    cur = current or {}
+    prev = previous or {}
+    return {
+        "candidateKey": key,
+        "strategy": cur.get("strategy") or prev.get("strategy"),
+        "symbol": cur.get("symbol") or prev.get("symbol"),
+        "timeframe": cur.get("timeframe") or prev.get("timeframe"),
+        "currentRank": cur.get("rank"),
+        "previousRank": prev.get("rank"),
+        "rankDelta": None if cur.get("rank") is None or prev.get("rank") is None else safe_float(prev.get("rank"), 0) - safe_float(cur.get("rank"), 0),
+        "currentStabilityScore": cur.get("stabilityScore"),
+        "previousStabilityScore": prev.get("stabilityScore"),
+        "stabilityScoreDelta": None if cur.get("stabilityScore") is None or prev.get("stabilityScore") is None else round(safe_float(cur.get("stabilityScore"), 0) - safe_float(prev.get("stabilityScore"), 0), 4),
+        "currentEligibilityStatus": cur.get("eligibilityStatus"),
+        "previousEligibilityStatus": prev.get("eligibilityStatus"),
+        "currentTier": cur.get("tier"),
+        "previousTier": prev.get("tier"),
+    }
+
+
+def research_payload_verdict(payload: dict) -> dict:
+    modules = payload.get("modules") or {}
+    campaign_stability = ((modules.get("stabilityFirstSearch") or {}).get("summary") or {}).get("verdict")
+    return payload.get("verdict") or campaign_stability or payload.get("recommendation") or {}
+
+
+def build_research_result_diff(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    current_path, previous_path, warnings = research_result_diff_files(args)
+    current_payload = read_research_json(current_path)
+    previous_payload = read_research_json(previous_path)
+    if not current_payload or not previous_payload:
+        return {
+            "ok": False,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "currentFile": str(current_path.relative_to(Path(app.root_path))).replace("\\", "/") if current_path else None,
+            "previousFile": str(previous_path.relative_to(Path(app.root_path))).replace("\\", "/") if previous_path else None,
+            "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
+        }, 404
+    current_source = str(current_path.relative_to(Path(app.root_path))).replace("\\", "/")
+    previous_source = str(previous_path.relative_to(Path(app.root_path))).replace("\\", "/")
+    current_rows = candidate_rows_by_key(current_payload, current_source)
+    previous_rows = candidate_rows_by_key(previous_payload, previous_source)
+    current_keys = set(current_rows.keys())
+    previous_keys = set(previous_rows.keys())
+    added = [compact_diff_row(key, current_rows[key], None) for key in sorted(current_keys - previous_keys)]
+    removed = [compact_diff_row(key, None, previous_rows[key]) for key in sorted(previous_keys - current_keys)]
+    changed = []
+    for key in sorted(current_keys & previous_keys):
+        row = compact_diff_row(key, current_rows[key], previous_rows[key])
+        if row["rankDelta"] not in {None, 0} or row["stabilityScoreDelta"] not in {None, 0} or row["currentEligibilityStatus"] != row["previousEligibilityStatus"]:
+            changed.append(row)
+    changed.sort(key=lambda row: abs(safe_float(row.get("stabilityScoreDelta"), 0)) + abs(safe_float(row.get("rankDelta"), 0)), reverse=True)
+    current_verdict = research_payload_verdict(current_payload)
+    previous_verdict = research_payload_verdict(previous_payload)
+    verdict_changed = (current_verdict.get("action") or current_verdict.get("status")) != (previous_verdict.get("action") or previous_verdict.get("status"))
+    recommendation = {
+        "action": "REVIEW_CHANGED_RESEARCH" if added or removed or changed or verdict_changed else "NO_MATERIAL_CHANGE",
+        "reason": "Review added/removed candidates, rank deltas, stability-score deltas, and verdict changes before rerunning or promoting anything.",
+    }
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "currentFile": current_source,
+        "previousFile": previous_source,
+        "currentGeneratedAt": current_payload.get("generatedAt"),
+        "previousGeneratedAt": previous_payload.get("generatedAt"),
+        "verdict": {
+            "changed": verdict_changed,
+            "current": current_verdict,
+            "previous": previous_verdict,
+        },
+        "counts": {
+            "currentCandidates": len(current_rows),
+            "previousCandidates": len(previous_rows),
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+        },
+        "addedCandidates": added[:25],
+        "removedCandidates": removed[:25],
+        "changedCandidates": changed[:25],
         "recommendation": recommendation,
         "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
     }, 200
