@@ -317,6 +317,7 @@ function organizeWorkflowPages() {
     ["research-campaign-runner-panel", "research-overview"],
     ["research-candidate-evidence-ledger-panel", "research-overview"],
     ["research-result-diff-panel", "research-overview"],
+    ["research-promotion-checklist-v2-panel", "research-overview"],
     ["research-timeframe-preset-search-panel", "research-search"],
     ["research-parameter-robustness-panel", "research-validation"],
     ["research-fee-slippage-stress-panel", "research-validation"],
@@ -3847,6 +3848,7 @@ function setupLearningControls() {
   document.querySelector("#research-campaign-runner-refresh")?.addEventListener("click", loadResearchCampaignRunner);
   document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
   document.querySelector("#research-result-diff-refresh")?.addEventListener("click", loadResearchResultDiff);
+  document.querySelector("#research-promotion-checklist-v2-refresh")?.addEventListener("click", loadResearchPromotionChecklistV2);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
@@ -5408,6 +5410,54 @@ function renderResearchResultDiff(payload) {
       <tbody>${changedRows || `<tr><td colspan="8">No material candidate rank, stability, or eligibility changes.</td></tr>`}</tbody>
     </table>
     <p class="modal-note">Read-only report comparison. This does not run backtests, write config, change paper, or touch real trading.</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchPromotionChecklistV2() {
+  const host = document.querySelector("#research-promotion-checklist-v2-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading promotion checklist...</p>`;
+    const payload = await apiGet("/api/research/promotion-checklist-v2");
+    host.innerHTML = renderResearchPromotionChecklistV2(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Promotion checklist could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchPromotionChecklistV2(payload) {
+  const verdict = payload.verdict || {};
+  const counts = payload.counts || {};
+  const candidate = payload.candidate || {};
+  const rows = (payload.checks || []).map((check) => {
+    const tone = check.pass ? "positive" : check.severity === "BLOCK" ? "negative" : "neutral";
+    return `
+      <tr>
+        <td>${check.pass ? "PASS" : escapeHtml(check.severity || "WARN")}</td>
+        <td>${escapeHtml(check.name || "-")}</td>
+        <td class="${tone}">${check.pass ? "yes" : "no"}</td>
+        <td>${escapeHtml(check.detail || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Promotion Checklist v2 <span class="neutral">${escapeHtml(verdict.status || "UNKNOWN")}</span></h3>
+    <p class="modal-note"><strong>${escapeHtml(verdict.action || "NO_ACTION")}:</strong> ${escapeHtml(verdict.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(candidate.symbol || "")} ${escapeHtml(candidate.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Pass</span><strong>${counts.pass ?? 0}</strong></div>
+      <div class="metric"><span>Warn</span><strong>${counts.warn ?? 0}</strong></div>
+      <div class="metric"><span>Block</span><strong>${counts.block ?? 0}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Severity</th><th>Check</th><th>Pass</th><th>Detail</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="4">No checklist rows returned.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Manual review only. This checklist does not promote, write config, enable paper, run paper ticks, or touch real trading.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }

@@ -1466,6 +1466,15 @@ def research_result_diff():
         return jsonify({"error": f"Could not build research result diff: {exc}"}), 502
 
 
+@app.get("/api/research/promotion-checklist-v2")
+def research_promotion_checklist_v2():
+    try:
+        payload, status_code = build_research_promotion_checklist_v2(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build promotion checklist v2: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -8347,6 +8356,108 @@ def build_research_result_diff(args) -> tuple[dict, int]:
         "removedCandidates": removed[:25],
         "changedCandidates": changed[:25],
         "recommendation": recommendation,
+        "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
+    }, 200
+
+
+def checklist_item(items: list[dict], name: str, passed: bool, severity: str, detail: str, evidence: dict | None = None) -> None:
+    items.append({
+        "name": name,
+        "pass": bool(passed),
+        "severity": severity,
+        "detail": detail,
+        "evidence": evidence or {},
+    })
+
+
+def promotion_checklist_verdict(items: list[dict], paper_enabled: bool, real_enabled: bool) -> dict:
+    blockers = [item for item in items if not item.get("pass") and item.get("severity") == "BLOCK"]
+    warnings = [item for item in items if not item.get("pass") and item.get("severity") == "WARN"]
+    if real_enabled:
+        return {"status": "BLOCKED", "action": "DO_NOT_PROMOTE", "reason": "Real trading is enabled or partially configured; promotion review is blocked."}
+    if blockers:
+        return {"status": "BLOCKED", "action": "RESEARCH_MORE", "reason": f"{len(blockers)} blocking checklist item(s) remain."}
+    if paper_enabled:
+        return {"status": "WATCH", "action": "WAIT_FOR_PAPER_OR_DISABLE_BEFORE_PROMOTION", "reason": "Paper is enabled; avoid config promotion while a paper session is running."}
+    if warnings:
+        return {"status": "READY_WITH_WARNINGS", "action": "MANUAL_REVIEW_REQUIRED", "reason": f"No blockers, but {len(warnings)} warning item(s) need manual review."}
+    return {"status": "READY_FOR_MANUAL_PROMOTION_REVIEW", "action": "REVIEW_CONFIG_ONLY_PROMOTION", "reason": "Checklist has no blockers. This is manual review only; no promotion is automatic."}
+
+
+def build_research_promotion_checklist_v2(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
+    symbol = active.get("symbol") or "ETHUSDT"
+    timeframe = active.get("interval") or active.get("timeframe") or "1h"
+    items: list[dict] = []
+    warnings = []
+
+    config_warnings = candidate_config_warnings(candidate)
+    validation = validate_candidate_config(candidate, candidate_validation_rules(args))
+    stability = build_candidate_stability_report({"compareCurrent": "true", "period": args.get("period", "365d")})
+    readiness = build_paper_readiness_report(args)
+    review = build_candidate_review()
+    ledger, _ = build_research_candidate_evidence_ledger({"fileLimit": args.get("fileLimit", "50"), "limit": args.get("ledgerLimit", "25")})
+    diff, diff_status = build_research_result_diff({"fileLimit": args.get("fileLimit", "20")})
+    if diff_status >= 400:
+        warnings.extend(diff.get("warnings") or [])
+
+    checklist_item(items, "real trading disabled", not real_enabled, "BLOCK", real_detail)
+    checklist_item(items, "paper disabled for config review", not paper_enabled, "WARN", "Paper is disabled." if not paper_enabled else "Paper is currently enabled; promotion review should wait.")
+    checklist_item(items, "current candidate exists", bool(candidate), "BLOCK", f"{strategy} {symbol} {timeframe}")
+    checklist_item(items, "config warnings empty", not config_warnings, "BLOCK", "No config warnings." if not config_warnings else "; ".join(config_warnings), {"configWarnings": config_warnings})
+    checklist_item(items, "candidate validation PASS", validation.get("status") == "PASS", "BLOCK", f"Validation status: {validation.get('status')}.", validation)
+    checklist_item(items, "candidate stability PASS", stability.get("status") == "PASS", "BLOCK", f"Stability status: {stability.get('status')}.", {"status": stability.get("status"), "windows": stability.get("windows")})
+    readiness_blockers = [check for check in readiness.get("checks") or [] if not check.get("pass") and check.get("severity") == "BLOCK"]
+    readiness_warnings = [check for check in readiness.get("checks") or [] if not check.get("pass") and check.get("severity") == "WARN"]
+    checklist_item(items, "paper readiness has no blockers", not readiness_blockers, "BLOCK", f"{len(readiness_blockers)} readiness blocker(s).", {"status": readiness.get("status"), "blockingIssues": len(readiness_blockers)})
+    checklist_item(items, "paper readiness warnings reviewed", not readiness_warnings, "WARN", f"{len(readiness_warnings)} readiness warning(s).", {"warnings": readiness_warnings[:5]})
+    review_readiness = review.get("readiness") or {}
+    checklist_item(items, "candidate review supports config-only review", bool(review_readiness.get("canPromoteConfigOnly") or review_readiness.get("safeForManualReview")), "WARN", review.get("nextAction", {}).get("reason", "Candidate review is advisory."), review_readiness)
+    ledger_summary = ledger.get("summary") or {}
+    active_rank = ledger_summary.get("activeCandidateLedgerRank")
+    checklist_item(items, "evidence ledger has active candidate memory", active_rank is not None, "WARN", f"Active candidate ledger rank: {active_rank or '-'}", ledger_summary)
+    diff_verdict = diff.get("verdict") or {}
+    checklist_item(items, "latest research diff has no verdict regression", diff_status < 400 and not diff_verdict.get("changed"), "WARN", "Latest saved verdict is unchanged." if not diff_verdict.get("changed") else "Latest saved verdict changed; review diff.", diff.get("counts") or {})
+
+    verdict = promotion_checklist_verdict(items, paper_enabled, real_enabled)
+    counts = {
+        "pass": sum(1 for item in items if item.get("pass")),
+        "warn": sum(1 for item in items if not item.get("pass") and item.get("severity") == "WARN"),
+        "block": sum(1 for item in items if not item.get("pass") and item.get("severity") == "BLOCK"),
+    }
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "candidate": {
+            **candidate_summary(candidate),
+            "strategy": strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+        },
+        "verdict": verdict,
+        "counts": counts,
+        "checks": items,
+        "supportingEvidence": {
+            "validation": validation,
+            "stability": {"status": stability.get("status"), "windows": stability.get("windows")},
+            "readiness": {"status": readiness.get("status"), "ready": readiness.get("ready"), "summary": readiness.get("summary")},
+            "review": {"nextAction": review.get("nextAction"), "readiness": review_readiness},
+            "ledger": ledger_summary,
+            "resultDiff": {"ok": diff_status < 400, "verdict": diff.get("verdict"), "counts": diff.get("counts")},
+        },
+        "safety": {
+            "promoted": False,
+            "configWritten": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "realTradingTouched": False,
+        },
         "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
     }, 200
 
