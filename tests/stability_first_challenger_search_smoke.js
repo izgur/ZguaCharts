@@ -78,6 +78,7 @@ assert(
   stableCandidate.stabilityScore > fragileCandidate.stabilityScore,
   "stable fold distribution should outrank fragile high-return concentration"
 );
+assert.strictEqual(lab.STABILITY_SCORE_DIRECTION, "higher_is_better", "stability score direction should be explicit");
 assert.strictEqual(fragileCandidate.returnConcentration.classification, "HIGHLY_CONCENTRATED", "fragile candidate should show high return concentration");
 
 const benchmark = candidateFixture({
@@ -109,5 +110,61 @@ assert(
 const comparison = lab.benchmarkComparison(stableCandidate, benchmark);
 assert(comparison.stabilityScoreDelta > 0, "benchmark comparison should expose positive stability delta");
 assert(comparison.foldPassDelta > 0, "benchmark comparison should expose better fold pass count");
+
+const positiveScore = candidateFixture();
+positiveScore.stabilityScore = 71;
+positiveScore.tier = "STABILITY_WATCH";
+positiveScore.eligibility = { status: "RESEARCH_MORE", failedGates: [] };
+const negativeScore = candidateFixture({
+  folds: [
+    fold(8, 1.8),
+    fold(-3, 0.75, "FAIL"),
+    fold(-2, 0.8, "FAIL"),
+    fold(-1.5, 0.9, "FAIL")
+  ]
+});
+negativeScore.stabilityScore = -71;
+negativeScore.tier = "REPRODUCIBLE";
+negativeScore.eligibility = { status: "REJECTED", failedGates: [{ name: "negative folds" }] };
+assert.strictEqual(
+  [negativeScore, positiveScore].sort(lab.stabilityRankComparator)[0],
+  positiveScore,
+  "higher stability score should outrank a negative-score reproducible row"
+);
+assert.strictEqual(
+  lab.tierFor(negativeScore),
+  "REJECTED",
+  "reproducible but rejected candidate should not become a stable tier"
+);
+assert.strictEqual(
+  lab.isStableResearchCandidate(negativeScore),
+  false,
+  "fragile concentrated 1/4-fold candidate should not become best stable merely because it is reproducible"
+);
+assert.strictEqual(
+  lab.isStableResearchCandidate(positiveScore),
+  true,
+  "ineligible research-more candidate can still be the best stable research candidate when it has coherent fold evidence"
+);
+const concentratedResearchMore = candidateFixture({
+  folds: [
+    fold(6, 1.7),
+    fold(0.2, 1.05),
+    fold(0.1, 1.02),
+    fold(-0.2, 0.95, "FAIL")
+  ]
+});
+concentratedResearchMore.tier = "STABILITY_WATCH";
+concentratedResearchMore.eligibility = { status: "RESEARCH_MORE", failedGates: [{ name: "concentration" }] };
+assert.strictEqual(
+  lab.isStableResearchCandidate(concentratedResearchMore),
+  false,
+  "research-more candidate with excessive return concentration should stay out of bestStableCandidate"
+);
+assert.strictEqual(
+  [negativeScore, fragileCandidate].find((candidate) => candidate.eligibility.status === "CHALLENGER_ELIGIBLE") || null,
+  null,
+  "bestEligibleChallenger remains null when no row passes gates"
+);
 
 console.log("stability_first_challenger_search_smoke ok");

@@ -49,6 +49,8 @@ const REPRO_TOLERANCES = {
   maxDrawdownPct: 0.0001
 };
 
+const STABILITY_SCORE_DIRECTION = "higher_is_better";
+
 function round(value, digits) {
   const factor = Math.pow(10, digits || 4);
   return Math.round(Number(value || 0) * factor) / factor;
@@ -66,6 +68,22 @@ function parseCsv(value, fallback) {
   return String(value).split(",").map((item) => item.trim()).filter(Boolean);
 }
 
+function stableParamKey(params) {
+  return JSON.stringify(Object.keys(params || {}).sort().reduce((out, key) => {
+    out[key] = params[key];
+    return out;
+  }, {}));
+}
+
+function normalizeParamAliases(params) {
+  const copy = Object.assign({}, params || {});
+  if (copy.useBreakout !== undefined && copy.requireBreakout === undefined) copy.requireBreakout = copy.useBreakout;
+  if (copy.useVolumeFilter !== undefined && copy.requireVolume === undefined) copy.requireVolume = copy.useVolumeFilter;
+  delete copy.useBreakout;
+  delete copy.useVolumeFilter;
+  return copy;
+}
+
 function periodDays(raw) {
   return Number(String(raw || "365d").replace(/d$/i, "")) || 365;
 }
@@ -81,6 +99,70 @@ function timeframeHours(timeframe) {
 function autoLimitFor(timeframe, days, cap) {
   const bars = Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
   return Math.max(250, Math.min(Number(cap || 5000), bars + 300));
+}
+
+function comboAt(ranges, index) {
+  const keys = Object.keys(ranges || {});
+  const out = {};
+  let remaining = Math.max(0, Math.floor(Number(index) || 0));
+  keys.forEach((key) => {
+    const values = Array.isArray(ranges[key]) ? ranges[key] : [ranges[key]];
+    const safeValues = values.length ? values : [undefined];
+    out[key] = safeValues[remaining % safeValues.length];
+    remaining = Math.floor(remaining / safeValues.length);
+  });
+  return normalizeParamAliases(out);
+}
+
+function plannedComboCount(ranges) {
+  return Object.keys(ranges || {}).reduce((count, key) => {
+    const values = Array.isArray(ranges[key]) ? ranges[key] : [ranges[key]];
+    return count * Math.max(1, values.length);
+  }, 1);
+}
+
+function boundedOptimizerGrid(strategy, maxCombos) {
+  const catalog = optimizer.optimizerGridCatalog();
+  const grid = catalog[strategy] || catalog.default_fallback || { params: optimizer.defaultRanges(), maxCombinations: maxCombos };
+  const ranges = grid.params || optimizer.defaultRanges();
+  const planned = plannedComboCount(ranges);
+  const limit = Math.max(1, Math.min(Number(maxCombos || grid.maxCombinations || 1000), Number(grid.maxCombinations || maxCombos || 1000), planned));
+  const lastIndex = Math.max(0, planned - 1);
+  const byKey = {};
+  let attempts = 0;
+  for (let sample = 0; Object.keys(byKey).length < limit && attempts < planned; sample += 1) {
+    const baseIndex = limit <= 1 ? 0 : Math.floor(sample * lastIndex / Math.max(1, limit - 1));
+    for (let offset = 0; offset < planned && Object.keys(byKey).length < limit; offset += 1) {
+      const combo = comboAt(ranges, (baseIndex + offset) % planned);
+      attempts += 1;
+      if (!optimizer.validCombo(combo)) continue;
+      byKey[stableParamKey(combo)] = combo;
+      break;
+    }
+    if (sample > limit + planned) break;
+  }
+  const combos = Object.keys(byKey).sort().map((key) => byKey[key]);
+  return {
+    combos,
+    metadata: {
+      strategyKey: grid.strategyKey,
+      gridName: grid.gridName || grid.humanName,
+      humanName: grid.humanName || grid.gridName,
+      params: ranges,
+      paramCount: Object.keys(ranges || {}).length,
+      candidateCountPlanned: planned,
+      candidateCountTested: combos.length,
+      maxCombinations: grid.maxCombinations,
+      fallbackUsed: false,
+      fallbackReason: null,
+      fallbackType: grid.fallbackType || null,
+      warning: grid.warning || null,
+      sampled: combos.length < planned,
+      notes: grid.notes || [],
+      riskLevel: grid.riskLevel || "unknown",
+      memoryBounded: true
+    }
+  };
 }
 
 function iso(time) {
@@ -208,8 +290,9 @@ function walkForwardSummary(folds) {
   const medianReturn = median(returns);
   const dispersion = Math.sqrt(returns.reduce((sum, value) => sum + Math.pow(value - medianReturn, 2), 0) / Math.max(1, returns.length));
   const latest = folds[folds.length - 1] || {};
-  return {
-    folds,
+  const summary = {
+    foldsEvaluated: folds.length,
+    passFoldCount,
     foldPassCount: passFoldCount,
     foldFailCount,
     foldPassRate: round(folds.length ? passFoldCount / folds.length * 100 : 0, 4),
@@ -225,6 +308,7 @@ function walkForwardSummary(folds) {
     latestFoldReturnPct: latest.totalReturnPct || 0,
     latestFoldProfitFactor: latest.profitFactor || 0
   };
+  return Object.assign({ folds, summary }, summary);
 }
 
 function concentrationPenalty(classification) {
@@ -470,7 +554,7 @@ async function buildReport(options) {
   const candidates = [];
   markets.forEach((market) => {
     strategiesSearched.forEach((strategy) => {
-      const grid = optimizer.selectOptimizerGrid(strategy, null, maxCombosPerStrategy);
+      const grid = boundedOptimizerGrid(strategy, maxCombosPerStrategy);
       const candles = candlesByKey[`${market.symbol}:${market.timeframe}`] || [];
       grid.combos.forEach((params) => {
         rawCombosEvaluated += 1;
@@ -515,17 +599,11 @@ async function buildReport(options) {
     candidate.eligibility = eligibility(candidate, benchmark, ELIGIBILITY_GATES);
     candidate.tier = tierFor(candidate);
   });
-  candidates.sort((a, b) => (
-    tierRank(b.tier) - tierRank(a.tier) ||
-    b.stabilityScore - a.stabilityScore ||
-    b.walkForward.foldPassCount - a.walkForward.foldPassCount ||
-    a.walkForward.negativeFoldCount - b.walkForward.negativeFoldCount ||
-    b.walkForward.worstFoldReturnPct - a.walkForward.worstFoldReturnPct ||
-    b.fullPeriod.profitFactor - a.fullPeriod.profitFactor
-  ));
+  candidates.sort(stabilityRankComparator);
   candidates.forEach((candidate, index) => { candidate.rank = index + 1; });
-  const bestEligible = candidates.find((candidate) => candidate.tier === "CHALLENGER_ELIGIBLE") || null;
-  const bestStable = candidates.find((candidate) => ["CHALLENGER_ELIGIBLE", "REPRODUCIBLE", "STABILITY_WATCH", "RESEARCH_MORE"].includes(candidate.tier)) || candidates[0] || null;
+  const bestEligible = candidates.find((candidate) => candidate.eligibility.status === "CHALLENGER_ELIGIBLE") || null;
+  const bestResearched = candidates[0] || null;
+  const bestStable = candidates.find(isStableResearchCandidate) || null;
   const bestRaw = rawRows.slice().sort((a, b) => b.rawScreenScore - a.rawScreenScore)[0] || null;
   const summary = {
     eligibleCount: candidates.filter((candidate) => candidate.tier === "CHALLENGER_ELIGIBLE").length,
@@ -555,6 +633,7 @@ async function buildReport(options) {
     ok: true,
     paperEnabled: options.paperEnabled === true,
     realTradingEnabled: false,
+    stabilityScoreDirection: STABILITY_SCORE_DIRECTION,
     runContext: { source, period: options.period || "365d", folds, from, to, costs, topN, maxCombosPerStrategy },
     benchmark,
     search: {
@@ -564,10 +643,13 @@ async function buildReport(options) {
       marketsSearched: markets,
       rawCombosEvaluated,
       candidatesChronologicallyTested: candidates.length,
-      reproducibilityAudited: includeReproAudit ? candidates.length + 1 : 0
+      reproducibilityAudited: includeReproAudit ? candidates.length + 1 : 0,
+      stabilityScoreDirection: STABILITY_SCORE_DIRECTION,
+      stageASampling: "memory_bounded_deterministic"
     },
     rules: {
       stabilityScoring: {
+        direction: STABILITY_SCORE_DIRECTION,
         primary: ["foldPassRate", "negativeFoldCount", "worstFoldReturn", "medianFoldReturn", "medianFoldProfitFactor", "foldDispersion", "returnConcentration", "latestFold"],
         secondary: ["stress", "recentWindows", "drawdown", "tradeSufficiency"],
         tertiary: ["fullPeriodProfitFactor", "fullPeriodReturn", "headlineScore"]
@@ -587,6 +669,7 @@ async function buildReport(options) {
     summary,
     topCandidates: candidates.slice(0, topN),
     bestRawCandidate: bestRaw,
+    bestResearchedCandidate: bestResearched,
     bestStableCandidate: bestStable,
     bestEligibleChallenger: bestEligible,
     verdict,
@@ -635,6 +718,7 @@ function tierFor(candidate) {
   if (candidate.fullPeriod.trades < 20) return "INSUFFICIENT_EVIDENCE";
   if ((candidate.reproducibility || {}).status === "UNSTABLE") return "REJECTED";
   if (candidate.eligibility.status === "RESEARCH_MORE") return "STABILITY_WATCH";
+  if (candidate.eligibility.status === "REJECTED") return "REJECTED";
   if ((candidate.reproducibility || {}).status === "REPRODUCIBLE") return "REPRODUCIBLE";
   return "REJECTED";
 }
@@ -651,15 +735,44 @@ function tierRank(tier) {
   }[tier] || 0;
 }
 
+function stabilityRankComparator(a, b) {
+  return (
+    b.stabilityScore - a.stabilityScore ||
+    b.walkForward.foldPassCount - a.walkForward.foldPassCount ||
+    a.walkForward.negativeFoldCount - b.walkForward.negativeFoldCount ||
+    b.walkForward.worstFoldReturnPct - a.walkForward.worstFoldReturnPct ||
+    tierRank(b.tier) - tierRank(a.tier) ||
+    b.fullPeriod.profitFactor - a.fullPeriod.profitFactor ||
+    b.fullPeriod.totalReturnPct - a.fullPeriod.totalReturnPct
+  );
+}
+
+function isStableResearchCandidate(candidate) {
+  if (!candidate || !candidate.eligibility) return false;
+  if (candidate.eligibility.status === "REJECTED") return false;
+  if (candidate.tier === "REJECTED" || candidate.tier === "INSUFFICIENT_EVIDENCE") return false;
+  if ((candidate.stress || {}).status === "COLLAPSES_UNDER_STRESS") return false;
+  if ((candidate.recentWindows || {}).status === "RECENTLY_WEAK") return false;
+  if ((candidate.returnConcentration || {}).bestFoldContributionPct > ELIGIBILITY_GATES.maxBestFoldContributionPct) return false;
+  return (
+    candidate.walkForward.foldPassCount >= ELIGIBILITY_GATES.researchMoreFoldPassCount &&
+    candidate.walkForward.negativeFoldCount <= ELIGIBILITY_GATES.maxNegativeFolds &&
+    Number.isFinite(Number(candidate.stabilityScore))
+  );
+}
+
 module.exports = {
   buildReport,
   stabilityScore,
+  stabilityRankComparator,
+  isStableResearchCandidate,
   eligibility,
   returnConcentration,
   walkForwardSummary,
   benchmarkComparison,
   foldSlices,
   tierFor,
+  STABILITY_SCORE_DIRECTION,
   ELIGIBILITY_GATES,
   DEFAULT_STRATEGIES,
   round

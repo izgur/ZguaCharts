@@ -5944,6 +5944,7 @@ function renderResearchStabilityFirstChallengerSearch(payload) {
   const benchmarkWalk = benchmark.walkForward || {};
   const bestStable = payload.bestStableCandidate || {};
   const bestEligible = payload.bestEligibleChallenger || {};
+  const bestResearched = payload.bestResearchedCandidate || {};
   const topRaw = payload.topRawScreeningCandidate || payload.bestRawCandidate || {};
   const formatGate = (gate) => typeof gate === "string" ? gate : `${gate.name || "gate"}: ${gate.detail || ""}`.trim();
   const topRows = (payload.topCandidates || []).slice(0, 20).map((row) => {
@@ -5987,6 +5988,7 @@ function renderResearchStabilityFirstChallengerSearch(payload) {
   const benchmarkText = benchmark.strategy ? `${benchmark.strategy} ${benchmark.symbol} ${benchmark.timeframe}` : "-";
   const bestStableText = bestStable.strategy ? `${bestStable.strategy} ${bestStable.symbol} ${bestStable.timeframe} score ${bestStable.stabilityScore ?? "-"}` : "none";
   const bestEligibleText = bestEligible.strategy ? `${bestEligible.strategy} ${bestEligible.symbol} ${bestEligible.timeframe} score ${bestEligible.stabilityScore ?? "-"}` : "none";
+  const bestResearchedText = bestResearched.strategy ? `${bestResearched.strategy} ${bestResearched.symbol} ${bestResearched.timeframe} ${bestResearched.eligibility?.status || bestResearched.tier || ""} score ${bestResearched.stabilityScore ?? "-"}` : "none";
   const topRawText = topRaw.strategy ? `${topRaw.strategy} ${topRaw.symbol} ${topRaw.timeframe} ret ${topRaw.totalReturnPct ?? "-"}%` : "none";
   return `
     <h3 class="modal-section-title">Stability-First Challenger Search <span class="neutral">${escapeHtml(verdict.action || "NO_ACTION")}</span></h3>
@@ -5999,7 +6001,9 @@ function renderResearchStabilityFirstChallengerSearch(payload) {
       <div class="metric"><span>Benchmark folds</span><strong>${benchmarkWalk.foldPassCount ?? 0}/${benchmarkWalk.foldsEvaluated ?? (benchmarkWalk.folds || []).length ?? 0}</strong></div>
       <div class="metric"><span>Benchmark PF</span><strong>${formatNumber(benchmarkFull.profitFactor)}</strong></div>
       <div class="metric"><span>Benchmark return</span><strong>${formatSigned(benchmarkFull.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Score direction</span><strong>${escapeHtml(payload.stabilityScoreDirection || "higher_is_better")}</strong></div>
       <div class="metric"><span>Top raw</span><strong>${escapeHtml(topRawText)}</strong></div>
+      <div class="metric"><span>Best researched</span><strong>${escapeHtml(bestResearchedText)}</strong></div>
       <div class="metric"><span>Best stable</span><strong>${escapeHtml(bestStableText)}</strong></div>
       <div class="metric"><span>Best eligible</span><strong>${escapeHtml(bestEligibleText)}</strong></div>
       <div class="metric"><span>Raw combos</span><strong>${search.rawCombosEvaluated ?? summary.rawCombosEvaluated ?? 0}</strong></div>
