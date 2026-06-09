@@ -23,6 +23,7 @@
     "research:walk-forward-review": "node cli/research_walk_forward_review.js",
     "research:regime-breakdown": "node cli/research_regime_breakdown.js",
     "research:regime-filter-counterfactual": "node cli/research_regime_filter_counterfactual.js",
+    "research:stability-first-challenger-search": "node cli/research_stability_first_challenger_search.js",
     "research:timeframe-preset-search": "node cli/research_timeframe_preset_search.js",
     "research:candidate-deep-compare": "node cli/research_candidate_deep_compare.js",
     "research:multi-strategy-matrix": "node cli/research_multi_strategy_matrix.js",

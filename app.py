@@ -1430,6 +1430,15 @@ def research_regime_filter_counterfactual():
         return jsonify({"error": f"Could not build regime filter counterfactual lab: {exc}"}), 502
 
 
+@app.get("/api/research/stability-first-challenger-search")
+def research_stability_first_challenger_search():
+    try:
+        payload, status_code = build_research_stability_first_challenger_search(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build stability-first challenger search: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -7684,6 +7693,90 @@ def build_research_regime_filter_counterfactual(args) -> tuple[dict, int]:
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "candidate": candidate_summary(candidate),
+        "warnings": warnings,
+        "command": " ".join(command),
+    })
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
+def build_research_stability_first_challenger_search(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = active.get("symbol") or "ETHUSDT"
+    active_timeframe = active.get("interval") or active.get("timeframe") or "1h"
+    active_strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
+    active_params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    for field in ("fillModel", "accountEquity", "riskPct", "maxOpenTrades", "maxNotional", "maxNotionalPerTrade", "regimeMode"):
+        if candidate.get(field) is not None and active_params.get(field) is None:
+            active_params[field] = candidate.get(field)
+    maker_fee = safe_float(candidate.get("makerFeePct"), 0)
+    taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
+    slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    command = package_node_script_args("research:stability-first-challenger-search")
+    command.extend([
+        "--symbols", str(args.get("symbols", "ETHUSDT,BTCUSDT")),
+        "--timeframes", str(args.get("timeframes", "1h,4h")),
+        "--strategies", str(args.get("strategies", "all")),
+        "--period", str(args.get("period", "365d")),
+        "--folds", str(max(2, min(int(safe_float(args.get("folds", 4), 4)), 8))),
+        "--maxCombosPerStrategy", str(max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 50)), 50)), 150))),
+        "--topN", str(max(1, min(int(safe_float(args.get("topN", args.get("top_n", 20)), 20)), 50))),
+        "--includeStress", "true" if str(args.get("includeStress", "true")).strip().lower() in {"1", "true", "yes", "on"} else "false",
+        "--includeRecentWindows", "true" if str(args.get("includeRecentWindows", "true")).strip().lower() in {"1", "true", "yes", "on"} else "false",
+        "--includeReproAudit", "true" if str(args.get("includeReproAudit", "true")).strip().lower() in {"1", "true", "yes", "on"} else "false",
+        "--reproReruns", str(max(1, min(int(safe_float(args.get("reproReruns", args.get("repro_reruns", 2)), 2)), 5))),
+        "--save", "true" if str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"} else "false",
+        "--activeStrategy", active_strategy,
+        "--activeSymbol", active_symbol,
+        "--activeTimeframe", active_timeframe,
+        "--activeParams", json.dumps(active_params),
+        "--makerFeePct", str(maker_fee),
+        "--takerFeePct", str(taker_fee),
+        "--slippageBps", str(slippage_bps),
+        "--paperEnabled", "true" if paper_enabled else "false",
+    ])
+    if args.get("limit"):
+        command.extend(["--limit", str(args.get("limit"))])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 540), 540)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Stability-first challenger search timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "benchmark": candidate_summary(candidate),
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Search timed out before final challenger ranking was returned."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Stability-first challenger search returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Stability-first challenger search returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Stability-first challenger search command failed.")
+    response = dict(payload)
+    response.update({
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
         "warnings": warnings,
         "command": " ".join(command),
     })

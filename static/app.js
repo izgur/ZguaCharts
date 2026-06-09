@@ -313,6 +313,7 @@ function organizeWorkflowPages() {
     ["paper-fast-discovery-panel", "research-search"],
     ["research-multi-strategy-matrix-panel", "research-search"],
     ["research-multi-strategy-optimizer-batch-panel", "research-search"],
+    ["research-stability-first-challenger-search-panel", "research-search"],
     ["research-timeframe-preset-search-panel", "research-search"],
     ["research-parameter-robustness-panel", "research-validation"],
     ["research-fee-slippage-stress-panel", "research-validation"],
@@ -3850,6 +3851,7 @@ function setupLearningControls() {
   document.querySelector("#research-optimizer-reproducibility-audit-refresh")?.addEventListener("click", loadResearchOptimizerReproducibilityAudit);
   document.querySelector("#research-multi-strategy-matrix-refresh")?.addEventListener("click", loadResearchMultiStrategyMatrix);
   document.querySelector("#research-multi-strategy-optimizer-batch-refresh")?.addEventListener("click", loadResearchMultiStrategyOptimizerBatch);
+  document.querySelector("#research-stability-first-challenger-search-refresh")?.addEventListener("click", loadResearchStabilityFirstChallengerSearch);
   document.querySelector("#research-reproducible-candidate-drilldown-refresh")?.addEventListener("click", loadResearchReproducibleCandidateDrilldown);
   document.querySelector("#research-lead-review-refresh")?.addEventListener("click", loadResearchLeadReview);
   document.querySelector("#research-activity-lab-refresh")?.addEventListener("click", loadResearchActivityLab);
@@ -5916,6 +5918,102 @@ function renderResearchMultiStrategyOptimizerBatch(payload) {
     <table class="trade-table">
       <thead><tr><th>Raw</th><th>Practical</th><th>Strategy</th><th>Market</th><th>Active</th><th>Status</th><th>Repro</th><th>Gate</th><th>Final tier</th><th>Eligible</th><th>Evidence</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Practical</th><th>Source</th><th>Rejection</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="20">No optimizer batch rows returned.</td></tr>`}</tbody>
+    </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchStabilityFirstChallengerSearch() {
+  const host = document.querySelector("#research-stability-first-challenger-search-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running stability-first challenger search...</p>`;
+    const payload = await apiGet("/api/research/stability-first-challenger-search");
+    host.innerHTML = renderResearchStabilityFirstChallengerSearch(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Stability-first challenger search could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchStabilityFirstChallengerSearch(payload) {
+  const search = payload.search || {};
+  const summary = payload.summary || {};
+  const verdict = payload.verdict || {};
+  const benchmark = payload.benchmark || {};
+  const benchmarkFull = benchmark.fullPeriod || {};
+  const benchmarkWalk = benchmark.walkForward || {};
+  const bestStable = payload.bestStableCandidate || {};
+  const bestEligible = payload.bestEligibleChallenger || {};
+  const topRaw = payload.topRawScreeningCandidate || payload.bestRawCandidate || {};
+  const formatGate = (gate) => typeof gate === "string" ? gate : `${gate.name || "gate"}: ${gate.detail || ""}`.trim();
+  const topRows = (payload.topCandidates || []).slice(0, 20).map((row) => {
+    const full = row.fullPeriod || {};
+    const walk = row.walkForward || {};
+    const stress = row.stress || {};
+    const repro = row.reproducibility || {};
+    const concentration = row.returnConcentration || {};
+    const eligible = row.eligibility || {};
+    const tone = eligible.status === "CHALLENGER_ELIGIBLE" ? "positive" : row.tier === "CHRONOLOGICALLY_TESTED" ? "neutral" : "negative";
+    const foldTotal = walk.foldsEvaluated ?? (walk.folds || []).length ?? 0;
+    const foldText = `${walk.foldPassCount ?? 0}/${foldTotal}`;
+    const reasons = (eligible.failedGates || eligible.reasons || row.rejectionReasons || []).slice(0, 3).map(formatGate).join(", ") || "-";
+    const params = row.params ? JSON.stringify(row.params) : "{}";
+    return `
+      <tr>
+        <td>${row.rank ?? "-"}</td>
+        <td class="${tone}">${escapeHtml(row.tier || "-")}</td>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td>${formatNumber(row.stabilityScore)}</td>
+        <td>${full.trades ?? row.trades ?? 0}</td>
+        <td>${formatNumber(full.profitFactor ?? row.profitFactor)}</td>
+        <td class="${(full.totalReturnPct ?? row.totalReturnPct ?? 0) >= 0 ? "positive" : "negative"}">${formatSigned(full.totalReturnPct ?? row.totalReturnPct ?? 0)}%</td>
+        <td>${formatNumber(full.maxDrawdownPct ?? row.maxDrawdownPct)}%</td>
+        <td>${escapeHtml(foldText)}</td>
+        <td>${walk.negativeFoldCount ?? 0}</td>
+        <td class="${(walk.worstFoldReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(walk.worstFoldReturnPct || 0)}%</td>
+        <td>${formatNumber(walk.medianFoldProfitFactor)}</td>
+        <td>${formatNumber(concentration.bestFoldContributionPct)}%</td>
+        <td>${escapeHtml(stress.status || "-")}</td>
+        <td>${escapeHtml(repro.status || "-")}</td>
+        <td class="${tone}">${escapeHtml(eligible.status || "-")}</td>
+        <td>${escapeHtml(reasons)}</td>
+        <td><details><summary>Params</summary><code>${escapeHtml(params)}</code></details></td>
+      </tr>
+    `;
+  }).join("");
+  const skipped = (search.strategiesSkipped || payload.strategiesSkipped || []).map((item) => `${item.strategy}: ${item.reason}`).join(", ");
+  const warnings = (payload.warnings || []).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const benchmarkText = benchmark.strategy ? `${benchmark.strategy} ${benchmark.symbol} ${benchmark.timeframe}` : "-";
+  const bestStableText = bestStable.strategy ? `${bestStable.strategy} ${bestStable.symbol} ${bestStable.timeframe} score ${bestStable.stabilityScore ?? "-"}` : "none";
+  const bestEligibleText = bestEligible.strategy ? `${bestEligible.strategy} ${bestEligible.symbol} ${bestEligible.timeframe} score ${bestEligible.stabilityScore ?? "-"}` : "none";
+  const topRawText = topRaw.strategy ? `${topRaw.strategy} ${topRaw.symbol} ${topRaw.timeframe} ret ${topRaw.totalReturnPct ?? "-"}%` : "none";
+  return `
+    <h3 class="modal-section-title">Stability-First Challenger Search <span class="neutral">${escapeHtml(verdict.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note">${escapeHtml(verdict.summary || verdict.reason || "Research-only challenger search. Candidates must survive chronological validation before review.")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Benchmark</span><strong>${escapeHtml(benchmarkText)}</strong></div>
+      <div class="metric"><span>Benchmark score</span><strong>${formatNumber(benchmark.stabilityScore)}</strong></div>
+      <div class="metric"><span>Benchmark folds</span><strong>${benchmarkWalk.foldPassCount ?? 0}/${benchmarkWalk.foldsEvaluated ?? (benchmarkWalk.folds || []).length ?? 0}</strong></div>
+      <div class="metric"><span>Benchmark PF</span><strong>${formatNumber(benchmarkFull.profitFactor)}</strong></div>
+      <div class="metric"><span>Benchmark return</span><strong>${formatSigned(benchmarkFull.totalReturnPct || 0)}%</strong></div>
+      <div class="metric"><span>Top raw</span><strong>${escapeHtml(topRawText)}</strong></div>
+      <div class="metric"><span>Best stable</span><strong>${escapeHtml(bestStableText)}</strong></div>
+      <div class="metric"><span>Best eligible</span><strong>${escapeHtml(bestEligibleText)}</strong></div>
+      <div class="metric"><span>Raw combos</span><strong>${search.rawCombosEvaluated ?? summary.rawCombosEvaluated ?? 0}</strong></div>
+      <div class="metric"><span>Chronological</span><strong>${search.candidatesChronologicallyTested ?? summary.chronologicalValidationCount ?? 0}</strong></div>
+      <div class="metric"><span>Eligible</span><strong>${summary.eligibleCount ?? summary.eligibleChallengerCount ?? 0}</strong></div>
+      <div class="metric"><span>Skipped strategies</span><strong>${(search.strategiesSkipped || []).length}</strong></div>
+      <div class="metric"><span>Saved report</span><strong>${escapeHtml(payload.savedPath || payload.savedReportPath || "-")}</strong></div>
+    </div>
+    <p class="modal-note"><strong>Scoring:</strong> ${escapeHtml(summary.scoringSummary || "Stability score rewards fold consistency, recent-window consistency, cost-stress survival, reproducibility, and low return concentration. Full-period return is tertiary.")}</p>
+    <p class="modal-note"><strong>Markets:</strong> ${escapeHtml((search.marketsSearched || []).map((market) => typeof market === "string" ? market : `${market.symbol || "-"} ${market.timeframe || "-"}`).join(", ") || "-")} <strong>Strategies:</strong> ${escapeHtml((search.strategiesSearched || []).join(", ") || "-")}</p>
+    ${skipped ? `<p class="modal-note"><strong>Skipped:</strong> ${escapeHtml(skipped)}</p>` : ""}
+    <table class="trade-table">
+      <thead><tr><th>Rank</th><th>Tier</th><th>Strategy</th><th>Market</th><th>Stability</th><th>Trades</th><th>PF</th><th>Return</th><th>DD</th><th>Folds</th><th>Neg</th><th>Worst Fold</th><th>Median PF</th><th>Concentration</th><th>Stress</th><th>Repro</th><th>Eligibility</th><th>Reason</th><th>Params</th></tr></thead>
+      <tbody>${topRows || `<tr><td colspan="19">No challengers entered chronological validation.</td></tr>`}</tbody>
     </table>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
