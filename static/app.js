@@ -314,6 +314,7 @@ function organizeWorkflowPages() {
     ["research-multi-strategy-matrix-panel", "research-search"],
     ["research-multi-strategy-optimizer-batch-panel", "research-search"],
     ["research-stability-first-challenger-search-panel", "research-search"],
+    ["research-campaign-runner-panel", "research-overview"],
     ["research-timeframe-preset-search-panel", "research-search"],
     ["research-parameter-robustness-panel", "research-validation"],
     ["research-fee-slippage-stress-panel", "research-validation"],
@@ -3841,6 +3842,7 @@ function setupLearningControls() {
   document.querySelector("#paper-candidate-comparison-refresh")?.addEventListener("click", loadPaperCandidateComparison);
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
+  document.querySelector("#research-campaign-runner-refresh")?.addEventListener("click", loadResearchCampaignRunner);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
@@ -5194,6 +5196,93 @@ function renderResearchCandidateLeaderboard(payload) {
       <thead><tr><th>Rank</th><th>Strategy</th><th>Market</th><th>Status</th><th>Active</th><th>Trades</th><th>/Month</th><th>PF</th><th>Return</th><th>DD</th><th>Score</th><th>Reason</th></tr></thead>
       <tbody>${rows || `<tr><td colspan="12">No leaderboard rows returned.</td></tr>`}</tbody>
     </table>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchCampaignRunner() {
+  const host = document.querySelector("#research-campaign-runner-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Running read-only research campaign...</p>`;
+    const payload = await apiGet("/api/research/campaign-runner");
+    host.innerHTML = renderResearchCampaignRunner(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research campaign could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchCampaignRunner(payload) {
+  const search = payload.search || {};
+  const modules = payload.modules || {};
+  const stability = modules.stabilityFirstSearch || {};
+  const stabilitySummary = stability.summary || {};
+  const recommendation = payload.recommendation || {};
+  const active = payload.activePaperCandidate || {};
+  const bestResearched = stabilitySummary.bestResearchedCandidate || {};
+  const bestStable = stabilitySummary.bestStableCandidate || {};
+  const bestEligible = stabilitySummary.bestEligibleChallenger || {};
+  const topRows = ((stabilitySummary.topCandidates || [])).slice(0, 8).map((row) => {
+    const tone = row.eligibilityStatus === "CHALLENGER_ELIGIBLE" ? "positive" : row.tier === "STABILITY_WATCH" ? "neutral" : "negative";
+    return `
+      <tr>
+        <td>${row.rank ?? "-"}</td>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td class="${tone}">${escapeHtml(row.tier || "-")}</td>
+        <td>${escapeHtml(row.eligibilityStatus || "-")}</td>
+        <td>${formatNumber(row.stabilityScore)}</td>
+        <td>${row.trades ?? 0}</td>
+        <td>${formatNumber(row.profitFactor)}</td>
+        <td class="${(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct || 0)}%</td>
+        <td>${row.foldPassCount ?? "-"}</td>
+        <td>${row.negativeFoldCount ?? "-"}</td>
+        <td>${formatNumber(row.returnConcentrationPct)}%</td>
+        <td>${escapeHtml(row.stressStatus || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const validationRows = (modules.deepValidation || []).map((item) => {
+    const candidate = item.candidate || {};
+    return `
+      <tr>
+        <td>${escapeHtml(candidate.strategy || "-")}</td>
+        <td>${escapeHtml(candidate.symbol || "-")} ${escapeHtml(candidate.timeframe || "-")}</td>
+        <td>${escapeHtml(item.feeSlippageStress?.status || "-")}</td>
+        <td>${escapeHtml(item.walkForward?.stability?.status || "-")}</td>
+        <td>${escapeHtml(item.regimeBreakdown?.dependencyStatus || "-")}</td>
+        <td>${escapeHtml((item.warnings || []).slice(0, 2).join("; ") || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const bestText = bestResearched.strategy ? `${bestResearched.strategy} ${bestResearched.symbol} ${bestResearched.timeframe} score ${bestResearched.stabilityScore ?? "-"}` : "none";
+  const stableText = bestStable.strategy ? `${bestStable.strategy} ${bestStable.symbol} ${bestStable.timeframe}` : "none";
+  const eligibleText = bestEligible.strategy ? `${bestEligible.strategy} ${bestEligible.symbol} ${bestEligible.timeframe}` : "none";
+  return `
+    <h3 class="modal-section-title">Research Campaign Runner <span class="neutral">${escapeHtml(recommendation.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note"><strong>Best researched:</strong> ${escapeHtml(bestText)}. <strong>Best stable:</strong> ${escapeHtml(stableText)}. <strong>Best eligible:</strong> ${escapeHtml(eligibleText)}. ${escapeHtml(recommendation.reason || "")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Active</span><strong>${active.strategy ? `${escapeHtml(active.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Symbols</span><strong>${escapeHtml((search.symbols || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Timeframes</span><strong>${escapeHtml((search.timeframes || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Strategies</span><strong>${escapeHtml(search.strategies || "-")}</strong></div>
+      <div class="metric"><span>Raw combos</span><strong>${stabilitySummary.search?.rawCombosEvaluated ?? "-"}</strong></div>
+      <div class="metric"><span>Chronological</span><strong>${stabilitySummary.search?.candidatesChronologicallyTested ?? "-"}</strong></div>
+      <div class="metric"><span>Validate top</span><strong>${search.validateTop ?? 0}</strong></div>
+      <div class="metric"><span>Saved</span><strong>${escapeHtml(payload.savedPath || "-")}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Rank</th><th>Strategy</th><th>Market</th><th>Tier</th><th>Eligibility</th><th>Stability</th><th>Trades</th><th>PF</th><th>Return</th><th>Folds</th><th>Neg</th><th>Concentration</th><th>Stress</th></tr></thead>
+      <tbody>${topRows || `<tr><td colspan="13">No campaign candidates returned.</td></tr>`}</tbody>
+    </table>
+    <table class="trade-table">
+      <thead><tr><th>Strategy</th><th>Market</th><th>Cost Stress</th><th>Walk-Forward</th><th>Regime</th><th>Warnings</th></tr></thead>
+      <tbody>${validationRows || `<tr><td colspan="6">No deep validation rows requested.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Manual research only. This campaign does not promote candidates, write config, run paper ticks, change paper state, or touch real trading.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }

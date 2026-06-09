@@ -1439,6 +1439,15 @@ def research_stability_first_challenger_search():
         return jsonify({"error": f"Could not build stability-first challenger search: {exc}"}), 502
 
 
+@app.get("/api/research/campaign-runner")
+def research_campaign_runner():
+    try:
+        payload, status_code = build_research_campaign_runner(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research campaign runner: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -7784,6 +7793,229 @@ def build_research_stability_first_challenger_search(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def campaign_bool(args, name: str, default: bool) -> bool:
+    return str(args.get(name, "true" if default else "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def campaign_int(args, name: str, default: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(int(safe_float(args.get(name, default), default)), maximum))
+
+
+def compact_campaign_candidate(row: dict) -> dict:
+    return {
+        "rank": row.get("rank"),
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "tier": row.get("tier"),
+        "eligibilityStatus": (row.get("eligibility") or {}).get("status"),
+        "stabilityScore": row.get("stabilityScore"),
+        "trades": (row.get("fullPeriod") or row).get("trades"),
+        "profitFactor": (row.get("fullPeriod") or row).get("profitFactor"),
+        "totalReturnPct": (row.get("fullPeriod") or row).get("totalReturnPct"),
+        "maxDrawdownPct": (row.get("fullPeriod") or row).get("maxDrawdownPct"),
+        "foldPassCount": (row.get("walkForward") or {}).get("foldPassCount"),
+        "negativeFoldCount": (row.get("walkForward") or {}).get("negativeFoldCount"),
+        "returnConcentrationPct": (row.get("returnConcentration") or {}).get("bestFoldContributionPct"),
+        "stressStatus": (row.get("stress") or {}).get("status"),
+        "recentWindowStatus": (row.get("recentWindows") or {}).get("status"),
+        "reproducibilityStatus": (row.get("reproducibility") or {}).get("status"),
+        "params": row.get("params") or {},
+        "failedGates": (row.get("eligibility") or {}).get("failedGates") or [],
+    }
+
+
+def compact_campaign_validation(candidate: dict, fee_stress: dict, walk_forward: dict, regime: dict) -> dict:
+    return {
+        "candidate": compact_campaign_candidate(candidate),
+        "feeSlippageStress": compact_snapshot_fee_stress(fee_stress),
+        "walkForward": compact_snapshot_walk_forward(walk_forward),
+        "regimeBreakdown": compact_snapshot_regime_breakdown(regime),
+        "warnings": dedupe_list((fee_stress.get("warnings") or []) + (walk_forward.get("warnings") or []) + (regime.get("warnings") or [])),
+    }
+
+
+def research_campaign_recommendation(stability: dict, validations: list[dict], real_enabled: bool) -> dict:
+    if real_enabled:
+        return {
+            "action": "REAL_TRADING_BLOCKED",
+            "reason": "Real trading is enabled or partially configured; research campaign remains advisory only.",
+        }
+    eligible = stability.get("bestEligibleChallenger")
+    stable = stability.get("bestStableCandidate")
+    if eligible:
+        return {
+            "action": "REVIEW_STABLE_CHALLENGER",
+            "reason": "At least one challenger passed stability-first eligibility gates. Review manually; no promotion is automatic.",
+        }
+    if stable:
+        return {
+            "action": "RESEARCH_STABLE_CANDIDATE_MORE",
+            "reason": "A stable research candidate exists, but no candidate cleared all eligibility gates.",
+        }
+    if validations:
+        return {
+            "action": "KEEP_CURRENT_RESEARCH_MORE",
+            "reason": "Top research rows were found, but validation still shows unresolved stability, concentration, stress, or regime issues.",
+        }
+    return {
+        "action": "NO_RESEARCH_LEAD",
+        "reason": "No campaign candidate produced enough evidence for deeper review.",
+    }
+
+
+def build_research_campaign_runner(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_symbol = active.get("symbol") or "ETHUSDT"
+    active_timeframe = active.get("interval") or active.get("timeframe") or "1h"
+    active_strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
+    period = str(args.get("period", "365d"))
+    symbols = str(args.get("symbols", "ETHUSDT,BTCUSDT"))
+    timeframes = str(args.get("timeframes", "1h,4h"))
+    strategies = str(args.get("strategies", "all"))
+    max_combos = str(campaign_int(args, "maxCombosPerStrategy", 10, 1, 50))
+    top_n = str(campaign_int(args, "topN", 8, 1, 20))
+    validate_top = campaign_int(args, "validateTop", 2, 0, 5)
+    save = campaign_bool(args, "save", False)
+    include_regime = campaign_bool(args, "includeRegime", True)
+    include_stress = campaign_bool(args, "includeStress", True)
+    include_recent = campaign_bool(args, "includeRecentWindows", True)
+    include_repro = campaign_bool(args, "includeReproAudit", True)
+    timeout_seconds = str(campaign_int(args, "timeout_seconds", 900, 60, 1800))
+    warnings = []
+
+    def capture(name: str, builder, section_args: dict) -> tuple[dict, bool]:
+        try:
+            payload, status_code = builder(section_args)
+            ok = status_code < 400 and payload.get("ok", True) is not False
+            if not ok:
+                warnings.append(f"{name} returned status {status_code}.")
+            warnings.extend(payload.get("warnings") or [])
+            return payload, ok
+        except Exception as exc:
+            warnings.append(f"{name} failed: {exc}")
+            return {"ok": False, "error": str(exc)}, False
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    search_args = {
+        "symbols": symbols,
+        "timeframes": timeframes,
+        "strategies": strategies,
+        "period": period,
+        "folds": args.get("folds", "4"),
+        "maxCombosPerStrategy": max_combos,
+        "topN": top_n,
+        "includeStress": "true" if include_stress else "false",
+        "includeRecentWindows": "true" if include_recent else "false",
+        "includeReproAudit": "true" if include_repro else "false",
+        "reproReruns": args.get("reproReruns", "2"),
+        "timeout_seconds": timeout_seconds,
+    }
+    stability, stability_ok = capture("stability-first challenger search", build_research_stability_first_challenger_search, search_args)
+    leaderboard, leaderboard_ok = capture(
+        "research candidate leaderboard",
+        build_research_candidate_leaderboard,
+        {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": active_strategy if strategies == "all" else strategies,
+            "period": period,
+            "maxCombos": args.get("leaderboardMaxCombos", args.get("maxCombos", "auto")),
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+    activity, activity_ok = capture(
+        "backtest activity lab",
+        build_research_activity_lab,
+        {
+            "symbols": symbols,
+            "timeframes": timeframes,
+            "strategies": active_strategy if strategies == "all" else strategies,
+            "period": period,
+            "maxCombos": args.get("activityMaxCombos", "auto"),
+            "optimize": args.get("activityOptimize", "false"),
+            "timeout_seconds": timeout_seconds,
+        },
+    )
+
+    top_rows = stability.get("topCandidates") or []
+    validation_rows = []
+    for row in top_rows[:validate_top]:
+        spec = {
+            "symbol": row.get("symbol") or active_symbol,
+            "timeframe": row.get("timeframe") or active_timeframe,
+            "strategy": row.get("strategy") or active_strategy,
+            "period": period,
+            "timeout_seconds": timeout_seconds,
+        }
+        fee_payload, _ = capture(f"fee/slippage stress {spec['strategy']} {spec['symbol']} {spec['timeframe']}", build_research_fee_slippage_stress, spec)
+        walk_payload, _ = capture(f"walk-forward review {spec['strategy']} {spec['symbol']} {spec['timeframe']}", build_research_walk_forward_review, {**spec, "folds": args.get("folds", "4")})
+        if include_regime:
+            regime_payload, _ = capture(f"regime breakdown {spec['strategy']} {spec['symbol']} {spec['timeframe']}", build_research_regime_breakdown, {**spec, "includeTrades": "false"})
+        else:
+            regime_payload = {"ok": True, "summary": {"regimeDependencyStatus": "NOT_RUN", "recommendation": {"action": "NOT_RUN", "reason": "includeRegime=false"}}}
+        validation_rows.append(compact_campaign_validation(row, fee_payload, walk_payload, regime_payload))
+
+    modules = {
+        "stabilityFirstSearch": {"ok": stability_ok, "summary": {
+            "verdict": stability.get("verdict") or {},
+            "search": stability.get("search") or {},
+            "benchmark": compact_campaign_candidate(stability.get("benchmark") or {}),
+            "bestResearchedCandidate": compact_campaign_candidate(stability.get("bestResearchedCandidate") or {}),
+            "bestStableCandidate": compact_campaign_candidate(stability.get("bestStableCandidate") or {}),
+            "bestEligibleChallenger": compact_campaign_candidate(stability.get("bestEligibleChallenger") or {}),
+            "topCandidates": [compact_campaign_candidate(row) for row in top_rows[: int(top_n)]],
+        }},
+        "leaderboard": {"ok": leaderboard_ok, "summary": compact_snapshot_leaderboard(leaderboard)},
+        "activity": {"ok": activity_ok, "summary": {
+            "rowsTested": len(activity.get("rows") or []),
+            "bestOverall": compact_snapshot_row((activity.get("summary") or {}).get("bestOverall") or {}),
+            "recommendation": (activity.get("summary") or {}).get("recommendation") or {},
+        }},
+        "deepValidation": validation_rows,
+    }
+    recommendation = research_campaign_recommendation(stability, validation_rows, real_enabled)
+    campaign = {
+        "ok": stability_ok and leaderboard_ok and activity_ok,
+        "generatedAt": generated_at,
+        "savedPath": None,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activePaperCandidate": {
+            **candidate_summary(candidate),
+            "strategy": active_strategy,
+            "symbol": active_symbol,
+            "timeframe": active_timeframe,
+        },
+        "search": {
+            "symbols": symbols.split(","),
+            "timeframes": timeframes.split(","),
+            "strategies": strategies,
+            "period": period,
+            "maxCombosPerStrategy": int(max_combos),
+            "topN": int(top_n),
+            "validateTop": validate_top,
+            "readOnly": True,
+        },
+        "modules": modules,
+        "recommendation": recommendation,
+        "safety": {
+            "promoted": False,
+            "configWritten": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "realTradingTouched": False,
+        },
+        "warnings": dedupe_list(([real_detail] if real_enabled else []) + [warning for warning in warnings if warning]),
+    }
+    if save:
+        campaign["savedPath"] = save_research_snapshot(campaign, "json")
+    return campaign, 200 if campaign["ok"] else 502
 
 
 def compact_replay_trade(trade: dict) -> dict:
