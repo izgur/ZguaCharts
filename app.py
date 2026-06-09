@@ -1892,9 +1892,12 @@ def paper_runner_instructions():
             "realTradingEnabled": real_enabled,
             "candidate": candidate_summary(candidate),
             "oneShotCommand": package_script_command("paper:run-once"),
+            "guidedCommand": "python scripts/paper_run_once.py --guided --log-file reports/paper-runner-guided-session.jsonl",
             "loopCommand": "python scripts/paper_run_once.py --loop --interval-minutes 5 --max-iterations 12 --log-file reports/paper-runner-session.jsonl",
+            "guidedLoopCommand": "python scripts/paper_run_once.py --guided --loop --interval-minutes 5 --max-iterations 12 --log-file reports/paper-runner-guided-session.jsonl",
             "notes": [
                 "This is local paper simulation only and cannot place real trades.",
+                "Guided mode runs read-only preflight checks and skips before POST /api/paper/run-once when paper is disabled, real trading is enabled, or stop rules recommend pause.",
                 "The loop runs only when started manually; no daemon or scheduled task is created.",
                 "Press Ctrl+C to stop a manually started loop; the runner prints a final interrupted summary.",
                 "Ctrl+C does not disable paper automatically; run POST /api/paper/disable manually when finished.",

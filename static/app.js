@@ -7258,7 +7258,9 @@ function renderPaperRunnerInstructions(payload) {
     <table class="trade-table">
       <tbody>
         <tr><th>One-shot command</th><td><code>${escapeHtml(payload.oneShotCommand || "-")}</code></td></tr>
+        <tr><th>Guided command</th><td><code>${escapeHtml(payload.guidedCommand || "-")}</code></td></tr>
         <tr><th>Loop command</th><td><code>${escapeHtml(payload.loopCommand || "-")}</code></td></tr>
+        <tr><th>Guided loop command</th><td><code>${escapeHtml(payload.guidedLoopCommand || "-")}</code></td></tr>
         <tr><th>Next action</th><td><strong>${escapeHtml(next.action || "-")}</strong> ${escapeHtml(next.reason || "")}</td></tr>
       </tbody>
     </table>

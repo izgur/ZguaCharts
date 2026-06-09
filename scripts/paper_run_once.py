@@ -35,6 +35,66 @@ def run_once(client) -> dict:
     return payload
 
 
+def get_json(client, path: str) -> dict:
+    response = client.get(path)
+    payload = response.get_json() or {"ok": False, "error": response.get_data(as_text=True)}
+    payload["httpStatus"] = response.status_code
+    return payload
+
+
+def guided_preflight(client) -> dict:
+    status = get_json(client, "/api/paper/status")
+    stop_rules = get_json(client, "/api/paper/stop-rules")
+    tick_readiness = get_json(client, "/api/paper/tick-readiness")
+    observation_targets = get_json(client, "/api/paper/observation-targets")
+    observation_report = get_json(client, "/api/paper/observation-report")
+    paper_enabled = bool(status.get("paperEnabled"))
+    real_enabled = bool(status.get("realTradingEnabled"))
+    stop_status = stop_rules.get("status")
+    blockers = []
+    if not paper_enabled:
+        blockers.append("paper_disabled")
+    if real_enabled:
+        blockers.append("real_trading_enabled")
+    if stop_status in {"STOP_RECOMMENDED", "PAUSE_RECOMMENDED", "BLOCKED"}:
+        blockers.append(f"stop_rules_{stop_status.lower()}")
+    return {
+        "ok": not blockers,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "blockers": blockers,
+        "status": status,
+        "stopRules": stop_rules,
+        "tickReadiness": tick_readiness,
+        "observationTargets": observation_targets,
+        "observationReport": observation_report,
+        "nextAction": observation_report.get("verdict", {}).get("nextAction") or observation_targets.get("nextAction") or tick_readiness.get("nextAction") or {},
+    }
+
+
+def guided_run_once(client) -> dict:
+    preflight = guided_preflight(client)
+    if not preflight.get("ok"):
+        return {
+            "ok": True,
+            "guided": True,
+            "tickRan": False,
+            "paperEnabled": preflight.get("paperEnabled"),
+            "realTradingEnabled": preflight.get("realTradingEnabled"),
+            "preflight": preflight,
+            "skipReason": ", ".join(preflight.get("blockers") or ["guided_preflight_blocked"]),
+            "nextAction": {
+                "action": "SKIP_GUIDED_RUN",
+                "reason": "Guided runner skipped before POST /api/paper/run-once because preflight blockers were present.",
+            },
+            "httpStatus": 200,
+        }
+    payload = run_once(client)
+    payload["guided"] = True
+    payload["preflight"] = preflight
+    return payload
+
+
 def compact_iteration(payload: dict, iteration: int) -> dict:
     summary = payload.get("summary") or {}
     refresh = payload.get("refresh") or {}
@@ -44,14 +104,23 @@ def compact_iteration(payload: dict, iteration: int) -> dict:
     observation_targets = payload.get("observationTargets") or {}
     observation_progress = observation_targets.get("progress") or {}
     stop_rules = payload.get("stopRulesAfter") or payload.get("stopRulesBefore") or {}
+    preflight = payload.get("preflight") or {}
+    if not tick_readiness_after:
+        tick_readiness_after = (preflight.get("tickReadiness") or {}).get("tickReadiness") or {}
+    if not observation_targets:
+        observation_targets = preflight.get("observationTargets") or {}
+        observation_progress = observation_targets.get("progress") or {}
+    if not stop_rules:
+        stop_rules = preflight.get("stopRules") or {}
     next_action = payload.get("nextAction") or {}
     tick_skip_reason = None
     if not payload.get("tickRan"):
-        tick_skip_reason = next_action.get("reason") or refresh.get("reason") or payload.get("error")
+        tick_skip_reason = payload.get("skipReason") or next_action.get("reason") or refresh.get("reason") or payload.get("error")
     return {
         "type": "iteration",
         "iteration": iteration,
         "timestamp": utc_now(),
+        "guided": bool(payload.get("guided")),
         "paperEnabled": payload.get("paperEnabled"),
         "realTradingEnabled": payload.get("realTradingEnabled"),
         "ok": payload.get("ok"),
@@ -67,6 +136,7 @@ def compact_iteration(payload: dict, iteration: int) -> dict:
         "ticksObserved": observation_progress.get("ticksObserved"),
         "closedTrades": observation_progress.get("closedTrades"),
         "stopRulesStatus": stop_rules.get("status") or summary.get("stopRulesAfter") or summary.get("stopRulesBefore"),
+        "preflightBlockers": preflight.get("blockers") or [],
         "nextAction": next_action,
         "error": payload.get("error"),
     }
@@ -94,6 +164,7 @@ def final_summary(results: list[dict], interrupted: bool = False) -> dict:
         "ticksRun": len([item for item in results if item.get("tickRan")]),
         "ticksSkipped": len([item for item in results if not item.get("tickRan")]),
         "errors": len(errors),
+        "guided": any(item.get("guided") for item in results),
         "finalPaperEnabled": final.get("paperEnabled"),
         "finalRealTradingEnabled": final.get("realTradingEnabled"),
         "finalObservationTargetStatus": final.get("observationTargetStatus"),
@@ -108,6 +179,7 @@ def main() -> int:
     parser.add_argument("--max-iterations", type=int, default=12, help="Maximum loop iterations.")
     parser.add_argument("--full", action="store_true", help="Print full endpoint payload instead of compact summary.")
     parser.add_argument("--log-file", help="Optional JSONL file for iteration and final summary records.")
+    parser.add_argument("--guided", action="store_true", help="Run explicit preflight checks and skip before POST when paper/real/stop-rule blockers exist.")
     args = parser.parse_args()
 
     results = []
@@ -124,7 +196,7 @@ def main() -> int:
         try:
             iterations = max(1, args.max_iterations) if args.loop else 1
             for index in range(iterations):
-                payload = run_once(client)
+                payload = guided_run_once(client) if args.guided else run_once(client)
                 item = payload if args.full else compact_iteration(payload, index + 1)
                 if args.full:
                     item = {**compact_iteration(payload, index + 1), "payload": item}
