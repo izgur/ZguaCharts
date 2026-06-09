@@ -315,6 +315,7 @@ function organizeWorkflowPages() {
     ["research-multi-strategy-optimizer-batch-panel", "research-search"],
     ["research-stability-first-challenger-search-panel", "research-search"],
     ["research-campaign-runner-panel", "research-overview"],
+    ["research-candidate-evidence-ledger-panel", "research-overview"],
     ["research-timeframe-preset-search-panel", "research-search"],
     ["research-parameter-robustness-panel", "research-validation"],
     ["research-fee-slippage-stress-panel", "research-validation"],
@@ -3843,6 +3844,7 @@ function setupLearningControls() {
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-campaign-runner-refresh")?.addEventListener("click", loadResearchCampaignRunner);
+  document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
   document.querySelector("#research-fee-slippage-stress-refresh")?.addEventListener("click", loadResearchFeeSlippageStress);
   document.querySelector("#research-walk-forward-review-refresh")?.addEventListener("click", loadResearchWalkForwardReview);
   document.querySelector("#research-regime-breakdown-refresh")?.addEventListener("click", loadResearchRegimeBreakdown);
@@ -5283,6 +5285,70 @@ function renderResearchCampaignRunner(payload) {
       <tbody>${validationRows || `<tr><td colspan="6">No deep validation rows requested.</td></tr>`}</tbody>
     </table>
     <p class="modal-note">Manual research only. This campaign does not promote candidates, write config, run paper ticks, change paper state, or touch real trading.</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchCandidateEvidenceLedger() {
+  const host = document.querySelector("#research-candidate-evidence-ledger-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading candidate evidence ledger...</p>`;
+    const payload = await apiGet("/api/research/candidate-evidence-ledger");
+    host.innerHTML = renderResearchCandidateEvidenceLedger(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Candidate evidence ledger could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchCandidateEvidenceLedger(payload) {
+  const summary = payload.summary || {};
+  const rec = payload.recommendation || {};
+  const active = payload.activePaperCandidate || {};
+  const rows = (payload.rows || []).slice(0, 25).map((row) => {
+    const tone = row.eligibleSightings ? "positive" : row.stableResearchSightings ? "neutral" : "negative";
+    const metrics = row.latestMetrics || {};
+    return `
+      <tr>
+        <td>${row.ledgerRank ?? "-"}</td>
+        <td>${escapeHtml(row.strategy || "-")}</td>
+        <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+        <td>${row.isActivePaperCandidate ? "yes" : ""}</td>
+        <td>${row.sightings ?? 0}</td>
+        <td>${row.bestRank ?? "-"}</td>
+        <td>${formatNumber(row.bestStabilityScore)}</td>
+        <td>${formatNumber(row.averageStabilityScore)}</td>
+        <td>${formatNumber(row.latestStabilityScore)}</td>
+        <td class="${tone}">${escapeHtml(row.latestEligibilityStatus || "-")}</td>
+        <td>${row.eligibleSightings ?? 0}</td>
+        <td>${row.stableResearchSightings ?? 0}</td>
+        <td>${metrics.trades ?? "-"}</td>
+        <td>${formatNumber(metrics.profitFactor)}</td>
+        <td class="${(metrics.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(metrics.totalReturnPct || 0)}%</td>
+        <td>${escapeHtml((row.sources || []).slice(0, 3).join(", ") || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Candidate Evidence Ledger <span class="neutral">${escapeHtml(rec.action || "NO_ACTION")}</span></h3>
+    <p class="modal-note">${escapeHtml(rec.reason || "Saved campaign evidence is summarized read-only.")}</p>
+    <div class="metric-grid">
+      <div class="metric"><span>Paper</span><strong>${payload.paperEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      <div class="metric"><span>Active</span><strong>${active.strategy ? `${escapeHtml(active.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.timeframe || "")}` : "-"}</strong></div>
+      <div class="metric"><span>Active ledger rank</span><strong>${summary.activeCandidateLedgerRank ?? "-"}</strong></div>
+      <div class="metric"><span>Candidates</span><strong>${summary.candidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Eligible</span><strong>${summary.eligibleCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Stable research</span><strong>${summary.stableResearchCandidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Files</span><strong>${(payload.sourceFiles || []).length}</strong></div>
+      <div class="metric"><span>Entries</span><strong>${payload.entriesRead ?? 0}</strong></div>
+    </div>
+    <table class="trade-table">
+      <thead><tr><th>Rank</th><th>Strategy</th><th>Market</th><th>Active</th><th>Sightings</th><th>Best Rank</th><th>Best Stability</th><th>Avg Stability</th><th>Latest Stability</th><th>Eligibility</th><th>Eligible Seen</th><th>Stable Seen</th><th>Trades</th><th>PF</th><th>Return</th><th>Sources</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="16">No saved candidate evidence found yet. Run campaign-runner with save=true after meaningful scans.</td></tr>`}</tbody>
+    </table>
+    <p class="modal-note">Read-only memory. This ledger reads ignored reports and does not run backtests, write config, change paper, or touch real trading.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }

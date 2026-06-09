@@ -1448,6 +1448,15 @@ def research_campaign_runner():
         return jsonify({"error": f"Could not build research campaign runner: {exc}"}), 502
 
 
+@app.get("/api/research/candidate-evidence-ledger")
+def research_candidate_evidence_ledger():
+    try:
+        payload, status_code = build_research_candidate_evidence_ledger(request.args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build candidate evidence ledger: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -8016,6 +8025,196 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
     if save:
         campaign["savedPath"] = save_research_snapshot(campaign, "json")
     return campaign, 200 if campaign["ok"] else 502
+
+
+def candidate_ledger_key(row: dict) -> str:
+    return "|".join([
+        str(row.get("strategy") or "-"),
+        str(row.get("symbol") or "-"),
+        str(row.get("timeframe") or "-"),
+    ])
+
+
+def candidate_ledger_source_files(limit: int) -> list[Path]:
+    roots = [
+        Path(app.root_path) / "reports" / "research-snapshots",
+        Path(app.root_path) / "reports" / "stability-first-search",
+    ]
+    files: list[Path] = []
+    for root in roots:
+        if root.exists():
+            files.extend(path for path in root.glob("*.json") if path.is_file())
+    files = sorted(files, key=lambda path: path.stat().st_mtime, reverse=True)
+    return files[:limit]
+
+
+def candidate_ledger_rows_from_payload(payload: dict, source: str) -> list[dict]:
+    rows: list[dict] = []
+    generated_at = payload.get("generatedAt")
+
+    def add(row: dict, source_section: str):
+        if not isinstance(row, dict) or not row.get("strategy"):
+            return
+        rows.append({
+            "source": source,
+            "sourceSection": source_section,
+            "observedAt": generated_at,
+            "strategy": row.get("strategy"),
+            "symbol": row.get("symbol"),
+            "timeframe": row.get("timeframe"),
+            "rank": row.get("rank"),
+            "tier": row.get("tier"),
+            "eligibilityStatus": row.get("eligibilityStatus") or (row.get("eligibility") or {}).get("status"),
+            "stabilityScore": row.get("stabilityScore"),
+            "trades": row.get("trades") or (row.get("fullPeriod") or {}).get("trades"),
+            "profitFactor": row.get("profitFactor") or (row.get("fullPeriod") or {}).get("profitFactor"),
+            "totalReturnPct": row.get("totalReturnPct") or (row.get("fullPeriod") or {}).get("totalReturnPct"),
+            "maxDrawdownPct": row.get("maxDrawdownPct") or (row.get("fullPeriod") or {}).get("maxDrawdownPct"),
+            "foldPassCount": row.get("foldPassCount") or (row.get("walkForward") or {}).get("foldPassCount"),
+            "negativeFoldCount": row.get("negativeFoldCount") or (row.get("walkForward") or {}).get("negativeFoldCount"),
+            "stressStatus": row.get("stressStatus") or (row.get("stress") or {}).get("status"),
+            "recentWindowStatus": row.get("recentWindowStatus") or (row.get("recentWindows") or {}).get("status"),
+            "reproducibilityStatus": row.get("reproducibilityStatus") or (row.get("reproducibility") or {}).get("status"),
+        })
+
+    modules = payload.get("modules") or {}
+    stability_summary = ((modules.get("stabilityFirstSearch") or {}).get("summary") or {})
+    for section in ("topCandidates", "bestResearchedCandidate", "bestStableCandidate", "bestEligibleChallenger"):
+        value = stability_summary.get(section)
+        if isinstance(value, list):
+            for row in value:
+                add(row, f"campaign.{section}")
+        else:
+            add(value or {}, f"campaign.{section}")
+    for row in payload.get("topCandidates") or []:
+        add(row, "stability.topCandidates")
+    for section in ("bestResearchedCandidate", "bestStableCandidate", "bestEligibleChallenger", "bestRawCandidate"):
+        add(payload.get(section) or {}, f"stability.{section}")
+    leaderboard_rows = payload.get("rows") or []
+    for row in leaderboard_rows:
+        add(row, "leaderboard.rows")
+    return rows
+
+
+def summarize_candidate_ledger(entries: list[dict], active_key: str) -> list[dict]:
+    grouped: dict[str, list[dict]] = {}
+    for entry in entries:
+        grouped.setdefault(candidate_ledger_key(entry), []).append(entry)
+    rows = []
+    for key, items in grouped.items():
+        items = sorted(items, key=lambda item: item.get("observedAt") or "")
+        latest = items[-1]
+        scores = [safe_float(item.get("stabilityScore"), None) for item in items if item.get("stabilityScore") is not None]
+        ranks = [safe_float(item.get("rank"), None) for item in items if item.get("rank") is not None]
+        eligible_count = sum(1 for item in items if item.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE")
+        stable_count = sum(1 for item in items if item.get("tier") in {"CHALLENGER_ELIGIBLE", "STABILITY_WATCH"} and item.get("eligibilityStatus") != "REJECTED")
+        rows.append({
+            "candidateKey": key,
+            "strategy": latest.get("strategy"),
+            "symbol": latest.get("symbol"),
+            "timeframe": latest.get("timeframe"),
+            "isActivePaperCandidate": key == active_key,
+            "sightings": len(items),
+            "firstSeenAt": items[0].get("observedAt"),
+            "latestSeenAt": latest.get("observedAt"),
+            "bestRank": min(ranks) if ranks else None,
+            "latestRank": latest.get("rank"),
+            "bestStabilityScore": max(scores) if scores else None,
+            "averageStabilityScore": round(sum(scores) / len(scores), 4) if scores else None,
+            "latestStabilityScore": latest.get("stabilityScore"),
+            "latestTier": latest.get("tier"),
+            "latestEligibilityStatus": latest.get("eligibilityStatus"),
+            "eligibleSightings": eligible_count,
+            "stableResearchSightings": stable_count,
+            "latestMetrics": {
+                "trades": latest.get("trades"),
+                "profitFactor": latest.get("profitFactor"),
+                "totalReturnPct": latest.get("totalReturnPct"),
+                "maxDrawdownPct": latest.get("maxDrawdownPct"),
+                "foldPassCount": latest.get("foldPassCount"),
+                "negativeFoldCount": latest.get("negativeFoldCount"),
+                "stressStatus": latest.get("stressStatus"),
+                "recentWindowStatus": latest.get("recentWindowStatus"),
+                "reproducibilityStatus": latest.get("reproducibilityStatus"),
+            },
+            "sources": sorted(set(item.get("sourceSection") for item in items if item.get("sourceSection"))),
+        })
+    rows.sort(key=lambda row: (
+        1 if row["eligibleSightings"] else 0,
+        row["stableResearchSightings"],
+        row["sightings"],
+        safe_float(row.get("bestStabilityScore"), -999999),
+        -safe_float(row.get("bestRank"), 999999),
+    ), reverse=True)
+    for index, row in enumerate(rows, start=1):
+        row["ledgerRank"] = index
+    return rows
+
+
+def build_research_candidate_evidence_ledger(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    active = primary_active_market(candidate)
+    active_strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
+    active_symbol = active.get("symbol") or "ETHUSDT"
+    active_timeframe = active.get("interval") or active.get("timeframe") or "1h"
+    active_key = candidate_ledger_key({"strategy": active_strategy, "symbol": active_symbol, "timeframe": active_timeframe})
+    file_limit = campaign_int(args, "fileLimit", 50, 1, 250)
+    row_limit = campaign_int(args, "limit", 25, 1, 100)
+    warnings = []
+    entries: list[dict] = []
+    files = candidate_ledger_source_files(file_limit)
+    for path in files:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            source = str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+            entries.extend(candidate_ledger_rows_from_payload(payload, source))
+        except Exception as exc:
+            warnings.append(f"Could not read ledger source {path.name}: {exc}")
+    active_entry = {
+        "source": "current_config",
+        "sourceSection": "activePaperCandidate",
+        "observedAt": datetime.now(timezone.utc).isoformat(),
+        "strategy": active_strategy,
+        "symbol": active_symbol,
+        "timeframe": active_timeframe,
+        "tier": "ACTIVE_PAPER_CANDIDATE",
+        "eligibilityStatus": "BASELINE",
+    }
+    entries.append(active_entry)
+    rows = summarize_candidate_ledger(entries, active_key)[:row_limit]
+    top = rows[0] if rows else {}
+    non_active_repeated = next((row for row in rows if not row.get("isActivePaperCandidate") and (row.get("eligibleSightings") or row.get("stableResearchSightings", 0) >= 2)), None)
+    recommendation = {
+        "action": "REVIEW_REPEATED_EVIDENCE" if non_active_repeated else "COLLECT_MORE_CAMPAIGNS",
+        "reason": "Ledger is strongest when candidates appear repeatedly across saved campaigns. Run campaign-runner with save=true after meaningful research scans.",
+    }
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "activePaperCandidate": {
+            **candidate_summary(candidate),
+            "strategy": active_strategy,
+            "symbol": active_symbol,
+            "timeframe": active_timeframe,
+            "candidateKey": active_key,
+        },
+        "sourceFiles": [str(path.relative_to(Path(app.root_path))).replace("\\", "/") for path in files],
+        "entriesRead": len(entries),
+        "rows": rows,
+        "summary": {
+            "candidateCount": len(rows),
+            "activeCandidateLedgerRank": next((row.get("ledgerRank") for row in rows if row.get("isActivePaperCandidate")), None),
+            "eligibleCandidateCount": sum(1 for row in rows if row.get("eligibleSightings")),
+            "stableResearchCandidateCount": sum(1 for row in rows if row.get("stableResearchSightings")),
+            "topCandidate": top,
+        },
+        "recommendation": recommendation,
+        "warnings": dedupe_list(([real_detail] if real_enabled else []) + warnings),
+    }, 200
 
 
 def compact_replay_trade(trade: dict) -> dict:
