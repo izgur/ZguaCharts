@@ -1,5 +1,6 @@
 import threading
 import time
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -31,9 +32,16 @@ def row(timestamp_ms, close):
 
 class BybitLoadingTests(unittest.TestCase):
     def setUp(self):
+        self._tmp_cache = tempfile.TemporaryDirectory()
+        self._cache_patch = patch.object(data_source, "BYBIT_DISK_CACHE_DIR", data_source.Path(self._tmp_cache.name))
+        self._cache_patch.start()
         data_source.clear_bybit_cache()
         data_source._bybit_rate_limiter._next_request_time = 0
         data_source._bybit_rate_limiter.total_wait_seconds = 0
+
+    def tearDown(self):
+        self._cache_patch.stop()
+        self._tmp_cache.cleanup()
 
     def test_bybit_requests_always_use_limit_1000(self):
         calls = []
@@ -84,10 +92,11 @@ class BybitLoadingTests(unittest.TestCase):
 
     def test_cache_reload_does_not_refetch_historical_candles(self):
         calls = []
+        now_minute = int(time.time() // 60) * 60_000
 
         def fake_get(_url, params, timeout):
             calls.append(dict(params))
-            return FakeResponse([row((1_000 + i) * 60_000, i) for i in range(1000)])
+            return FakeResponse([row(now_minute - (999 - i) * 60_000, i) for i in range(1000)])
 
         with patch.object(data_source.requests, "get", side_effect=fake_get):
             first = data_source.fetch_bybit_candles("BTCUSDT", "1m", 500)

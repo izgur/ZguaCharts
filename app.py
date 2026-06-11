@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import os
 import re
@@ -7421,10 +7422,21 @@ def build_research_fee_slippage_stress(args) -> tuple[dict, int]:
     timeframe = (args.get("timeframe") or args.get("interval") or active.get("interval") or active.get("timeframe") or "1h").strip()
     strategy = (args.get("strategy") or candidate.get("strategy") or "SimpleAtrTrendV2").strip()
     period = args.get("period", "365d")
-    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
-    maker_fee = safe_float(candidate.get("makerFeePct"), 0)
-    taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
-    slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    params, params_error, params_source = research_params_from_args(candidate, args)
+    context = candidate_context_from_config(candidate)
+    maker_fee = context["makerFeePct"]
+    taker_fee = context["takerFeePct"]
+    slippage_bps = context["slippageBps"]
+    candidate_identity = candidate_identity_from_parts(strategy, symbol, timeframe, params or {}, context["fillModel"], maker_fee, taker_fee, slippage_bps)
+    params_meta = validation_params_meta(params or {}, params_source, candidate_identity)
+    if params_error:
+        return {
+            **validation_not_comparable(params_error, params_meta),
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period},
+        }, 400
     command = package_node_script_args("research:fee-slippage-stress")
     command.extend([
         "--symbol", symbol,
@@ -7432,7 +7444,7 @@ def build_research_fee_slippage_stress(args) -> tuple[dict, int]:
         "--strategy", strategy,
         "--period", period,
         "--scenarios", args.get("scenarios", "default"),
-        "--baseParams", json.dumps(params),
+        "--baseParams", json.dumps(params or {}),
         "--makerFeePct", str(maker_fee),
         "--takerFeePct", str(taker_fee),
         "--slippageBps", str(slippage_bps),
@@ -7475,6 +7487,13 @@ def build_research_fee_slippage_stress(args) -> tuple[dict, int]:
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "candidate": candidate_summary(candidate),
+        "candidateKey": candidate_identity["candidateKey"],
+        "paramsUsed": params_meta["paramsUsed"],
+        "normalizedParams": params_meta["normalizedParams"],
+        "paramsHash": params_meta["paramsHash"],
+        "paramsSource": params_meta["paramsSource"],
+        "candidateParamsHash": params_meta["candidateParamsHash"],
+        "paramsMatchCandidate": params_meta["paramsMatchCandidate"],
         "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "scenarios": args.get("scenarios", "default")},
         "baseCostModel": payload.get("baseCostModel") or {"makerFeePct": maker_fee, "takerFeePct": taker_fee, "slippageBps": slippage_bps},
         "rows": payload.get("rows") or [],
@@ -7499,10 +7518,21 @@ def build_research_walk_forward_review(args) -> tuple[dict, int]:
     period = args.get("period", "365d")
     folds = max(1, min(int(safe_float(args.get("folds", 4), 4)), 12))
     recent_windows = args.get("recentWindows", args.get("recent_windows", "90,180,365"))
-    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
-    maker_fee = safe_float(candidate.get("makerFeePct"), 0)
-    taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
-    slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    params, params_error, params_source = research_params_from_args(candidate, args)
+    context = candidate_context_from_config(candidate)
+    maker_fee = context["makerFeePct"]
+    taker_fee = context["takerFeePct"]
+    slippage_bps = context["slippageBps"]
+    candidate_identity = candidate_identity_from_parts(strategy, symbol, timeframe, params or {}, context["fillModel"], maker_fee, taker_fee, slippage_bps)
+    params_meta = validation_params_meta(params or {}, params_source, candidate_identity)
+    if params_error:
+        return {
+            **validation_not_comparable(params_error, params_meta),
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "folds": folds, "recentWindows": recent_windows},
+        }, 400
     command = package_node_script_args("research:walk-forward-review")
     command.extend([
         "--symbol", symbol,
@@ -7511,7 +7541,7 @@ def build_research_walk_forward_review(args) -> tuple[dict, int]:
         "--period", period,
         "--folds", str(folds),
         "--recentWindows", str(recent_windows),
-        "--baseParams", json.dumps(params),
+        "--baseParams", json.dumps(params or {}),
         "--makerFeePct", str(maker_fee),
         "--takerFeePct", str(taker_fee),
         "--slippageBps", str(slippage_bps),
@@ -7553,6 +7583,13 @@ def build_research_walk_forward_review(args) -> tuple[dict, int]:
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "candidate": candidate_summary(candidate),
+        "candidateKey": candidate_identity["candidateKey"],
+        "paramsUsed": params_meta["paramsUsed"],
+        "normalizedParams": params_meta["normalizedParams"],
+        "paramsHash": params_meta["paramsHash"],
+        "paramsSource": params_meta["paramsSource"],
+        "candidateParamsHash": params_meta["candidateParamsHash"],
+        "paramsMatchCandidate": params_meta["paramsMatchCandidate"],
         "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "folds": folds, "recentWindows": recent_windows},
         "full": payload.get("full") or {},
         "recentWindows": payload.get("recentWindows") or [],
@@ -7578,10 +7615,21 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
     period = args.get("period", "365d")
     regime_basis = args.get("regimeBasis", args.get("regime_basis", "symbol1h"))
     include_trades = str(args.get("includeTrades", args.get("include_trades", "true"))).strip().lower() not in {"0", "false", "no", "off"}
-    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
-    maker_fee = safe_float(candidate.get("makerFeePct"), 0)
-    taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
-    slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    params, params_error, params_source = research_params_from_args(candidate, args)
+    context = candidate_context_from_config(candidate)
+    maker_fee = context["makerFeePct"]
+    taker_fee = context["takerFeePct"]
+    slippage_bps = context["slippageBps"]
+    candidate_identity = candidate_identity_from_parts(strategy, symbol, timeframe, params or {}, context["fillModel"], maker_fee, taker_fee, slippage_bps)
+    params_meta = validation_params_meta(params or {}, params_source, candidate_identity)
+    if params_error:
+        return {
+            **validation_not_comparable(params_error, params_meta),
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "candidate": candidate_summary(candidate),
+            "search": {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "regimeBasis": regime_basis, "includeTrades": include_trades},
+        }, 400
     command = package_node_script_args("research:regime-breakdown")
     command.extend([
         "--symbol", symbol,
@@ -7590,7 +7638,7 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
         "--period", period,
         "--regimeBasis", str(regime_basis),
         "--includeTrades", "true" if include_trades else "false",
-        "--baseParams", json.dumps(params),
+        "--baseParams", json.dumps(params or {}),
         "--makerFeePct", str(maker_fee),
         "--takerFeePct", str(taker_fee),
         "--slippageBps", str(slippage_bps),
@@ -7632,6 +7680,13 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "candidate": candidate_summary(candidate),
+        "candidateKey": candidate_identity["candidateKey"],
+        "paramsUsed": params_meta["paramsUsed"],
+        "normalizedParams": params_meta["normalizedParams"],
+        "paramsHash": params_meta["paramsHash"],
+        "paramsSource": params_meta["paramsSource"],
+        "candidateParamsHash": params_meta["candidateParamsHash"],
+        "paramsMatchCandidate": params_meta["paramsMatchCandidate"],
         "search": payload.get("search") or {"symbol": symbol, "timeframe": timeframe, "strategy": strategy, "period": period, "regimeBasis": regime_basis, "includeTrades": include_trades},
         "full": payload.get("full") or {},
         "summary": payload.get("summary") or {},
@@ -7756,6 +7811,7 @@ def build_research_stability_first_challenger_search(args) -> tuple[dict, int]:
     maker_fee = safe_float(candidate.get("makerFeePct"), 0)
     taker_fee = safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055))
     slippage_bps = safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100)
+    fill_model = candidate.get("fillModel") or "next-open"
     command = package_node_script_args("research:stability-first-challenger-search")
     command.extend([
         "--symbols", str(args.get("symbols", "ETHUSDT,BTCUSDT")),
@@ -7777,6 +7833,7 @@ def build_research_stability_first_challenger_search(args) -> tuple[dict, int]:
         "--makerFeePct", str(maker_fee),
         "--takerFeePct", str(taker_fee),
         "--slippageBps", str(slippage_bps),
+        "--fillModel", str(fill_model),
         "--paperEnabled", "true" if paper_enabled else "false",
     ])
     if args.get("limit"):
@@ -7833,12 +7890,199 @@ def campaign_int(args, name: str, default: int, minimum: int, maximum: int) -> i
     return max(minimum, min(int(safe_float(args.get(name, default), default)), maximum))
 
 
+CANONICAL_CANDIDATE_IDENTITY_VERSION = "candidate-identity-v1"
+
+
+def stable_json(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def short_hash(value) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()[:16]
+
+
+def current_git_commit() -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def normalized_candidate_params(params: dict | None) -> dict:
+    if not isinstance(params, dict):
+        return {}
+    normalized = {}
+    for key in sorted(params):
+        value = params[key]
+        if value is None:
+            continue
+        if isinstance(value, float):
+            normalized[key] = round(value, 10)
+        elif isinstance(value, dict):
+            normalized[key] = normalized_candidate_params(value)
+        elif isinstance(value, list):
+            normalized[key] = [normalized_candidate_params(item) if isinstance(item, dict) else item for item in value]
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def parse_json_arg(args, *names: str) -> tuple[dict | None, str | None]:
+    for name in names:
+        raw = args.get(name) if hasattr(args, "get") else None
+        if raw in (None, ""):
+            continue
+        if isinstance(raw, dict):
+            return dict(raw), None
+        try:
+            parsed = json.loads(str(raw))
+        except Exception as exc:
+            return None, f"{name} must be valid JSON: {exc}"
+        if not isinstance(parsed, dict):
+            return None, f"{name} must be a JSON object."
+        return parsed, None
+    return None, None
+
+
+def research_params_from_args(candidate: dict, args) -> tuple[dict | None, str | None, str]:
+    params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
+    params_source = "current_candidate"
+    for field in ("fillModel", "accountEquity", "riskPct", "maxOpenTrades", "maxNotional", "maxNotionalPerTrade", "regimeMode"):
+        if candidate.get(field) is not None and params.get(field) is None:
+            params[field] = candidate.get(field)
+    override, error = parse_json_arg(args, "baseParams", "params")
+    if error:
+        return None, error, params_source
+    if override is not None:
+        params = override
+        params_source = "explicit_args"
+    return params, None, params_source
+
+
+def candidate_identity_from_parts(
+    strategy: str | None,
+    symbol: str | None,
+    timeframe: str | None,
+    params: dict | None,
+    fill_model: str | None = None,
+    maker_fee_pct=None,
+    taker_fee_pct=None,
+    slippage_bps=None,
+) -> dict:
+    normalized_params = normalized_candidate_params(params)
+    params_hash = short_hash(normalized_params)
+    execution_context = {
+        "fillModel": fill_model or "next-open",
+        "makerFeePct": safe_float(maker_fee_pct, 0),
+        "takerFeePct": safe_float(taker_fee_pct, 0),
+        "slippageBps": safe_float(slippage_bps, 0),
+    }
+    identity_payload = {
+        "candidateIdentityVersion": CANONICAL_CANDIDATE_IDENTITY_VERSION,
+        "strategy": strategy or "-",
+        "symbol": symbol or "-",
+        "timeframe": timeframe or "-",
+        "normalizedParams": normalized_params,
+        "paramsHash": params_hash,
+        **execution_context,
+    }
+    execution_context_hash = short_hash(execution_context)
+    candidate_key = "|".join([
+        CANONICAL_CANDIDATE_IDENTITY_VERSION,
+        str(identity_payload["strategy"]),
+        str(identity_payload["symbol"]),
+        str(identity_payload["timeframe"]),
+        params_hash,
+        execution_context_hash,
+    ])
+    return {
+        **identity_payload,
+        "candidateKey": candidate_key,
+        "executionContextHash": execution_context_hash,
+    }
+
+
+def candidate_identity_from_row(row: dict, default_context: dict | None = None) -> dict:
+    default_context = default_context or {}
+    if row.get("candidateKey") and row.get("paramsHash"):
+        return {
+            "candidateKey": row.get("candidateKey"),
+            "paramsHash": row.get("paramsHash"),
+            "normalizedParams": row.get("normalizedParams") or normalized_candidate_params(row.get("params") or {}),
+            "executionContextHash": row.get("executionContextHash"),
+            "candidateIdentityVersion": row.get("candidateIdentityVersion") or CANONICAL_CANDIDATE_IDENTITY_VERSION,
+            "legacyIdentity": False,
+        }
+    params = row.get("normalizedParams") or row.get("params") or {}
+    identity = candidate_identity_from_parts(
+        row.get("strategy"),
+        row.get("symbol"),
+        row.get("timeframe"),
+        params,
+        row.get("fillModel") or default_context.get("fillModel"),
+        row.get("makerFeePct", default_context.get("makerFeePct")),
+        row.get("takerFeePct", default_context.get("takerFeePct")),
+        row.get("slippageBps", default_context.get("slippageBps")),
+    )
+    identity["legacyIdentity"] = not bool(row.get("paramsHash"))
+    return identity
+
+
+def candidate_context_from_config(candidate: dict) -> dict:
+    return {
+        "fillModel": candidate.get("fillModel") or "next-open",
+        "makerFeePct": safe_float(candidate.get("makerFeePct"), 0),
+        "takerFeePct": safe_float(candidate.get("takerFeePct"), safe_float(candidate.get("feePct"), 0.055)),
+        "slippageBps": safe_float(candidate.get("slippageBps"), safe_float(candidate.get("slippagePct"), 0.02) * 100),
+    }
+
+
+def validation_params_meta(params: dict | None, params_source: str, candidate_identity: dict | None = None) -> dict:
+    normalized = normalized_candidate_params(params)
+    params_hash = short_hash(normalized)
+    candidate_hash = (candidate_identity or {}).get("paramsHash")
+    return {
+        "paramsUsed": params or {},
+        "normalizedParams": normalized,
+        "paramsHash": params_hash,
+        "paramsSource": params_source,
+        "candidateParamsHash": candidate_hash,
+        "paramsMatchCandidate": candidate_hash is None or params_hash == candidate_hash,
+    }
+
+
+def validation_not_comparable(reason: str, params_meta: dict | None = None) -> dict:
+    return {
+        "ok": False,
+        "status": "VALIDATION_NOT_COMPARABLE",
+        "reason": reason,
+        **(params_meta or {}),
+        "warnings": [reason],
+    }
+
+
 def compact_campaign_candidate(row: dict) -> dict:
+    identity = candidate_identity_from_row(row)
     return {
         "rank": row.get("rank"),
         "strategy": row.get("strategy"),
         "symbol": row.get("symbol"),
         "timeframe": row.get("timeframe"),
+        "candidateKey": identity.get("candidateKey"),
+        "paramsHash": identity.get("paramsHash"),
+        "executionContextHash": identity.get("executionContextHash"),
+        "candidateIdentityVersion": identity.get("candidateIdentityVersion"),
+        "legacyIdentity": identity.get("legacyIdentity"),
+        "normalizedParams": identity.get("normalizedParams"),
         "tier": row.get("tier"),
         "eligibilityStatus": (row.get("eligibility") or {}).get("status"),
         "stabilityScore": row.get("stabilityScore"),
@@ -7858,8 +8102,29 @@ def compact_campaign_candidate(row: dict) -> dict:
 
 
 def compact_campaign_validation(candidate: dict, fee_stress: dict, walk_forward: dict, regime: dict) -> dict:
+    candidate_compact = compact_campaign_candidate(candidate)
+    candidate_hash = candidate_compact.get("paramsHash")
+
+    def comparable(module: dict) -> bool:
+        if not module:
+            return False
+        if module.get("ok") is False or module.get("status") in {"PARAM_MISMATCH", "VALIDATION_NOT_COMPARABLE", "ERROR"}:
+            return False
+        if candidate_hash and module.get("candidateParamsHash") and module.get("candidateParamsHash") != candidate_hash:
+            return False
+        return module.get("paramsMatchCandidate") is not False
+
+    module_status = {
+        "feeSlippageStress": "COMPARABLE" if comparable(fee_stress) else "VALIDATION_NOT_COMPARABLE",
+        "walkForward": "COMPARABLE" if comparable(walk_forward) else "VALIDATION_NOT_COMPARABLE",
+        "regimeBreakdown": "COMPARABLE" if comparable(regime) else "VALIDATION_NOT_COMPARABLE",
+    }
     return {
-        "candidate": compact_campaign_candidate(candidate),
+        "candidate": candidate_compact,
+        "candidateKey": candidate_compact.get("candidateKey"),
+        "paramsHash": candidate_hash,
+        "validationComparability": module_status,
+        "comparableEvidenceOnly": all(value == "COMPARABLE" for value in module_status.values()),
         "feeSlippageStress": compact_snapshot_fee_stress(fee_stress),
         "walkForward": compact_snapshot_walk_forward(walk_forward),
         "regimeBreakdown": compact_snapshot_regime_breakdown(regime),
@@ -7885,7 +8150,13 @@ def research_campaign_recommendation(stability: dict, validations: list[dict], r
             "action": "RESEARCH_STABLE_CANDIDATE_MORE",
             "reason": "A stable research candidate exists, but no candidate cleared all eligibility gates.",
         }
-    if validations:
+    comparable_validations = [row for row in validations if row.get("comparableEvidenceOnly")]
+    if validations and not comparable_validations:
+        return {
+            "action": "VALIDATION_NOT_COMPARABLE",
+            "reason": "Deep validation did not match selected candidate parameters, so campaign conclusions exclude it.",
+        }
+    if comparable_validations:
         return {
             "action": "KEEP_CURRENT_RESEARCH_MORE",
             "reason": "Top research rows were found, but validation still shows unresolved stability, concentration, stress, or regime issues.",
@@ -7919,6 +8190,20 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
     timeout_seconds = str(campaign_int(args, "timeout_seconds", 900, 60, 1800))
     warnings = []
 
+    def module_envelope(name: str, ok: bool, summary: dict, scope: dict, started_at: str) -> dict:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        return {
+            "name": name,
+            "ok": ok,
+            "status": "PASS" if ok else "ERROR",
+            "startedAt": started_at,
+            "finishedAt": finished_at,
+            "scope": scope,
+            "inputProvenance": {"source": "backend_builder_args", "readOnly": True},
+            "outputProvenance": {"source": "subprocess_or_backend_payload", "readOnly": True},
+            "summary": summary,
+        }
+
     def capture(name: str, builder, section_args: dict) -> tuple[dict, bool]:
         try:
             payload, status_code = builder(section_args)
@@ -7932,6 +8217,8 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             return {"ok": False, "error": str(exc)}, False
 
     generated_at = datetime.now(timezone.utc).isoformat()
+    campaign_id = f"campaign-{generated_at.replace(':', '').replace('-', '').replace('+00:00', 'Z')}-{uuid.uuid4().hex[:8]}"
+    git_commit = current_git_commit()
     search_args = {
         "symbols": symbols,
         "timeframes": timeframes,
@@ -7946,7 +8233,9 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
         "reproReruns": args.get("reproReruns", "2"),
         "timeout_seconds": timeout_seconds,
     }
+    stability_started = datetime.now(timezone.utc).isoformat()
     stability, stability_ok = capture("stability-first challenger search", build_research_stability_first_challenger_search, search_args)
+    leaderboard_started = datetime.now(timezone.utc).isoformat()
     leaderboard, leaderboard_ok = capture(
         "research candidate leaderboard",
         build_research_candidate_leaderboard,
@@ -7959,6 +8248,7 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             "timeout_seconds": timeout_seconds,
         },
     )
+    activity_started = datetime.now(timezone.utc).isoformat()
     activity, activity_ok = capture(
         "backtest activity lab",
         build_research_activity_lab,
@@ -7976,12 +8266,15 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
     top_rows = stability.get("topCandidates") or []
     validation_rows = []
     for row in top_rows[:validate_top]:
+        row_identity = candidate_identity_from_row(row)
+        selected_params = row_identity.get("normalizedParams") or row.get("params") or {}
         spec = {
             "symbol": row.get("symbol") or active_symbol,
             "timeframe": row.get("timeframe") or active_timeframe,
             "strategy": row.get("strategy") or active_strategy,
             "period": period,
             "timeout_seconds": timeout_seconds,
+            "baseParams": json.dumps(selected_params),
         }
         fee_payload, _ = capture(f"fee/slippage stress {spec['strategy']} {spec['symbol']} {spec['timeframe']}", build_research_fee_slippage_stress, spec)
         walk_payload, _ = capture(f"walk-forward review {spec['strategy']} {spec['symbol']} {spec['timeframe']}", build_research_walk_forward_review, {**spec, "folds": args.get("folds", "4")})
@@ -7991,8 +8284,7 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             regime_payload = {"ok": True, "summary": {"regimeDependencyStatus": "NOT_RUN", "recommendation": {"action": "NOT_RUN", "reason": "includeRegime=false"}}}
         validation_rows.append(compact_campaign_validation(row, fee_payload, walk_payload, regime_payload))
 
-    modules = {
-        "stabilityFirstSearch": {"ok": stability_ok, "summary": {
+    stability_summary = {
             "verdict": stability.get("verdict") or {},
             "search": stability.get("search") or {},
             "benchmark": compact_campaign_candidate(stability.get("benchmark") or {}),
@@ -8000,19 +8292,33 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             "bestStableCandidate": compact_campaign_candidate(stability.get("bestStableCandidate") or {}),
             "bestEligibleChallenger": compact_campaign_candidate(stability.get("bestEligibleChallenger") or {}),
             "topCandidates": [compact_campaign_candidate(row) for row in top_rows[: int(top_n)]],
-        }},
-        "leaderboard": {"ok": leaderboard_ok, "summary": compact_snapshot_leaderboard(leaderboard)},
-        "activity": {"ok": activity_ok, "summary": {
+        }
+    leaderboard_summary = compact_snapshot_leaderboard(leaderboard)
+    activity_summary = {
             "rowsTested": len(activity.get("rows") or []),
             "bestOverall": compact_snapshot_row((activity.get("summary") or {}).get("bestOverall") or {}),
             "recommendation": (activity.get("summary") or {}).get("recommendation") or {},
-        }},
+        }
+    scope_common = {
+        "symbols": symbols.split(","),
+        "timeframes": timeframes.split(","),
+        "period": period,
+        "source": "bybit",
+    }
+    modules = {
+        "stabilityFirstSearch": module_envelope("stabilityFirstSearch", stability_ok, stability_summary, {**scope_common, "strategies": strategies, "maxCombosPerStrategy": int(max_combos), "topN": int(top_n)}, stability_started),
+        "leaderboard": module_envelope("leaderboard", leaderboard_ok, leaderboard_summary, {**scope_common, "strategies": active_strategy if strategies == "all" else strategies, "scopeMismatch": strategies == "all"}, leaderboard_started),
+        "activity": module_envelope("activity", activity_ok, activity_summary, {**scope_common, "strategies": active_strategy if strategies == "all" else strategies, "scopeMismatch": strategies == "all"}, activity_started),
         "deepValidation": validation_rows,
     }
     recommendation = research_campaign_recommendation(stability, validation_rows, real_enabled)
     campaign = {
         "ok": stability_ok and leaderboard_ok and activity_ok,
+        "schemaVersion": "research-campaign-v2",
+        "campaignId": campaign_id,
         "generatedAt": generated_at,
+        "gitCommit": git_commit,
+        "candidateIdentityVersion": CANONICAL_CANDIDATE_IDENTITY_VERSION,
         "savedPath": None,
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
@@ -8030,8 +8336,27 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             "maxCombosPerStrategy": int(max_combos),
             "topN": int(top_n),
             "validateTop": validate_top,
+            "folds": int(safe_float(args.get("folds", 4), 4)),
+            "includeStress": include_stress,
+            "includeRecentWindows": include_recent,
+            "includeReproAudit": include_repro,
             "readOnly": True,
         },
+        "dataContext": {
+            "source": "bybit",
+            "requestedPeriod": period,
+            "requestedSymbols": symbols.split(","),
+            "requestedTimeframes": timeframes.split(","),
+        },
+        "executionContext": {
+            **candidate_context_from_config(candidate),
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+        },
+        "scopeWarnings": [
+            "leaderboard/activity scoped to active strategy while stability search used all strategies"
+        ] if strategies == "all" else [],
+        "comparableEvidenceOnly": all(row.get("comparableEvidenceOnly") for row in validation_rows) if validation_rows else True,
         "modules": modules,
         "recommendation": recommendation,
         "safety": {
@@ -8049,7 +8374,8 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
 
 
 def candidate_ledger_key(row: dict) -> str:
-    return "|".join([
+    return candidate_identity_from_row(row).get("candidateKey") or "|".join([
+        "legacy",
         str(row.get("strategy") or "-"),
         str(row.get("symbol") or "-"),
         str(row.get("timeframe") or "-"),
@@ -8069,6 +8395,31 @@ def candidate_ledger_source_files(limit: int) -> list[Path]:
     return files[:limit]
 
 
+def approved_research_report_roots() -> list[Path]:
+    return [
+        Path(app.root_path) / "reports" / "research-snapshots",
+        Path(app.root_path) / "reports" / "stability-first-search",
+        Path(app.root_path) / "reports" / "research-audits",
+        Path(app.root_path) / "reports" / "research-batches",
+        Path(app.root_path) / "reports" / "research-drilldowns",
+        Path(app.root_path) / "reports" / "research-leads",
+    ]
+
+
+def resolve_research_report_path(raw: str) -> Path | None:
+    root = Path(app.root_path).resolve()
+    path = (root / str(raw)).resolve()
+    if path.suffix.lower() != ".json":
+        return None
+    for allowed in approved_research_report_roots():
+        try:
+            path.relative_to(allowed.resolve())
+            return path
+        except ValueError:
+            continue
+    return None
+
+
 def candidate_ledger_rows_from_payload(payload: dict, source: str) -> list[dict]:
     rows: list[dict] = []
     generated_at = payload.get("generatedAt")
@@ -8076,6 +8427,7 @@ def candidate_ledger_rows_from_payload(payload: dict, source: str) -> list[dict]
     def add(row: dict, source_section: str):
         if not isinstance(row, dict) or not row.get("strategy"):
             return
+        identity = candidate_identity_from_row(row)
         rows.append({
             "source": source,
             "sourceSection": source_section,
@@ -8083,6 +8435,13 @@ def candidate_ledger_rows_from_payload(payload: dict, source: str) -> list[dict]
             "strategy": row.get("strategy"),
             "symbol": row.get("symbol"),
             "timeframe": row.get("timeframe"),
+            "candidateKey": identity.get("candidateKey"),
+            "paramsHash": identity.get("paramsHash"),
+            "executionContextHash": identity.get("executionContextHash"),
+            "candidateIdentityVersion": identity.get("candidateIdentityVersion"),
+            "legacyIdentity": identity.get("legacyIdentity"),
+            "params": row.get("params") or {},
+            "normalizedParams": identity.get("normalizedParams"),
             "rank": row.get("rank"),
             "tier": row.get("tier"),
             "eligibilityStatus": row.get("eligibilityStatus") or (row.get("eligibility") or {}).get("status"),
@@ -8125,17 +8484,30 @@ def summarize_candidate_ledger(entries: list[dict], active_key: str) -> list[dic
     for key, items in grouped.items():
         items = sorted(items, key=lambda item: item.get("observedAt") or "")
         latest = items[-1]
+        campaign_items = [item for item in items if item.get("source") != "current_config"]
+        by_source: dict[str, list[dict]] = {}
+        for item in campaign_items:
+            by_source.setdefault(item.get("source") or "-", []).append(item)
         scores = [safe_float(item.get("stabilityScore"), None) for item in items if item.get("stabilityScore") is not None]
         ranks = [safe_float(item.get("rank"), None) for item in items if item.get("rank") is not None]
-        eligible_count = sum(1 for item in items if item.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE")
-        stable_count = sum(1 for item in items if item.get("tier") in {"CHALLENGER_ELIGIBLE", "STABILITY_WATCH"} and item.get("eligibilityStatus") != "REJECTED")
+        eligible_count = sum(1 for source_items in by_source.values() if any(item.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE" for item in source_items))
+        stable_count = sum(1 for source_items in by_source.values() if any(item.get("tier") in {"CHALLENGER_ELIGIBLE", "STABILITY_WATCH"} and item.get("eligibilityStatus") != "REJECTED" for item in source_items))
+        source_reports = sorted(by_source.keys())
         rows.append({
             "candidateKey": key,
+            "paramsHash": latest.get("paramsHash"),
+            "executionContextHash": latest.get("executionContextHash"),
+            "candidateIdentityVersion": latest.get("candidateIdentityVersion") or "legacy",
+            "legacyIdentity": bool(latest.get("legacyIdentity")),
+            "normalizedParams": latest.get("normalizedParams") or {},
             "strategy": latest.get("strategy"),
             "symbol": latest.get("symbol"),
             "timeframe": latest.get("timeframe"),
             "isActivePaperCandidate": key == active_key,
-            "sightings": len(items),
+            "sightings": len(source_reports),
+            "campaignSightings": len(source_reports),
+            "sourceReportCount": len(source_reports),
+            "sectionAppearances": len(campaign_items),
             "firstSeenAt": items[0].get("observedAt"),
             "latestSeenAt": latest.get("observedAt"),
             "bestRank": min(ranks) if ranks else None,
@@ -8158,6 +8530,7 @@ def summarize_candidate_ledger(entries: list[dict], active_key: str) -> list[dic
                 "recentWindowStatus": latest.get("recentWindowStatus"),
                 "reproducibilityStatus": latest.get("reproducibilityStatus"),
             },
+            "sourceReports": source_reports,
             "sources": sorted(set(item.get("sourceSection") for item in items if item.get("sourceSection"))),
         })
     rows.sort(key=lambda row: (
@@ -8180,7 +8553,17 @@ def build_research_candidate_evidence_ledger(args) -> tuple[dict, int]:
     active_strategy = candidate.get("strategy") or "SimpleAtrTrendV2"
     active_symbol = active.get("symbol") or "ETHUSDT"
     active_timeframe = active.get("interval") or active.get("timeframe") or "1h"
-    active_key = candidate_ledger_key({"strategy": active_strategy, "symbol": active_symbol, "timeframe": active_timeframe})
+    active_context = candidate_context_from_config(candidate)
+    active_key = candidate_identity_from_parts(
+        active_strategy,
+        active_symbol,
+        active_timeframe,
+        candidate.get("params") if isinstance(candidate.get("params"), dict) else {},
+        active_context["fillModel"],
+        active_context["makerFeePct"],
+        active_context["takerFeePct"],
+        active_context["slippageBps"],
+    )["candidateKey"]
     file_limit = campaign_int(args, "fileLimit", 50, 1, 250)
     row_limit = campaign_int(args, "limit", 25, 1, 100)
     warnings = []
@@ -8200,6 +8583,11 @@ def build_research_candidate_evidence_ledger(args) -> tuple[dict, int]:
         "strategy": active_strategy,
         "symbol": active_symbol,
         "timeframe": active_timeframe,
+        "params": candidate.get("params") if isinstance(candidate.get("params"), dict) else {},
+        "fillModel": active_context["fillModel"],
+        "makerFeePct": active_context["makerFeePct"],
+        "takerFeePct": active_context["takerFeePct"],
+        "slippageBps": active_context["slippageBps"],
         "tier": "ACTIVE_PAPER_CANDIDATE",
         "eligibilityStatus": "BASELINE",
     }
@@ -8240,12 +8628,14 @@ def build_research_candidate_evidence_ledger(args) -> tuple[dict, int]:
 
 def research_result_diff_files(args) -> tuple[Path | None, Path | None, list[str]]:
     warnings = []
-    root = Path(app.root_path)
     current_arg = args.get("current")
     previous_arg = args.get("previous")
     if current_arg and previous_arg:
-        current = root / str(current_arg)
-        previous = root / str(previous_arg)
+        current = resolve_research_report_path(str(current_arg))
+        previous = resolve_research_report_path(str(previous_arg))
+        if not current or not previous:
+            warnings.append("Explicit report paths must stay under approved reports directories and point to JSON files.")
+            return None, None, warnings
         return current, previous, warnings
     files = candidate_ledger_source_files(campaign_int(args, "fileLimit", 20, 2, 250))
     if len(files) < 2:
@@ -8270,7 +8660,59 @@ def candidate_rows_by_key(payload: dict, source: str) -> dict[str, dict]:
     return by_key
 
 
-def compact_diff_row(key: str, current: dict | None, previous: dict | None) -> dict:
+def research_context_for_diff(payload: dict) -> dict:
+    search = payload.get("search") or {}
+    run_context = payload.get("runContext") or {}
+    modules = payload.get("modules") or {}
+    stability_scope = (((modules.get("stabilityFirstSearch") or {}).get("scope")) or {})
+    execution = payload.get("executionContext") or {}
+    data_context = payload.get("dataContext") or {}
+    return {
+        "period": search.get("period") or run_context.get("period") or data_context.get("requestedPeriod"),
+        "source": data_context.get("source") or run_context.get("source") or search.get("source") or "bybit",
+        "symbols": search.get("symbols") or stability_scope.get("symbols"),
+        "timeframes": search.get("timeframes") or stability_scope.get("timeframes"),
+        "strategies": search.get("strategies") or stability_scope.get("strategies"),
+        "folds": search.get("folds") or run_context.get("folds"),
+        "maxCombosPerStrategy": search.get("maxCombosPerStrategy") or run_context.get("maxCombosPerStrategy"),
+        "topN": search.get("topN") or run_context.get("topN"),
+        "validateTop": search.get("validateTop"),
+        "from": run_context.get("from"),
+        "to": run_context.get("to"),
+        "costs": run_context.get("costs") or {
+            "makerFeePct": execution.get("makerFeePct"),
+            "takerFeePct": execution.get("takerFeePct"),
+            "slippageBps": execution.get("slippageBps"),
+        },
+        "fillModel": run_context.get("fillModel") or execution.get("fillModel"),
+        "schemaVersion": payload.get("schemaVersion"),
+        "candidateIdentityVersion": payload.get("candidateIdentityVersion"),
+        "gitCommit": payload.get("gitCommit"),
+    }
+
+
+def compare_research_contexts(current: dict, previous: dict) -> dict:
+    important = ["period", "source", "symbols", "timeframes", "strategies", "folds", "costs", "fillModel", "candidateIdentityVersion"]
+    optional = ["from", "to", "maxCombosPerStrategy", "topN", "validateTop", "schemaVersion", "gitCommit"]
+    differences = []
+    for key in important + optional:
+        if stable_json(current.get(key)) != stable_json(previous.get(key)):
+            differences.append({"field": key, "current": current.get(key), "previous": previous.get(key), "severity": "important" if key in important else "optional"})
+    important_differences = [item for item in differences if item["severity"] == "important"]
+    if not differences:
+        status = "COMPARABLE"
+    elif important_differences:
+        status = "NOT_COMPARABLE" if any(item["field"] in {"period", "source", "costs", "fillModel", "candidateIdentityVersion"} for item in important_differences) else "PARTIALLY_COMPARABLE"
+    else:
+        status = "PARTIALLY_COMPARABLE"
+    return {
+        "status": status,
+        "differences": differences,
+        "scoreDeltasAllowed": status == "COMPARABLE",
+    }
+
+
+def compact_diff_row(key: str, current: dict | None, previous: dict | None, score_deltas_allowed: bool = True) -> dict:
     cur = current or {}
     prev = previous or {}
     return {
@@ -8283,7 +8725,7 @@ def compact_diff_row(key: str, current: dict | None, previous: dict | None) -> d
         "rankDelta": None if cur.get("rank") is None or prev.get("rank") is None else safe_float(prev.get("rank"), 0) - safe_float(cur.get("rank"), 0),
         "currentStabilityScore": cur.get("stabilityScore"),
         "previousStabilityScore": prev.get("stabilityScore"),
-        "stabilityScoreDelta": None if cur.get("stabilityScore") is None or prev.get("stabilityScore") is None else round(safe_float(cur.get("stabilityScore"), 0) - safe_float(prev.get("stabilityScore"), 0), 4),
+        "stabilityScoreDelta": None if not score_deltas_allowed or cur.get("stabilityScore") is None or prev.get("stabilityScore") is None else round(safe_float(cur.get("stabilityScore"), 0) - safe_float(prev.get("stabilityScore"), 0), 4),
         "currentEligibilityStatus": cur.get("eligibilityStatus"),
         "previousEligibilityStatus": prev.get("eligibilityStatus"),
         "currentTier": cur.get("tier"),
@@ -8315,15 +8757,19 @@ def build_research_result_diff(args) -> tuple[dict, int]:
         }, 404
     current_source = str(current_path.relative_to(Path(app.root_path))).replace("\\", "/")
     previous_source = str(previous_path.relative_to(Path(app.root_path))).replace("\\", "/")
+    current_context = research_context_for_diff(current_payload)
+    previous_context = research_context_for_diff(previous_payload)
+    comparability = compare_research_contexts(current_context, previous_context)
+    score_deltas_allowed = comparability.get("scoreDeltasAllowed") is True
     current_rows = candidate_rows_by_key(current_payload, current_source)
     previous_rows = candidate_rows_by_key(previous_payload, previous_source)
     current_keys = set(current_rows.keys())
     previous_keys = set(previous_rows.keys())
-    added = [compact_diff_row(key, current_rows[key], None) for key in sorted(current_keys - previous_keys)]
-    removed = [compact_diff_row(key, None, previous_rows[key]) for key in sorted(previous_keys - current_keys)]
+    added = [compact_diff_row(key, current_rows[key], None, score_deltas_allowed) for key in sorted(current_keys - previous_keys)]
+    removed = [compact_diff_row(key, None, previous_rows[key], score_deltas_allowed) for key in sorted(previous_keys - current_keys)]
     changed = []
     for key in sorted(current_keys & previous_keys):
-        row = compact_diff_row(key, current_rows[key], previous_rows[key])
+        row = compact_diff_row(key, current_rows[key], previous_rows[key], score_deltas_allowed)
         if row["rankDelta"] not in {None, 0} or row["stabilityScoreDelta"] not in {None, 0} or row["currentEligibilityStatus"] != row["previousEligibilityStatus"]:
             changed.append(row)
     changed.sort(key=lambda row: abs(safe_float(row.get("stabilityScoreDelta"), 0)) + abs(safe_float(row.get("rankDelta"), 0)), reverse=True)
@@ -8343,6 +8789,9 @@ def build_research_result_diff(args) -> tuple[dict, int]:
         "previousFile": previous_source,
         "currentGeneratedAt": current_payload.get("generatedAt"),
         "previousGeneratedAt": previous_payload.get("generatedAt"),
+        "comparability": comparability,
+        "currentContext": current_context,
+        "previousContext": previous_context,
         "verdict": {
             "changed": verdict_changed,
             "current": current_verdict,
@@ -8373,6 +8822,63 @@ def checklist_item(items: list[dict], name: str, passed: bool, severity: str, de
     })
 
 
+def normalize_stability_status(payload: dict) -> dict:
+    candidates = [
+        ("validation.status", ((payload.get("validation") or {}).get("status"))),
+        ("status", payload.get("status")),
+        ("stability.status", ((payload.get("stability") or {}).get("status"))),
+    ]
+    raw = None
+    source = None
+    for field, value in candidates:
+        if value not in (None, ""):
+            raw = str(value).upper()
+            source = field
+            break
+    mapping = {
+        "PASS": "PASS",
+        "WATCH": "WATCH",
+        "WARN": "WATCH",
+        "STABLE": "PASS",
+        "FAIL": "FAIL",
+        "ERROR": "ERROR",
+        "BLOCKED": "FAIL",
+    }
+    normalized = mapping.get(raw or "", "UNKNOWN")
+    validation = payload.get("validation") or {}
+    aggregate = validation.get("aggregate") or {}
+    windows = validation.get("windows") or []
+    fold_returns = [safe_float(row.get("totalReturnPct"), None) for row in windows if row.get("totalReturnPct") is not None]
+    fold_pfs = [safe_float(row.get("profitFactor"), None) for row in windows if row.get("profitFactor") is not None]
+    worst = min(windows, key=lambda row: safe_float(row.get("totalReturnPct"), 999999), default=None)
+    return {
+        "status": normalized,
+        "rawStatus": raw,
+        "statusSource": source,
+        "windows": windows,
+        "walkForwardPassCount": aggregate.get("passWindows") or aggregate.get("passFoldCount"),
+        "negativeFolds": aggregate.get("negativeWindows") or aggregate.get("negativeFoldCount"),
+        "worstFold": worst,
+        "medianFoldReturn": median_numbers(fold_returns),
+        "medianFoldProfitFactor": median_numbers(fold_pfs),
+        "fullTrades": aggregate.get("totalTrades"),
+        "fullProfitFactor": aggregate.get("profitFactor"),
+        "fullReturn": aggregate.get("totalReturnPct"),
+        "drawdown": aggregate.get("maxDrawdownPct"),
+        "summary": validation.get("summary"),
+    }
+
+
+def median_numbers(values: list[float]) -> float | None:
+    nums = sorted(value for value in values if value is not None and math.isfinite(value))
+    if not nums:
+        return None
+    mid = len(nums) // 2
+    if len(nums) % 2:
+        return nums[mid]
+    return round((nums[mid - 1] + nums[mid]) / 2, 4)
+
+
 def promotion_checklist_verdict(items: list[dict], paper_enabled: bool, real_enabled: bool) -> dict:
     blockers = [item for item in items if not item.get("pass") and item.get("severity") == "BLOCK"]
     warnings = [item for item in items if not item.get("pass") and item.get("severity") == "WARN"]
@@ -8401,6 +8907,7 @@ def build_research_promotion_checklist_v2(args) -> tuple[dict, int]:
     config_warnings = candidate_config_warnings(candidate)
     validation = validate_candidate_config(candidate, candidate_validation_rules(args))
     stability = build_candidate_stability_report({"compareCurrent": "true", "period": args.get("period", "365d")})
+    stability_norm = normalize_stability_status(stability)
     readiness = build_paper_readiness_report(args)
     review = build_candidate_review()
     ledger, _ = build_research_candidate_evidence_ledger({"fileLimit": args.get("fileLimit", "50"), "limit": args.get("ledgerLimit", "25")})
@@ -8413,7 +8920,12 @@ def build_research_promotion_checklist_v2(args) -> tuple[dict, int]:
     checklist_item(items, "current candidate exists", bool(candidate), "BLOCK", f"{strategy} {symbol} {timeframe}")
     checklist_item(items, "config warnings empty", not config_warnings, "BLOCK", "No config warnings." if not config_warnings else "; ".join(config_warnings), {"configWarnings": config_warnings})
     checklist_item(items, "candidate validation PASS", validation.get("status") == "PASS", "BLOCK", f"Validation status: {validation.get('status')}.", validation)
-    checklist_item(items, "candidate stability PASS", stability.get("status") == "PASS", "BLOCK", f"Stability status: {stability.get('status')}.", {"status": stability.get("status"), "windows": stability.get("windows")})
+    stability_is_pass = stability_norm["status"] == "PASS"
+    stability_severity = "BLOCK" if stability_norm["status"] in {"FAIL", "ERROR"} else "WARN"
+    stability_detail = f"Stability status: {stability_norm['status']}."
+    if stability_norm["status"] == "UNKNOWN":
+        stability_detail = "Stability evidence unavailable or integration shape unknown; manual review required."
+    checklist_item(items, "candidate stability PASS", stability_is_pass, stability_severity, stability_detail, stability_norm)
     readiness_blockers = [check for check in readiness.get("checks") or [] if not check.get("pass") and check.get("severity") == "BLOCK"]
     readiness_warnings = [check for check in readiness.get("checks") or [] if not check.get("pass") and check.get("severity") == "WARN"]
     checklist_item(items, "paper readiness has no blockers", not readiness_blockers, "BLOCK", f"{len(readiness_blockers)} readiness blocker(s).", {"status": readiness.get("status"), "blockingIssues": len(readiness_blockers)})
@@ -8442,17 +8954,27 @@ def build_research_promotion_checklist_v2(args) -> tuple[dict, int]:
             "strategy": strategy,
             "symbol": symbol,
             "timeframe": timeframe,
+            **candidate_identity_from_parts(
+                strategy,
+                symbol,
+                timeframe,
+                candidate.get("params") if isinstance(candidate.get("params"), dict) else {},
+                candidate_context_from_config(candidate)["fillModel"],
+                candidate_context_from_config(candidate)["makerFeePct"],
+                candidate_context_from_config(candidate)["takerFeePct"],
+                candidate_context_from_config(candidate)["slippageBps"],
+            ),
         },
         "verdict": verdict,
         "counts": counts,
         "checks": items,
         "supportingEvidence": {
             "validation": validation,
-            "stability": {"status": stability.get("status"), "windows": stability.get("windows")},
+            "stability": stability_norm,
             "readiness": {"status": readiness.get("status"), "ready": readiness.get("ready"), "summary": readiness.get("summary")},
             "review": {"nextAction": review.get("nextAction"), "readiness": review_readiness},
             "ledger": ledger_summary,
-            "resultDiff": {"ok": diff_status < 400, "verdict": diff.get("verdict"), "counts": diff.get("counts")},
+            "resultDiff": {"ok": diff_status < 400, "verdict": diff.get("verdict"), "counts": diff.get("counts"), "comparability": diff.get("comparability")},
         },
         "safety": {
             "promoted": False,

@@ -51,6 +51,9 @@ def guided_preflight(client) -> dict:
     paper_enabled = bool(status.get("paperEnabled"))
     real_enabled = bool(status.get("realTradingEnabled"))
     stop_status = stop_rules.get("status")
+    readiness = tick_readiness.get("tickReadiness") or {}
+    readiness_status = readiness.get("status") or "MALFORMED"
+    useful_now = readiness.get("usefulNow") is True
     blockers = []
     if not paper_enabled:
         blockers.append("paper_disabled")
@@ -58,11 +61,27 @@ def guided_preflight(client) -> dict:
         blockers.append("real_trading_enabled")
     if stop_status in {"STOP_RECOMMENDED", "PAUSE_RECOMMENDED", "BLOCKED"}:
         blockers.append(f"stop_rules_{stop_status.lower()}")
+    blocked_readiness = {
+        "WAIT_FOR_NEXT_CANDLE",
+        "DISABLED",
+        "NOT_READY",
+        "NOT_INITIALIZED",
+        "STALE_ACTIVE_MARKET",
+        "DATA_STALE",
+        "BLOCKED",
+        "MALFORMED",
+    }
+    if not useful_now or readiness_status in blocked_readiness:
+        blockers.append(f"tick_readiness_{str(readiness_status).lower()}")
+    preflight_post_allowed = not blockers and useful_now
     return {
-        "ok": not blockers,
+        "ok": preflight_post_allowed,
         "paperEnabled": paper_enabled,
         "realTradingEnabled": real_enabled,
         "blockers": blockers,
+        "preflightPostAllowed": preflight_post_allowed,
+        "tickReadinessStatus": readiness_status,
+        "tickReadinessUsefulNow": useful_now,
         "status": status,
         "stopRules": stop_rules,
         "tickReadiness": tick_readiness,
@@ -82,7 +101,11 @@ def guided_run_once(client) -> dict:
             "paperEnabled": preflight.get("paperEnabled"),
             "realTradingEnabled": preflight.get("realTradingEnabled"),
             "preflight": preflight,
+            "preflightPostAllowed": False,
+            "postAttempted": False,
             "skipReason": ", ".join(preflight.get("blockers") or ["guided_preflight_blocked"]),
+            "tickReadinessStatus": preflight.get("tickReadinessStatus"),
+            "preflightBlockers": preflight.get("blockers") or [],
             "nextAction": {
                 "action": "SKIP_GUIDED_RUN",
                 "reason": "Guided runner skipped before POST /api/paper/run-once because preflight blockers were present.",
@@ -92,6 +115,8 @@ def guided_run_once(client) -> dict:
     payload = run_once(client)
     payload["guided"] = True
     payload["preflight"] = preflight
+    payload["preflightPostAllowed"] = True
+    payload["postAttempted"] = True
     return payload
 
 
@@ -129,6 +154,8 @@ def compact_iteration(payload: dict, iteration: int) -> dict:
         "refreshStatus": "SKIPPED" if refresh.get("attempted") is False else "OK" if refresh.get("ok") else "FAILED" if refresh.get("ok") is False else None,
         "tickReadinessStatus": tick_readiness_after.get("status") or summary.get("readinessAfter") or summary.get("readinessBefore"),
         "tickRan": bool(payload.get("tickRan")),
+        "preflightPostAllowed": payload.get("preflightPostAllowed", (preflight or {}).get("preflightPostAllowed")),
+        "postAttempted": payload.get("postAttempted"),
         "tickSkipReason": tick_skip_reason,
         "processedCandlesDelta": summary.get("processedCandlesDelta", tick_summary.get("processedCandlesDelta")),
         "newSignals": tick_summary.get("newSignals"),
@@ -163,6 +190,7 @@ def final_summary(results: list[dict], interrupted: bool = False) -> dict:
         "iterationsAttempted": len(results),
         "ticksRun": len([item for item in results if item.get("tickRan")]),
         "ticksSkipped": len([item for item in results if not item.get("tickRan")]),
+        "postsAttempted": len([item for item in results if item.get("postAttempted")]),
         "errors": len(errors),
         "guided": any(item.get("guided") for item in results),
         "finalPaperEnabled": final.get("paperEnabled"),
@@ -202,6 +230,10 @@ def main() -> int:
                     item = {**compact_iteration(payload, index + 1), "payload": item}
                 results.append(item)
                 write_jsonl(log_handle, item)
+                if args.guided and item.get("stopRulesStatus") in {"STOP_RECOMMENDED", "PAUSE_RECOMMENDED", "BLOCKED"}:
+                    break
+                if args.guided and any(str(blocker).startswith("stop_rules_") for blocker in item.get("preflightBlockers") or []):
+                    break
                 if not args.loop or index >= iterations - 1:
                     break
                 time.sleep(max(0, args.interval_minutes) * 60)

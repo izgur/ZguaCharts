@@ -1,5 +1,6 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const backtest = require("../backtest");
 const data = require("../data");
@@ -50,6 +51,61 @@ const REPRO_TOLERANCES = {
 };
 
 const STABILITY_SCORE_DIRECTION = "higher_is_better";
+const CANDIDATE_IDENTITY_VERSION = "candidate-identity-v1";
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function shortHash(value) {
+  return crypto.createHash("sha256").update(stableJson(value)).digest("hex").slice(0, 16);
+}
+
+function normalizeParams(params) {
+  const out = {};
+  Object.keys(params || {}).sort().forEach((key) => {
+    const value = params[key];
+    if (value === undefined || value === null) return;
+    if (Array.isArray(value)) out[key] = value.map((item) => (item && typeof item === "object" && !Array.isArray(item) ? normalizeParams(item) : item));
+    else if (value && typeof value === "object") out[key] = normalizeParams(value);
+    else out[key] = value;
+  });
+  return out;
+}
+
+function candidateIdentity(row, context) {
+  const normalizedParams = normalizeParams(row.params || {});
+  const paramsHash = shortHash(normalizedParams);
+  const executionContext = {
+    fillModel: context.fillModel || "next-open",
+    makerFeePct: Number((context.costs || {}).makerFeePct || 0),
+    takerFeePct: Number((context.costs || {}).takerFeePct || 0),
+    slippageBps: Number((context.costs || {}).slippageBps || 0)
+  };
+  const executionContextHash = shortHash(executionContext);
+  return {
+    candidateIdentityVersion: CANDIDATE_IDENTITY_VERSION,
+    candidateKey: [
+      CANDIDATE_IDENTITY_VERSION,
+      row.strategy || "-",
+      row.symbol || "-",
+      row.timeframe || "-",
+      paramsHash,
+      executionContextHash
+    ].join("|"),
+    normalizedParams,
+    paramsHash,
+    executionContextHash,
+    fillModel: executionContext.fillModel,
+    makerFeePct: executionContext.makerFeePct,
+    takerFeePct: executionContext.takerFeePct,
+    slippageBps: executionContext.slippageBps
+  };
+}
 
 function round(value, digits) {
   const factor = Math.pow(10, digits || 4);
@@ -200,6 +256,7 @@ function compactResult(result, context) {
     mainFailureReason: null,
     warnings: result.warnings || []
   };
+  Object.assign(row, candidateIdentity(row, context));
   row.mainFailureReason = failureReason(row);
   row.status = statusFor(row);
   return row;
@@ -510,6 +567,7 @@ async function buildReport(options) {
     takerFeePct: Number(options.takerFeePct || 0.055),
     slippageBps: Number(options.slippageBps || 2)
   };
+  const fillModel = options.fillModel || "next-open";
   const strategiesDiscovered = strategiesRegistry.listStrategies().map((item) => item.name).filter((name) => name !== "AlwaysLongTest");
   const catalog = optimizer.optimizerGridCatalog();
   const strategiesSkipped = [];
@@ -559,7 +617,7 @@ async function buildReport(options) {
       grid.combos.forEach((params) => {
         rawCombosEvaluated += 1;
         try {
-          const context = { source, symbol: market.symbol, timeframe: market.timeframe, strategy, params, days, paramsSource: "stageA_screening" };
+          const context = { source, symbol: market.symbol, timeframe: market.timeframe, strategy, params, days, paramsSource: "stageA_screening", costs, fillModel };
           const full = compactResult(runCandidate(candles, regimeCandles, context, params, costs), context);
           full.rawScreenScore = screenScore(full);
           full.optimizerGrid = grid.metadata;
@@ -631,10 +689,12 @@ async function buildReport(options) {
       };
   const payload = {
     ok: true,
+    schemaVersion: "stability-first-search-v2",
+    candidateIdentityVersion: CANDIDATE_IDENTITY_VERSION,
     paperEnabled: options.paperEnabled === true,
     realTradingEnabled: false,
     stabilityScoreDirection: STABILITY_SCORE_DIRECTION,
-    runContext: { source, period: options.period || "365d", folds, from, to, costs, topN, maxCombosPerStrategy },
+    runContext: { source, period: options.period || "365d", folds, from, to, costs, fillModel, topN, maxCombosPerStrategy },
     benchmark,
     search: {
       strategiesDiscovered,
@@ -682,7 +742,7 @@ async function buildReport(options) {
 }
 
 function validateCandidate(spec, candles, regimeCandles, options) {
-  const context = { source: options.source, symbol: spec.symbol, timeframe: spec.timeframe, strategy: spec.strategy, days: options.days, params: spec.params };
+  const context = { source: options.source, symbol: spec.symbol, timeframe: spec.timeframe, strategy: spec.strategy, days: options.days, params: spec.params, costs: options.costs, fillModel: options.fillModel || "next-open" };
   const fullPeriod = compactResult(runCandidate(candles, regimeCandles, context, spec.params, options.costs), context);
   const folds = evaluateFolds(candles, regimeCandles, context, spec.params, options.costs, options.folds);
   const walkForward = walkForwardSummary(folds);
@@ -696,6 +756,7 @@ function validateCandidate(spec, candles, regimeCandles, options) {
     symbol: spec.symbol,
     timeframe: spec.timeframe,
     params: spec.params,
+    ...candidateIdentity({ strategy: spec.strategy, symbol: spec.symbol, timeframe: spec.timeframe, params: spec.params }, context),
     tier: "CHRONOLOGICALLY_TESTED",
     antiLookaheadStatus: "PASS",
     days: options.days,
