@@ -315,6 +315,7 @@ function organizeWorkflowPages() {
     ["research-multi-strategy-optimizer-batch-panel", "research-search"],
     ["research-stability-first-challenger-search-panel", "research-search"],
     ["research-campaign-runner-panel", "research-overview"],
+    ["research-autopilot-panel", "research-overview"],
     ["research-candidate-evidence-ledger-panel", "research-overview"],
     ["research-result-diff-panel", "research-overview"],
     ["research-promotion-checklist-v2-panel", "research-overview"],
@@ -3846,6 +3847,11 @@ function setupLearningControls() {
   document.querySelector("#paper-fast-discovery-refresh")?.addEventListener("click", loadPaperFastDiscovery);
   document.querySelector("#research-candidate-leaderboard-refresh")?.addEventListener("click", loadResearchCandidateLeaderboard);
   document.querySelector("#research-campaign-runner-refresh")?.addEventListener("click", loadResearchCampaignRunner);
+  document.querySelector("#research-autopilot-status")?.addEventListener("click", () => loadResearchAutopilot("status"));
+  document.querySelector("#research-autopilot-plan")?.addEventListener("click", () => loadResearchAutopilot("plan"));
+  document.querySelector("#research-autopilot-run-next")?.addEventListener("click", () => loadResearchAutopilot("runNext"));
+  document.querySelector("#research-autopilot-run-batch")?.addEventListener("click", () => loadResearchAutopilot("runBatch"));
+  document.querySelector("#research-autopilot-summary")?.addEventListener("click", () => loadResearchAutopilot("summary"));
   document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
   document.querySelector("#research-result-diff-refresh")?.addEventListener("click", loadResearchResultDiff);
   document.querySelector("#research-promotion-checklist-v2-refresh")?.addEventListener("click", loadResearchPromotionChecklistV2);
@@ -5289,6 +5295,119 @@ function renderResearchCampaignRunner(payload) {
       <tbody>${validationRows || `<tr><td colspan="6">No deep validation rows requested.</td></tr>`}</tbody>
     </table>
     <p class="modal-note">Manual research only. This campaign does not promote candidates, write config, run paper ticks, change paper state, or touch real trading.</p>
+    ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchAutopilot(action = "status") {
+  const host = document.querySelector("#research-autopilot-panel");
+  if (!host) return;
+  const labels = {
+    status: "Loading research autopilot status...",
+    plan: "Planning bounded research jobs...",
+    runNext: "Running one queued research job...",
+    runBatch: "Running a small research batch...",
+    summary: "Building research autopilot summary...",
+  };
+  try {
+    host.innerHTML = `<p class="pane-status">${labels[action] || labels.status}</p>`;
+    let payload;
+    if (action === "plan") payload = await apiPost("/api/research/autopilot/plan", { maxJobs: 12 });
+    else if (action === "runNext") payload = await apiPost("/api/research/autopilot/run-next", {});
+    else if (action === "runBatch") payload = await apiPost("/api/research/autopilot/run-batch", { maxJobs: 3 });
+    else if (action === "summary") payload = await apiGet("/api/research/autopilot/summary");
+    else payload = await apiGet("/api/research/autopilot/status");
+    host.innerHTML = renderResearchAutopilot(payload, action);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research autopilot could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderAutopilotJob(job) {
+  const strategies = job.strategies || (job.strategy ? [job.strategy] : []);
+  const symbols = job.symbols || (job.symbol ? [job.symbol] : []);
+  const timeframes = job.timeframes || (job.timeframe ? [job.timeframe] : []);
+  return `
+    <tr>
+      <td>${escapeHtml(job.status || "QUEUED")}</td>
+      <td>${job.priority ?? "-"}</td>
+      <td>${escapeHtml(strategies.join(", ") || "-")}</td>
+      <td>${escapeHtml(symbols.join(", ") || "-")}</td>
+      <td>${escapeHtml(timeframes.join(", ") || "-")}</td>
+      <td>${escapeHtml(job.period || "-")}</td>
+      <td>${job.maxCombosPerStrategy ?? "-"}</td>
+      <td>${escapeHtml(job.generatedBy || "-")}</td>
+      <td>${escapeHtml(job.reason || "-")}</td>
+    </tr>
+  `;
+}
+
+function renderAutopilotBranch(row) {
+  return `
+    <tr>
+      <td>${escapeHtml(row.reasonCategory || "-")}</td>
+      <td>${escapeHtml(row.strategy || "-")}</td>
+      <td>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</td>
+      <td>${escapeHtml(row.period || "-")}</td>
+      <td>${row.fullTrades ?? "-"}</td>
+      <td>${formatNumber(row.profitFactor)}</td>
+      <td class="${(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct || 0)}%</td>
+      <td>${row.negativeFolds ?? "-"}</td>
+      <td>${escapeHtml(row.stressStatus || "-")}</td>
+    </tr>
+  `;
+}
+
+function renderResearchAutopilot(payload, action = "status") {
+  if (action === "summary") {
+    const jobs = (payload.nextRecommendedJobs || []).map(renderAutopilotJob).join("");
+    const rejected = (payload.branchesRejected || []).slice(0, 8).map(renderAutopilotBranch).join("");
+    const more = (payload.branchesWorthMoreTesting || []).slice(0, 8).map(renderAutopilotBranch).join("");
+    return `
+      <h3 class="modal-section-title">Research Autopilot Summary</h3>
+      <p class="modal-note">${escapeHtml(payload.summaryText || "No summary available.")}</p>
+      <div class="metric-grid">
+        <div class="metric"><span>Branches tested</span><strong>${payload.branchesTested ?? 0}</strong></div>
+        <div class="metric"><span>Real trading</span><strong>${payload.safety?.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+        <div class="metric"><span>Research only</span><strong>${payload.safety?.researchOnly ? "yes" : "no"}</strong></div>
+      </div>
+      <table class="trade-table"><thead><tr><th>Status</th><th>Priority</th><th>Strategies</th><th>Symbols</th><th>Frames</th><th>Period</th><th>Combos</th><th>By</th><th>Reason</th></tr></thead><tbody>${jobs || `<tr><td colspan="9">No queued recommended jobs.</td></tr>`}</tbody></table>
+      <h4 class="modal-section-title">Worth More Testing</h4>
+      <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${more || `<tr><td colspan="9">No branches currently marked for more testing.</td></tr>`}</tbody></table>
+      <h4 class="modal-section-title">Rejected</h4>
+      <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${rejected || `<tr><td colspan="9">No rejected branches in memory.</td></tr>`}</tbody></table>
+      <p class="modal-note">Research-only summary. No promotion, config write, paper enablement, paper tick, or live order action is available here.</p>
+    `;
+  }
+  const queue = payload.queue || {};
+  const counts = queue.counts || {};
+  const memory = payload.memory || {};
+  const leads = (memory.topLeads || []).slice(0, 8).map(renderAutopilotBranch).join("");
+  const rare = (memory.promisingButRare || []).slice(0, 8).map(renderAutopilotBranch).join("");
+  const rejected = (memory.rejectedBranches || []).slice(0, 8).map(renderAutopilotBranch).join("");
+  const jobs = ((queue.nextJobs || payload.addedJobs || [])).slice(0, 8).map(renderAutopilotJob).join("");
+  const actionNote = action === "plan" ? `${payload.addedJobs?.length || 0} job(s) added, ${payload.skippedJobs?.length || 0} duplicate(s) skipped.` : action === "runNext" ? `Ran job ${payload.job?.jobId || "-"}.` : action === "runBatch" ? `Attempted ${payload.jobsAttempted || 0} job(s).` : "Queue and research memory are loaded.";
+  const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Research Autopilot <span class="neutral">${escapeHtml(actionNote)}</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Queue length</span><strong>${queue.length ?? 0}</strong></div>
+      <div class="metric"><span>Queued</span><strong>${counts.QUEUED ?? 0}</strong></div>
+      <div class="metric"><span>Running</span><strong>${counts.RUNNING ?? 0}</strong></div>
+      <div class="metric"><span>Done</span><strong>${counts.DONE ?? 0}</strong></div>
+      <div class="metric"><span>Failed</span><strong>${counts.FAILED ?? 0}</strong></div>
+      <div class="metric"><span>Branches</span><strong>${memory.branchesTested ?? 0}</strong></div>
+      <div class="metric"><span>Candidates</span><strong>${memory.candidates ?? 0}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.safety?.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+    </div>
+    <table class="trade-table"><thead><tr><th>Status</th><th>Priority</th><th>Strategies</th><th>Symbols</th><th>Frames</th><th>Period</th><th>Combos</th><th>By</th><th>Reason</th></tr></thead><tbody>${jobs || `<tr><td colspan="9">No queued jobs yet. Plan next jobs to seed the queue.</td></tr>`}</tbody></table>
+    <h4 class="modal-section-title">Top Leads</h4>
+    <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${leads || `<tr><td colspan="9">No leads in memory yet.</td></tr>`}</tbody></table>
+    <h4 class="modal-section-title">Promising But Rare</h4>
+    <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${rare || `<tr><td colspan="9">No rare promising branches found.</td></tr>`}</tbody></table>
+    <h4 class="modal-section-title">Rejected Branches</h4>
+    <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${rejected || `<tr><td colspan="9">No rejected branches in memory.</td></tr>`}</tbody></table>
+    <p class="modal-note">Autopilot is research-only. It may save reports and queue state under ignored reports directories, but it cannot promote candidates, write config, enable paper, run paper ticks, or touch live orders.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
   `;
 }

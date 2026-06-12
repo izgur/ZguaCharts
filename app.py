@@ -46,6 +46,9 @@ LEARNING_CONFIG_DEFAULT_PATH = CONFIG_DIR / "learning-runner.default.json"
 LEARNING_CONFIG_LOCAL_PATH = LOCAL_CONFIG_DIR / "learning-runner.json"
 LEARNING_REPORTS_PATH = Path(app.root_path) / "data" / "learning-reports.json"
 LEARNING_DECISIONS_PATH = Path(app.root_path) / "data" / "learning-decisions.json"
+RESEARCH_AUTOPILOT_DIR = Path(app.root_path) / "reports" / "research-autopilot"
+RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
+RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
 MAX_LEARNING_REPORTS = 100
@@ -1474,6 +1477,61 @@ def research_promotion_checklist_v2():
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not build promotion checklist v2: {exc}"}), 502
+
+
+@app.get("/api/research/autopilot/status")
+def research_autopilot_status():
+    try:
+        return jsonify(build_research_autopilot_status())
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research autopilot status: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/plan")
+def research_autopilot_plan():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_plan(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not plan research autopilot jobs: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/run-next")
+def research_autopilot_run_next():
+    try:
+        payload, status_code = build_research_autopilot_run_next()
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not run next research autopilot job: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/run-batch")
+def research_autopilot_run_batch():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_run_batch(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not run research autopilot batch: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/reset-queue")
+def research_autopilot_reset_queue():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_reset_queue(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not reset research autopilot queue: {exc}"}), 502
+
+
+@app.get("/api/research/autopilot/summary")
+def research_autopilot_summary():
+    try:
+        return jsonify(build_research_autopilot_summary())
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research autopilot summary: {exc}"}), 502
 
 
 @app.get("/api/research/signal-replay-report")
@@ -8371,6 +8429,599 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
     if save:
         campaign["savedPath"] = save_research_snapshot(campaign, "json")
     return campaign, 200 if campaign["ok"] else 502
+
+
+AUTOPILOT_SCHEMA_VERSION = "research-autopilot-v1"
+AUTOPILOT_DEFAULT_STRATEGIES = [
+    "SimpleAtrTrendV2",
+    "MeanReversion",
+    "PullbackTrend",
+    "MomentumScalping",
+    "ConservativeTrendLoose",
+    "RegimeDonchian20",
+    "RelativeStrengthV2",
+    "EmaBounceV2",
+]
+AUTOPILOT_FIRST_PASS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
+AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
+AUTOPILOT_PERIODS = ["365d", "730d"]
+
+
+def autopilot_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def autopilot_list(value, fallback=None) -> list[str]:
+    if fallback is None:
+        fallback = []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return [str(item).strip() for item in fallback if str(item).strip()]
+
+
+def autopilot_display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+    except ValueError:
+        return str(path).replace("\\", "/")
+
+
+def autopilot_paths() -> dict:
+    return {
+        "dir": RESEARCH_AUTOPILOT_DIR,
+        "queue": RESEARCH_AUTOPILOT_QUEUE_PATH,
+        "memory": RESEARCH_AUTOPILOT_MEMORY_PATH,
+    }
+
+
+def load_autopilot_queue() -> dict:
+    payload = read_json_file(str(RESEARCH_AUTOPILOT_QUEUE_PATH), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("schemaVersion", AUTOPILOT_SCHEMA_VERSION)
+    payload.setdefault("generatedAt", None)
+    payload.setdefault("updatedAt", None)
+    payload.setdefault("jobs", [])
+    return payload
+
+
+def save_autopilot_queue(payload: dict) -> None:
+    RESEARCH_AUTOPILOT_DIR.mkdir(parents=True, exist_ok=True)
+    payload["schemaVersion"] = AUTOPILOT_SCHEMA_VERSION
+    payload["updatedAt"] = autopilot_now()
+    if not payload.get("generatedAt"):
+        payload["generatedAt"] = payload["updatedAt"]
+    write_autopilot_json(RESEARCH_AUTOPILOT_QUEUE_PATH, payload)
+
+
+def load_autopilot_memory() -> dict:
+    payload = read_json_file(str(RESEARCH_AUTOPILOT_MEMORY_PATH), {})
+    if not isinstance(payload, dict):
+        payload = {}
+    payload.setdefault("schemaVersion", AUTOPILOT_SCHEMA_VERSION)
+    payload.setdefault("generatedAt", None)
+    payload.setdefault("updatedAt", None)
+    payload.setdefault("branches", [])
+    payload.setdefault("candidates", [])
+    payload.setdefault("sourceReports", [])
+    return payload
+
+
+def save_autopilot_memory(payload: dict) -> None:
+    RESEARCH_AUTOPILOT_DIR.mkdir(parents=True, exist_ok=True)
+    payload["schemaVersion"] = AUTOPILOT_SCHEMA_VERSION
+    payload["updatedAt"] = autopilot_now()
+    if not payload.get("generatedAt"):
+        payload["generatedAt"] = payload["updatedAt"]
+    write_autopilot_json(RESEARCH_AUTOPILOT_MEMORY_PATH, payload)
+
+
+def write_autopilot_json(path: Path, payload: dict) -> None:
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    temp_path.replace(path)
+
+
+def autopilot_job_signature(job: dict) -> str:
+    return stable_json({
+        "strategies": sorted(autopilot_list(job.get("strategies") or job.get("strategy"))),
+        "symbols": sorted(autopilot_list(job.get("symbols") or job.get("symbol"))),
+        "timeframes": sorted(autopilot_list(job.get("timeframes") or job.get("timeframe"))),
+        "period": job.get("period"),
+        "maxCombosPerStrategy": int(safe_float(job.get("maxCombosPerStrategy"), 0)),
+        "topN": int(safe_float(job.get("topN"), 0)),
+        "includeStress": bool(job.get("includeStress")),
+        "includeRecentWindows": bool(job.get("includeRecentWindows")),
+        "includeReproAudit": bool(job.get("includeReproAudit")),
+    })
+
+
+def make_autopilot_job(
+    strategies,
+    symbols,
+    timeframes,
+    period: str,
+    reason: str,
+    priority: int = 50,
+    parent_job_id: str | None = None,
+    generated_by: str = "planner",
+    previous_evidence: dict | None = None,
+    max_combos: int = 12,
+    top_n: int = 18,
+    include_stress: bool = True,
+    include_recent: bool = True,
+    include_repro: bool = True,
+    repro_reruns: int = 2,
+    timeout_seconds: int = 900,
+) -> dict:
+    strategy_list = autopilot_list(strategies)
+    symbol_list = autopilot_list(symbols)
+    timeframe_list = autopilot_list(timeframes)
+    job = {
+        "jobId": f"research-job-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}",
+        "createdAt": autopilot_now(),
+        "updatedAt": None,
+        "startedAt": None,
+        "finishedAt": None,
+        "status": "QUEUED",
+        "priority": int(priority),
+        "reason": reason,
+        "strategy": ",".join(strategy_list),
+        "strategies": strategy_list,
+        "symbol": ",".join(symbol_list),
+        "symbols": symbol_list,
+        "timeframe": ",".join(timeframe_list),
+        "timeframes": timeframe_list,
+        "period": period,
+        "maxCombosPerStrategy": max(1, min(int(max_combos), 20)),
+        "topN": max(5, min(int(top_n), 25)),
+        "includeStress": bool(include_stress),
+        "includeRecentWindows": bool(include_recent),
+        "includeReproAudit": bool(include_repro),
+        "reproReruns": max(1, min(int(repro_reruns), 3)),
+        "timeoutSeconds": max(60, min(int(timeout_seconds), 1200)),
+        "parentJobId": parent_job_id,
+        "generatedBy": generated_by,
+        "previousEvidenceSummary": previous_evidence or {},
+    }
+    job["signature"] = autopilot_job_signature(job)
+    return job
+
+
+def autopilot_enqueue(queue: dict, jobs: list[dict]) -> tuple[list[dict], list[dict]]:
+    existing = {job.get("signature") for job in queue.get("jobs", []) if job.get("status") in {"QUEUED", "RUNNING", "DONE"}}
+    added = []
+    skipped = []
+    for job in jobs:
+        signature = job.get("signature") or autopilot_job_signature(job)
+        job["signature"] = signature
+        if signature in existing:
+            skipped.append({**job, "status": "SKIPPED", "skipReason": "duplicate_job_signature"})
+            continue
+        queue.setdefault("jobs", []).append(job)
+        existing.add(signature)
+        added.append(job)
+    queue["jobs"] = sorted(queue.get("jobs", []), key=lambda item: (item.get("status") != "QUEUED", -safe_float(item.get("priority"), 0), item.get("createdAt") or ""))
+    return added, skipped
+
+
+def autopilot_queue_counts(queue: dict) -> dict:
+    counts = Counter(job.get("status", "UNKNOWN") for job in queue.get("jobs", []))
+    return {status: counts.get(status, 0) for status in ["QUEUED", "RUNNING", "DONE", "FAILED", "SKIPPED"]}
+
+
+def autopilot_branch_key(row: dict, period: str | None = None) -> str:
+    return "|".join([
+        str(row.get("strategy") or "-"),
+        str(row.get("symbol") or "-"),
+        str(row.get("timeframe") or "-"),
+        str(period or row.get("period") or "-"),
+    ])
+
+
+def autopilot_reason_category(row: dict) -> str:
+    full = row.get("fullPeriod") or row
+    eligibility_status = row.get("eligibilityStatus") or (row.get("eligibility") or {}).get("status")
+    tier = row.get("tier")
+    trades = int(safe_float(row.get("trades", full.get("trades")), 0))
+    pf = safe_float(row.get("profitFactor", full.get("profitFactor")), 0)
+    ret = safe_float(row.get("totalReturnPct", full.get("totalReturnPct")), 0)
+    failed_gate_names = [str(item.get("name") or item.get("reason") or "") for item in (row.get("failedGates") or (row.get("eligibility") or {}).get("failedGates") or [])]
+    stress_status = row.get("stressStatus") or (row.get("stress") or {}).get("status")
+    recent_status = row.get("recentWindowStatus") or (row.get("recentWindows") or {}).get("status")
+    negative_folds = int(safe_float(row.get("negativeFoldCount") or (row.get("walkForward") or {}).get("negativeFoldCount"), 0))
+    fold_pass = int(safe_float(row.get("foldPassCount") or (row.get("walkForward") or {}).get("foldPassCount"), 0))
+    if eligibility_status == "CHALLENGER_ELIGIBLE" or tier == "CHALLENGER_ELIGIBLE":
+        return "PROMISING_STABLE"
+    if trades < 40 and pf >= 1.1 and ret > 0:
+        return "PROMISING_BUT_RARE"
+    if trades < 20 or any("trade" in name.lower() or "activity" in name.lower() for name in failed_gate_names):
+        return "TOO_FEW_TRADES"
+    if ret < 0:
+        return "NEGATIVE_RETURN"
+    if pf < 1:
+        return "LOW_PROFIT_FACTOR"
+    if stress_status in {"COLLAPSES_UNDER_STRESS", "FAIL"}:
+        return "STRESS_COLLAPSE"
+    if recent_status == "RECENTLY_WEAK":
+        return "RECENTLY_WEAK"
+    if negative_folds > 1 or fold_pass < 2:
+        return "BAD_WALK_FORWARD"
+    if eligibility_status == "REJECTED" or tier == "REJECTED":
+        return "REJECTED"
+    return "REJECTED"
+
+
+def compact_autopilot_candidate(row: dict, source_report: str, period: str | None, seen_at: str | None) -> dict:
+    identity = candidate_identity_from_row(row)
+    full = row.get("fullPeriod") or row
+    wf = row.get("walkForward") or {}
+    category = autopilot_reason_category(row)
+    return {
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "period": period,
+        "paramsHash": identity.get("paramsHash"),
+        "candidateKey": identity.get("candidateKey"),
+        "candidateIdentityVersion": identity.get("candidateIdentityVersion"),
+        "bestTier": row.get("tier"),
+        "eligibilityStatus": row.get("eligibilityStatus") or (row.get("eligibility") or {}).get("status"),
+        "fullTrades": int(safe_float(row.get("trades", full.get("trades")), 0)),
+        "profitFactor": safe_float(row.get("profitFactor", full.get("profitFactor")), None),
+        "totalReturnPct": safe_float(row.get("totalReturnPct", full.get("totalReturnPct")), None),
+        "maxDrawdownPct": safe_float(row.get("maxDrawdownPct", full.get("maxDrawdownPct")), None),
+        "foldPassCount": int(safe_float(row.get("foldPassCount", wf.get("foldPassCount")), 0)),
+        "negativeFolds": int(safe_float(row.get("negativeFoldCount", wf.get("negativeFoldCount")), 0)),
+        "worstFold": wf.get("worstFold") or {"returnPct": wf.get("worstFoldReturnPct")},
+        "stressStatus": row.get("stressStatus") or (row.get("stress") or {}).get("status"),
+        "recentWindowStatus": row.get("recentWindowStatus") or (row.get("recentWindows") or {}).get("status"),
+        "failedGates": row.get("failedGates") or (row.get("eligibility") or {}).get("failedGates") or [],
+        "reasonCategory": category,
+        "lastSeenAt": seen_at,
+        "sourceReport": source_report,
+    }
+
+
+def autopilot_rows_from_campaign(payload: dict, source_report: str) -> list[dict]:
+    rows = []
+    generated_at = payload.get("generatedAt")
+    period = (payload.get("search") or {}).get("period") or ((payload.get("runContext") or {}).get("period"))
+    modules = payload.get("modules") or {}
+    stability = (modules.get("stabilityFirstSearch") or {}).get("summary") or {}
+    for section in ("topCandidates", "bestResearchedCandidate", "bestStableCandidate", "bestEligibleChallenger"):
+        value = stability.get(section)
+        if isinstance(value, list):
+            rows.extend(compact_autopilot_candidate(row, source_report, period, generated_at) for row in value if isinstance(row, dict) and row.get("strategy"))
+        elif isinstance(value, dict) and value.get("strategy"):
+            rows.append(compact_autopilot_candidate(value, source_report, period, generated_at))
+    for row in payload.get("topCandidates") or []:
+        if isinstance(row, dict) and row.get("strategy"):
+            rows.append(compact_autopilot_candidate(row, source_report, period, generated_at))
+    by_key = {}
+    for row in rows:
+        key = row.get("candidateKey") or stable_json([row.get("strategy"), row.get("symbol"), row.get("timeframe"), row.get("period"), row.get("paramsHash")])
+        old = by_key.get(key)
+        if old is None or safe_float(row.get("profitFactor"), -1) > safe_float(old.get("profitFactor"), -1):
+            by_key[key] = row
+    return list(by_key.values())
+
+
+def update_autopilot_memory_from_report(payload: dict, source_report: str | None = None) -> dict:
+    memory = load_autopilot_memory()
+    source_report = source_report or payload.get("savedPath") or "inline"
+    rows = autopilot_rows_from_campaign(payload, source_report)
+    candidate_map = {row.get("candidateKey"): row for row in memory.get("candidates", []) if row.get("candidateKey")}
+    for row in rows:
+        candidate_map[row["candidateKey"]] = row
+    branch_map = {row.get("branchKey"): row for row in memory.get("branches", []) if row.get("branchKey")}
+    for row in rows:
+        branch_key = autopilot_branch_key(row, row.get("period"))
+        old = branch_map.get(branch_key, {})
+        best = row
+        if old and safe_float(old.get("profitFactor"), -1) > safe_float(row.get("profitFactor"), -1):
+            best = {**old, "lastSeenAt": row.get("lastSeenAt"), "sourceReport": row.get("sourceReport")}
+        branch_map[branch_key] = {
+            **best,
+            "branchKey": branch_key,
+            "strategy": row.get("strategy"),
+            "symbol": row.get("symbol"),
+            "timeframe": row.get("timeframe"),
+            "period": row.get("period"),
+            "reasonCategory": row.get("reasonCategory"),
+            "lastSeenAt": row.get("lastSeenAt"),
+            "sourceReport": row.get("sourceReport"),
+        }
+    reports = set(memory.get("sourceReports") or [])
+    reports.add(source_report)
+    memory.update({
+        "sourceReports": sorted(reports),
+        "candidates": sorted(candidate_map.values(), key=lambda row: (row.get("reasonCategory") != "PROMISING_STABLE", -safe_float(row.get("profitFactor"), 0), -safe_float(row.get("fullTrades"), 0))),
+        "branches": sorted(branch_map.values(), key=lambda row: (row.get("strategy") or "", row.get("symbol") or "", row.get("timeframe") or "", row.get("period") or "")),
+    })
+    save_autopilot_memory(memory)
+    return memory
+
+
+def rebuild_autopilot_memory_from_saved_reports(file_limit: int = 80) -> dict:
+    memory = {
+        "schemaVersion": AUTOPILOT_SCHEMA_VERSION,
+        "generatedAt": autopilot_now(),
+        "updatedAt": autopilot_now(),
+        "branches": [],
+        "candidates": [],
+        "sourceReports": [],
+    }
+    save_autopilot_memory(memory)
+    for path in candidate_ledger_source_files(file_limit):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        source = autopilot_display_path(path)
+        memory = update_autopilot_memory_from_report(payload, source)
+    return memory
+
+
+def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timeframe: str, period: str) -> bool:
+    for branch in memory.get("branches", []):
+        if branch.get("strategy") == strategy and branch.get("symbol") == symbol and branch.get("timeframe") == timeframe and branch.get("period") == period:
+            if branch.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"} and safe_float(branch.get("profitFactor"), 0) < 1:
+                return True
+    return False
+
+
+def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[list[dict], list[str]]:
+    jobs = []
+    warnings = []
+    queued_or_done = {job.get("signature") for job in queue.get("jobs", []) if job.get("status") in {"QUEUED", "RUNNING", "DONE"}}
+
+    def maybe_add(job: dict):
+        if len(jobs) >= max_jobs:
+            return
+        if job.get("signature") in queued_or_done or any(existing.get("signature") == job.get("signature") for existing in jobs):
+            return
+        jobs.append(job)
+
+    if not memory.get("branches"):
+        for strategy in AUTOPILOT_DEFAULT_STRATEGIES[:5]:
+            for timeframe in AUTOPILOT_TIMEFRAMES:
+                maybe_add(make_autopilot_job(
+                    [strategy],
+                    AUTOPILOT_FIRST_PASS_SYMBOLS,
+                    [timeframe],
+                    "365d",
+                    f"Initial safe first-pass scan for {strategy} on {timeframe}.",
+                    priority=70 if timeframe == "1h" else 65,
+                    generated_by="seed",
+                    max_combos=12,
+                    top_n=18,
+                ))
+        return jobs, warnings
+
+    for branch in memory.get("branches", []):
+        strategy = branch.get("strategy")
+        symbol = branch.get("symbol")
+        timeframe = branch.get("timeframe")
+        period = branch.get("period") or "365d"
+        category = branch.get("reasonCategory")
+        if not strategy or not symbol or not timeframe:
+            continue
+        if category == "PROMISING_STABLE":
+            next_period = "1095d" if period != "1095d" else period
+            maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], next_period, "Confirm eligible candidate on longer/full validation window.", 95, generated_by="eligible_confirmation", previous_evidence=branch, max_combos=10, top_n=20, include_stress=True, include_recent=True, include_repro=True))
+        elif category == "PROMISING_BUT_RARE":
+            if timeframe == "4h":
+                maybe_add(make_autopilot_job([strategy], [symbol], ["1h"], period, "Promising but rare on 4h; test lower timeframe for more activity.", 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20))
+            other_symbols = [item for item in AUTOPILOT_FIRST_PASS_SYMBOLS + AUTOPILOT_SECOND_PASS_SYMBOLS if item != symbol][:3]
+            maybe_add(make_autopilot_job([strategy], other_symbols, [timeframe], period, "Promising but rare; test same strategy/timeframe on related symbols.", 78, generated_by="rare_symbol_expansion", previous_evidence=branch, max_combos=10, top_n=20))
+        elif category in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}:
+            warnings.append(f"Deprioritized rejected branch {strategy} {symbol} {timeframe} {period}.")
+
+    for strategy in AUTOPILOT_DEFAULT_STRATEGIES:
+        for symbol in AUTOPILOT_FIRST_PASS_SYMBOLS:
+            for timeframe in AUTOPILOT_TIMEFRAMES:
+                period = "365d"
+                if autopilot_branch_rejected(memory, strategy, symbol, timeframe, period):
+                    continue
+                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15))
+                if len(jobs) >= max_jobs:
+                    return jobs, warnings
+    return jobs, warnings
+
+
+def build_research_autopilot_status() -> dict:
+    queue = load_autopilot_queue()
+    memory = load_autopilot_memory()
+    if not memory.get("branches") and candidate_ledger_source_files(20):
+        memory = rebuild_autopilot_memory_from_saved_reports(40)
+    counts = autopilot_queue_counts(queue)
+    leads = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}]
+    rejected = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
+    rare = [row for row in memory.get("branches", []) if row.get("reasonCategory") == "PROMISING_BUT_RARE"]
+    next_jobs = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"][:5]
+    real_enabled, real_detail = paper_real_trading_enabled()
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "queuePath": autopilot_display_path(RESEARCH_AUTOPILOT_QUEUE_PATH),
+        "memoryPath": autopilot_display_path(RESEARCH_AUTOPILOT_MEMORY_PATH),
+        "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs},
+        "memory": {
+            "branchesTested": len(memory.get("branches", [])),
+            "candidates": len(memory.get("candidates", [])),
+            "sourceReports": len(memory.get("sourceReports", [])),
+            "topLeads": sorted(leads, key=lambda row: (row.get("reasonCategory") != "PROMISING_STABLE", -safe_float(row.get("profitFactor"), 0)))[:8],
+            "rejectedBranches": rejected[:12],
+            "promisingButRare": rare[:8],
+        },
+        "safety": {
+            "researchOnly": True,
+            "paperEnabled": canonical_paper_enabled(load_paper_candidate_config()),
+            "realTradingEnabled": real_enabled,
+            "realTradingDetail": real_detail,
+            "promotionAttempted": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+        },
+    }
+
+
+def build_research_autopilot_plan(args) -> tuple[dict, int]:
+    queue = load_autopilot_queue()
+    memory = load_autopilot_memory()
+    if not memory.get("branches") and candidate_ledger_source_files(20):
+        memory = rebuild_autopilot_memory_from_saved_reports(40)
+    max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 12)), 12)), 25))
+    planned, warnings = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs)
+    added, skipped = autopilot_enqueue(queue, planned)
+    save_autopilot_queue(queue)
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "addedJobs": added,
+        "skippedJobs": skipped,
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
+        "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
+        "warnings": warnings,
+        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+    }, 200
+
+
+def autopilot_campaign_args(job: dict) -> dict:
+    return {
+        "symbols": ",".join(autopilot_list(job.get("symbols") or job.get("symbol"))),
+        "timeframes": ",".join(autopilot_list(job.get("timeframes") or job.get("timeframe"))),
+        "strategies": ",".join(autopilot_list(job.get("strategies") or job.get("strategy"))),
+        "period": job.get("period", "365d"),
+        "maxCombosPerStrategy": str(job.get("maxCombosPerStrategy", 10)),
+        "topN": str(job.get("topN", 15)),
+        "validateTop": "2",
+        "includeStress": "true" if job.get("includeStress", True) else "false",
+        "includeRecentWindows": "true" if job.get("includeRecentWindows", True) else "false",
+        "includeReproAudit": "true" if job.get("includeReproAudit", True) else "false",
+        "reproReruns": str(job.get("reproReruns", 2)),
+        "timeout_seconds": str(job.get("timeoutSeconds", 900)),
+        "save": "true",
+    }
+
+
+def run_autopilot_job(job: dict) -> tuple[dict, int]:
+    job["status"] = "RUNNING"
+    job["startedAt"] = autopilot_now()
+    job["updatedAt"] = job["startedAt"]
+    payload, status = build_research_campaign_runner(autopilot_campaign_args(job))
+    job["finishedAt"] = autopilot_now()
+    job["updatedAt"] = job["finishedAt"]
+    job["resultStatusCode"] = status
+    job["savedPath"] = payload.get("savedPath")
+    job["resultSummary"] = {
+        "ok": payload.get("ok"),
+        "recommendation": payload.get("recommendation"),
+        "savedPath": payload.get("savedPath"),
+        "candidateIdentityVersion": payload.get("candidateIdentityVersion"),
+    }
+    if status < 400 and payload.get("ok", True) is not False:
+        job["status"] = "DONE"
+        memory = update_autopilot_memory_from_report(payload, payload.get("savedPath"))
+    else:
+        job["status"] = "FAILED"
+        job["error"] = payload.get("error") or "; ".join(payload.get("warnings") or []) or "Campaign runner failed."
+        memory = load_autopilot_memory()
+    return {"job": job, "campaign": payload, "memory": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))}}, status
+
+
+def build_research_autopilot_run_next() -> tuple[dict, int]:
+    queue = load_autopilot_queue()
+    queued = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"]
+    if not queued:
+        return {"ok": False, "error": "No queued research autopilot jobs.", "queue": {"counts": autopilot_queue_counts(queue)}}, 404
+    job = sorted(queued, key=lambda item: (-safe_float(item.get("priority"), 0), item.get("createdAt") or ""))[0]
+    result, status = run_autopilot_job(job)
+    save_autopilot_queue(queue)
+    return {
+        "ok": status < 400 and result["job"].get("status") == "DONE",
+        "generatedAt": autopilot_now(),
+        **result,
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
+        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+    }, 200 if status < 400 else 502
+
+
+def build_research_autopilot_run_batch(args) -> tuple[dict, int]:
+    max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 3)), 3)), 3))
+    results = []
+    errors = 0
+    for _ in range(max_jobs):
+        payload, status = build_research_autopilot_run_next()
+        if status == 404:
+            break
+        results.append({"statusCode": status, "job": payload.get("job"), "ok": payload.get("ok")})
+        if status >= 400 or not payload.get("ok"):
+            errors += 1
+    queue = load_autopilot_queue()
+    return {
+        "ok": errors == 0,
+        "generatedAt": autopilot_now(),
+        "maxJobs": max_jobs,
+        "jobsAttempted": len(results),
+        "results": results,
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
+        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+    }, 200 if errors == 0 else 207
+
+
+def build_research_autopilot_reset_queue(args) -> tuple[dict, int]:
+    confirm = str(args.get("confirm", "")).strip().lower() in {"1", "true", "yes", "reset"}
+    if not confirm:
+        return {"ok": False, "error": "reset-queue requires confirm=true.", "queuePreserved": True}, 400
+    queue = {"schemaVersion": AUTOPILOT_SCHEMA_VERSION, "generatedAt": autopilot_now(), "updatedAt": autopilot_now(), "jobs": []}
+    save_autopilot_queue(queue)
+    return {"ok": True, "reset": True, "queue": {"counts": autopilot_queue_counts(queue), "length": 0}, "safety": {"researchOnly": True, "configWritten": False, "paperStateChanged": False}}, 200
+
+
+def build_research_autopilot_summary() -> dict:
+    status = build_research_autopilot_status()
+    memory = load_autopilot_memory()
+    queue = load_autopilot_queue()
+    branches = memory.get("branches", [])
+    candidates = memory.get("candidates", [])
+    best_candidate = next((row for row in candidates if row.get("reasonCategory") == "PROMISING_STABLE"), candidates[0] if candidates else None)
+    best_challenger = next((row for row in branches if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}), None)
+    rejected = [row for row in branches if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
+    more = [row for row in branches if row.get("reasonCategory") in {"PROMISING_BUT_RARE", "BAD_WALK_FORWARD", "TOO_FEW_TRADES"}]
+    next_jobs = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"][:3]
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "summaryText": autopilot_summary_text(best_candidate, best_challenger, branches, rejected, more, next_jobs, status.get("safety", {})),
+        "bestCurrentCandidate": best_candidate,
+        "bestChallenger": best_challenger,
+        "branchesTested": len(branches),
+        "branchesRejected": rejected[:12],
+        "branchesWorthMoreTesting": more[:12],
+        "nextRecommendedJobs": next_jobs,
+        "safety": status.get("safety", {}),
+    }
+
+
+def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, more, next_jobs, safety) -> str:
+    best = f"{best_candidate.get('strategy')} {best_candidate.get('symbol')} {best_candidate.get('timeframe')}" if best_candidate else "No saved candidate yet"
+    challenger = f"{best_challenger.get('strategy')} {best_challenger.get('symbol')} {best_challenger.get('timeframe')} ({best_challenger.get('reasonCategory')})" if best_challenger else "No challenger yet"
+    jobs = "; ".join(f"{','.join(job.get('strategies') or [])} {','.join(job.get('symbols') or [])} {','.join(job.get('timeframes') or [])} {job.get('period')}: {job.get('reason')}" for job in next_jobs) or "No queued jobs"
+    return (
+        f"Best current research candidate: {best}. "
+        f"Best challenger: {challenger}. "
+        f"Branches tested: {len(branches)}; rejected: {len(rejected)}; worth more testing: {len(more)}. "
+        f"Next jobs: {jobs}. "
+        f"Safety: research-only={safety.get('researchOnly')}, realTradingEnabled={safety.get('realTradingEnabled')}, no promotion/config/paper-state side effects."
+    )
 
 
 def candidate_ledger_key(row: dict) -> str:
