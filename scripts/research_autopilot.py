@@ -49,6 +49,11 @@ def print_status(payload: dict) -> None:
     print(f"Best current candidate: {branch_label(lead)}")
     print(f"Best challenger: {branch_label(rare or lead)}")
     print("Rejected branches: " + ("; ".join(branch_label(row) for row in rejected) if rejected else "-"))
+    families = memory.get("strategyFamilies") or []
+    if families:
+        print("Strategy families:")
+        for family in families[:8]:
+            print(f"- {family.get('strategy')}: {family.get('familyStatus')} ({family.get('reason')})")
     skips = queue.get("lastPlanSkippedJobs") or []
     if skips:
         print("Last plan skips:")
@@ -92,6 +97,9 @@ def main() -> int:
     status_parser.add_argument("--json", action="store_true")
     plan = sub.add_parser("plan")
     plan.add_argument("--max-jobs", type=int, default=12)
+    plan.add_argument("--include-cooled", action="store_true")
+    plan.add_argument("--force-strategy")
+    plan.add_argument("--force-branch")
     sub.add_parser("run-next")
     batch = sub.add_parser("run-batch")
     batch.add_argument("--max-jobs", type=int, default=3)
@@ -105,7 +113,12 @@ def main() -> int:
         if args.command == "status":
             payload, status = get_json(client, "/api/research/autopilot/status")
         elif args.command == "plan":
-            payload, status = post_json(client, "/api/research/autopilot/plan", {"maxJobs": args.max_jobs})
+            payload, status = post_json(client, "/api/research/autopilot/plan", {
+                "maxJobs": args.max_jobs,
+                "includeCooled": args.include_cooled,
+                "forceStrategy": args.force_strategy,
+                "forceBranch": args.force_branch,
+            })
         elif args.command == "run-next":
             payload, status = post_json(client, "/api/research/autopilot/run-next")
         elif args.command == "run-batch":

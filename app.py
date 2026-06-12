@@ -8515,6 +8515,7 @@ AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
 AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
 AUTOPILOT_PERIODS = ["365d", "730d"]
 AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WALK_FORWARD", "STRESS_COLLAPSE", "REJECTED", "RECENTLY_WEAK"}
+AUTOPILOT_COOL_DOWN_STATUSES = {"COOL_DOWN", "REJECTED_FAMILY", "EXHAUSTED_IN_CURRENT_SCOPE"}
 
 
 def autopilot_now() -> str:
@@ -8730,6 +8731,113 @@ def autopilot_memory_branch_map(memory: dict) -> dict:
         for row in memory.get("branches", [])
         if is_real_research_candidate(row)
     }
+
+
+def autopilot_family_summary(memory: dict) -> list[dict]:
+    families = {}
+    for branch in memory.get("branches", []):
+        if not is_real_research_candidate(branch):
+            continue
+        strategy = branch.get("strategy")
+        family = families.setdefault(strategy, {
+            "strategy": strategy,
+            "branchesTested": 0,
+            "rejectedBranches": 0,
+            "negativeReturnBranches": 0,
+            "stressCollapseBranches": 0,
+            "recentlyWeakBranches": 0,
+            "insufficientEvidenceBranches": 0,
+            "promisingRareBranches": 0,
+            "eligibleOrStableBranches": 0,
+            "bestBranch": None,
+            "bestPF": None,
+            "bestReturnPct": None,
+            "bestTrades": None,
+            "latestSeenAt": None,
+            "familyStatus": "ACTIVE",
+            "cooldownCycleCount": 0,
+            "cooldownUntil": None,
+            "recommendedNextAction": "Continue bounded research.",
+            "reason": "",
+        })
+        category = branch.get("reasonCategory")
+        family["branchesTested"] += 1
+        if category in AUTOPILOT_REJECTED_CATEGORIES:
+            family["rejectedBranches"] += 1
+        if category == "NEGATIVE_RETURN":
+            family["negativeReturnBranches"] += 1
+        if category == "STRESS_COLLAPSE" or branch.get("stressStatus") == "COLLAPSES_UNDER_STRESS":
+            family["stressCollapseBranches"] += 1
+        if category == "RECENTLY_WEAK" or branch.get("recentWindowStatus") == "RECENTLY_WEAK":
+            family["recentlyWeakBranches"] += 1
+        if category in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}:
+            family["insufficientEvidenceBranches"] += 1
+        if category == "PROMISING_BUT_RARE":
+            family["promisingRareBranches"] += 1
+        if category == "PROMISING_STABLE" or branch.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE":
+            family["eligibleOrStableBranches"] += 1
+        if not family["latestSeenAt"] or str(branch.get("lastSeenAt") or "") > str(family["latestSeenAt"] or ""):
+            family["latestSeenAt"] = branch.get("lastSeenAt")
+        best = family.get("bestBranch")
+        if best is None or (
+            safe_float(branch.get("profitFactor"), -1) > safe_float(best.get("profitFactor"), -1)
+            or (
+                safe_float(branch.get("profitFactor"), -1) == safe_float(best.get("profitFactor"), -1)
+                and safe_float(branch.get("totalReturnPct"), -999) > safe_float(best.get("totalReturnPct"), -999)
+            )
+        ):
+            family["bestBranch"] = branch
+            family["bestPF"] = branch.get("profitFactor")
+            family["bestReturnPct"] = branch.get("totalReturnPct")
+            family["bestTrades"] = branch.get("fullTrades")
+
+    summaries = []
+    for family in families.values():
+        tested = family["branchesTested"]
+        rejected_like = family["rejectedBranches"]
+        weak_like = rejected_like + family["insufficientEvidenceBranches"]
+        has_stable = family["eligibleOrStableBranches"] > 0
+        has_rare = family["promisingRareBranches"] > 0
+        if has_stable:
+            status = "NEEDS_DEEP_CONFIRMATION"
+            action = "Confirm stable or eligible branch on longer windows before any manual review."
+        elif has_rare:
+            status = "PROMISING_BUT_RARE"
+            action = "Run controlled period confirmation and limited related-market tests."
+        elif tested >= 4 and rejected_like == tested:
+            status = "REJECTED_FAMILY"
+            action = "Cool down this strategy family; all tested branches are rejected-like."
+        elif tested >= 4 and rejected_like >= max(3, math.ceil(tested * 0.6)):
+            status = "COOL_DOWN"
+            action = "Cool down this strategy family before more broad expansion."
+        elif tested >= 4 and weak_like >= tested:
+            status = "EXHAUSTED_IN_CURRENT_SCOPE"
+            action = "Pause broad search in the current symbol/timeframe scope."
+        else:
+            status = "ACTIVE"
+            action = "Continue bounded exploration if queue capacity remains."
+        family["familyStatus"] = status
+        family["recommendedNextAction"] = action
+        family["reason"] = (
+            f"{strategy_family_label(family)}: {tested} branches tested, "
+            f"{family['negativeReturnBranches']} negative-return, "
+            f"{family['stressCollapseBranches']} stress-collapse, "
+            f"{family['insufficientEvidenceBranches']} insufficient-evidence, "
+            f"{family['promisingRareBranches']} promising-rare, "
+            f"{family['eligibleOrStableBranches']} eligible/stable."
+        )
+        if status in AUTOPILOT_COOL_DOWN_STATUSES:
+            family["cooldownCycleCount"] = 1
+        summaries.append(family)
+    return sorted(summaries, key=lambda row: (row.get("familyStatus") not in {"PROMISING_BUT_RARE", "NEEDS_DEEP_CONFIRMATION"}, -(row.get("branchesTested") or 0), row.get("strategy") or ""))
+
+
+def strategy_family_label(family: dict) -> str:
+    return str(family.get("strategy") or "Unknown strategy")
+
+
+def autopilot_family_map(memory: dict) -> dict:
+    return {row.get("strategy"): row for row in autopilot_family_summary(memory)}
 
 
 def autopilot_branch_was_recent(row: dict | None, days: int = 30) -> bool:
@@ -8981,7 +9089,16 @@ def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timefram
     return bool(branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES)
 
 
-def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[list[dict], list[str], list[dict]]:
+def autopilot_parse_force_branch(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    parts = [part.strip() for part in str(raw).split(":")]
+    if len(parts) != 4 or not all(parts):
+        return None
+    return {"strategy": parts[0], "symbol": parts[1], "timeframe": parts[2], "period": parts[3]}
+
+
+def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_cooled: bool = False, force_strategy: str | None = None, force_branch: str | None = None) -> tuple[list[dict], list[str], list[dict]]:
     jobs = []
     warnings = []
     skipped = []
@@ -8989,8 +9106,11 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
     existing_branch_keys = autopilot_queue_branch_keys(queue)
     planned_branch_keys = set()
     branch_map = autopilot_memory_branch_map(memory)
+    family_map = autopilot_family_map(memory)
+    forced_strategy = str(force_strategy or "").strip() or None
+    forced_branch = autopilot_parse_force_branch(force_branch)
 
-    def maybe_add(job: dict):
+    def maybe_add(job: dict, bypass_family: bool = False, bypass_branch: bool = False):
         if len(jobs) >= max_jobs:
             return False
         job_keys = autopilot_job_branch_keys(job)
@@ -8998,18 +9118,38 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
         if duplicate_keys:
             skipped.append(autopilot_skip_record(job, "duplicate_queued_job", f"Skipped because branch is already queued, running, done, or planned: {duplicate_keys[0]}.", duplicate_keys[0], branch_map.get(duplicate_keys[0])))
             return False
-        for key in sorted(job_keys):
-            branch = branch_map.get(key)
-            if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
-                reason = "recently_tested_rejected_branch" if autopilot_branch_was_recent(branch) else "rejected_branch"
-                skipped.append(autopilot_skip_record(job, reason, f"Skipped because branch {key} is {branch.get('reasonCategory')}.", key, branch))
-                return False
+        if not bypass_branch:
+            for key in sorted(job_keys):
+                branch = branch_map.get(key)
+                if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
+                    reason = "recently_tested_rejected_branch" if autopilot_branch_was_recent(branch) else "rejected_branch"
+                    skipped.append(autopilot_skip_record(job, reason, f"Skipped because branch {key} is {branch.get('reasonCategory')}.", key, branch))
+                    return False
+        if not bypass_family and not include_cooled:
+            for strategy in autopilot_list(job.get("strategies") or job.get("strategy")):
+                family = family_map.get(strategy)
+                if family and family.get("familyStatus") in AUTOPILOT_COOL_DOWN_STATUSES:
+                    skipped.append(autopilot_skip_record(job, "cooled_strategy_family", f"Skipped because {strategy} family is {family.get('familyStatus')}: {family.get('reason')}", next(iter(job_keys), None), {"family": family}))
+                    return False
         if job.get("signature") in queued_or_done or any(existing.get("signature") == job.get("signature") for existing in jobs):
             skipped.append(autopilot_skip_record(job, "duplicate_queued_job", "Skipped because an exact job signature is already queued, running, done, or planned."))
             return
         jobs.append(job)
         planned_branch_keys.update(job_keys)
         return True
+
+    if forced_branch:
+        maybe_add(make_autopilot_job(
+            [forced_branch["strategy"]],
+            [forced_branch["symbol"]],
+            [forced_branch["timeframe"]],
+            forced_branch["period"],
+            "Manually forced research branch.",
+            100,
+            generated_by="forced_branch",
+            max_combos=10,
+            top_n=20,
+        ), bypass_family=True, bypass_branch=True)
 
     if not memory.get("branches"):
         for strategy in AUTOPILOT_DEFAULT_STRATEGIES[:5]:
@@ -9039,14 +9179,19 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
             next_period = "1095d" if period != "1095d" else period
             maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], next_period, "Confirm eligible candidate on longer/full validation window.", 95, generated_by="eligible_confirmation", previous_evidence=branch, max_combos=10, top_n=20, include_stress=True, include_recent=True, include_repro=True))
         elif category == "PROMISING_BUT_RARE":
+            if period in {"365d", "730d"}:
+                next_period = "730d" if period == "365d" else "1095d"
+                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], next_period, "Confirm promising-but-rare branch on a wider period before more expansion.", 88, generated_by="rare_period_confirmation", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
             if timeframe == "4h":
-                maybe_add(make_autopilot_job([strategy], [symbol], ["1h"], period, "Promising but rare on 4h; test lower timeframe for more activity.", 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20))
+                maybe_add(make_autopilot_job([strategy], [symbol], ["1h"], period, "Promising but rare on 4h; test lower timeframe for more activity.", 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
             other_symbols = [item for item in AUTOPILOT_FIRST_PASS_SYMBOLS + AUTOPILOT_SECOND_PASS_SYMBOLS if item != symbol][:3]
-            maybe_add(make_autopilot_job([strategy], other_symbols, [timeframe], period, "Promising but rare; test same strategy/timeframe on related symbols.", 78, generated_by="rare_symbol_expansion", previous_evidence=branch, max_combos=10, top_n=20))
+            maybe_add(make_autopilot_job([strategy], other_symbols, [timeframe], period, "Promising but rare; test same strategy/timeframe on related symbols.", 78, generated_by="rare_symbol_expansion", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
         elif category in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}:
             warnings.append(f"Deprioritized rejected branch {strategy} {symbol} {timeframe} {period}.")
 
     for strategy in AUTOPILOT_DEFAULT_STRATEGIES:
+        if forced_strategy and strategy != forced_strategy:
+            continue
         for symbol in AUTOPILOT_FIRST_PASS_SYMBOLS:
             for timeframe in AUTOPILOT_TIMEFRAMES:
                 period = "365d"
@@ -9056,7 +9201,7 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
                     warnings.append(f"Deprioritized rejected branch {strategy} {symbol} {timeframe} {period}.")
                     skipped.append(autopilot_skip_record(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15), "rejected_branch", f"Skipped because branch {branch_key} is {branch.get('reasonCategory')}.", branch_key, branch))
                     continue
-                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15))
+                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15), bypass_family=bool(forced_strategy and strategy == forced_strategy))
                 if len(jobs) >= max_jobs:
                     return jobs, warnings, skipped
     return jobs, warnings, skipped
@@ -9076,6 +9221,7 @@ def build_research_autopilot_status() -> dict:
     leads = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}]
     rejected = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
     rare = [row for row in memory.get("branches", []) if row.get("reasonCategory") == "PROMISING_BUT_RARE"]
+    families = autopilot_family_summary(memory)
     next_jobs = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"][:5]
     safety = autopilot_safety_payload()
     return {
@@ -9091,6 +9237,7 @@ def build_research_autopilot_status() -> dict:
             "topLeads": sorted(leads, key=lambda row: (row.get("reasonCategory") != "PROMISING_STABLE", -safe_float(row.get("profitFactor"), 0)))[:8],
             "rejectedBranches": rejected[:12],
             "promisingButRare": rare[:8],
+            "strategyFamilies": families,
         },
         "safety": safety,
     }
@@ -9104,7 +9251,10 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
         memory = rebuild_autopilot_memory_from_saved_reports(40)
     skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
     max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 12)), 12)), 25))
-    planned, warnings, planner_skipped = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs)
+    include_cooled = str(args.get("includeCooled", args.get("include_cooled", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+    force_strategy = args.get("forceStrategy", args.get("force_strategy"))
+    force_branch = args.get("forceBranch", args.get("force_branch"))
+    planned, warnings, planner_skipped = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs, include_cooled=include_cooled, force_strategy=force_strategy, force_branch=force_branch)
     added, enqueue_skipped = autopilot_enqueue(queue, planned)
     skipped = skipped_deprioritized + planner_skipped + enqueue_skipped
     queue["lastPlanSkippedJobs"] = skipped[:25]
@@ -9117,6 +9267,8 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
         "skippedJobs": skipped,
         "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized},
         "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
+        "plannerOptions": {"includeCooled": include_cooled, "forceStrategy": force_strategy, "forceBranch": force_branch},
+        "strategyFamilies": autopilot_family_summary(memory),
         "warnings": warnings,
         "safety": autopilot_safety_payload(),
     }, 200
@@ -9247,6 +9399,7 @@ def build_research_autopilot_summary() -> dict:
         "branchesInsufficientEvidence": insufficient[:12],
         "branchesWorthMoreTesting": more[:12],
         "nextRecommendedJobs": next_jobs,
+        "strategyFamilies": autopilot_family_summary(memory),
         "safety": status.get("safety", {}),
     }
 
@@ -9256,6 +9409,7 @@ def build_research_autopilot_journal() -> dict:
     summary = build_research_autopilot_summary()
     queue = load_autopilot_queue()
     memory = load_autopilot_memory()
+    families = autopilot_family_summary(memory)
     entries = []
     for event in summary.get("learningEvents") or []:
         entries.append({
@@ -9301,6 +9455,7 @@ def build_research_autopilot_journal() -> dict:
         "rejectedBranches": summary.get("branchesRejected", []),
         "insufficientEvidence": summary.get("branchesInsufficientEvidence", []),
         "nextRecommendedJobs": summary.get("nextRecommendedJobs", []),
+        "strategyFamilies": families,
         "queue": status.get("queue", {}),
         "safety": status.get("safety", {}),
     }

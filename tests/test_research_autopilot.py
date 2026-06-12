@@ -74,6 +74,21 @@ def campaign_payload(row):
     }
 
 
+def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2, trades=40, stress=None, seen="2026-06-12T00:00:00+00:00"):
+    return {
+        "strategy": strategy,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "period": period,
+        "reasonCategory": category,
+        "profitFactor": pf,
+        "totalReturnPct": ret,
+        "fullTrades": trades,
+        "stressStatus": stress,
+        "lastSeenAt": seen,
+    }
+
+
 FORBIDDEN_AUTOPILOT_CALLS = [
     "write_candidate_config",
     "write_paper_candidate_config",
@@ -225,6 +240,77 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status["queue"]["counts"]["QUEUED"], 0)
         self.assertEqual(status["queue"]["counts"]["SKIPPED"], 1)
         self.assertTrue(any(item.get("branchKey") == "SimpleAtrTrendV2|ETHUSDT|1h|365d" for item in status["queue"]["skippedDeprioritizedJobs"]))
+
+    def test_repeated_negative_family_cools_down_and_blocks_broad_search(self):
+        memory = {"branches": [
+            branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "BTCUSDT", "4h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "4h", "LOW_PROFIT_FACTOR"),
+        ], "candidates": []}
+        families = zgua_app.autopilot_family_summary(memory)
+        family = next(row for row in families if row["strategy"] == "PullbackTrend")
+        self.assertIn(family["familyStatus"], {"COOL_DOWN", "REJECTED_FAMILY"})
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=20)
+        self.assertFalse(any(job.get("strategy") == "PullbackTrend" for job in jobs))
+        self.assertTrue(any(item.get("skipReason") == "cooled_strategy_family" for item in skipped))
+
+    def test_repeated_stress_collapse_family_cools_down(self):
+        memory = {"branches": [
+            branch("PullbackTrend", "BTCUSDT", "1h", "STRESS_COLLAPSE", stress="COLLAPSES_UNDER_STRESS"),
+            branch("PullbackTrend", "BTCUSDT", "4h", "STRESS_COLLAPSE", stress="COLLAPSES_UNDER_STRESS"),
+            branch("PullbackTrend", "ETHUSDT", "1h", "STRESS_COLLAPSE", stress="COLLAPSES_UNDER_STRESS"),
+            branch("PullbackTrend", "ETHUSDT", "4h", "TOO_FEW_TRADES", pf=1.3, ret=2, trades=18),
+        ], "candidates": []}
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "PullbackTrend")
+        self.assertEqual(family["familyStatus"], "COOL_DOWN")
+
+    def test_promising_rare_family_gets_period_confirmation(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=5)
+        self.assertTrue(any(job.get("generatedBy") == "rare_period_confirmation" and job.get("period") == "730d" for job in jobs))
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "BreakoutRetestV2")
+        self.assertEqual(family["familyStatus"], "PROMISING_BUT_RARE")
+
+    def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
+        memory = {"branches": [
+            branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "BTCUSDT", "4h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "4h", "LOW_PROFIT_FACTOR"),
+        ], "candidates": []}
+        default_jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=30)
+        self.assertFalse(any(job.get("strategy") == "PullbackTrend" for job in default_jobs))
+        cooled_jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=30, include_cooled=True)
+        self.assertTrue(any(job.get("strategy") == "PullbackTrend" and "SOLUSDT" in job.get("symbols", []) for job in cooled_jobs))
+        forced_jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=5, force_strategy="PullbackTrend")
+        self.assertTrue(any(job.get("strategy") == "PullbackTrend" for job in forced_jobs))
+
+    def test_force_branch_bypasses_family_and_branch_cooldown(self):
+        memory = {"branches": [
+            branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "BTCUSDT", "4h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "4h", "LOW_PROFIT_FACTOR"),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, force_branch="PullbackTrend:ETHUSDT:4h:365d")
+        self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
+        self.assertEqual(jobs[0].get("strategy"), "PullbackTrend")
+
+    def test_family_status_appears_in_journal(self):
+        memory = {"branches": [
+            branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "BTCUSDT", "4h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+            branch("PullbackTrend", "ETHUSDT", "4h", "LOW_PROFIT_FACTOR"),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        payload = zgua_app.build_research_autopilot_journal()
+        family = next(row for row in payload["strategyFamilies"] if row["strategy"] == "PullbackTrend")
+        self.assertIn(family["familyStatus"], {"COOL_DOWN", "REJECTED_FAMILY"})
 
     def test_run_next_updates_queue_and_memory_without_side_effects(self):
         queue = zgua_app.load_autopilot_queue()
