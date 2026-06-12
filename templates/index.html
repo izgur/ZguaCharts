@@ -538,6 +538,25 @@
             <button id="research-autopilot-journal" type="button">Research Journal</button>
           </div>
         </div>
+        <div class="lab-controls autopilot-controls">
+          <label><span>Planning Mode</span><select id="research-autopilot-mode">
+            <option value="conservative">Conservative</option>
+            <option value="balanced" selected>Balanced</option>
+            <option value="exploratory">Exploratory</option>
+          </select></label>
+          <label><span>Include Cooled Families</span><input id="research-autopilot-include-cooled" type="checkbox"></label>
+          <label><span>Force Strategy</span><input id="research-autopilot-force-strategy" list="research-autopilot-strategies" placeholder="Optional strategy family"></label>
+          <datalist id="research-autopilot-strategies">
+            <option value="BreakoutRetestV2"></option>
+            <option value="MeanReversion"></option>
+            <option value="MomentumScalping"></option>
+            <option value="PullbackTrend"></option>
+            <option value="RelativeStrengthV2"></option>
+            <option value="SimpleAtrTrendV2"></option>
+          </datalist>
+          <label><span>Force Branch</span><input id="research-autopilot-force-branch" placeholder="PullbackTrend:ETHUSDT:4h:365d"></label>
+          <label><span>Max Jobs</span><input id="research-autopilot-max-jobs" type="number" min="1" max="20" value="5"></label>
+        </div>
         <div id="research-autopilot-panel" class="paper-validation-result">
           <p class="pane-status">No research autopilot status loaded.</p>
         </div>

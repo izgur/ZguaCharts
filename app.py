@@ -8516,6 +8516,7 @@ AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
 AUTOPILOT_PERIODS = ["365d", "730d"]
 AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WALK_FORWARD", "STRESS_COLLAPSE", "REJECTED", "RECENTLY_WEAK"}
 AUTOPILOT_COOL_DOWN_STATUSES = {"COOL_DOWN", "REJECTED_FAMILY", "EXHAUSTED_IN_CURRENT_SCOPE"}
+AUTOPILOT_PLANNING_MODES = {"conservative", "balanced", "exploratory"}
 
 
 def autopilot_now() -> str:
@@ -8733,7 +8734,22 @@ def autopilot_memory_branch_map(memory: dict) -> dict:
     }
 
 
-def autopilot_family_summary(memory: dict) -> list[dict]:
+def normalize_autopilot_planning_mode(raw: str | None) -> str:
+    mode = str(raw or "balanced").strip().lower()
+    return mode if mode in AUTOPILOT_PLANNING_MODES else "balanced"
+
+
+def autopilot_family_thresholds(planning_mode: str) -> dict:
+    mode = normalize_autopilot_planning_mode(planning_mode)
+    if mode == "conservative":
+        return {"all_rejected_min": 3, "cool_min": 3, "cool_ratio": 0.5, "cool_floor": 2, "exhausted_min": 3}
+    if mode == "exploratory":
+        return {"all_rejected_min": 6, "cool_min": 6, "cool_ratio": 0.75, "cool_floor": 5, "exhausted_min": 6}
+    return {"all_rejected_min": 4, "cool_min": 4, "cool_ratio": 0.6, "cool_floor": 3, "exhausted_min": 4}
+
+
+def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> list[dict]:
+    thresholds = autopilot_family_thresholds(planning_mode)
     families = {}
     for branch in memory.get("branches", []):
         if not is_real_research_candidate(branch):
@@ -8804,13 +8820,13 @@ def autopilot_family_summary(memory: dict) -> list[dict]:
         elif has_rare:
             status = "PROMISING_BUT_RARE"
             action = "Run controlled period confirmation and limited related-market tests."
-        elif tested >= 4 and rejected_like == tested:
+        elif tested >= thresholds["all_rejected_min"] and rejected_like == tested:
             status = "REJECTED_FAMILY"
             action = "Cool down this strategy family; all tested branches are rejected-like."
-        elif tested >= 4 and rejected_like >= max(3, math.ceil(tested * 0.6)):
+        elif tested >= thresholds["cool_min"] and rejected_like >= max(thresholds["cool_floor"], math.ceil(tested * thresholds["cool_ratio"])):
             status = "COOL_DOWN"
             action = "Cool down this strategy family before more broad expansion."
-        elif tested >= 4 and weak_like >= tested:
+        elif tested >= thresholds["exhausted_min"] and weak_like >= tested:
             status = "EXHAUSTED_IN_CURRENT_SCOPE"
             action = "Pause broad search in the current symbol/timeframe scope."
         else:
@@ -8836,8 +8852,8 @@ def strategy_family_label(family: dict) -> str:
     return str(family.get("strategy") or "Unknown strategy")
 
 
-def autopilot_family_map(memory: dict) -> dict:
-    return {row.get("strategy"): row for row in autopilot_family_summary(memory)}
+def autopilot_family_map(memory: dict, planning_mode: str = "balanced") -> dict:
+    return {row.get("strategy"): row for row in autopilot_family_summary(memory, planning_mode=planning_mode)}
 
 
 def autopilot_branch_was_recent(row: dict | None, days: int = 30) -> bool:
@@ -9098,7 +9114,7 @@ def autopilot_parse_force_branch(raw: str | None) -> dict | None:
     return {"strategy": parts[0], "symbol": parts[1], "timeframe": parts[2], "period": parts[3]}
 
 
-def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_cooled: bool = False, force_strategy: str | None = None, force_branch: str | None = None) -> tuple[list[dict], list[str], list[dict]]:
+def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_cooled: bool = False, force_strategy: str | None = None, force_branch: str | None = None, planning_mode: str = "balanced") -> tuple[list[dict], list[str], list[dict]]:
     jobs = []
     warnings = []
     skipped = []
@@ -9106,7 +9122,8 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
     existing_branch_keys = autopilot_queue_branch_keys(queue)
     planned_branch_keys = set()
     branch_map = autopilot_memory_branch_map(memory)
-    family_map = autopilot_family_map(memory)
+    planning_mode = normalize_autopilot_planning_mode(planning_mode)
+    family_map = autopilot_family_map(memory, planning_mode=planning_mode)
     forced_strategy = str(force_strategy or "").strip() or None
     forced_branch = autopilot_parse_force_branch(force_branch)
 
@@ -9250,11 +9267,12 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
     skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
-    max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 12)), 12)), 25))
+    max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 5)), 5)), 20))
+    planning_mode = normalize_autopilot_planning_mode(args.get("planningMode", args.get("mode", args.get("planning_mode"))))
     include_cooled = str(args.get("includeCooled", args.get("include_cooled", "false"))).strip().lower() in {"1", "true", "yes", "on"}
     force_strategy = args.get("forceStrategy", args.get("force_strategy"))
     force_branch = args.get("forceBranch", args.get("force_branch"))
-    planned, warnings, planner_skipped = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs, include_cooled=include_cooled, force_strategy=force_strategy, force_branch=force_branch)
+    planned, warnings, planner_skipped = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs, include_cooled=include_cooled, force_strategy=force_strategy, force_branch=force_branch, planning_mode=planning_mode)
     added, enqueue_skipped = autopilot_enqueue(queue, planned)
     skipped = skipped_deprioritized + planner_skipped + enqueue_skipped
     queue["lastPlanSkippedJobs"] = skipped[:25]
@@ -9267,8 +9285,8 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
         "skippedJobs": skipped,
         "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized},
         "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
-        "plannerOptions": {"includeCooled": include_cooled, "forceStrategy": force_strategy, "forceBranch": force_branch},
-        "strategyFamilies": autopilot_family_summary(memory),
+        "plannerOptions": {"includeCooled": include_cooled, "forceStrategy": force_strategy, "forceBranch": force_branch, "planningMode": planning_mode, "maxJobs": max_jobs},
+        "strategyFamilies": autopilot_family_summary(memory, planning_mode=planning_mode),
         "warnings": warnings,
         "safety": autopilot_safety_payload(),
     }, 200

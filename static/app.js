@@ -5314,7 +5314,7 @@ async function loadResearchAutopilot(action = "status") {
   try {
     host.innerHTML = `<p class="pane-status">${labels[action] || labels.status}</p>`;
     let payload;
-    if (action === "plan") payload = await apiPost("/api/research/autopilot/plan", { maxJobs: 12 });
+    if (action === "plan") payload = await apiPost("/api/research/autopilot/plan", researchAutopilotPlanOptions());
     else if (action === "runNext") payload = await apiPost("/api/research/autopilot/run-next", {});
     else if (action === "runBatch") payload = await apiPost("/api/research/autopilot/run-batch", { maxJobs: 3 });
     else if (action === "summary") payload = await apiGet("/api/research/autopilot/summary");
@@ -5324,6 +5324,22 @@ async function loadResearchAutopilot(action = "status") {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Research autopilot could not load: ${escapeHtml(error.message)}</p>`;
   }
+}
+
+function researchAutopilotPlanOptions() {
+  const mode = document.querySelector("#research-autopilot-mode")?.value || "balanced";
+  const includeCooled = Boolean(document.querySelector("#research-autopilot-include-cooled")?.checked);
+  const forceStrategy = (document.querySelector("#research-autopilot-force-strategy")?.value || "").trim();
+  const forceBranch = (document.querySelector("#research-autopilot-force-branch")?.value || "").trim();
+  const rawMaxJobs = Number.parseInt(document.querySelector("#research-autopilot-max-jobs")?.value || "5", 10);
+  const maxJobs = Math.max(1, Math.min(Number.isFinite(rawMaxJobs) ? rawMaxJobs : 5, 20));
+  return {
+    planningMode: ["conservative", "balanced", "exploratory"].includes(mode) ? mode : "balanced",
+    includeCooled,
+    forceStrategy,
+    forceBranch,
+    maxJobs,
+  };
 }
 
 function formatAutopilotGate(gate) {
@@ -5342,8 +5358,10 @@ function renderAutopilotJob(job) {
   const sourceLabel = {
     rare_lower_timeframe: "Rare lower-timeframe follow-up",
     rare_symbol_expansion: "Rare symbol expansion",
+    rare_period_confirmation: "Rare period confirmation",
     broad_search: "Broad safe search",
     eligible_confirmation: "Eligible confirmation",
+    forced_branch: "Forced branch",
     seed: "Initial seed scan",
   }[job.generatedBy] || job.generatedBy || "-";
   return `
@@ -5524,6 +5542,17 @@ function renderResearchAutopilot(payload, action = "status") {
   const skipped = ((payload.skippedJobs || queue.lastPlanSkippedJobs || [])).slice(0, 12).map(renderAutopilotSkip).join("");
   const actionNote = action === "plan" ? `${payload.addedJobs?.length || 0} job(s) added, ${payload.skippedJobs?.length || 0} skip(s) recorded.` : action === "runNext" ? `Ran job ${payload.job?.jobId || "-"}.` : action === "runBatch" ? `Attempted ${payload.jobsAttempted || 0} job(s).` : "Queue and research memory are loaded.";
   const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
+  const plannerOptions = payload.plannerOptions || {};
+  const plannerOptionPanel = action === "plan" ? `
+    <h4 class="modal-section-title">Planner Options</h4>
+    <div class="metric-grid">
+      <div class="metric"><span>Mode</span><strong>${escapeHtml(plannerOptions.planningMode || "balanced")}</strong></div>
+      <div class="metric"><span>Include cooled</span><strong>${plannerOptions.includeCooled ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Force strategy</span><strong>${escapeHtml(plannerOptions.forceStrategy || "-")}</strong></div>
+      <div class="metric"><span>Force branch</span><strong>${escapeHtml(plannerOptions.forceBranch || "-")}</strong></div>
+      <div class="metric"><span>Max jobs</span><strong>${plannerOptions.maxJobs ?? "-"}</strong></div>
+    </div>
+  ` : "";
   return `
     <h3 class="modal-section-title">Research Autopilot <span class="neutral">${escapeHtml(actionNote)}</span></h3>
     <div class="metric-grid">
@@ -5536,6 +5565,7 @@ function renderResearchAutopilot(payload, action = "status") {
       <div class="metric"><span>Candidates</span><strong>${memory.candidates ?? 0}</strong></div>
       <div class="metric"><span>Real trading</span><strong>${payload.safety?.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
     </div>
+    ${plannerOptionPanel}
     <h4 class="modal-section-title">Job Details</h4>
     ${jobs || `<p class="modal-note">No queued jobs yet. Plan next jobs to seed the queue.</p>`}
     <h4 class="modal-section-title">Last Plan Skips</h4>

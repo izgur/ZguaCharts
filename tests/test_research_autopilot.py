@@ -300,6 +300,50 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
         self.assertEqual(jobs[0].get("strategy"), "PullbackTrend")
 
+    def test_default_api_planning_uses_balanced_mode(self):
+        with patch.object(zgua_app, "autopilot_plan_jobs", return_value=([], [], [])) as planner:
+            payload, status = zgua_app.build_research_autopilot_plan({})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["plannerOptions"]["planningMode"], "balanced")
+        self.assertEqual(payload["plannerOptions"]["maxJobs"], 5)
+        planner_kwargs = planner.call_args[1]
+        self.assertEqual(planner_kwargs["planning_mode"], "balanced")
+        self.assertEqual(planner_kwargs["max_jobs"], 5)
+
+    def test_api_planning_options_reach_planner(self):
+        with patch.object(zgua_app, "autopilot_plan_jobs", return_value=([], [], [])) as planner:
+            payload, status = zgua_app.build_research_autopilot_plan({
+                "planningMode": "exploratory",
+                "includeCooled": True,
+                "forceStrategy": "PullbackTrend",
+                "forceBranch": "PullbackTrend:ETHUSDT:4h:365d",
+                "maxJobs": 20,
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["plannerOptions"]["planningMode"], "exploratory")
+        self.assertTrue(payload["plannerOptions"]["includeCooled"])
+        self.assertEqual(payload["plannerOptions"]["forceStrategy"], "PullbackTrend")
+        self.assertEqual(payload["plannerOptions"]["forceBranch"], "PullbackTrend:ETHUSDT:4h:365d")
+        self.assertEqual(payload["plannerOptions"]["maxJobs"], 20)
+        planner_kwargs = planner.call_args[1]
+        self.assertEqual(planner_kwargs["planning_mode"], "exploratory")
+        self.assertTrue(planner_kwargs["include_cooled"])
+        self.assertEqual(planner_kwargs["force_strategy"], "PullbackTrend")
+        self.assertEqual(planner_kwargs["force_branch"], "PullbackTrend:ETHUSDT:4h:365d")
+
+    def test_exploratory_mode_does_not_bypass_exact_rejected_branch_guard(self):
+        memory = {"branches": [
+            branch("SimpleAtrTrendV2", "ETHUSDT", "1h", "NEGATIVE_RETURN"),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=12, planning_mode="exploratory")
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("SimpleAtrTrendV2|ETHUSDT|1h|365d", planned_keys)
+        self.assertTrue(any(item.get("branchKey") == "SimpleAtrTrendV2|ETHUSDT|1h|365d" and item.get("skipReason") in {"rejected_branch", "recently_tested_rejected_branch"} for item in skipped))
+
+        forced_jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, planning_mode="exploratory", force_branch="SimpleAtrTrendV2:ETHUSDT:1h:365d")
+        self.assertEqual(forced_jobs[0].get("generatedBy"), "forced_branch")
+        self.assertIn("SimpleAtrTrendV2|ETHUSDT|1h|365d", zgua_app.autopilot_job_branch_keys(forced_jobs[0]))
+
     def test_family_status_appears_in_journal(self):
         memory = {"branches": [
             branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),
