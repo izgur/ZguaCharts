@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,9 +74,61 @@ def campaign_payload(row):
     }
 
 
+FORBIDDEN_AUTOPILOT_CALLS = [
+    "write_candidate_config",
+    "write_paper_candidate_config",
+    "enable_paper_simulation_controlled",
+    "disable_paper_simulation_controlled",
+    "run_paper_tick_once",
+    "run_paper_once_controlled",
+    "auto_promote_candidate_if_allowed",
+    "build_candidate_promotion_preview",
+]
+
+
 class ResearchAutopilotTests(unittest.TestCase):
     def setUp(self):
         patch_autopilot_paths(self)
+        self.paper_candidate_before = dict(zgua_app.load_paper_candidate_config())
+        self.paper_enabled_before = zgua_app.canonical_paper_enabled(self.paper_candidate_before)
+        self.real_enabled_before = zgua_app.paper_real_trading_enabled()[0]
+
+    def assert_autopilot_safety(self, payload):
+        safety = payload.get("safety") or {}
+        self.assertTrue(safety.get("researchOnly"))
+        self.assertEqual(safety.get("paperEnabled"), self.paper_enabled_before)
+        self.assertEqual(safety.get("realTradingEnabled"), self.real_enabled_before)
+        self.assertFalse(safety.get("promotionAttempted"))
+        self.assertFalse(safety.get("configWritten"))
+        self.assertFalse(safety.get("paperStateChanged"))
+        self.assertFalse(safety.get("paperTickRan"))
+        self.assertFalse(safety.get("liveOrdersTouched"))
+        self.assertFalse(safety.get("realOrderFunctionsCalled"))
+        self.assertFalse(safety.get("activePaperCandidateMutated"))
+        self.assertFalse(safety.get("riskSettingsChanged"))
+        self.assertFalse(safety.get("apiKeyPathCreated"))
+        after = zgua_app.load_paper_candidate_config()
+        self.assertEqual(zgua_app.canonical_paper_enabled(after), self.paper_enabled_before)
+        for field in ("strategy", "riskPct", "maxOpenTrades", "maxNotional", "maxNotionalPerTrade"):
+            self.assertEqual(after.get(field), self.paper_candidate_before.get(field))
+
+    def forbidden_boundary_patches(self):
+        patches = []
+        for name in FORBIDDEN_AUTOPILOT_CALLS:
+            if hasattr(zgua_app, name):
+                patches.append(patch.object(zgua_app, name, side_effect=AssertionError(f"Autopilot must not call {name}")))
+        return patches
+
+    def run_with_forbidden_boundaries(self, func, *args, **kwargs):
+        patches = self.forbidden_boundary_patches()
+        started = [item.start() for item in patches]
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for mocked in started:
+                self.assertFalse(mocked.called)
+            for item in reversed(patches):
+                item.stop()
 
     def test_queue_deduplicates_exact_jobs(self):
         queue = zgua_app.load_autopilot_queue()
@@ -138,7 +191,7 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["job"]["status"], "DONE")
-        self.assertFalse(payload["safety"]["configWritten"])
+        self.assert_autopilot_safety(payload)
         memory = zgua_app.load_autopilot_memory()
         self.assertEqual(len(memory["candidates"]), 1)
         self.assertTrue(memory["candidates"][0].get("candidateKey"))
@@ -166,14 +219,78 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["job"]["status"], "FAILED")
-        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assert_autopilot_safety(payload)
 
     def test_status_and_summary_safety_flags(self):
         status = zgua_app.build_research_autopilot_status()
         summary = zgua_app.build_research_autopilot_summary()
-        self.assertTrue(status["safety"]["researchOnly"])
-        self.assertFalse(status["safety"]["promotionAttempted"])
+        self.assert_autopilot_safety(status)
+        self.assert_autopilot_safety(summary)
         self.assertIn("Safety:", summary["summaryText"])
+
+    def test_autopilot_commands_do_not_cross_promotion_boundary(self):
+        queue = zgua_app.load_autopilot_queue()
+        zgua_app.autopilot_enqueue(queue, [zgua_app.make_autopilot_job(["MeanReversion"], ["BTCUSDT"], ["4h"], "730d", "test")])
+        zgua_app.save_autopilot_queue(queue)
+        row = candidate_row()
+        with patch.object(zgua_app, "build_research_campaign_runner", return_value=(campaign_payload(row), 200)):
+            plan, plan_status = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_plan, {"maxJobs": 2})
+            run_next, run_next_status = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_run_next)
+            batch, batch_status = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_run_batch, {"maxJobs": 1})
+        summary = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_summary)
+        reset, reset_status = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_reset_queue, {"confirm": True})
+        self.assertEqual(plan_status, 200)
+        self.assertIn(run_next_status, {200, 502})
+        self.assertIn(batch_status, {200, 207})
+        self.assertEqual(reset_status, 200)
+        for payload in (plan, run_next, batch, summary, reset):
+            self.assert_autopilot_safety(payload)
+
+    def test_no_queue_and_malformed_queue_fail_safely(self):
+        payload, status = zgua_app.build_research_autopilot_run_next()
+        self.assertEqual(status, 404)
+        self.assert_autopilot_safety(payload)
+        zgua_app.RESEARCH_AUTOPILOT_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        zgua_app.RESEARCH_AUTOPILOT_QUEUE_PATH.write_text("{not-json", encoding="utf-8")
+        payload, status = zgua_app.build_research_autopilot_run_next()
+        self.assertEqual(status, 404)
+        self.assert_autopilot_safety(payload)
+
+    def test_stale_running_job_recovered_without_execution(self):
+        old = (datetime.now(timezone.utc) - timedelta(hours=4)).isoformat()
+        queue = zgua_app.load_autopilot_queue()
+        job = zgua_app.make_autopilot_job(["MeanReversion"], ["BTCUSDT"], ["4h"], "730d", "stale")
+        job["status"] = "RUNNING"
+        job["startedAt"] = old
+        queue["jobs"] = [job]
+        zgua_app.save_autopilot_queue(queue)
+        with patch.object(zgua_app, "build_research_campaign_runner", side_effect=AssertionError("stale recovery must not execute campaign")):
+            payload, status = zgua_app.build_research_autopilot_run_next()
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["queue"]["counts"]["FAILED"], 1)
+        self.assertEqual(payload["queue"]["recoveredStaleJobs"][0]["status"], "FAILED")
+        self.assert_autopilot_safety(payload)
+
+    def test_failed_gate_display_and_placeholder_candidates_are_sanitized(self):
+        placeholder = zgua_app.compact_campaign_candidate({})
+        self.assertEqual(placeholder, {})
+        formatted = zgua_app.format_failed_gates([
+            {"name": "full trades", "detail": "22 >= 40"},
+            {"name": "full PF", "detail": "0.7478 >= 1.05"},
+            {"name": "negative folds", "detail": "3 <= 1"},
+            {"name": "concentration", "detail": "82.81% <= 75%"},
+            {"name": "worst fold", "detail": "-1.31% > -1%"},
+        ])
+        details = [item["detail"] for item in formatted]
+        self.assertIn("22 trades < required 40", details)
+        self.assertIn("PF 0.7478 < required 1.05", details)
+        self.assertIn("3 negative folds > allowed 1", details)
+        self.assertIn("concentration 82.81% > allowed 75%", details)
+        self.assertIn("worst fold -1.31% < allowed -1%", details)
+        payload = campaign_payload({})
+        memory = zgua_app.update_autopilot_memory_from_report(payload, "inline-placeholder")
+        self.assertEqual(memory["candidates"], [])
+        self.assertEqual(memory["branches"], [])
 
 
 if __name__ == "__main__":

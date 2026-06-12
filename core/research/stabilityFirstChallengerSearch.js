@@ -478,23 +478,26 @@ function eligibility(candidate, benchmark, rules) {
   const stress = candidate.stress || { status: "NOT_RUN" };
   const repro = candidate.reproducibility || { status: "NOT_RUN" };
   const expected = activityExpectation(candidate.timeframe, candidate.days || 365);
-  function gate(name, ok, detail) {
-    (ok ? passed : failed).push({ name, detail });
+  function gate(name, ok, passDetail, failDetail) {
+    (ok ? passed : failed).push({ name, detail: ok ? passDetail : (failDetail || passDetail) });
   }
+  const atLeast = (label, value, required, suffix = "") => [`${label} ${value}${suffix} >= required ${required}${suffix}`, `${label} ${value}${suffix} < required ${required}${suffix}`];
+  const greaterThan = (label, value, required, suffix = "") => [`${label} ${value}${suffix} > required ${required}${suffix}`, `${label} ${value}${suffix} <= required ${required}${suffix}`];
+  const atMost = (label, value, allowed, suffix = "") => [`${label} ${value}${suffix} <= allowed ${allowed}${suffix}`, `${label} ${value}${suffix} > allowed ${allowed}${suffix}`];
   gate("anti-lookahead", candidate.antiLookaheadStatus === "PASS", "Candidate parameters are fixed before fold tests; no test-fold selection is used.");
   gate("reproducibility", !["UNSTABLE"].includes(repro.status), `Reproducibility is ${repro.status}.`);
-  gate("full trades", full.trades >= rules.minFullTrades, `${full.trades} >= ${rules.minFullTrades}`);
-  gate("activity", full.trades >= expected.halfExpectedTrades, `${full.trades} >= ${expected.halfExpectedTrades} half expected trades for ${candidate.timeframe}`);
-  gate("fold pass count", wf.foldPassCount >= rules.minFoldPassCount, `${wf.foldPassCount} >= ${rules.minFoldPassCount}`);
-  gate("negative folds", wf.negativeFoldCount <= rules.maxNegativeFolds, `${wf.negativeFoldCount} <= ${rules.maxNegativeFolds}`);
-  gate("worst fold", wf.worstFoldReturnPct > rules.minWorstFoldReturnPct, `${wf.worstFoldReturnPct}% > ${rules.minWorstFoldReturnPct}%`);
-  gate("median fold return", wf.medianFoldReturnPct > rules.minMedianFoldReturnPct, `${wf.medianFoldReturnPct}% > ${rules.minMedianFoldReturnPct}%`);
-  gate("median fold PF", wf.medianFoldProfitFactor > rules.minMedianFoldProfitFactor, `${wf.medianFoldProfitFactor} > ${rules.minMedianFoldProfitFactor}`);
-  gate("full PF", full.profitFactor >= rules.minProfitFactor, `${full.profitFactor} >= ${rules.minProfitFactor}`);
-  gate("full return", full.totalReturnPct > 0, `${full.totalReturnPct}% > 0`);
-  gate("drawdown", full.maxDrawdownPct <= rules.maxDrawdownPct, `${full.maxDrawdownPct}% <= ${rules.maxDrawdownPct}%`);
+  gate("full trades", full.trades >= rules.minFullTrades, ...atLeast("trades", full.trades, rules.minFullTrades));
+  gate("activity", full.trades >= expected.halfExpectedTrades, `${full.trades} trades >= required ${expected.halfExpectedTrades} half expected trades for ${candidate.timeframe}`, `${full.trades} trades < required ${expected.halfExpectedTrades} half expected trades for ${candidate.timeframe}`);
+  gate("fold pass count", wf.foldPassCount >= rules.minFoldPassCount, ...atLeast("fold pass count", wf.foldPassCount, rules.minFoldPassCount));
+  gate("negative folds", wf.negativeFoldCount <= rules.maxNegativeFolds, ...atMost("negative folds", wf.negativeFoldCount, rules.maxNegativeFolds));
+  gate("worst fold", wf.worstFoldReturnPct > rules.minWorstFoldReturnPct, ...greaterThan("worst fold", wf.worstFoldReturnPct, rules.minWorstFoldReturnPct, "%"));
+  gate("median fold return", wf.medianFoldReturnPct > rules.minMedianFoldReturnPct, ...greaterThan("median fold return", wf.medianFoldReturnPct, rules.minMedianFoldReturnPct, "%"));
+  gate("median fold PF", wf.medianFoldProfitFactor > rules.minMedianFoldProfitFactor, ...greaterThan("median fold PF", wf.medianFoldProfitFactor, rules.minMedianFoldProfitFactor));
+  gate("full PF", full.profitFactor >= rules.minProfitFactor, ...atLeast("PF", full.profitFactor, rules.minProfitFactor));
+  gate("full return", full.totalReturnPct > 0, ...greaterThan("return", full.totalReturnPct, 0, "%"));
+  gate("drawdown", full.maxDrawdownPct <= rules.maxDrawdownPct, ...atMost("drawdown", full.maxDrawdownPct, rules.maxDrawdownPct, "%"));
   gate("stress", stress.status !== "COLLAPSES_UNDER_STRESS", `Stress status is ${stress.status}.`);
-  gate("concentration", concentration.bestFoldContributionPct <= rules.maxBestFoldContributionPct, `${concentration.bestFoldContributionPct}% <= ${rules.maxBestFoldContributionPct}%`);
+  gate("concentration", concentration.bestFoldContributionPct <= rules.maxBestFoldContributionPct, ...atMost("concentration", concentration.bestFoldContributionPct, rules.maxBestFoldContributionPct, "%"));
   if (benchmark) {
     gate("benchmark stability improvement", candidate.stabilityScore >= benchmark.stabilityScore + rules.minStabilityScoreImprovement, `${candidate.stabilityScore} vs benchmark ${benchmark.stabilityScore}`);
     gate("benchmark negative folds", wf.negativeFoldCount < benchmark.walkForward.negativeFoldCount || wf.foldPassCount > benchmark.walkForward.foldPassCount, "Must improve folds or negative-fold count.");

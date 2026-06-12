@@ -10,6 +10,9 @@ server.pid
 .research-cache/
 data/
 reports/
+reports/research-autopilot/
+reports/research-snapshots/
+reports/stability-first-search/
 reports-smoke/
 reports-cli-smoke/
 config/backups/

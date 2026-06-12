@@ -8104,6 +8104,64 @@ def candidate_context_from_config(candidate: dict) -> dict:
     }
 
 
+def is_real_research_candidate(row: dict | None) -> bool:
+    if not isinstance(row, dict):
+        return False
+    strategy = str(row.get("strategy") or "").strip()
+    symbol = str(row.get("symbol") or "").strip()
+    timeframe = str(row.get("timeframe") or "").strip()
+    if not strategy or not symbol or not timeframe or "-" in {strategy, symbol, timeframe}:
+        return False
+    candidate_key = str(row.get("candidateKey") or "")
+    if candidate_key.startswith(f"{CANONICAL_CANDIDATE_IDENTITY_VERSION}|-|-|-|"):
+        return False
+    return True
+
+
+def format_failed_gate(gate) -> dict:
+    if isinstance(gate, str):
+        return {"name": gate, "detail": gate}
+    if not isinstance(gate, dict):
+        return {"name": "gate", "detail": str(gate)}
+    name = str(gate.get("name") or gate.get("reason") or "gate")
+    detail = str(gate.get("detail") or gate.get("summary") or "")
+    match = re.match(r"^\s*(-?\d+(?:\.\d+)?)%?\s*(>=|>|<=|<)\s*(-?\d+(?:\.\d+)?)%?\s*(.*)$", detail)
+    if match:
+        left, op, right, suffix = match.groups()
+        suffix = suffix.strip()
+        pct = "%" if "%" in detail else ""
+        if name == "full trades":
+            detail = f"{left} trades < required {right}" if op in {">=", ">"} else f"{left} trades > allowed {right}"
+        elif name == "activity":
+            detail = f"{left} trades < required {right} {suffix}".strip()
+        elif name == "fold pass count":
+            detail = f"fold pass count {left} < required {right}"
+        elif name == "negative folds":
+            detail = f"{left} negative folds > allowed {right}"
+        elif name == "worst fold":
+            detail = f"worst fold {left}% < allowed {right}%"
+        elif name == "median fold return":
+            detail = f"median fold return {left}% < required {right}%"
+        elif name == "median fold PF":
+            detail = f"median fold PF {left} < required {right}"
+        elif name == "full PF":
+            detail = f"PF {left} < required {right}"
+        elif name == "full return":
+            detail = f"return {left}% <= required {right}%"
+        elif name == "drawdown":
+            detail = f"drawdown {left}% > allowed {right}%"
+        elif name == "concentration":
+            detail = f"concentration {left}% > allowed {right}%"
+        else:
+            comparator = "< required" if op in {">=", ">"} else "> allowed"
+            detail = f"{name} {left}{pct} {comparator} {right}{pct}".strip()
+    return {**gate, "name": name, "detail": detail}
+
+
+def format_failed_gates(gates) -> list[dict]:
+    return [format_failed_gate(gate) for gate in (gates or [])]
+
+
 def validation_params_meta(params: dict | None, params_source: str, candidate_identity: dict | None = None) -> dict:
     normalized = normalized_candidate_params(params)
     params_hash = short_hash(normalized)
@@ -8129,6 +8187,8 @@ def validation_not_comparable(reason: str, params_meta: dict | None = None) -> d
 
 
 def compact_campaign_candidate(row: dict) -> dict:
+    if not is_real_research_candidate(row):
+        return {}
     identity = candidate_identity_from_row(row)
     return {
         "rank": row.get("rank"),
@@ -8155,7 +8215,7 @@ def compact_campaign_candidate(row: dict) -> dict:
         "recentWindowStatus": (row.get("recentWindows") or {}).get("status"),
         "reproducibilityStatus": (row.get("reproducibility") or {}).get("status"),
         "params": row.get("params") or {},
-        "failedGates": (row.get("eligibility") or {}).get("failedGates") or [],
+        "failedGates": format_failed_gates((row.get("eligibility") or {}).get("failedGates") or row.get("failedGates") or []),
     }
 
 
@@ -8196,8 +8256,8 @@ def research_campaign_recommendation(stability: dict, validations: list[dict], r
             "action": "REAL_TRADING_BLOCKED",
             "reason": "Real trading is enabled or partially configured; research campaign remains advisory only.",
         }
-    eligible = stability.get("bestEligibleChallenger")
-    stable = stability.get("bestStableCandidate")
+    eligible = stability.get("bestEligibleChallenger") if is_real_research_candidate(stability.get("bestEligibleChallenger")) else None
+    stable = stability.get("bestStableCandidate") if is_real_research_candidate(stability.get("bestStableCandidate")) else None
     if eligible:
         return {
             "action": "REVIEW_STABLE_CHALLENGER",
@@ -8349,7 +8409,7 @@ def build_research_campaign_runner(args) -> tuple[dict, int]:
             "bestResearchedCandidate": compact_campaign_candidate(stability.get("bestResearchedCandidate") or {}),
             "bestStableCandidate": compact_campaign_candidate(stability.get("bestStableCandidate") or {}),
             "bestEligibleChallenger": compact_campaign_candidate(stability.get("bestEligibleChallenger") or {}),
-            "topCandidates": [compact_campaign_candidate(row) for row in top_rows[: int(top_n)]],
+            "topCandidates": [candidate for candidate in (compact_campaign_candidate(row) for row in top_rows[: int(top_n)]) if candidate],
         }
     leaderboard_summary = compact_snapshot_leaderboard(leaderboard)
     activity_summary = {
@@ -8478,7 +8538,10 @@ def autopilot_paths() -> dict:
 
 
 def load_autopilot_queue() -> dict:
-    payload = read_json_file(str(RESEARCH_AUTOPILOT_QUEUE_PATH), {})
+    try:
+        payload = read_json_file(str(RESEARCH_AUTOPILOT_QUEUE_PATH), {})
+    except Exception:
+        payload = {}
     if not isinstance(payload, dict):
         payload = {}
     payload.setdefault("schemaVersion", AUTOPILOT_SCHEMA_VERSION)
@@ -8498,14 +8561,17 @@ def save_autopilot_queue(payload: dict) -> None:
 
 
 def load_autopilot_memory() -> dict:
-    payload = read_json_file(str(RESEARCH_AUTOPILOT_MEMORY_PATH), {})
+    try:
+        payload = read_json_file(str(RESEARCH_AUTOPILOT_MEMORY_PATH), {})
+    except Exception:
+        payload = {}
     if not isinstance(payload, dict):
         payload = {}
     payload.setdefault("schemaVersion", AUTOPILOT_SCHEMA_VERSION)
     payload.setdefault("generatedAt", None)
     payload.setdefault("updatedAt", None)
-    payload.setdefault("branches", [])
-    payload.setdefault("candidates", [])
+    payload["branches"] = [sanitize_autopilot_memory_row(row) for row in payload.get("branches", []) if is_real_research_candidate(row)]
+    payload["candidates"] = [sanitize_autopilot_memory_row(row) for row in payload.get("candidates", []) if is_real_research_candidate(row)]
     payload.setdefault("sourceReports", [])
     return payload
 
@@ -8525,6 +8591,10 @@ def write_autopilot_json(path: Path, payload: dict) -> None:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
     temp_path.replace(path)
+
+
+def sanitize_autopilot_memory_row(row: dict) -> dict:
+    return {**row, "failedGates": format_failed_gates(row.get("failedGates") or [])}
 
 
 def autopilot_job_signature(job: dict) -> str:
@@ -8615,6 +8685,45 @@ def autopilot_queue_counts(queue: dict) -> dict:
     return {status: counts.get(status, 0) for status in ["QUEUED", "RUNNING", "DONE", "FAILED", "SKIPPED"]}
 
 
+def recover_stale_autopilot_running_jobs(queue: dict, max_age_minutes: int = 120) -> list[dict]:
+    recovered = []
+    now = datetime.now(timezone.utc)
+    for job in queue.get("jobs", []):
+        if job.get("status") != "RUNNING":
+            continue
+        started = parse_iso_timestamp(job.get("startedAt") or job.get("updatedAt") or job.get("createdAt"))
+        if started is None:
+            age_minutes = max_age_minutes + 1
+        else:
+            age_minutes = (now - started).total_seconds() / 60
+        if age_minutes > max_age_minutes:
+            job["status"] = "FAILED"
+            job["updatedAt"] = autopilot_now()
+            job["finishedAt"] = job.get("finishedAt") or job["updatedAt"]
+            job["error"] = "Recovered stale RUNNING job; no live execution is resumed automatically."
+            recovered.append(job)
+    return recovered
+
+
+def autopilot_safety_payload() -> dict:
+    real_enabled, real_detail = paper_real_trading_enabled()
+    return {
+        "researchOnly": True,
+        "paperEnabled": canonical_paper_enabled(load_paper_candidate_config()),
+        "realTradingEnabled": real_enabled,
+        "realTradingDetail": real_detail,
+        "promotionAttempted": False,
+        "configWritten": False,
+        "paperStateChanged": False,
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realOrderFunctionsCalled": False,
+        "activePaperCandidateMutated": False,
+        "riskSettingsChanged": False,
+        "apiKeyPathCreated": False,
+    }
+
+
 def autopilot_branch_key(row: dict, period: str | None = None) -> str:
     return "|".join([
         str(row.get("strategy") or "-"),
@@ -8658,6 +8767,8 @@ def autopilot_reason_category(row: dict) -> str:
 
 
 def compact_autopilot_candidate(row: dict, source_report: str, period: str | None, seen_at: str | None) -> dict:
+    if not is_real_research_candidate(row):
+        return {}
     identity = candidate_identity_from_row(row)
     full = row.get("fullPeriod") or row
     wf = row.get("walkForward") or {}
@@ -8681,7 +8792,7 @@ def compact_autopilot_candidate(row: dict, source_report: str, period: str | Non
         "worstFold": wf.get("worstFold") or {"returnPct": wf.get("worstFoldReturnPct")},
         "stressStatus": row.get("stressStatus") or (row.get("stress") or {}).get("status"),
         "recentWindowStatus": row.get("recentWindowStatus") or (row.get("recentWindows") or {}).get("status"),
-        "failedGates": row.get("failedGates") or (row.get("eligibility") or {}).get("failedGates") or [],
+        "failedGates": format_failed_gates(row.get("failedGates") or (row.get("eligibility") or {}).get("failedGates") or []),
         "reasonCategory": category,
         "lastSeenAt": seen_at,
         "sourceReport": source_report,
@@ -8697,14 +8808,20 @@ def autopilot_rows_from_campaign(payload: dict, source_report: str) -> list[dict
     for section in ("topCandidates", "bestResearchedCandidate", "bestStableCandidate", "bestEligibleChallenger"):
         value = stability.get(section)
         if isinstance(value, list):
-            rows.extend(compact_autopilot_candidate(row, source_report, period, generated_at) for row in value if isinstance(row, dict) and row.get("strategy"))
-        elif isinstance(value, dict) and value.get("strategy"):
-            rows.append(compact_autopilot_candidate(value, source_report, period, generated_at))
+            rows.extend(candidate for candidate in (compact_autopilot_candidate(row, source_report, period, generated_at) for row in value if isinstance(row, dict)) if candidate)
+        elif isinstance(value, dict):
+            candidate = compact_autopilot_candidate(value, source_report, period, generated_at)
+            if candidate:
+                rows.append(candidate)
     for row in payload.get("topCandidates") or []:
-        if isinstance(row, dict) and row.get("strategy"):
-            rows.append(compact_autopilot_candidate(row, source_report, period, generated_at))
+        if isinstance(row, dict):
+            candidate = compact_autopilot_candidate(row, source_report, period, generated_at)
+            if candidate:
+                rows.append(candidate)
     by_key = {}
     for row in rows:
+        if not row.get("candidateKey"):
+            continue
         key = row.get("candidateKey") or stable_json([row.get("strategy"), row.get("symbol"), row.get("timeframe"), row.get("period"), row.get("paramsHash")])
         old = by_key.get(key)
         if old is None or safe_float(row.get("profitFactor"), -1) > safe_float(old.get("profitFactor"), -1):
@@ -8716,10 +8833,11 @@ def update_autopilot_memory_from_report(payload: dict, source_report: str | None
     memory = load_autopilot_memory()
     source_report = source_report or payload.get("savedPath") or "inline"
     rows = autopilot_rows_from_campaign(payload, source_report)
-    candidate_map = {row.get("candidateKey"): row for row in memory.get("candidates", []) if row.get("candidateKey")}
+    candidate_map = {row.get("candidateKey"): row for row in memory.get("candidates", []) if row.get("candidateKey") and is_real_research_candidate(row)}
     for row in rows:
-        candidate_map[row["candidateKey"]] = row
-    branch_map = {row.get("branchKey"): row for row in memory.get("branches", []) if row.get("branchKey")}
+        if row.get("candidateKey") and is_real_research_candidate(row):
+            candidate_map[row["candidateKey"]] = row
+    branch_map = {row.get("branchKey"): row for row in memory.get("branches", []) if row.get("branchKey") and is_real_research_candidate(row)}
     for row in rows:
         branch_key = autopilot_branch_key(row, row.get("period"))
         old = branch_map.get(branch_key, {})
@@ -8837,6 +8955,9 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
 
 def build_research_autopilot_status() -> dict:
     queue = load_autopilot_queue()
+    recovered = recover_stale_autopilot_running_jobs(queue)
+    if recovered:
+        save_autopilot_queue(queue)
     memory = load_autopilot_memory()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
@@ -8845,13 +8966,13 @@ def build_research_autopilot_status() -> dict:
     rejected = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
     rare = [row for row in memory.get("branches", []) if row.get("reasonCategory") == "PROMISING_BUT_RARE"]
     next_jobs = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"][:5]
-    real_enabled, real_detail = paper_real_trading_enabled()
+    safety = autopilot_safety_payload()
     return {
         "ok": True,
         "generatedAt": autopilot_now(),
         "queuePath": autopilot_display_path(RESEARCH_AUTOPILOT_QUEUE_PATH),
         "memoryPath": autopilot_display_path(RESEARCH_AUTOPILOT_MEMORY_PATH),
-        "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs},
+        "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs, "recoveredStaleJobs": recovered},
         "memory": {
             "branchesTested": len(memory.get("branches", [])),
             "candidates": len(memory.get("candidates", [])),
@@ -8860,21 +8981,13 @@ def build_research_autopilot_status() -> dict:
             "rejectedBranches": rejected[:12],
             "promisingButRare": rare[:8],
         },
-        "safety": {
-            "researchOnly": True,
-            "paperEnabled": canonical_paper_enabled(load_paper_candidate_config()),
-            "realTradingEnabled": real_enabled,
-            "realTradingDetail": real_detail,
-            "promotionAttempted": False,
-            "configWritten": False,
-            "paperStateChanged": False,
-            "liveOrdersTouched": False,
-        },
+        "safety": safety,
     }
 
 
 def build_research_autopilot_plan(args) -> tuple[dict, int]:
     queue = load_autopilot_queue()
+    recovered = recover_stale_autopilot_running_jobs(queue)
     memory = load_autopilot_memory()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
@@ -8887,10 +9000,10 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
         "generatedAt": autopilot_now(),
         "addedJobs": added,
         "skippedJobs": skipped,
-        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered},
         "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
         "warnings": warnings,
-        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+        "safety": autopilot_safety_payload(),
     }, 200
 
 
@@ -8939,9 +9052,12 @@ def run_autopilot_job(job: dict) -> tuple[dict, int]:
 
 def build_research_autopilot_run_next() -> tuple[dict, int]:
     queue = load_autopilot_queue()
+    recovered = recover_stale_autopilot_running_jobs(queue)
     queued = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"]
     if not queued:
-        return {"ok": False, "error": "No queued research autopilot jobs.", "queue": {"counts": autopilot_queue_counts(queue)}}, 404
+        if recovered:
+            save_autopilot_queue(queue)
+        return {"ok": False, "error": "No queued research autopilot jobs.", "queue": {"counts": autopilot_queue_counts(queue), "recoveredStaleJobs": recovered}, "safety": autopilot_safety_payload()}, 404
     job = sorted(queued, key=lambda item: (-safe_float(item.get("priority"), 0), item.get("createdAt") or ""))[0]
     result, status = run_autopilot_job(job)
     save_autopilot_queue(queue)
@@ -8949,8 +9065,8 @@ def build_research_autopilot_run_next() -> tuple[dict, int]:
         "ok": status < 400 and result["job"].get("status") == "DONE",
         "generatedAt": autopilot_now(),
         **result,
-        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
-        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered},
+        "safety": autopilot_safety_payload(),
     }, 200 if status < 400 else 502
 
 
@@ -8973,7 +9089,7 @@ def build_research_autopilot_run_batch(args) -> tuple[dict, int]:
         "jobsAttempted": len(results),
         "results": results,
         "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},
-        "safety": {"researchOnly": True, "promotionAttempted": False, "configWritten": False, "paperStateChanged": False, "liveOrdersTouched": False},
+        "safety": autopilot_safety_payload(),
     }, 200 if errors == 0 else 207
 
 
@@ -8983,7 +9099,7 @@ def build_research_autopilot_reset_queue(args) -> tuple[dict, int]:
         return {"ok": False, "error": "reset-queue requires confirm=true.", "queuePreserved": True}, 400
     queue = {"schemaVersion": AUTOPILOT_SCHEMA_VERSION, "generatedAt": autopilot_now(), "updatedAt": autopilot_now(), "jobs": []}
     save_autopilot_queue(queue)
-    return {"ok": True, "reset": True, "queue": {"counts": autopilot_queue_counts(queue), "length": 0}, "safety": {"researchOnly": True, "configWritten": False, "paperStateChanged": False}}, 200
+    return {"ok": True, "reset": True, "queue": {"counts": autopilot_queue_counts(queue), "length": 0}, "safety": autopilot_safety_payload()}, 200
 
 
 def build_research_autopilot_summary() -> dict:
@@ -8991,35 +9107,128 @@ def build_research_autopilot_summary() -> dict:
     memory = load_autopilot_memory()
     queue = load_autopilot_queue()
     branches = memory.get("branches", [])
-    candidates = memory.get("candidates", [])
-    best_candidate = next((row for row in candidates if row.get("reasonCategory") == "PROMISING_STABLE"), candidates[0] if candidates else None)
+    candidates = [row for row in memory.get("candidates", []) if is_real_research_candidate(row)]
+    best_candidate = next((row for row in candidates if row.get("reasonCategory") == "PROMISING_STABLE"), None)
     best_challenger = next((row for row in branches if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}), None)
-    rejected = [row for row in branches if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
+    rejected = [row for row in branches if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED", "STRESS_COLLAPSE", "RECENTLY_WEAK"}]
+    insufficient = [row for row in branches if row.get("reasonCategory") in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}]
     more = [row for row in branches if row.get("reasonCategory") in {"PROMISING_BUT_RARE", "BAD_WALK_FORWARD", "TOO_FEW_TRADES"}]
     next_jobs = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"][:3]
+    learning_events = autopilot_learning_events(queue, branches)
     return {
         "ok": True,
         "generatedAt": autopilot_now(),
-        "summaryText": autopilot_summary_text(best_candidate, best_challenger, branches, rejected, more, next_jobs, status.get("safety", {})),
+        "summaryText": autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, status.get("safety", {})),
+        "learningEvents": learning_events,
         "bestCurrentCandidate": best_candidate,
         "bestChallenger": best_challenger,
+        "bestEligibleChallenger": next((row for row in branches if row.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"), None),
+        "bestStableCandidate": best_candidate,
         "branchesTested": len(branches),
         "branchesRejected": rejected[:12],
+        "branchesInsufficientEvidence": insufficient[:12],
         "branchesWorthMoreTesting": more[:12],
         "nextRecommendedJobs": next_jobs,
         "safety": status.get("safety", {}),
     }
 
 
-def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, more, next_jobs, safety) -> str:
-    best = f"{best_candidate.get('strategy')} {best_candidate.get('symbol')} {best_candidate.get('timeframe')}" if best_candidate else "No saved candidate yet"
-    challenger = f"{best_challenger.get('strategy')} {best_challenger.get('symbol')} {best_challenger.get('timeframe')} ({best_challenger.get('reasonCategory')})" if best_challenger else "No challenger yet"
-    jobs = "; ".join(f"{','.join(job.get('strategies') or [])} {','.join(job.get('symbols') or [])} {','.join(job.get('timeframes') or [])} {job.get('period')}: {job.get('reason')}" for job in next_jobs) or "No queued jobs"
+def autopilot_branch_label(row: dict | None) -> str:
+    if not row:
+        return "No branch"
+    return f"{row.get('strategy') or '-'} {row.get('symbol') or '-'} {row.get('timeframe') or '-'} {row.get('period') or ''}".strip()
+
+
+def autopilot_job_label(job: dict | None) -> str:
+    if not job:
+        return "No job"
+    return f"{','.join(job.get('strategies') or autopilot_list(job.get('strategy')))} {','.join(job.get('symbols') or autopilot_list(job.get('symbol')))} {','.join(job.get('timeframes') or autopilot_list(job.get('timeframe')))} {job.get('period') or ''}".strip()
+
+
+def autopilot_gate_summary(row: dict | None, limit: int = 3) -> str:
+    gates = format_failed_gates((row or {}).get("failedGates") or [])
+    return ", ".join(gate.get("detail") or gate.get("name") for gate in gates[:limit]) or "no failed gates recorded"
+
+
+def autopilot_job_origin_text(job: dict) -> str:
+    source = job.get("generatedBy") or "planner"
+    if source == "rare_lower_timeframe":
+        return "lower timeframe follow-up for a promising-but-rare branch"
+    if source == "rare_symbol_expansion":
+        return "same-strategy symbol expansion for a promising-but-rare branch"
+    if source == "broad_search":
+        return "broad safe exploration of an untested branch"
+    if source == "eligible_confirmation":
+        return "confirmation of an eligible/stable branch on a longer validation window"
+    if source == "seed":
+        return "initial safe first-pass scan"
+    return source
+
+
+def autopilot_learning_events(queue: dict, branches: list[dict]) -> list[dict]:
+    branch_map = {(row.get("strategy"), row.get("symbol"), row.get("timeframe"), row.get("period")): row for row in branches}
+    events = []
+    for job in sorted(queue.get("jobs", []), key=lambda item: item.get("finishedAt") or item.get("startedAt") or item.get("createdAt") or "", reverse=True):
+        if job.get("status") not in {"DONE", "FAILED"}:
+            continue
+        evidence = job.get("previousEvidenceSummary") or {}
+        statuses = []
+        for strategy in autopilot_list(job.get("strategies") or job.get("strategy")):
+            for symbol in autopilot_list(job.get("symbols") or job.get("symbol")):
+                for timeframe in autopilot_list(job.get("timeframes") or job.get("timeframe")):
+                    row = branch_map.get((strategy, symbol, timeframe, job.get("period")))
+                    if row:
+                        statuses.append(row)
+        primary = statuses[0] if statuses else None
+        outcome = "failed to return usable research output" if job.get("status") == "FAILED" else "updated research memory"
+        if primary:
+            category = primary.get("reasonCategory") or "UNKNOWN"
+            if category in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "STRESS_COLLAPSE", "RECENTLY_WEAK", "REJECTED"}:
+                outcome = f"rejected or deprioritized as {category}"
+            elif category in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}:
+                outcome = f"kept as insufficient evidence ({category})"
+            elif category == "PROMISING_BUT_RARE":
+                outcome = "still promising but rare"
+            elif category == "PROMISING_STABLE":
+                outcome = "promising and stable enough for confirmation"
+        text = (
+            f"{autopilot_job_label(job)} was tested because it was a {autopilot_job_origin_text(job)}. "
+            f"Result: {outcome}."
+        )
+        if evidence:
+            text += f" Parent evidence: {autopilot_branch_label(evidence)} ({evidence.get('reasonCategory') or 'UNKNOWN'})."
+        if primary:
+            text += f" Main blockers: {autopilot_gate_summary(primary)}."
+        events.append({
+            "jobId": job.get("jobId"),
+            "status": job.get("status"),
+            "generatedBy": job.get("generatedBy"),
+            "job": autopilot_job_label(job),
+            "outcome": outcome,
+            "branch": primary,
+            "previousEvidenceSummary": evidence,
+            "text": text,
+        })
+    return events[:8]
+
+
+def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, safety) -> str:
+    best = f"{autopilot_branch_label(best_candidate)}" if best_candidate else "No eligible or stable candidate found"
+    challenger = f"{autopilot_branch_label(best_challenger)} ({best_challenger.get('reasonCategory')})" if best_challenger else "No eligible challenger found"
+    learned = " ".join(event.get("text", "") for event in learning_events[:3]) or "No completed Autopilot jobs have been learned from yet."
+    rejected_text = "; ".join(f"{autopilot_branch_label(row)}: {row.get('reasonCategory')}" for row in rejected[:3]) or "No rejected branch recorded"
+    rare_text = "; ".join(f"{autopilot_branch_label(row)}: PF {safe_float(row.get('profitFactor'), 0):.4g}, trades {row.get('fullTrades')}" for row in more[:3] if row.get("reasonCategory") == "PROMISING_BUT_RARE") or "No promising-but-rare branch remains"
+    insufficient_text = "; ".join(f"{autopilot_branch_label(row)}: {row.get('reasonCategory')}" for row in insufficient[:3]) or "No insufficient-evidence branch recorded"
+    jobs = "; ".join(f"{autopilot_job_label(job)}: {job.get('reason')}" for job in next_jobs) or "No queued jobs"
     return (
         f"Best current research candidate: {best}. "
         f"Best challenger: {challenger}. "
+        f"What Autopilot learned: {learned} "
+        f"Rejected branches: {rejected_text}. "
+        f"Promising but rare: {rare_text}. "
+        f"Insufficient evidence: {insufficient_text}. "
         f"Branches tested: {len(branches)}; rejected: {len(rejected)}; worth more testing: {len(more)}. "
-        f"Next jobs: {jobs}. "
+        f"Next tests: {jobs}. "
         f"Safety: research-only={safety.get('researchOnly')}, realTradingEnabled={safety.get('realTradingEnabled')}, no promotion/config/paper-state side effects."
     )
 
