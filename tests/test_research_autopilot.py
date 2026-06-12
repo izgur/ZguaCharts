@@ -140,19 +140,20 @@ class ResearchAutopilotTests(unittest.TestCase):
     def test_rejected_branch_deprioritized(self):
         memory = {
             "branches": [{
-                "strategy": "MeanReversion",
+                "strategy": "SimpleAtrTrendV2",
                 "symbol": "BTCUSDT",
                 "timeframe": "1h",
-                "period": "1095d",
+                "period": "365d",
                 "reasonCategory": "NEGATIVE_RETURN",
                 "profitFactor": 0.8,
                 "totalReturnPct": -3,
             }],
             "candidates": [],
         }
-        jobs, warnings = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=5)
+        jobs, warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=5)
         self.assertTrue(any("Deprioritized rejected branch" in warning for warning in warnings))
-        self.assertFalse(any(job.get("strategies") == ["MeanReversion"] and job.get("symbols") == ["BTCUSDT"] and job.get("timeframes") == ["1h"] and job.get("period") == "1095d" for job in jobs))
+        self.assertFalse(any(job.get("strategies") == ["SimpleAtrTrendV2"] and job.get("symbols") == ["BTCUSDT"] and job.get("timeframes") == ["1h"] and job.get("period") == "365d" for job in jobs))
+        self.assertTrue(any(item.get("skipReason") in {"rejected_branch", "recently_tested_rejected_branch"} for item in skipped))
 
     def test_promising_but_rare_creates_followups(self):
         memory = {"branches": [{
@@ -165,7 +166,7 @@ class ResearchAutopilotTests(unittest.TestCase):
             "totalReturnPct": 4,
             "fullTrades": 47,
         }], "candidates": []}
-        jobs, _warnings = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=4)
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=4)
         self.assertTrue(any(job.get("timeframes") == ["1h"] for job in jobs))
         self.assertTrue(any("ETHUSDT" in job.get("symbols", []) or "SOLUSDT" in job.get("symbols", []) for job in jobs))
 
@@ -178,8 +179,52 @@ class ResearchAutopilotTests(unittest.TestCase):
             "reasonCategory": "PROMISING_STABLE",
             "profitFactor": 1.5,
         }], "candidates": []}
-        jobs, _warnings = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=3)
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=3)
         self.assertTrue(any(job.get("period") == "1095d" and job.get("includeReproAudit") for job in jobs))
+
+    def test_broad_search_does_not_requeue_rejected_exact_branches(self):
+        memory = {"branches": [
+            {"strategy": "SimpleAtrTrendV2", "symbol": "ETHUSDT", "timeframe": "1h", "period": "365d", "reasonCategory": "REJECTED", "profitFactor": 1.2, "lastSeenAt": "2026-06-12T00:00:00+00:00"},
+            {"strategy": "SimpleAtrTrendV2", "symbol": "BTCUSDT", "timeframe": "1h", "period": "365d", "reasonCategory": "LOW_PROFIT_FACTOR", "profitFactor": 0.9, "lastSeenAt": "2026-06-12T00:00:00+00:00"},
+            {"strategy": "BreakoutRetestV2", "symbol": "ETHUSDT", "timeframe": "4h", "period": "365d", "reasonCategory": "PROMISING_BUT_RARE", "profitFactor": 2.2, "totalReturnPct": 4, "fullTrades": 22, "lastSeenAt": "2026-06-12T00:00:00+00:00"},
+            {"strategy": "BreakoutRetestV2", "symbol": "ETHUSDT", "timeframe": "1h", "period": "365d", "reasonCategory": "NEGATIVE_RETURN", "profitFactor": 0.8, "lastSeenAt": "2026-06-12T00:00:00+00:00"},
+        ], "candidates": []}
+        jobs, warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=12)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("SimpleAtrTrendV2|ETHUSDT|1h|365d", planned_keys)
+        self.assertNotIn("SimpleAtrTrendV2|BTCUSDT|1h|365d", planned_keys)
+        self.assertNotIn("BreakoutRetestV2|ETHUSDT|1h|365d", planned_keys)
+        self.assertIn("SimpleAtrTrendV2|BTCUSDT|4h|365d", planned_keys)
+        self.assertTrue(any("SimpleAtrTrendV2 ETHUSDT 1h 365d" in warning for warning in warnings))
+        skipped_keys = {item.get("branchKey") for item in skipped}
+        self.assertIn("SimpleAtrTrendV2|ETHUSDT|1h|365d", skipped_keys)
+        self.assertIn("SimpleAtrTrendV2|BTCUSDT|1h|365d", skipped_keys)
+        self.assertIn("BreakoutRetestV2|ETHUSDT|1h|365d", skipped_keys)
+
+    def test_existing_queued_branch_is_not_duplicated_by_planner(self):
+        memory = {"branches": [{"strategy": "SimpleAtrTrendV2", "symbol": "ETHUSDT", "timeframe": "4h", "period": "365d", "reasonCategory": "TOO_FEW_TRADES"}], "candidates": []}
+        queue = {"jobs": [zgua_app.make_autopilot_job(["SimpleAtrTrendV2"], ["BTCUSDT"], ["1h"], "365d", "already queued", generated_by="broad_search")]}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, queue, max_jobs=8)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("SimpleAtrTrendV2|BTCUSDT|1h|365d", planned_keys)
+        self.assertTrue(any(item.get("skipReason") == "duplicate_queued_job" and item.get("branchKey") == "SimpleAtrTrendV2|BTCUSDT|1h|365d" for item in skipped))
+
+    def test_existing_queued_rejected_branch_is_marked_skipped_before_status(self):
+        memory = {"branches": [{
+            "strategy": "SimpleAtrTrendV2",
+            "symbol": "ETHUSDT",
+            "timeframe": "1h",
+            "period": "365d",
+            "reasonCategory": "REJECTED",
+        }], "candidates": [], "sourceReports": []}
+        queue = zgua_app.load_autopilot_queue()
+        zgua_app.autopilot_enqueue(queue, [zgua_app.make_autopilot_job(["SimpleAtrTrendV2"], ["ETHUSDT"], ["1h"], "365d", "old queued branch", generated_by="broad_search")])
+        zgua_app.save_autopilot_queue(queue)
+        zgua_app.save_autopilot_memory(memory)
+        status = zgua_app.build_research_autopilot_status()
+        self.assertEqual(status["queue"]["counts"]["QUEUED"], 0)
+        self.assertEqual(status["queue"]["counts"]["SKIPPED"], 1)
+        self.assertTrue(any(item.get("branchKey") == "SimpleAtrTrendV2|ETHUSDT|1h|365d" for item in status["queue"]["skippedDeprioritizedJobs"]))
 
     def test_run_next_updates_queue_and_memory_without_side_effects(self):
         queue = zgua_app.load_autopilot_queue()

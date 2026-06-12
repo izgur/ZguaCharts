@@ -1534,6 +1534,14 @@ def research_autopilot_summary():
         return jsonify({"error": f"Could not build research autopilot summary: {exc}"}), 502
 
 
+@app.get("/api/research/autopilot/journal")
+def research_autopilot_journal():
+    try:
+        return jsonify(build_research_autopilot_journal())
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research autopilot journal: {exc}"}), 502
+
+
 @app.get("/api/research/signal-replay-report")
 def research_signal_replay_report():
     try:
@@ -8506,6 +8514,7 @@ AUTOPILOT_FIRST_PASS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
 AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
 AUTOPILOT_PERIODS = ["365d", "730d"]
+AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WALK_FORWARD", "STRESS_COLLAPSE", "REJECTED", "RECENTLY_WEAK"}
 
 
 def autopilot_now() -> str:
@@ -8548,6 +8557,8 @@ def load_autopilot_queue() -> dict:
     payload.setdefault("generatedAt", None)
     payload.setdefault("updatedAt", None)
     payload.setdefault("jobs", [])
+    payload.setdefault("lastPlanSkippedJobs", [])
+    payload.setdefault("lastPlanWarnings", [])
     return payload
 
 
@@ -8685,6 +8696,90 @@ def autopilot_queue_counts(queue: dict) -> dict:
     return {status: counts.get(status, 0) for status in ["QUEUED", "RUNNING", "DONE", "FAILED", "SKIPPED"]}
 
 
+def autopilot_normalized_branch_key(strategy: str | None, symbol: str | None, timeframe: str | None, period: str | None) -> str:
+    return "|".join([
+        str(strategy or "-").strip(),
+        str(symbol or "-").strip().upper(),
+        str(timeframe or "-").strip().lower(),
+        str(period or "-").strip().lower(),
+    ])
+
+
+def autopilot_job_branch_keys(job: dict) -> set[str]:
+    period = job.get("period") or "365d"
+    keys = set()
+    for strategy in autopilot_list(job.get("strategies") or job.get("strategy")):
+        for symbol in autopilot_list(job.get("symbols") or job.get("symbol")):
+            for timeframe in autopilot_list(job.get("timeframes") or job.get("timeframe")):
+                keys.add(autopilot_normalized_branch_key(strategy, symbol, timeframe, period))
+    return keys
+
+
+def autopilot_queue_branch_keys(queue: dict, statuses=None) -> set[str]:
+    statuses = statuses or {"QUEUED", "RUNNING", "DONE"}
+    keys = set()
+    for job in queue.get("jobs", []):
+        if job.get("status") in statuses:
+            keys.update(autopilot_job_branch_keys(job))
+    return keys
+
+
+def autopilot_memory_branch_map(memory: dict) -> dict:
+    return {
+        autopilot_branch_key(row, row.get("period")): row
+        for row in memory.get("branches", [])
+        if is_real_research_candidate(row)
+    }
+
+
+def autopilot_branch_was_recent(row: dict | None, days: int = 30) -> bool:
+    if not row:
+        return False
+    seen = parse_iso_timestamp(row.get("lastSeenAt"))
+    if seen is None:
+        return False
+    return (datetime.now(timezone.utc) - seen).total_seconds() <= days * 86400
+
+
+def autopilot_skip_record(job: dict, skip_reason: str, detail: str, branch_key: str | None = None, branch: dict | None = None) -> dict:
+    return {
+        "jobId": job.get("jobId"),
+        "status": "SKIPPED",
+        "skipReason": skip_reason,
+        "detail": detail,
+        "branchKey": branch_key,
+        "branch": branch,
+        "generatedBy": job.get("generatedBy"),
+        "strategy": job.get("strategy"),
+        "strategies": job.get("strategies"),
+        "symbol": job.get("symbol"),
+        "symbols": job.get("symbols"),
+        "timeframe": job.get("timeframe"),
+        "timeframes": job.get("timeframes"),
+        "period": job.get("period"),
+        "reason": job.get("reason"),
+    }
+
+
+def skip_deprioritized_autopilot_queue_jobs(queue: dict, memory: dict) -> list[dict]:
+    branch_map = autopilot_memory_branch_map(memory)
+    skipped = []
+    for job in queue.get("jobs", []):
+        if job.get("status") != "QUEUED":
+            continue
+        for key in sorted(autopilot_job_branch_keys(job)):
+            branch = branch_map.get(key)
+            if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
+                job["status"] = "SKIPPED"
+                job["updatedAt"] = autopilot_now()
+                job["skipReason"] = "rejected_branch_in_memory"
+                job["skipDetail"] = f"Skipped queued job because branch {key} is {branch.get('reasonCategory')}."
+                record = autopilot_skip_record(job, job["skipReason"], job["skipDetail"], key, branch)
+                skipped.append(record)
+                break
+    return skipped
+
+
 def recover_stale_autopilot_running_jobs(queue: dict, max_age_minutes: int = 120) -> list[dict]:
     recovered = []
     now = datetime.now(timezone.utc)
@@ -8725,12 +8820,7 @@ def autopilot_safety_payload() -> dict:
 
 
 def autopilot_branch_key(row: dict, period: str | None = None) -> str:
-    return "|".join([
-        str(row.get("strategy") or "-"),
-        str(row.get("symbol") or "-"),
-        str(row.get("timeframe") or "-"),
-        str(period or row.get("period") or "-"),
-    ])
+    return autopilot_normalized_branch_key(row.get("strategy"), row.get("symbol"), row.get("timeframe"), period or row.get("period"))
 
 
 def autopilot_reason_category(row: dict) -> str:
@@ -8887,24 +8977,39 @@ def rebuild_autopilot_memory_from_saved_reports(file_limit: int = 80) -> dict:
 
 
 def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timeframe: str, period: str) -> bool:
-    for branch in memory.get("branches", []):
-        if branch.get("strategy") == strategy and branch.get("symbol") == symbol and branch.get("timeframe") == timeframe and branch.get("period") == period:
-            if branch.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"} and safe_float(branch.get("profitFactor"), 0) < 1:
-                return True
-    return False
+    branch = autopilot_memory_branch_map(memory).get(autopilot_normalized_branch_key(strategy, symbol, timeframe, period))
+    return bool(branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES)
 
 
-def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[list[dict], list[str]]:
+def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[list[dict], list[str], list[dict]]:
     jobs = []
     warnings = []
+    skipped = []
     queued_or_done = {job.get("signature") for job in queue.get("jobs", []) if job.get("status") in {"QUEUED", "RUNNING", "DONE"}}
+    existing_branch_keys = autopilot_queue_branch_keys(queue)
+    planned_branch_keys = set()
+    branch_map = autopilot_memory_branch_map(memory)
 
     def maybe_add(job: dict):
         if len(jobs) >= max_jobs:
-            return
+            return False
+        job_keys = autopilot_job_branch_keys(job)
+        duplicate_keys = sorted(job_keys & (existing_branch_keys | planned_branch_keys))
+        if duplicate_keys:
+            skipped.append(autopilot_skip_record(job, "duplicate_queued_job", f"Skipped because branch is already queued, running, done, or planned: {duplicate_keys[0]}.", duplicate_keys[0], branch_map.get(duplicate_keys[0])))
+            return False
+        for key in sorted(job_keys):
+            branch = branch_map.get(key)
+            if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
+                reason = "recently_tested_rejected_branch" if autopilot_branch_was_recent(branch) else "rejected_branch"
+                skipped.append(autopilot_skip_record(job, reason, f"Skipped because branch {key} is {branch.get('reasonCategory')}.", key, branch))
+                return False
         if job.get("signature") in queued_or_done or any(existing.get("signature") == job.get("signature") for existing in jobs):
+            skipped.append(autopilot_skip_record(job, "duplicate_queued_job", "Skipped because an exact job signature is already queued, running, done, or planned."))
             return
         jobs.append(job)
+        planned_branch_keys.update(job_keys)
+        return True
 
     if not memory.get("branches"):
         for strategy in AUTOPILOT_DEFAULT_STRATEGIES[:5]:
@@ -8920,7 +9025,7 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
                     max_combos=12,
                     top_n=18,
                 ))
-        return jobs, warnings
+        return jobs, warnings, skipped
 
     for branch in memory.get("branches", []):
         strategy = branch.get("strategy")
@@ -8945,22 +9050,28 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12) -> tuple[
         for symbol in AUTOPILOT_FIRST_PASS_SYMBOLS:
             for timeframe in AUTOPILOT_TIMEFRAMES:
                 period = "365d"
-                if autopilot_branch_rejected(memory, strategy, symbol, timeframe, period):
+                branch_key = autopilot_normalized_branch_key(strategy, symbol, timeframe, period)
+                branch = branch_map.get(branch_key)
+                if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
+                    warnings.append(f"Deprioritized rejected branch {strategy} {symbol} {timeframe} {period}.")
+                    skipped.append(autopilot_skip_record(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15), "rejected_branch", f"Skipped because branch {branch_key} is {branch.get('reasonCategory')}.", branch_key, branch))
                     continue
                 maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15))
                 if len(jobs) >= max_jobs:
-                    return jobs, warnings
-    return jobs, warnings
+                    return jobs, warnings, skipped
+    return jobs, warnings, skipped
 
 
 def build_research_autopilot_status() -> dict:
     queue = load_autopilot_queue()
     recovered = recover_stale_autopilot_running_jobs(queue)
-    if recovered:
-        save_autopilot_queue(queue)
     memory = load_autopilot_memory()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
+    skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
+    if recovered or skipped_deprioritized:
+        queue["lastPlanSkippedJobs"] = (skipped_deprioritized + queue.get("lastPlanSkippedJobs", []))[:25]
+        save_autopilot_queue(queue)
     counts = autopilot_queue_counts(queue)
     leads = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}]
     rejected = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
@@ -8972,7 +9083,7 @@ def build_research_autopilot_status() -> dict:
         "generatedAt": autopilot_now(),
         "queuePath": autopilot_display_path(RESEARCH_AUTOPILOT_QUEUE_PATH),
         "memoryPath": autopilot_display_path(RESEARCH_AUTOPILOT_MEMORY_PATH),
-        "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs, "recoveredStaleJobs": recovered},
+        "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs, "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized, "lastPlanSkippedJobs": queue.get("lastPlanSkippedJobs", []), "lastPlanWarnings": queue.get("lastPlanWarnings", [])},
         "memory": {
             "branchesTested": len(memory.get("branches", [])),
             "candidates": len(memory.get("candidates", [])),
@@ -8991,16 +9102,20 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
     memory = load_autopilot_memory()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
+    skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
     max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 12)), 12)), 25))
-    planned, warnings = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs)
-    added, skipped = autopilot_enqueue(queue, planned)
+    planned, warnings, planner_skipped = autopilot_plan_jobs(memory, queue, max_jobs=max_jobs)
+    added, enqueue_skipped = autopilot_enqueue(queue, planned)
+    skipped = skipped_deprioritized + planner_skipped + enqueue_skipped
+    queue["lastPlanSkippedJobs"] = skipped[:25]
+    queue["lastPlanWarnings"] = warnings[:25]
     save_autopilot_queue(queue)
     return {
         "ok": True,
         "generatedAt": autopilot_now(),
         "addedJobs": added,
         "skippedJobs": skipped,
-        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered},
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized},
         "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
         "warnings": warnings,
         "safety": autopilot_safety_payload(),
@@ -9053,11 +9168,14 @@ def run_autopilot_job(job: dict) -> tuple[dict, int]:
 def build_research_autopilot_run_next() -> tuple[dict, int]:
     queue = load_autopilot_queue()
     recovered = recover_stale_autopilot_running_jobs(queue)
+    memory = load_autopilot_memory()
+    skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
     queued = [job for job in queue.get("jobs", []) if job.get("status") == "QUEUED"]
     if not queued:
-        if recovered:
+        if recovered or skipped_deprioritized:
+            queue["lastPlanSkippedJobs"] = (skipped_deprioritized + queue.get("lastPlanSkippedJobs", []))[:25]
             save_autopilot_queue(queue)
-        return {"ok": False, "error": "No queued research autopilot jobs.", "queue": {"counts": autopilot_queue_counts(queue), "recoveredStaleJobs": recovered}, "safety": autopilot_safety_payload()}, 404
+        return {"ok": False, "error": "No queued research autopilot jobs.", "queue": {"counts": autopilot_queue_counts(queue), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized}, "safety": autopilot_safety_payload()}, 404
     job = sorted(queued, key=lambda item: (-safe_float(item.get("priority"), 0), item.get("createdAt") or ""))[0]
     result, status = run_autopilot_job(job)
     save_autopilot_queue(queue)
@@ -9065,7 +9183,7 @@ def build_research_autopilot_run_next() -> tuple[dict, int]:
         "ok": status < 400 and result["job"].get("status") == "DONE",
         "generatedAt": autopilot_now(),
         **result,
-        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered},
+        "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized},
         "safety": autopilot_safety_payload(),
     }, 200 if status < 400 else 502
 
@@ -9129,6 +9247,61 @@ def build_research_autopilot_summary() -> dict:
         "branchesInsufficientEvidence": insufficient[:12],
         "branchesWorthMoreTesting": more[:12],
         "nextRecommendedJobs": next_jobs,
+        "safety": status.get("safety", {}),
+    }
+
+
+def build_research_autopilot_journal() -> dict:
+    status = build_research_autopilot_status()
+    summary = build_research_autopilot_summary()
+    queue = load_autopilot_queue()
+    memory = load_autopilot_memory()
+    entries = []
+    for event in summary.get("learningEvents") or []:
+        entries.append({
+            "type": "learning",
+            "time": (event.get("branch") or {}).get("lastSeenAt"),
+            "title": event.get("outcome") or "Autopilot learned from job",
+            "text": event.get("text"),
+            "jobId": event.get("jobId"),
+            "branch": event.get("branch"),
+        })
+    for job in queue.get("jobs", []):
+        entries.append({
+            "type": "job",
+            "time": job.get("finishedAt") or job.get("startedAt") or job.get("createdAt"),
+            "title": f"{job.get('status', 'UNKNOWN')} {autopilot_job_label(job)}",
+            "text": job.get("reason"),
+            "job": job,
+        })
+    for branch in memory.get("branches", []):
+        category = branch.get("reasonCategory")
+        if category in AUTOPILOT_REJECTED_CATEGORIES:
+            title = f"Rejected branch: {autopilot_branch_label(branch)}"
+        elif category == "PROMISING_BUT_RARE":
+            title = f"Open hypothesis: {autopilot_branch_label(branch)}"
+        elif category in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}:
+            title = f"Insufficient evidence: {autopilot_branch_label(branch)}"
+        else:
+            continue
+        entries.append({
+            "type": "branch",
+            "time": branch.get("lastSeenAt"),
+            "title": title,
+            "text": f"{category}; PF {safe_float(branch.get('profitFactor'), 0):.4g}; trades {branch.get('fullTrades')}; blockers: {autopilot_gate_summary(branch)}.",
+            "branch": branch,
+        })
+    entries = sorted(entries, key=lambda item: item.get("time") or "", reverse=True)[:40]
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "summaryText": summary.get("summaryText"),
+        "entries": entries,
+        "openHypotheses": summary.get("branchesWorthMoreTesting", []),
+        "rejectedBranches": summary.get("branchesRejected", []),
+        "insufficientEvidence": summary.get("branchesInsufficientEvidence", []),
+        "nextRecommendedJobs": summary.get("nextRecommendedJobs", []),
+        "queue": status.get("queue", {}),
         "safety": status.get("safety", {}),
     }
 

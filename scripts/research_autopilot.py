@@ -49,6 +49,13 @@ def print_status(payload: dict) -> None:
     print(f"Best current candidate: {branch_label(lead)}")
     print(f"Best challenger: {branch_label(rare or lead)}")
     print("Rejected branches: " + ("; ".join(branch_label(row) for row in rejected) if rejected else "-"))
+    skips = queue.get("lastPlanSkippedJobs") or []
+    if skips:
+        print("Last plan skips:")
+        for item in skips[:8]:
+            print(f"- {item.get('skipReason')}: {item.get('branchKey') or job_label(item)} ({item.get('detail') or '-'})")
+    elif queue.get("lastPlanWarnings"):
+        print("Last plan warnings: " + "; ".join(str(item) for item in queue.get("lastPlanWarnings", [])[:5]))
     print(f"Safety: researchOnly={safety.get('researchOnly')} paperEnabled={safety.get('paperEnabled')} realTradingEnabled={safety.get('realTradingEnabled')} configWritten={safety.get('configWritten')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')}")
 
 

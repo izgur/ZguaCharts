@@ -3852,6 +3852,7 @@ function setupLearningControls() {
   document.querySelector("#research-autopilot-run-next")?.addEventListener("click", () => loadResearchAutopilot("runNext"));
   document.querySelector("#research-autopilot-run-batch")?.addEventListener("click", () => loadResearchAutopilot("runBatch"));
   document.querySelector("#research-autopilot-summary")?.addEventListener("click", () => loadResearchAutopilot("summary"));
+  document.querySelector("#research-autopilot-journal")?.addEventListener("click", () => loadResearchAutopilot("journal"));
   document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
   document.querySelector("#research-result-diff-refresh")?.addEventListener("click", loadResearchResultDiff);
   document.querySelector("#research-promotion-checklist-v2-refresh")?.addEventListener("click", loadResearchPromotionChecklistV2);
@@ -5308,6 +5309,7 @@ async function loadResearchAutopilot(action = "status") {
     runNext: "Running one queued research job...",
     runBatch: "Running a small research batch...",
     summary: "Building research autopilot summary...",
+    journal: "Building research autopilot journal...",
   };
   try {
     host.innerHTML = `<p class="pane-status">${labels[action] || labels.status}</p>`;
@@ -5316,6 +5318,7 @@ async function loadResearchAutopilot(action = "status") {
     else if (action === "runNext") payload = await apiPost("/api/research/autopilot/run-next", {});
     else if (action === "runBatch") payload = await apiPost("/api/research/autopilot/run-batch", { maxJobs: 3 });
     else if (action === "summary") payload = await apiGet("/api/research/autopilot/summary");
+    else if (action === "journal") payload = await apiGet("/api/research/autopilot/journal");
     else payload = await apiGet("/api/research/autopilot/status");
     host.innerHTML = renderResearchAutopilot(payload, action);
   } catch (error) {
@@ -5404,7 +5407,58 @@ function renderAutopilotBranch(row) {
   `;
 }
 
+function renderAutopilotSkip(item) {
+  return `
+    <tr>
+      <td>${escapeHtml(item.skipReason || "-")}</td>
+      <td>${escapeHtml(item.branchKey || "-")}</td>
+      <td>${escapeHtml(item.generatedBy || "-")}</td>
+      <td>${escapeHtml(item.detail || "-")}</td>
+    </tr>
+  `;
+}
+
+function renderAutopilotJournalEntry(entry) {
+  const branch = entry.branch || {};
+  const job = entry.job || {};
+  return `
+    <details class="paper-validation-result">
+      <summary><strong>${escapeHtml(entry.type || "entry")}</strong> ${escapeHtml(entry.title || "-")} <span class="neutral">${escapeHtml(entry.time || "")}</span></summary>
+      <p class="modal-note">${escapeHtml(entry.text || "-")}</p>
+      <div class="metric-grid">
+        <div class="metric"><span>Job</span><strong>${escapeHtml(entry.jobId || job.jobId || "-")}</strong></div>
+        <div class="metric"><span>Status</span><strong>${escapeHtml(job.status || "-")}</strong></div>
+        <div class="metric"><span>Branch</span><strong>${escapeHtml(branch.branchKey || "-")}</strong></div>
+        <div class="metric"><span>Category</span><strong>${escapeHtml(branch.reasonCategory || "-")}</strong></div>
+        <div class="metric"><span>PF</span><strong>${formatNumber(branch.profitFactor)}</strong></div>
+        <div class="metric"><span>Trades</span><strong>${branch.fullTrades ?? "-"}</strong></div>
+      </div>
+    </details>
+  `;
+}
+
 function renderResearchAutopilot(payload, action = "status") {
+  if (action === "journal") {
+    const entries = (payload.entries || []).map(renderAutopilotJournalEntry).join("");
+    const nextJobs = (payload.nextRecommendedJobs || []).map(renderAutopilotJob).join("");
+    return `
+      <h3 class="modal-section-title">Research Journal</h3>
+      <p class="modal-note">${escapeHtml(payload.summaryText || "No journal summary available.")}</p>
+      <div class="metric-grid">
+        <div class="metric"><span>Entries</span><strong>${(payload.entries || []).length}</strong></div>
+        <div class="metric"><span>Open hypotheses</span><strong>${(payload.openHypotheses || []).length}</strong></div>
+        <div class="metric"><span>Rejected</span><strong>${(payload.rejectedBranches || []).length}</strong></div>
+        <div class="metric"><span>Next jobs</span><strong>${(payload.nextRecommendedJobs || []).length}</strong></div>
+        <div class="metric"><span>Research only</span><strong>${payload.safety?.researchOnly ? "yes" : "no"}</strong></div>
+        <div class="metric"><span>Real trading</span><strong>${payload.safety?.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
+      </div>
+      <h4 class="modal-section-title">Timeline</h4>
+      ${entries || `<p class="modal-note">No journal entries yet.</p>`}
+      <h4 class="modal-section-title">Next Tests</h4>
+      ${nextJobs || `<p class="modal-note">No queued next tests.</p>`}
+      <p class="modal-note">Journal is read-only. It summarizes research jobs, lessons, rejected branches, and still-open hypotheses.</p>
+    `;
+  }
   if (action === "summary") {
     const jobs = (payload.nextRecommendedJobs || []).map(renderAutopilotJob).join("");
     const learning = (payload.learningEvents || []).slice(0, 5).map((event) => `<li>${escapeHtml(event.text || "-")}</li>`).join("");
@@ -5438,7 +5492,8 @@ function renderResearchAutopilot(payload, action = "status") {
   const rare = (memory.promisingButRare || []).slice(0, 8).map(renderAutopilotBranch).join("");
   const rejected = (memory.rejectedBranches || []).slice(0, 8).map(renderAutopilotBranch).join("");
   const jobs = ((queue.nextJobs || payload.addedJobs || (payload.job ? [payload.job] : []))).slice(0, 8).map(renderAutopilotJob).join("");
-  const actionNote = action === "plan" ? `${payload.addedJobs?.length || 0} job(s) added, ${payload.skippedJobs?.length || 0} duplicate(s) skipped.` : action === "runNext" ? `Ran job ${payload.job?.jobId || "-"}.` : action === "runBatch" ? `Attempted ${payload.jobsAttempted || 0} job(s).` : "Queue and research memory are loaded.";
+  const skipped = ((payload.skippedJobs || queue.lastPlanSkippedJobs || [])).slice(0, 12).map(renderAutopilotSkip).join("");
+  const actionNote = action === "plan" ? `${payload.addedJobs?.length || 0} job(s) added, ${payload.skippedJobs?.length || 0} skip(s) recorded.` : action === "runNext" ? `Ran job ${payload.job?.jobId || "-"}.` : action === "runBatch" ? `Attempted ${payload.jobsAttempted || 0} job(s).` : "Queue and research memory are loaded.";
   const warnings = (payload.warnings || []).slice(0, 8).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
   return `
     <h3 class="modal-section-title">Research Autopilot <span class="neutral">${escapeHtml(actionNote)}</span></h3>
@@ -5454,6 +5509,8 @@ function renderResearchAutopilot(payload, action = "status") {
     </div>
     <h4 class="modal-section-title">Job Details</h4>
     ${jobs || `<p class="modal-note">No queued jobs yet. Plan next jobs to seed the queue.</p>`}
+    <h4 class="modal-section-title">Last Plan Skips</h4>
+    <table class="trade-table"><thead><tr><th>Reason</th><th>Branch</th><th>Generated By</th><th>Detail</th></tr></thead><tbody>${skipped || `<tr><td colspan="4">No skipped jobs recorded for the last plan.</td></tr>`}</tbody></table>
     <h4 class="modal-section-title">Top Leads</h4>
     <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${leads || `<tr><td colspan="9">No leads in memory yet.</td></tr>`}</tbody></table>
     <h4 class="modal-section-title">Promising But Rare</h4>
