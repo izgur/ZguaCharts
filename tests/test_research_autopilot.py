@@ -275,6 +275,54 @@ class ResearchAutopilotTests(unittest.TestCase):
         family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "BreakoutRetestV2")
         self.assertEqual(family["familyStatus"], "PROMISING_BUT_RARE")
 
+    def test_rejected_lower_timeframe_is_not_requeued_at_wider_period(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=8)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("BreakoutRetestV2|ETHUSDT|1h|730d", planned_keys)
+        skip = next(item for item in skipped if item.get("skipReason") == "rejected_lower_timeframe_period_retry")
+        self.assertEqual(skip.get("branchKey"), "BreakoutRetestV2|ETHUSDT|1h|365d")
+        self.assertIn("ETHUSDT 1h 365d was already rejected as NEGATIVE_RETURN", skip.get("detail", ""))
+
+    def test_force_branch_can_retry_rejected_lower_timeframe_period(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, force_branch="BreakoutRetestV2:ETHUSDT:1h:730d")
+        self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
+        self.assertIn("BreakoutRetestV2|ETHUSDT|1h|730d", zgua_app.autopilot_job_branch_keys(jobs[0]))
+
+    def test_same_timeframe_wider_period_confirmation_still_allowed_before_failure(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=8)
+        self.assertTrue(any(job.get("generatedBy") == "rare_period_confirmation" and job.get("period") == "1095d" and job.get("timeframes") == ["4h"] for job in jobs))
+
+    def test_failed_1095d_confirmation_prefers_new_uncooled_families(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "RECENTLY_WEAK", period="1095d", pf=1.1, ret=1, trades=35),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=6)
+        first_broad = next(job for job in jobs if job.get("generatedBy") == "broad_search")
+        self.assertIn(first_broad.get("strategy"), {
+            "ConservativeTrendLoose",
+            "RelativeStrengthV2",
+            "MomentumContinuation",
+            "RangeExpansionV2",
+            "EmaBounceV2",
+            "VolatilitySqueezeBreakout",
+        })
+        self.assertGreaterEqual(first_broad.get("priority"), max(job.get("priority", 0) for job in jobs if job.get("generatedBy") in {"rare_symbol_expansion", "rare_lower_timeframe"}))
+        self.assertTrue(any(item.get("skipReason") == "rejected_lower_timeframe_period_retry" for item in skipped))
+
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [
             branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),

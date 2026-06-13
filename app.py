@@ -8506,15 +8506,27 @@ AUTOPILOT_DEFAULT_STRATEGIES = [
     "PullbackTrend",
     "MomentumScalping",
     "ConservativeTrendLoose",
+    "MomentumContinuation",
+    "RangeExpansionV2",
     "RegimeDonchian20",
     "RelativeStrengthV2",
     "EmaBounceV2",
+    "VolatilitySqueezeBreakout",
+]
+AUTOPILOT_NEW_FAMILY_PREFERRED_STRATEGIES = [
+    "ConservativeTrendLoose",
+    "RelativeStrengthV2",
+    "MomentumContinuation",
+    "RangeExpansionV2",
+    "EmaBounceV2",
+    "VolatilitySqueezeBreakout",
 ]
 AUTOPILOT_FIRST_PASS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
 AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
 AUTOPILOT_PERIODS = ["365d", "730d"]
 AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WALK_FORWARD", "STRESS_COLLAPSE", "REJECTED", "RECENTLY_WEAK"}
+AUTOPILOT_LOWER_TIMEFRAME_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "RECENTLY_WEAK", "STRESS_COLLAPSE", "REJECTED"}
 AUTOPILOT_COOL_DOWN_STATUSES = {"COOL_DOWN", "REJECTED_FAMILY", "EXHAUSTED_IN_CURRENT_SCOPE"}
 AUTOPILOT_PLANNING_MODES = {"conservative", "balanced", "exploratory"}
 
@@ -9105,6 +9117,45 @@ def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timefram
     return bool(branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES)
 
 
+def autopilot_related_lower_timeframe_rejection(memory: dict, strategy: str, symbol: str, timeframe: str) -> dict | None:
+    for branch in memory.get("branches", []):
+        if not is_real_research_candidate(branch):
+            continue
+        if str(branch.get("strategy") or "") != str(strategy or ""):
+            continue
+        if str(branch.get("symbol") or "").upper() != str(symbol or "").upper():
+            continue
+        if str(branch.get("timeframe") or "").lower() != str(timeframe or "").lower():
+            continue
+        category = branch.get("reasonCategory")
+        if category in AUTOPILOT_LOWER_TIMEFRAME_REJECTED_CATEGORIES or branch.get("stressStatus") == "COLLAPSES_UNDER_STRESS":
+            return branch
+    return None
+
+
+def autopilot_failed_long_confirmation_strategies(memory: dict) -> set[str]:
+    failed = set()
+    for branch in memory.get("branches", []):
+        if not is_real_research_candidate(branch):
+            continue
+        if str(branch.get("period") or "").lower() != "1095d":
+            continue
+        category = branch.get("reasonCategory")
+        if category in AUTOPILOT_REJECTED_CATEGORIES or branch.get("stressStatus") == "COLLAPSES_UNDER_STRESS" or branch.get("recentWindowStatus") == "RECENTLY_WEAK":
+            strategy = branch.get("strategy")
+            if strategy:
+                failed.add(strategy)
+    return failed
+
+
+def autopilot_strategy_order(memory: dict) -> list[str]:
+    strategies = list(AUTOPILOT_DEFAULT_STRATEGIES)
+    if not autopilot_failed_long_confirmation_strategies(memory):
+        return strategies
+    preferred = [strategy for strategy in AUTOPILOT_NEW_FAMILY_PREFERRED_STRATEGIES if strategy in strategies]
+    return preferred + [strategy for strategy in strategies if strategy not in preferred]
+
+
 def autopilot_parse_force_branch(raw: str | None) -> dict | None:
     if not raw:
         return None
@@ -9124,6 +9175,7 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
     branch_map = autopilot_memory_branch_map(memory)
     planning_mode = normalize_autopilot_planning_mode(planning_mode)
     family_map = autopilot_family_map(memory, planning_mode=planning_mode)
+    failed_long_confirmation_strategies = autopilot_failed_long_confirmation_strategies(memory)
     forced_strategy = str(force_strategy or "").strip() or None
     forced_branch = autopilot_parse_force_branch(force_branch)
 
@@ -9198,15 +9250,29 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
         elif category == "PROMISING_BUT_RARE":
             if period in {"365d", "730d"}:
                 next_period = "730d" if period == "365d" else "1095d"
-                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], next_period, "Confirm promising-but-rare branch on a wider period before more expansion.", 88, generated_by="rare_period_confirmation", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
+                priority = 52 if strategy in failed_long_confirmation_strategies else 88
+                maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], next_period, "Confirm promising-but-rare branch on a wider period before more expansion.", priority, generated_by="rare_period_confirmation", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
             if timeframe == "4h":
-                maybe_add(make_autopilot_job([strategy], [symbol], ["1h"], period, "Promising but rare on 4h; test lower timeframe for more activity.", 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
+                lower_timeframe = "1h"
+                lower_rejection = autopilot_related_lower_timeframe_rejection(memory, strategy, symbol, lower_timeframe)
+                lower_job = make_autopilot_job([strategy], [symbol], [lower_timeframe], period, "Promising but rare on 4h; test lower timeframe for more activity.", 42 if strategy in failed_long_confirmation_strategies else 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20)
+                if lower_rejection:
+                    lower_key = autopilot_branch_key(lower_rejection, lower_rejection.get("period"))
+                    skipped.append(autopilot_skip_record(
+                        lower_job,
+                        "rejected_lower_timeframe_period_retry",
+                        f"Skipped {strategy} {symbol} {lower_timeframe} {period} because {symbol} {lower_timeframe} {lower_rejection.get('period') or '-'} was already rejected as {lower_rejection.get('reasonCategory')}.",
+                        lower_key,
+                        lower_rejection,
+                    ))
+                else:
+                    maybe_add(lower_job, bypass_family=True)
             other_symbols = [item for item in AUTOPILOT_FIRST_PASS_SYMBOLS + AUTOPILOT_SECOND_PASS_SYMBOLS if item != symbol][:3]
-            maybe_add(make_autopilot_job([strategy], other_symbols, [timeframe], period, "Promising but rare; test same strategy/timeframe on related symbols.", 78, generated_by="rare_symbol_expansion", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
+            maybe_add(make_autopilot_job([strategy], other_symbols, [timeframe], period, "Promising but rare; test same strategy/timeframe on related symbols.", 46 if strategy in failed_long_confirmation_strategies else 78, generated_by="rare_symbol_expansion", previous_evidence=branch, max_combos=10, top_n=20), bypass_family=True)
         elif category in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}:
             warnings.append(f"Deprioritized rejected branch {strategy} {symbol} {timeframe} {period}.")
 
-    for strategy in AUTOPILOT_DEFAULT_STRATEGIES:
+    for strategy in autopilot_strategy_order(memory):
         if forced_strategy and strategy != forced_strategy:
             continue
         for symbol in AUTOPILOT_FIRST_PASS_SYMBOLS:
@@ -9220,8 +9286,8 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
                     continue
                 maybe_add(make_autopilot_job([strategy], [symbol], [timeframe], period, "Broader safe exploration across untested strategy/market branches.", 50, generated_by="broad_search", max_combos=10, top_n=15), bypass_family=bool(forced_strategy and strategy == forced_strategy))
                 if len(jobs) >= max_jobs:
-                    return jobs, warnings, skipped
-    return jobs, warnings, skipped
+                    return sorted(jobs, key=lambda item: (-safe_float(item.get("priority"), 0), item.get("createdAt") or ""))[:max_jobs], warnings, skipped
+    return sorted(jobs, key=lambda item: (-safe_float(item.get("priority"), 0), item.get("createdAt") or ""))[:max_jobs], warnings, skipped
 
 
 def build_research_autopilot_status() -> dict:
