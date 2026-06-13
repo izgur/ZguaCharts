@@ -132,6 +132,19 @@ def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2,
     }
 
 
+def stable_branch(strategy="EmaBounceV2", symbol="BTCUSDT", timeframe="4h", period="730d", pf=2.5385, ret=8.1011, trades=49, seen="2026-06-12T00:00:00+00:00"):
+    row = branch(strategy, symbol, timeframe, "PROMISING_STABLE", period=period, pf=pf, ret=ret, trades=trades, stress="SURVIVES_MODERATE_STRESS", recent="RECENTLY_CONSISTENT", seen=seen)
+    row.update({
+        "eligibilityStatus": "CHALLENGER_ELIGIBLE",
+        "bestTier": "CHALLENGER_ELIGIBLE",
+        "foldPassCount": 4,
+        "negativeFolds": 0,
+        "maxDrawdownPct": 2.667,
+        "failedGates": [],
+    })
+    return row
+
+
 FORBIDDEN_AUTOPILOT_CALLS = [
     "write_candidate_config",
     "write_paper_candidate_config",
@@ -452,6 +465,55 @@ class ResearchAutopilotTests(unittest.TestCase):
         jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=80)
         self.assertFalse(any(job.get("strategy") == "RelativeStrengthV2" for job in jobs))
         self.assertTrue(any(item.get("skipReason") == "cooled_strategy_family" and item.get("strategy") == "RelativeStrengthV2" for item in skipped))
+
+    def test_summary_does_not_select_rejected_eth_over_confirmed_btc_chain(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d", pf=2.5385, ret=8.1011),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d", pf=2.2, ret=7.5),
+            branch("EmaBounceV2", "ETHUSDT", "4h", "REJECTED", period="730d", pf=3.5, ret=10, trades=44),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        summary = zgua_app.build_research_autopilot_summary()
+        self.assertEqual(summary["bestCurrentCandidate"]["symbol"], "BTCUSDT")
+        self.assertEqual(summary["bestCurrentCandidate"]["period"], "1095d")
+        self.assertFalse(summary["summaryText"].startswith("Best current research candidate: EmaBounceV2 ETHUSDT 4h 730d"))
+        self.assertIn("EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d", summary["summaryText"])
+        self.assert_autopilot_safety(summary)
+
+    def test_status_prefers_confirmed_btc_1095d_chain(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d", pf=2.1, ret=7.2),
+            branch("EmaBounceV2", "ETHUSDT", "4h", "REJECTED", period="730d", pf=4.0, ret=12, trades=50),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        status = zgua_app.build_research_autopilot_status()
+        best = status["memory"]["bestCurrentCandidate"]
+        self.assertEqual(best["symbol"], "BTCUSDT")
+        self.assertEqual(best["period"], "1095d")
+        self.assertEqual(status["memory"]["confirmedChain"]["label"], "EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d")
+        self.assertEqual(status["memory"]["topLeads"][0]["period"], "1095d")
+        self.assert_autopilot_safety(status)
+
+    def test_exact_already_tested_eligible_branch_is_not_requeued(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d"),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=6)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("EmaBounceV2|BTCUSDT|4h|730d", planned_keys)
+        self.assertNotIn("EmaBounceV2|BTCUSDT|4h|1095d", planned_keys)
+        self.assertTrue(any(item.get("skipReason") == "already_tested_eligible_branch" and item.get("branchKey") == "EmaBounceV2|BTCUSDT|4h|1095d" for item in skipped))
+
+    def test_confirmed_chain_changes_family_status_to_review_ready(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d"),
+        ], "candidates": []}
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "EmaBounceV2")
+        self.assertEqual(family["familyStatus"], "CONFIRMED_CHALLENGER_REVIEW")
+        self.assertEqual(family["confirmedChains"][0]["label"], "EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d")
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

@@ -8539,6 +8539,7 @@ AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WA
 AUTOPILOT_NO_LEAD_CATEGORIES = {"NO_RESEARCH_LEAD"}
 AUTOPILOT_LOWER_TIMEFRAME_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "RECENTLY_WEAK", "STRESS_COLLAPSE", "REJECTED"}
 AUTOPILOT_COOL_DOWN_STATUSES = {"COOL_DOWN", "REJECTED_FAMILY", "EXHAUSTED_IN_CURRENT_SCOPE"}
+AUTOPILOT_CONFIRMED_REVIEW_STATUSES = {"CONFIRMED_CHALLENGER_REVIEW", "REVIEW_READY"}
 AUTOPILOT_PLANNING_MODES = {"conservative", "balanced", "exploratory"}
 
 
@@ -8788,6 +8789,7 @@ def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> l
             "insufficientEvidenceBranches": 0,
             "promisingRareBranches": 0,
             "eligibleOrStableBranches": 0,
+            "confirmedChains": [],
             "bestBranch": None,
             "bestPF": None,
             "bestReturnPct": None,
@@ -8837,7 +8839,11 @@ def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> l
         weak_like = rejected_like + family["insufficientEvidenceBranches"]
         has_stable = family["eligibleOrStableBranches"] > 0
         has_rare = family["promisingRareBranches"] > 0
-        if has_stable:
+        family["confirmedChains"] = autopilot_confirmed_chains([row for row in memory.get("branches", []) if row.get("strategy") == family.get("strategy")])
+        if family["confirmedChains"]:
+            status = "CONFIRMED_CHALLENGER_REVIEW"
+            action = "Review confirmed challenger chain manually; no automatic promotion or paper/live enablement."
+        elif has_stable:
             status = "NEEDS_DEEP_CONFIRMATION"
             action = "Confirm stable or eligible branch on longer windows before any manual review."
         elif has_rare:
@@ -8868,7 +8874,7 @@ def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> l
         if status in AUTOPILOT_COOL_DOWN_STATUSES:
             family["cooldownCycleCount"] = 1
         summaries.append(family)
-    return sorted(summaries, key=lambda row: (row.get("familyStatus") not in {"PROMISING_BUT_RARE", "NEEDS_DEEP_CONFIRMATION"}, -(row.get("branchesTested") or 0), row.get("strategy") or ""))
+    return sorted(summaries, key=lambda row: (row.get("familyStatus") not in {"CONFIRMED_CHALLENGER_REVIEW", "PROMISING_BUT_RARE", "NEEDS_DEEP_CONFIRMATION"}, -(row.get("branchesTested") or 0), row.get("strategy") or ""))
 
 
 def strategy_family_label(family: dict) -> str:
@@ -8929,6 +8935,14 @@ def skip_deprioritized_autopilot_queue_jobs(queue: dict, memory: dict) -> list[d
                 job["updatedAt"] = autopilot_now()
                 job["skipReason"] = "already_tested_no_research_lead"
                 job["skipDetail"] = f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact branch was already tested and produced NO_RESEARCH_LEAD."
+                record = autopilot_skip_record(job, job["skipReason"], job["skipDetail"], key, branch)
+                skipped.append(record)
+                break
+            if branch and autopilot_branch_is_eligible_or_stable(branch):
+                job["status"] = "SKIPPED"
+                job["updatedAt"] = autopilot_now()
+                job["skipReason"] = "already_tested_eligible_branch"
+                job["skipDetail"] = f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact eligible branch was already tested as {branch.get('reasonCategory') or branch.get('eligibilityStatus')}."
                 record = autopilot_skip_record(job, job["skipReason"], job["skipDetail"], key, branch)
                 skipped.append(record)
                 break
@@ -9230,13 +9244,7 @@ def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timefram
 
 
 def autopilot_branch_is_eligible_or_stable(branch: dict | None) -> bool:
-    if not branch:
-        return False
-    return (
-        branch.get("reasonCategory") == "PROMISING_STABLE"
-        or branch.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"
-        or branch.get("bestTier") == "CHALLENGER_ELIGIBLE"
-    )
+    return autopilot_branch_is_confirmed_candidate(branch)
 
 
 def autopilot_branch_result_label(branch: dict | None) -> str:
@@ -9256,6 +9264,78 @@ def autopilot_branch_result_label(branch: dict | None) -> str:
 def autopilot_period_days(period: str | None) -> int:
     match = re.match(r"^(\d+)d$", str(period or "").strip().lower())
     return int(match.group(1)) if match else 0
+
+
+def autopilot_branch_is_confirmed_candidate(branch: dict | None) -> bool:
+    if not branch:
+        return False
+    return (
+        branch.get("reasonCategory") == "PROMISING_STABLE"
+        or branch.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"
+        or branch.get("bestTier") == "CHALLENGER_ELIGIBLE"
+    )
+
+
+def autopilot_confirmed_chains(branches: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    for branch in branches:
+        if not is_real_research_candidate(branch) or not autopilot_branch_is_confirmed_candidate(branch):
+            continue
+        key = (
+            str(branch.get("strategy") or ""),
+            str(branch.get("symbol") or "").upper(),
+            str(branch.get("timeframe") or "").lower(),
+        )
+        grouped.setdefault(key, []).append(branch)
+    chains = []
+    for (strategy, symbol, timeframe), rows in grouped.items():
+        by_period = {str(row.get("period") or "").lower(): row for row in rows}
+        if "730d" not in by_period or "1095d" not in by_period:
+            continue
+        ordered = sorted(rows, key=lambda row: autopilot_period_days(row.get("period")))
+        best = ordered[-1]
+        chains.append({
+            "strategy": strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "periods": [row.get("period") for row in ordered],
+            "label": f"{strategy} {symbol} {timeframe} confirmed chain: {' + '.join(row.get('period') or '-' for row in ordered)}",
+            "branches": ordered,
+            "bestBranch": best,
+        })
+    return sorted(chains, key=lambda chain: (
+        -autopilot_period_days((chain.get("bestBranch") or {}).get("period")),
+        -safe_float((chain.get("bestBranch") or {}).get("profitFactor"), 0),
+        chain.get("strategy") or "",
+        chain.get("symbol") or "",
+        chain.get("timeframe") or "",
+    ))
+
+
+def autopilot_best_candidate_sort_key(branch: dict) -> tuple:
+    return (
+        0 if autopilot_branch_is_confirmed_candidate(branch) else 1,
+        -autopilot_period_days(branch.get("period")),
+        -safe_float(branch.get("profitFactor"), 0),
+        -safe_float(branch.get("totalReturnPct"), 0),
+        -(int(safe_float(branch.get("fullTrades"), 0))),
+        branch.get("strategy") or "",
+        branch.get("symbol") or "",
+        branch.get("timeframe") or "",
+    )
+
+
+def autopilot_best_current_candidate(memory: dict) -> tuple[dict | None, dict | None, list[dict]]:
+    branches = [row for row in memory.get("branches", []) if is_real_research_candidate(row)]
+    chains = autopilot_confirmed_chains(branches)
+    if chains:
+        chain = chains[0]
+        return chain.get("bestBranch"), chain, chains
+    eligible = sorted([row for row in branches if autopilot_branch_is_confirmed_candidate(row)], key=autopilot_best_candidate_sort_key)
+    if eligible:
+        return eligible[0], None, chains
+    rare = sorted([row for row in branches if row.get("reasonCategory") == "PROMISING_BUT_RARE"], key=autopilot_best_candidate_sort_key)
+    return (rare[0] if rare else None), None, chains
 
 
 def autopilot_branch_failed_confirmation(branch: dict | None) -> bool:
@@ -9377,6 +9457,15 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
                         job,
                         "already_tested_no_research_lead",
                         f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact branch was already tested and produced NO_RESEARCH_LEAD.",
+                        key,
+                        branch,
+                    ))
+                    return False
+                if branch and autopilot_branch_is_eligible_or_stable(branch):
+                    skipped.append(autopilot_skip_record(
+                        job,
+                        "already_tested_eligible_branch",
+                        f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact eligible branch was already tested as {branch.get('reasonCategory') or branch.get('eligibilityStatus')}.",
                         key,
                         branch,
                     ))
@@ -9508,6 +9597,10 @@ def build_research_autopilot_status() -> dict:
         save_autopilot_queue(queue)
     counts = autopilot_queue_counts(queue)
     leads = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}]
+    best_candidate, confirmed_chain, confirmed_chains = autopilot_best_current_candidate(memory)
+    sorted_leads = sorted(leads, key=autopilot_best_candidate_sort_key)
+    if best_candidate:
+        sorted_leads = [best_candidate] + [row for row in sorted_leads if autopilot_branch_key(row, row.get("period")) != autopilot_branch_key(best_candidate, best_candidate.get("period"))]
     rejected = [row for row in memory.get("branches", []) if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED"}]
     rare = [row for row in memory.get("branches", []) if row.get("reasonCategory") == "PROMISING_BUT_RARE"]
     families = autopilot_family_summary(memory)
@@ -9524,7 +9617,10 @@ def build_research_autopilot_status() -> dict:
             "branchesTested": len(memory.get("branches", [])),
             "candidates": len(memory.get("candidates", [])),
             "sourceReports": len(memory.get("sourceReports", [])),
-            "topLeads": sorted(leads, key=lambda row: (row.get("reasonCategory") != "PROMISING_STABLE", -safe_float(row.get("profitFactor"), 0)))[:8],
+            "topLeads": sorted_leads[:8],
+            "bestCurrentCandidate": best_candidate,
+            "confirmedChain": confirmed_chain,
+            "confirmedChains": confirmed_chains,
             "rejectedBranches": rejected[:12],
             "promisingButRare": rare[:8],
             "strategyFamilies": families,
@@ -9681,9 +9777,8 @@ def build_research_autopilot_summary() -> dict:
     memory = load_autopilot_memory()
     queue = load_autopilot_queue()
     branches = memory.get("branches", [])
-    candidates = [row for row in memory.get("candidates", []) if is_real_research_candidate(row)]
-    best_candidate = next((row for row in candidates if row.get("reasonCategory") == "PROMISING_STABLE"), None)
-    best_challenger = next((row for row in branches if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}), None)
+    best_candidate, confirmed_chain, confirmed_chains = autopilot_best_current_candidate(memory)
+    best_challenger = best_candidate or next((row for row in branches if row.get("reasonCategory") in {"PROMISING_STABLE", "PROMISING_BUT_RARE"}), None)
     rejected = [row for row in branches if row.get("reasonCategory") in {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "REJECTED", "STRESS_COLLAPSE", "RECENTLY_WEAK"}]
     insufficient = [row for row in branches if row.get("reasonCategory") in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}]
     more = [row for row in branches if row.get("reasonCategory") in {"PROMISING_BUT_RARE", "BAD_WALK_FORWARD", "TOO_FEW_TRADES"}]
@@ -9692,11 +9787,13 @@ def build_research_autopilot_summary() -> dict:
     return {
         "ok": True,
         "generatedAt": autopilot_now(),
-        "summaryText": autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, status.get("safety", {})),
+        "summaryText": autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, status.get("safety", {}), confirmed_chain),
         "learningEvents": learning_events,
         "bestCurrentCandidate": best_candidate,
         "bestChallenger": best_challenger,
-        "bestEligibleChallenger": next((row for row in branches if row.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"), None),
+        "confirmedChain": confirmed_chain,
+        "confirmedChains": confirmed_chains,
+        "bestEligibleChallenger": best_candidate if autopilot_branch_is_confirmed_candidate(best_candidate) else next((row for row in branches if row.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"), None),
         "bestStableCandidate": best_candidate,
         "branchesTested": len(branches),
         "branchesRejected": rejected[:12],
@@ -9844,9 +9941,12 @@ def autopilot_learning_events(queue: dict, branches: list[dict]) -> list[dict]:
     return events[:8]
 
 
-def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, safety) -> str:
+def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, insufficient, more, next_jobs, learning_events, safety, confirmed_chain=None) -> str:
     best = f"{autopilot_branch_label(best_candidate)}" if best_candidate else "No eligible or stable candidate found"
+    if confirmed_chain:
+        best = confirmed_chain.get("label") or best
     challenger = f"{autopilot_branch_label(best_challenger)} ({best_challenger.get('reasonCategory')})" if best_challenger else "No eligible challenger found"
+    chain_text = f" Confirmed chain: {confirmed_chain.get('label')}." if confirmed_chain else ""
     learned = " ".join(event.get("text", "") for event in learning_events[:3]) or "No completed Autopilot jobs have been learned from yet."
     rejected_text = "; ".join(f"{autopilot_branch_label(row)}: {row.get('reasonCategory')}" for row in rejected[:3]) or "No rejected branch recorded"
     rare_text = "; ".join(f"{autopilot_branch_label(row)}: PF {safe_float(row.get('profitFactor'), 0):.4g}, trades {row.get('fullTrades')}" for row in more[:3] if row.get("reasonCategory") == "PROMISING_BUT_RARE") or "No promising-but-rare branch remains"
@@ -9855,6 +9955,7 @@ def autopilot_summary_text(best_candidate, best_challenger, branches, rejected, 
     return (
         f"Best current research candidate: {best}. "
         f"Best challenger: {challenger}. "
+        f"{chain_text}"
         f"What Autopilot learned: {learned} "
         f"Rejected branches: {rejected_text}. "
         f"Promising but rare: {rare_text}. "
