@@ -16,6 +16,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_DIR", root),
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_QUEUE_PATH", root / "research-queue.json"),
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_MEMORY_PATH", root / "research-memory.json"),
+        patch.object(zgua_app, "RESEARCH_DOSSIER_DIR", root / "research-dossiers"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
     for item in patches:
@@ -514,6 +515,40 @@ class ResearchAutopilotTests(unittest.TestCase):
         family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "EmaBounceV2")
         self.assertEqual(family["familyStatus"], "CONFIRMED_CHALLENGER_REVIEW")
         self.assertEqual(family["confirmedChains"][0]["label"], "EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d")
+
+    def test_candidate_dossier_finds_confirmed_chain_and_writes_markdown(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d", pf=2.0214, ret=7.1006, trades=61),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        payload, status = zgua_app.build_research_autopilot_candidate_dossier({"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["confirmedChain"]["periods"], ["730d", "1095d"])
+        self.assertEqual([row["period"] for row in payload["metrics"]], ["730d", "1095d"])
+        self.assertIn("EmaBounceV2-BTCUSDT-4h-confirmed-chain.md", payload["savedPath"])
+        saved = zgua_app.RESEARCH_DOSSIER_DIR / "EmaBounceV2-BTCUSDT-4h-confirmed-chain.md"
+        self.assertTrue(saved.exists())
+        text = saved.read_text(encoding="utf-8")
+        self.assertIn("# EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d", text)
+        self.assertIn("Manual review only", text)
+        self.assertIn("No automatic promotion", text)
+        self.assert_autopilot_safety(payload)
+
+    def test_candidate_dossier_does_not_include_rejected_other_symbols_as_confirmed(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d"),
+            branch("EmaBounceV2", "ETHUSDT", "4h", "REJECTED", period="730d", pf=4, ret=12, trades=50),
+            branch("EmaBounceV2", "SOLUSDT", "4h", "REJECTED", period="730d", pf=3, ret=9, trades=42),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        payload, status = zgua_app.build_research_autopilot_candidate_dossier({"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 200)
+        self.assertTrue(all(row["symbol"] == "BTCUSDT" for row in payload["branches"]))
+        self.assertNotIn("ETHUSDT", payload["markdown"])
+        self.assertNotIn("SOLUSDT", payload["markdown"])
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

@@ -110,6 +110,10 @@ def main() -> int:
     reset.add_argument("--confirm", action="store_true")
     backfill = sub.add_parser("backfill-memory")
     backfill.add_argument("--file-limit", type=int, default=250)
+    dossier = sub.add_parser("candidate-dossier")
+    dossier.add_argument("--strategy", required=True)
+    dossier.add_argument("--symbol", required=True)
+    dossier.add_argument("--timeframe", required=True)
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -133,6 +137,12 @@ def main() -> int:
             payload, status = post_json(client, "/api/research/autopilot/reset-queue", {"confirm": args.confirm})
         elif args.command == "backfill-memory":
             payload, status = post_json(client, "/api/research/autopilot/backfill-memory", {"fileLimit": args.file_limit})
+        elif args.command == "candidate-dossier":
+            payload, status = post_json(client, "/api/research/autopilot/candidate-dossier", {
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+            })
         else:
             payload, status = {"ok": False, "error": "Unknown command."}, 2
     if args.command == "status" and not args.json:

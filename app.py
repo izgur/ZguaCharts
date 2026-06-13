@@ -49,6 +49,7 @@ LEARNING_DECISIONS_PATH = Path(app.root_path) / "data" / "learning-decisions.jso
 RESEARCH_AUTOPILOT_DIR = Path(app.root_path) / "reports" / "research-autopilot"
 RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
 RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
+RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
 MAX_LEARNING_REPORTS = 100
@@ -1534,6 +1535,16 @@ def research_autopilot_backfill_memory():
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not backfill research autopilot memory: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/candidate-dossier")
+def research_autopilot_candidate_dossier():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_candidate_dossier(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research autopilot candidate dossier: {exc}"}), 502
 
 
 @app.get("/api/research/autopilot/summary")
@@ -9667,6 +9678,185 @@ def build_research_autopilot_backfill_memory(args) -> tuple[dict, int]:
     payload = backfill_autopilot_no_research_leads(file_limit=file_limit)
     payload["fileLimit"] = file_limit
     return payload, 200
+
+
+def autopilot_dossier_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip("-")
+    return slug or "candidate"
+
+
+def autopilot_branch_metric_row(branch: dict) -> dict:
+    return {
+        "period": branch.get("period"),
+        "bestTier": branch.get("bestTier"),
+        "eligibilityStatus": branch.get("eligibilityStatus"),
+        "reasonCategory": branch.get("reasonCategory"),
+        "profitFactor": safe_float(branch.get("profitFactor"), 0),
+        "totalReturnPct": safe_float(branch.get("totalReturnPct"), 0),
+        "fullTrades": int(safe_float(branch.get("fullTrades"), 0)),
+        "foldPassCount": int(safe_float(branch.get("foldPassCount"), 0)),
+        "negativeFolds": int(safe_float(branch.get("negativeFolds", branch.get("negativeFoldCount")), 0)),
+        "maxDrawdownPct": safe_float(branch.get("maxDrawdownPct"), 0),
+        "recentWindowStatus": branch.get("recentWindowStatus") or "UNKNOWN",
+        "stressStatus": branch.get("stressStatus") or "UNKNOWN",
+        "paramsHash": branch.get("paramsHash"),
+        "candidateKey": branch.get("candidateKey"),
+    }
+
+
+def autopilot_table(headers: list[str], rows: list[list]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+    ]
+    for row in rows:
+        lines.append("| " + " | ".join(str(item if item is not None else "-") for item in row) + " |")
+    return "\n".join(lines)
+
+
+def render_autopilot_candidate_dossier_markdown(dossier: dict) -> str:
+    chain = dossier.get("confirmedChain") or {}
+    branches = dossier.get("branches") or []
+    metrics = dossier.get("metrics") or []
+    identity = dossier.get("identity") or {}
+    safety = dossier.get("safety") or {}
+    metric_rows = [[
+        row.get("period"),
+        row.get("bestTier"),
+        row.get("eligibilityStatus"),
+        row.get("reasonCategory"),
+        f"{safe_float(row.get('profitFactor'), 0):.4g}",
+        f"{safe_float(row.get('totalReturnPct'), 0):.4g}%",
+        row.get("fullTrades"),
+        row.get("foldPassCount"),
+        row.get("negativeFolds"),
+        f"{safe_float(row.get('maxDrawdownPct'), 0):.4g}%",
+        row.get("recentWindowStatus"),
+        row.get("stressStatus"),
+    ] for row in metrics]
+    gate_rows = []
+    for branch in branches:
+        gates = format_failed_gates(branch.get("failedGates") or [])
+        if not gates:
+            gate_rows.append([branch.get("period"), "none", "No failed gates recorded."])
+        else:
+            gate_rows.extend([[branch.get("period"), gate.get("name"), gate.get("detail")] for gate in gates])
+    wf_rows = [[branch.get("period"), branch.get("foldPassCount", "-"), branch.get("negativeFolds", branch.get("negativeFoldCount", "-")), (branch.get("worstFold") or {}).get("returnPct", "-")] for branch in branches]
+    stress_rows = [[branch.get("period"), branch.get("stressStatus") or "UNKNOWN", branch.get("stressDetail") or branch.get("stressSummary") or "Stored branch summary only."] for branch in branches]
+    recent_rows = [[branch.get("period"), branch.get("recentWindowStatus") or "UNKNOWN", branch.get("recentWindowDetail") or branch.get("recentWindowSummary") or "Stored branch summary only."] for branch in branches]
+    repro_rows = [[branch.get("period"), branch.get("reproducibilityStatus") or "UNKNOWN", branch.get("reproducibilityDetail") or "No detailed repro audit stored in branch memory."] for branch in branches]
+    concentration_rows = [[branch.get("period"), branch.get("fullTrades", 0), branch.get("returnConcentration", branch.get("concentration", "UNKNOWN"))] for branch in branches]
+    benchmark_rows = [[branch.get("period"), branch.get("benchmarkStatus") or "UNKNOWN", branch.get("benchmarkComparison") or "No benchmark comparison stored in branch memory."] for branch in branches]
+    warnings = dossier.get("warnings") or ["Manual review required before any paper or live action."]
+    lines = [
+        f"# {chain.get('label') or identity.get('label') or 'Research Autopilot Candidate Dossier'}",
+        "",
+        "## Verdict",
+        "",
+        "- Manual review only.",
+        "- Not paper-enabled.",
+        "- Not live-enabled.",
+        "- No automatic promotion.",
+        f"- researchOnly={safety.get('researchOnly')} paperEnabled={safety.get('paperEnabled')} realTradingEnabled={safety.get('realTradingEnabled')} configWritten={safety.get('configWritten')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')}",
+        "",
+        "## Candidate Identity",
+        "",
+        f"- Strategy: {identity.get('strategy')}",
+        f"- Symbol: {identity.get('symbol')}",
+        f"- Timeframe: {identity.get('timeframe')}",
+        f"- Params hash: {identity.get('paramsHash') or '-'}",
+        f"- Candidate key: {identity.get('candidateKey') or '-'}",
+        "",
+        "## Confirmed Chain",
+        "",
+        f"- Periods: {' + '.join(chain.get('periods') or [])}",
+        "",
+        "## Metrics",
+        "",
+        autopilot_table(["Period", "Tier", "Eligibility", "Category", "PF", "Return", "Trades", "Fold pass", "Negative folds", "Max DD", "Recent", "Stress"], metric_rows),
+        "",
+        "## Failed Gates",
+        "",
+        autopilot_table(["Period", "Gate", "Detail"], gate_rows),
+        "",
+        "## Walk Forward",
+        "",
+        autopilot_table(["Period", "Fold pass", "Negative folds", "Worst fold return"], wf_rows),
+        "",
+        "## Stress",
+        "",
+        autopilot_table(["Period", "Status", "Detail"], stress_rows),
+        "",
+        "## Recent Windows",
+        "",
+        autopilot_table(["Period", "Status", "Detail"], recent_rows),
+        "",
+        "## Repro Audit",
+        "",
+        autopilot_table(["Period", "Status", "Detail"], repro_rows),
+        "",
+        "## Trade Count And Concentration",
+        "",
+        autopilot_table(["Period", "Trades", "Concentration"], concentration_rows),
+        "",
+        "## Benchmark Comparison",
+        "",
+        autopilot_table(["Period", "Status", "Comparison"], benchmark_rows),
+        "",
+        "## Warnings And Known Weaknesses",
+        "",
+    ]
+    lines.extend(f"- {warning}" for warning in warnings)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_research_autopilot_candidate_dossier(args) -> tuple[dict, int]:
+    strategy = str(args.get("strategy") or "").strip()
+    symbol = str(args.get("symbol") or "").strip().upper()
+    timeframe = str(args.get("timeframe") or args.get("interval") or "").strip().lower()
+    if not strategy or not symbol or not timeframe:
+        return {"ok": False, "error": "strategy, symbol, and timeframe are required.", "safety": autopilot_safety_payload()}, 400
+    memory, backfill = load_autopilot_memory_after_backfill()
+    chains = [
+        chain for chain in autopilot_confirmed_chains(memory.get("branches", []))
+        if chain.get("strategy") == strategy and chain.get("symbol") == symbol and chain.get("timeframe") == timeframe
+    ]
+    if not chains:
+        return {"ok": False, "error": f"No confirmed chain found for {strategy} {symbol} {timeframe}.", "backfill": backfill, "safety": autopilot_safety_payload()}, 404
+    chain = chains[0]
+    branches = chain.get("branches") or []
+    best = chain.get("bestBranch") or branches[-1]
+    identity = {
+        "strategy": strategy,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "paramsHash": best.get("paramsHash") or next((branch.get("paramsHash") for branch in branches if branch.get("paramsHash")), None),
+        "candidateKey": best.get("candidateKey") or next((branch.get("candidateKey") for branch in branches if branch.get("candidateKey")), None),
+        "label": chain.get("label"),
+    }
+    dossier = {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "identity": identity,
+        "confirmedChain": chain,
+        "branches": branches,
+        "metrics": [autopilot_branch_metric_row(branch) for branch in branches],
+        "warnings": [
+            "Stored branch memory may not include detailed walk-forward, stress, recent-window, reproducibility, concentration, or benchmark internals for every historical report.",
+            "Manual review only; no config, paper, or live trading changes were made.",
+        ],
+        "backfill": backfill,
+        "safety": autopilot_safety_payload(),
+    }
+    markdown = render_autopilot_candidate_dossier_markdown(dossier)
+    RESEARCH_DOSSIER_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{autopilot_dossier_slug(strategy)}-{autopilot_dossier_slug(symbol)}-{autopilot_dossier_slug(timeframe)}-confirmed-chain.md"
+    path = RESEARCH_DOSSIER_DIR / filename
+    path.write_text(markdown, encoding="utf-8")
+    dossier["markdown"] = markdown
+    dossier["savedPath"] = autopilot_display_path(path)
+    return dossier, 200
 
 
 def autopilot_campaign_args(job: dict) -> dict:
