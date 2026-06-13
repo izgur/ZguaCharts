@@ -297,6 +297,27 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
         self.assertIn("BreakoutRetestV2|ETHUSDT|1h|730d", zgua_app.autopilot_job_branch_keys(jobs[0]))
 
+    def test_failed_parent_confirmation_blocks_rare_lower_timeframe(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "BNBUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=25),
+            branch("BreakoutRetestV2", "BNBUSDT", "4h", "NEGATIVE_RETURN", period="1095d", pf=0.9, ret=-4, trades=25),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=8)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("BreakoutRetestV2|BNBUSDT|1h|730d", planned_keys)
+        skip = next(item for item in skipped if item.get("skipReason") == "failed_parent_period_confirmation")
+        self.assertEqual(skip.get("branchKey"), "BreakoutRetestV2|BNBUSDT|4h|1095d")
+        self.assertIn("BNBUSDT 4h 1095d failed as NEGATIVE_RETURN", skip.get("detail", ""))
+
+    def test_force_branch_can_override_failed_parent_confirmation(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "BNBUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=25),
+            branch("BreakoutRetestV2", "BNBUSDT", "4h", "NEGATIVE_RETURN", period="1095d", pf=0.9, ret=-4, trades=25),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, force_branch="BreakoutRetestV2:BNBUSDT:1h:730d")
+        self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
+        self.assertIn("BreakoutRetestV2|BNBUSDT|1h|730d", zgua_app.autopilot_job_branch_keys(jobs[0]))
+
     def test_same_timeframe_wider_period_confirmation_still_allowed_before_failure(self):
         memory = {"branches": [
             branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
@@ -360,26 +381,35 @@ class ResearchAutopilotTests(unittest.TestCase):
         payload, status = zgua_app.build_research_autopilot_plan({"maxJobs": 8})
         self.assertEqual(status, 200)
         planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in payload["addedJobs"])) if payload["addedJobs"] else set()
-        self.assertTrue(any(key.startswith("ConservativeTrendLoose|") for key in planned_keys))
+        self.assertTrue(any(key.startswith(("MomentumContinuation|", "RangeExpansionV2|", "EmaBounceV2|", "VolatilitySqueezeBreakout|")) for key in planned_keys))
 
     def test_failed_1095d_confirmation_prefers_new_uncooled_families(self):
         memory = {"branches": [
             branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=2.4, ret=6, trades=22),
             branch("BreakoutRetestV2", "ETHUSDT", "4h", "RECENTLY_WEAK", period="1095d", pf=1.1, ret=1, trades=35),
             branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+            branch("RelativeStrengthV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
         ], "candidates": []}
         jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=6)
         first_broad = next(job for job in jobs if job.get("generatedBy") == "broad_search")
         self.assertIn(first_broad.get("strategy"), {
-            "ConservativeTrendLoose",
-            "RelativeStrengthV2",
             "MomentumContinuation",
             "RangeExpansionV2",
             "EmaBounceV2",
             "VolatilitySqueezeBreakout",
         })
         self.assertGreaterEqual(first_broad.get("priority"), max(job.get("priority", 0) for job in jobs if job.get("generatedBy") in {"rare_symbol_expansion", "rare_lower_timeframe"}))
-        self.assertTrue(any(item.get("skipReason") == "rejected_lower_timeframe_period_retry" for item in skipped))
+        self.assertTrue(any(item.get("skipReason") == "failed_parent_period_confirmation" for item in skipped))
+
+    def test_relative_strength_rejected_family_blocks_normal_broad_search(self):
+        memory = {"branches": [
+            branch("RelativeStrengthV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "RelativeStrengthV2")
+        self.assertEqual(family["familyStatus"], "REJECTED_FAMILY")
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=80)
+        self.assertFalse(any(job.get("strategy") == "RelativeStrengthV2" for job in jobs))
+        self.assertTrue(any(item.get("skipReason") == "cooled_strategy_family" and item.get("strategy") == "RelativeStrengthV2" for item in skipped))
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

@@ -8514,12 +8514,12 @@ AUTOPILOT_DEFAULT_STRATEGIES = [
     "VolatilitySqueezeBreakout",
 ]
 AUTOPILOT_NEW_FAMILY_PREFERRED_STRATEGIES = [
-    "ConservativeTrendLoose",
-    "RelativeStrengthV2",
     "MomentumContinuation",
     "RangeExpansionV2",
     "EmaBounceV2",
     "VolatilitySqueezeBreakout",
+    "ConservativeTrendLoose",
+    "RelativeStrengthV2",
 ]
 AUTOPILOT_FIRST_PASS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
@@ -8832,7 +8832,7 @@ def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> l
         elif has_rare:
             status = "PROMISING_BUT_RARE"
             action = "Run controlled period confirmation and limited related-market tests."
-        elif tested >= thresholds["all_rejected_min"] and rejected_like == tested:
+        elif rejected_like == tested and (tested >= thresholds["all_rejected_min"] or family.get("strategy") == "RelativeStrengthV2"):
             status = "REJECTED_FAMILY"
             action = "Cool down this strategy family; all tested branches are rejected-like."
         elif tested >= thresholds["cool_min"] and rejected_like >= max(thresholds["cool_floor"], math.ceil(tested * thresholds["cool_ratio"])):
@@ -9141,6 +9141,48 @@ def autopilot_branch_result_label(branch: dict | None) -> str:
     return " / ".join(labels) if labels else "-"
 
 
+def autopilot_period_days(period: str | None) -> int:
+    match = re.match(r"^(\d+)d$", str(period or "").strip().lower())
+    return int(match.group(1)) if match else 0
+
+
+def autopilot_branch_failed_confirmation(branch: dict | None) -> bool:
+    if not branch:
+        return False
+    category = branch.get("reasonCategory")
+    if category in AUTOPILOT_REJECTED_CATEGORIES:
+        return True
+    if branch.get("stressStatus") == "COLLAPSES_UNDER_STRESS":
+        return True
+    if branch.get("recentWindowStatus") == "RECENTLY_WEAK":
+        return True
+    if branch.get("eligibilityStatus") == "REJECTED" or branch.get("bestTier") == "REJECTED":
+        return True
+    if int(safe_float(branch.get("foldPassCount"), 0)) and int(safe_float(branch.get("foldPassCount"), 0)) < 3:
+        return True
+    return False
+
+
+def autopilot_failed_parent_period_confirmation(memory: dict, strategy: str, symbol: str, parent_timeframe: str, parent_period: str) -> dict | None:
+    parent_days = autopilot_period_days(parent_period)
+    failures = []
+    for branch in memory.get("branches", []):
+        if not is_real_research_candidate(branch):
+            continue
+        if str(branch.get("strategy") or "") != str(strategy or ""):
+            continue
+        if str(branch.get("symbol") or "").upper() != str(symbol or "").upper():
+            continue
+        if str(branch.get("timeframe") or "").lower() != str(parent_timeframe or "").lower():
+            continue
+        branch_days = autopilot_period_days(branch.get("period"))
+        if branch_days <= parent_days:
+            continue
+        if autopilot_branch_failed_confirmation(branch):
+            failures.append(branch)
+    return sorted(failures, key=lambda row: autopilot_period_days(row.get("period")), reverse=True)[0] if failures else None
+
+
 def autopilot_related_lower_timeframe_rejection(memory: dict, strategy: str, symbol: str, timeframe: str) -> dict | None:
     for branch in memory.get("branches", []):
         if not is_real_research_candidate(branch):
@@ -9288,8 +9330,18 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
             if timeframe == "4h":
                 lower_timeframe = "1h"
                 lower_rejection = autopilot_related_lower_timeframe_rejection(memory, strategy, symbol, lower_timeframe)
+                parent_confirmation_failure = autopilot_failed_parent_period_confirmation(memory, strategy, symbol, timeframe, period)
                 lower_job = make_autopilot_job([strategy], [symbol], [lower_timeframe], period, "Promising but rare on 4h; test lower timeframe for more activity.", 42 if strategy in failed_long_confirmation_strategies else 82, generated_by="rare_lower_timeframe", previous_evidence=branch, max_combos=10, top_n=20)
-                if lower_rejection:
+                if parent_confirmation_failure:
+                    parent_key = autopilot_branch_key(parent_confirmation_failure, parent_confirmation_failure.get("period"))
+                    skipped.append(autopilot_skip_record(
+                        lower_job,
+                        "failed_parent_period_confirmation",
+                        f"Skipped {strategy} {symbol} {lower_timeframe} {period} because {symbol} {timeframe} {parent_confirmation_failure.get('period') or '-'} failed as {parent_confirmation_failure.get('reasonCategory')}.",
+                        parent_key,
+                        parent_confirmation_failure,
+                    ))
+                elif lower_rejection:
                     lower_key = autopilot_branch_key(lower_rejection, lower_rejection.get("period"))
                     skipped.append(autopilot_skip_record(
                         lower_job,
