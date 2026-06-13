@@ -9117,6 +9117,30 @@ def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timefram
     return bool(branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES)
 
 
+def autopilot_branch_is_eligible_or_stable(branch: dict | None) -> bool:
+    if not branch:
+        return False
+    return (
+        branch.get("reasonCategory") == "PROMISING_STABLE"
+        or branch.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE"
+        or branch.get("bestTier") == "CHALLENGER_ELIGIBLE"
+    )
+
+
+def autopilot_branch_result_label(branch: dict | None) -> str:
+    if not branch:
+        return "-"
+    labels = []
+    for value in (
+        branch.get("reasonCategory"),
+        branch.get("recentWindowStatus"),
+        branch.get("stressStatus"),
+    ):
+        if value and value not in labels:
+            labels.append(str(value))
+    return " / ".join(labels) if labels else "-"
+
+
 def autopilot_related_lower_timeframe_rejection(memory: dict, strategy: str, symbol: str, timeframe: str) -> dict | None:
     for branch in memory.get("branches", []):
         if not is_real_research_candidate(branch):
@@ -9193,6 +9217,15 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
                 if branch and branch.get("reasonCategory") in AUTOPILOT_REJECTED_CATEGORIES:
                     reason = "recently_tested_rejected_branch" if autopilot_branch_was_recent(branch) else "rejected_branch"
                     skipped.append(autopilot_skip_record(job, reason, f"Skipped because branch {key} is {branch.get('reasonCategory')}.", key, branch))
+                    return False
+                if branch and not autopilot_branch_is_eligible_or_stable(branch):
+                    skipped.append(autopilot_skip_record(
+                        job,
+                        "already_tested_branch",
+                        f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact branch was already tested and remains {autopilot_branch_result_label(branch)}.",
+                        key,
+                        branch,
+                    ))
                     return False
         if not bypass_family and not include_cooled:
             for strategy in autopilot_list(job.get("strategies") or job.get("strategy")):

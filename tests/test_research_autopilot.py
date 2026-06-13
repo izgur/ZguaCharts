@@ -74,7 +74,7 @@ def campaign_payload(row):
     }
 
 
-def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2, trades=40, stress=None, seen="2026-06-12T00:00:00+00:00"):
+def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2, trades=40, stress=None, recent=None, seen="2026-06-12T00:00:00+00:00"):
     return {
         "strategy": strategy,
         "symbol": symbol,
@@ -85,6 +85,7 @@ def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2,
         "totalReturnPct": ret,
         "fullTrades": trades,
         "stressStatus": stress,
+        "recentWindowStatus": recent,
         "lastSeenAt": seen,
     }
 
@@ -303,6 +304,63 @@ class ResearchAutopilotTests(unittest.TestCase):
         ], "candidates": []}
         jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=8)
         self.assertTrue(any(job.get("generatedBy") == "rare_period_confirmation" and job.get("period") == "1095d" and job.get("timeframes") == ["4h"] for job in jobs))
+
+    def test_already_tested_exact_branch_is_not_requeued(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="365d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=1.2, ret=1, trades=34, recent="RECENTLY_WEAK"),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=8)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in jobs)) if jobs else set()
+        self.assertNotIn("BreakoutRetestV2|ETHUSDT|4h|730d", planned_keys)
+        skip = next(item for item in skipped if item.get("skipReason") == "already_tested_branch")
+        self.assertEqual(skip.get("branchKey"), "BreakoutRetestV2|ETHUSDT|4h|730d")
+        self.assertIn("PROMISING_BUT_RARE / RECENTLY_WEAK", skip.get("detail", ""))
+
+    def test_reset_queue_does_not_allow_memory_tested_branch_to_requeue(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="365d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=1.2, ret=1, trades=34, recent="RECENTLY_WEAK"),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        queue = zgua_app.load_autopilot_queue()
+        zgua_app.autopilot_enqueue(queue, [zgua_app.make_autopilot_job(["BreakoutRetestV2"], ["ETHUSDT"], ["4h"], "730d", "old queued", generated_by="rare_period_confirmation")])
+        zgua_app.save_autopilot_queue(queue)
+
+        reset, reset_status = zgua_app.build_research_autopilot_reset_queue({"confirm": True})
+        self.assertEqual(reset_status, 200)
+        self.assertEqual(reset["queue"]["length"], 0)
+
+        payload, status = zgua_app.build_research_autopilot_plan({"maxJobs": 8})
+        self.assertEqual(status, 200)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in payload["addedJobs"])) if payload["addedJobs"] else set()
+        self.assertNotIn("BreakoutRetestV2|ETHUSDT|4h|730d", planned_keys)
+        self.assertTrue(any(item.get("skipReason") == "already_tested_branch" and item.get("branchKey") == "BreakoutRetestV2|ETHUSDT|4h|730d" for item in payload["skippedJobs"]))
+
+    def test_force_branch_can_override_already_tested_branch(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=1.2, ret=1, trades=34, recent="RECENTLY_WEAK"),
+        ], "candidates": []}
+        jobs, _warnings, _skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, force_branch="BreakoutRetestV2:ETHUSDT:4h:730d")
+        self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
+        self.assertIn("BreakoutRetestV2|ETHUSDT|4h|730d", zgua_app.autopilot_job_branch_keys(jobs[0]))
+
+    def test_new_conservative_trend_branches_still_queue_after_reset(self):
+        memory = {"branches": [
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="365d", pf=2.4, ret=6, trades=22),
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "PROMISING_BUT_RARE", period="730d", pf=1.2, ret=1, trades=34, recent="RECENTLY_WEAK"),
+            branch("BreakoutRetestV2", "ETHUSDT", "4h", "RECENTLY_WEAK", period="1095d", pf=1.1, ret=1, trades=35),
+            branch("BreakoutRetestV2", "ETHUSDT", "1h", "NEGATIVE_RETURN", period="365d"),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        reset, reset_status = zgua_app.build_research_autopilot_reset_queue({"confirm": True})
+        self.assertEqual(reset_status, 200)
+        payload, status = zgua_app.build_research_autopilot_plan({"maxJobs": 8})
+        self.assertEqual(status, 200)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in payload["addedJobs"])) if payload["addedJobs"] else set()
+        self.assertTrue(any(key.startswith("ConservativeTrendLoose|") for key in planned_keys))
 
     def test_failed_1095d_confirmation_prefers_new_uncooled_families(self):
         memory = {"branches": [
