@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_DIR", root),
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_QUEUE_PATH", root / "research-queue.json"),
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_MEMORY_PATH", root / "research-memory.json"),
+        patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
     for item in patches:
         item.start()
@@ -64,6 +66,46 @@ def campaign_payload(row):
             }
         },
         "recommendation": {"action": "TEST"},
+        "safety": {
+            "promoted": False,
+            "configWritten": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "realTradingTouched": False,
+        },
+    }
+
+
+def no_research_lead_payload(strategy="MomentumContinuation", symbols=None, timeframes=None, period="365d"):
+    symbols = symbols or ["BTCUSDT"]
+    timeframes = timeframes or ["1h"]
+    return {
+        "ok": True,
+        "schemaVersion": "research-campaign-v2",
+        "candidateIdentityVersion": zgua_app.CANONICAL_CANDIDATE_IDENTITY_VERSION,
+        "generatedAt": "2026-06-12T00:00:00+00:00",
+        "savedPath": "reports/research-snapshots/no-lead-test.json",
+        "search": {
+            "period": period,
+            "strategies": strategy,
+            "symbols": symbols,
+            "timeframes": timeframes,
+        },
+        "modules": {
+            "stabilityFirstSearch": {
+                "summary": {
+                    "topCandidates": [],
+                    "bestResearchedCandidate": {},
+                    "bestStableCandidate": {},
+                    "bestEligibleChallenger": {},
+                }
+            }
+        },
+        "topCandidates": [],
+        "recommendation": {
+            "action": "NO_RESEARCH_LEAD",
+            "reason": "No campaign candidate produced enough evidence for deeper review.",
+        },
         "safety": {
             "promoted": False,
             "configWritten": False,
@@ -520,6 +562,137 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["jobsAttempted"], 1)
         self.assertLessEqual(payload["jobsAttempted"], 1)
+
+    def test_run_batch_reports_safety_cap_when_requested_above_three(self):
+        queue = zgua_app.load_autopilot_queue()
+        jobs = [
+            zgua_app.make_autopilot_job(["MeanReversion"], [f"TEST{i}USDT"], ["1h"], "365d", "batch")
+            for i in range(5)
+        ]
+        zgua_app.autopilot_enqueue(queue, jobs)
+        zgua_app.save_autopilot_queue(queue)
+        with patch.object(zgua_app, "build_research_campaign_runner", return_value=(campaign_payload(candidate_row()), 200)):
+            payload, status = zgua_app.build_research_autopilot_run_batch({"maxJobs": 5})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["maxJobsRequested"], 5)
+        self.assertEqual(payload["maxJobsEffective"], 3)
+        self.assertEqual(payload["maxJobs"], 3)
+        self.assertEqual(payload["capReason"], "safety cap")
+        self.assertEqual(payload["jobsAttempted"], 3)
+
+    def test_no_research_lead_writes_durable_branch_memory(self):
+        payload = no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])
+        memory = zgua_app.update_autopilot_memory_from_report(payload, payload["savedPath"])
+        self.assertEqual(memory["candidates"], [])
+        branch_row = next(row for row in memory["branches"] if row["branchKey"] == "MomentumContinuation|BTCUSDT|1h|365d")
+        self.assertEqual(branch_row["reasonCategory"], "NO_RESEARCH_LEAD")
+        self.assertEqual(branch_row["eligibilityStatus"], "NO_RESEARCH_LEAD")
+        self.assertEqual(branch_row["bestTier"], "NO_RESEARCH_LEAD")
+        self.assertEqual(branch_row["fullTrades"], 0)
+        self.assertEqual(branch_row["profitFactor"], 0)
+        self.assertEqual(branch_row["totalReturnPct"], 0)
+        self.assertEqual(branch_row["recentWindowStatus"], "NO_RESEARCH_LEAD")
+        self.assertEqual(branch_row["stressStatus"], "NO_RESEARCH_LEAD")
+
+    def test_no_research_lead_prevents_exact_requeue_after_reset(self):
+        payload = no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])
+        zgua_app.update_autopilot_memory_from_report(payload, payload["savedPath"])
+        reset, reset_status = zgua_app.build_research_autopilot_reset_queue({"confirm": True})
+        self.assertEqual(reset_status, 200)
+        self.assertTrue(reset["ok"])
+        plan, plan_status = zgua_app.build_research_autopilot_plan({"maxJobs": 20, "forceStrategy": "MomentumContinuation"})
+        self.assertEqual(plan_status, 200)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in plan["addedJobs"])) if plan["addedJobs"] else set()
+        self.assertNotIn("MomentumContinuation|BTCUSDT|1h|365d", planned_keys)
+        self.assertTrue(any(item.get("skipReason") == "already_tested_no_research_lead" and item.get("branchKey") == "MomentumContinuation|BTCUSDT|1h|365d" for item in plan["skippedJobs"]))
+
+    def test_no_research_lead_contributes_to_family_exhaustion(self):
+        payload = no_research_lead_payload("MomentumContinuation", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], ["1h", "4h"])
+        memory = zgua_app.update_autopilot_memory_from_report(payload, payload["savedPath"])
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "MomentumContinuation")
+        self.assertEqual(family["branchesTested"], 6)
+        self.assertEqual(family["insufficientEvidenceBranches"], 6)
+        self.assertIn(family["familyStatus"], {"EXHAUSTED_IN_CURRENT_SCOPE", "COOL_DOWN"})
+
+    def test_range_expansion_no_research_lead_appears_in_family_summary(self):
+        payload = no_research_lead_payload("RangeExpansionV2", ["BTCUSDT"], ["4h"])
+        memory = zgua_app.update_autopilot_memory_from_report(payload, payload["savedPath"])
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "RangeExpansionV2")
+        self.assertEqual(family["branchesTested"], 1)
+        self.assertEqual(family["insufficientEvidenceBranches"], 1)
+
+    def test_force_branch_can_override_no_research_lead_branch(self):
+        memory = {"branches": [
+            branch("MomentumContinuation", "BTCUSDT", "1h", "NO_RESEARCH_LEAD", period="365d", pf=0, ret=0, trades=0),
+        ], "candidates": []}
+        jobs, _warnings, skipped = zgua_app.autopilot_plan_jobs(memory, {"jobs": []}, max_jobs=1, force_branch="MomentumContinuation:BTCUSDT:1h:365d")
+        self.assertEqual(jobs[0].get("generatedBy"), "forced_branch")
+        self.assertIn("MomentumContinuation|BTCUSDT|1h|365d", zgua_app.autopilot_job_branch_keys(jobs[0]))
+        self.assertFalse(any(item.get("skipReason") == "already_tested_no_research_lead" and item.get("branchKey") == "MomentumContinuation|BTCUSDT|1h|365d" for item in skipped))
+
+    def test_historical_no_research_lead_report_is_backfilled_into_memory(self):
+        report = zgua_app.RESEARCH_AUTOPILOT_DIR / "historical-no-lead.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])), encoding="utf-8")
+        with patch.object(zgua_app, "candidate_ledger_source_files", return_value=[report]):
+            payload = zgua_app.backfill_autopilot_no_research_leads()
+        self.assertEqual(payload["noResearchLeadReports"], 1)
+        memory = zgua_app.load_autopilot_memory()
+        self.assertTrue(any(row.get("branchKey") == "MomentumContinuation|BTCUSDT|1h|365d" and row.get("reasonCategory") == "NO_RESEARCH_LEAD" for row in memory["branches"]))
+
+    def test_no_research_lead_backfill_is_idempotent(self):
+        report = zgua_app.RESEARCH_AUTOPILOT_DIR / "historical-no-lead.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])), encoding="utf-8")
+        with patch.object(zgua_app, "candidate_ledger_source_files", return_value=[report]):
+            first = zgua_app.backfill_autopilot_no_research_leads()
+            second = zgua_app.backfill_autopilot_no_research_leads()
+        self.assertEqual(first["backfilledBranches"], 1)
+        self.assertEqual(second["backfilledBranches"], 0)
+        memory = zgua_app.load_autopilot_memory()
+        matches = [row for row in memory["branches"] if row.get("branchKey") == "MomentumContinuation|BTCUSDT|1h|365d"]
+        self.assertEqual(len(matches), 1)
+
+    def test_no_research_lead_backfill_does_not_overwrite_better_branch_evidence(self):
+        existing = branch("MomentumContinuation", "BTCUSDT", "1h", "PROMISING_BUT_RARE", period="365d", pf=2.1, ret=4, trades=22)
+        existing["branchKey"] = zgua_app.autopilot_branch_key(existing, existing["period"])
+        zgua_app.save_autopilot_memory({"branches": [existing], "candidates": [], "sourceReports": []})
+        report = zgua_app.RESEARCH_AUTOPILOT_DIR / "historical-no-lead.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])), encoding="utf-8")
+        with patch.object(zgua_app, "candidate_ledger_source_files", return_value=[report]):
+            zgua_app.backfill_autopilot_no_research_leads()
+        row = next(item for item in zgua_app.load_autopilot_memory()["branches"] if item.get("branchKey") == "MomentumContinuation|BTCUSDT|1h|365d")
+        self.assertEqual(row["reasonCategory"], "PROMISING_BUT_RARE")
+        self.assertEqual(row["profitFactor"], 2.1)
+
+    def test_reset_queue_and_plan_skip_backfilled_no_research_lead_branch(self):
+        report = zgua_app.RESEARCH_AUTOPILOT_DIR / "historical-no-lead.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(no_research_lead_payload("MomentumContinuation", ["BTCUSDT"], ["1h"])), encoding="utf-8")
+        with patch.object(zgua_app, "candidate_ledger_source_files", return_value=[report]):
+            reset, reset_status = zgua_app.build_research_autopilot_reset_queue({"confirm": True})
+            plan, plan_status = zgua_app.build_research_autopilot_plan({"maxJobs": 20, "forceStrategy": "MomentumContinuation"})
+        self.assertEqual(reset_status, 200)
+        self.assertTrue(reset["ok"])
+        self.assertEqual(plan_status, 200)
+        planned_keys = set().union(*(zgua_app.autopilot_job_branch_keys(job) for job in plan["addedJobs"])) if plan["addedJobs"] else set()
+        self.assertNotIn("MomentumContinuation|BTCUSDT|1h|365d", planned_keys)
+        skip = next(item for item in plan["skippedJobs"] if item.get("skipReason") == "already_tested_no_research_lead")
+        self.assertEqual(skip.get("branchKey"), "MomentumContinuation|BTCUSDT|1h|365d")
+        self.assertIn("produced NO_RESEARCH_LEAD", skip.get("detail", ""))
+
+    def test_momentum_continuation_historical_no_leads_exhaust_family(self):
+        report = zgua_app.RESEARCH_AUTOPILOT_DIR / "historical-no-lead.json"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(json.dumps(no_research_lead_payload("MomentumContinuation", ["BTCUSDT", "ETHUSDT", "SOLUSDT"], ["1h", "4h"])), encoding="utf-8")
+        with patch.object(zgua_app, "candidate_ledger_source_files", return_value=[report]):
+            zgua_app.backfill_autopilot_no_research_leads()
+        memory = zgua_app.load_autopilot_memory()
+        family = next(row for row in zgua_app.autopilot_family_summary(memory) if row["strategy"] == "MomentumContinuation")
+        self.assertEqual(family["branchesTested"], 6)
+        self.assertEqual(family["insufficientEvidenceBranches"], 6)
+        self.assertIn(family["familyStatus"], {"EXHAUSTED_IN_CURRENT_SCOPE", "COOL_DOWN"})
 
     def test_malformed_result_fails_safely(self):
         queue = zgua_app.load_autopilot_queue()

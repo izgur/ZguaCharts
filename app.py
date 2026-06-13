@@ -1526,6 +1526,16 @@ def research_autopilot_reset_queue():
         return jsonify({"error": f"Could not reset research autopilot queue: {exc}"}), 502
 
 
+@app.post("/api/research/autopilot/backfill-memory")
+def research_autopilot_backfill_memory():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_backfill_memory(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not backfill research autopilot memory: {exc}"}), 502
+
+
 @app.get("/api/research/autopilot/summary")
 def research_autopilot_summary():
     try:
@@ -8526,6 +8536,7 @@ AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
 AUTOPILOT_TIMEFRAMES = ["1h", "4h"]
 AUTOPILOT_PERIODS = ["365d", "730d"]
 AUTOPILOT_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "LOW_PROFIT_FACTOR", "BAD_WALK_FORWARD", "STRESS_COLLAPSE", "REJECTED", "RECENTLY_WEAK"}
+AUTOPILOT_NO_LEAD_CATEGORIES = {"NO_RESEARCH_LEAD"}
 AUTOPILOT_LOWER_TIMEFRAME_REJECTED_CATEGORIES = {"NEGATIVE_RETURN", "RECENTLY_WEAK", "STRESS_COLLAPSE", "REJECTED"}
 AUTOPILOT_COOL_DOWN_STATUSES = {"COOL_DOWN", "REJECTED_FAMILY", "EXHAUSTED_IN_CURRENT_SCOPE"}
 AUTOPILOT_PLANNING_MODES = {"conservative", "balanced", "exploratory"}
@@ -8798,7 +8809,7 @@ def autopilot_family_summary(memory: dict, planning_mode: str = "balanced") -> l
             family["stressCollapseBranches"] += 1
         if category == "RECENTLY_WEAK" or branch.get("recentWindowStatus") == "RECENTLY_WEAK":
             family["recentlyWeakBranches"] += 1
-        if category in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD"}:
+        if category in {"TOO_FEW_TRADES", "BAD_WALK_FORWARD", "NO_RESEARCH_LEAD"}:
             family["insufficientEvidenceBranches"] += 1
         if category == "PROMISING_BUT_RARE":
             family["promisingRareBranches"] += 1
@@ -8910,6 +8921,14 @@ def skip_deprioritized_autopilot_queue_jobs(queue: dict, memory: dict) -> list[d
                 job["updatedAt"] = autopilot_now()
                 job["skipReason"] = "rejected_branch_in_memory"
                 job["skipDetail"] = f"Skipped queued job because branch {key} is {branch.get('reasonCategory')}."
+                record = autopilot_skip_record(job, job["skipReason"], job["skipDetail"], key, branch)
+                skipped.append(record)
+                break
+            if branch and branch.get("reasonCategory") in AUTOPILOT_NO_LEAD_CATEGORIES:
+                job["status"] = "SKIPPED"
+                job["updatedAt"] = autopilot_now()
+                job["skipReason"] = "already_tested_no_research_lead"
+                job["skipDetail"] = f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact branch was already tested and produced NO_RESEARCH_LEAD."
                 record = autopilot_skip_record(job, job["skipReason"], job["skipDetail"], key, branch)
                 skipped.append(record)
                 break
@@ -9044,9 +9063,42 @@ def autopilot_rows_from_campaign(payload: dict, source_report: str) -> list[dict
             candidate = compact_autopilot_candidate(row, source_report, period, generated_at)
             if candidate:
                 rows.append(candidate)
+    recommendation = payload.get("recommendation") or {}
+    if recommendation.get("action") == "NO_RESEARCH_LEAD":
+        search = payload.get("search") or {}
+        strategies = autopilot_list(search.get("strategies"))
+        if strategies == ["all"]:
+            strategies = []
+        for strategy in strategies:
+            for symbol in autopilot_list(search.get("symbols")):
+                for timeframe in autopilot_list(search.get("timeframes")):
+                    rows.append({
+                        "strategy": strategy,
+                        "symbol": symbol,
+                        "timeframe": timeframe,
+                        "period": period,
+                        "paramsHash": "no-research-lead",
+                        "candidateKey": None,
+                        "candidateIdentityVersion": CANONICAL_CANDIDATE_IDENTITY_VERSION,
+                        "bestTier": "NO_RESEARCH_LEAD",
+                        "eligibilityStatus": "NO_RESEARCH_LEAD",
+                        "fullTrades": 0,
+                        "profitFactor": 0,
+                        "totalReturnPct": 0,
+                        "maxDrawdownPct": 0,
+                        "foldPassCount": 0,
+                        "negativeFolds": 0,
+                        "worstFold": {"returnPct": 0},
+                        "stressStatus": "NO_RESEARCH_LEAD",
+                        "recentWindowStatus": "NO_RESEARCH_LEAD",
+                        "failedGates": [{"name": "research lead", "detail": recommendation.get("reason") or "No campaign candidate produced enough evidence for deeper review."}],
+                        "reasonCategory": "NO_RESEARCH_LEAD",
+                        "lastSeenAt": generated_at,
+                        "sourceReport": source_report,
+                    })
     by_key = {}
     for row in rows:
-        if not row.get("candidateKey"):
+        if not row.get("candidateKey") and row.get("reasonCategory") != "NO_RESEARCH_LEAD":
             continue
         key = row.get("candidateKey") or stable_json([row.get("strategy"), row.get("symbol"), row.get("timeframe"), row.get("period"), row.get("paramsHash")])
         old = by_key.get(key)
@@ -9073,13 +9125,13 @@ def update_autopilot_memory_from_report(payload: dict, source_report: str | None
         branch_map[branch_key] = {
             **best,
             "branchKey": branch_key,
-            "strategy": row.get("strategy"),
-            "symbol": row.get("symbol"),
-            "timeframe": row.get("timeframe"),
-            "period": row.get("period"),
-            "reasonCategory": row.get("reasonCategory"),
-            "lastSeenAt": row.get("lastSeenAt"),
-            "sourceReport": row.get("sourceReport"),
+            "strategy": best.get("strategy") or row.get("strategy"),
+            "symbol": best.get("symbol") or row.get("symbol"),
+            "timeframe": best.get("timeframe") or row.get("timeframe"),
+            "period": best.get("period") or row.get("period"),
+            "reasonCategory": best.get("reasonCategory"),
+            "lastSeenAt": best.get("lastSeenAt") or row.get("lastSeenAt"),
+            "sourceReport": best.get("sourceReport") or row.get("sourceReport"),
         }
     reports = set(memory.get("sourceReports") or [])
     reports.add(source_report)
@@ -9110,6 +9162,66 @@ def rebuild_autopilot_memory_from_saved_reports(file_limit: int = 80) -> dict:
         source = autopilot_display_path(path)
         memory = update_autopilot_memory_from_report(payload, source)
     return memory
+
+
+def autopilot_backfill_source_files(file_limit: int = 250) -> list[Path]:
+    files = list(candidate_ledger_source_files(file_limit))
+    queue = load_autopilot_queue()
+    for job in queue.get("jobs", []):
+        saved = job.get("savedPath") or ((job.get("resultSummary") or {}).get("savedPath"))
+        if saved:
+            resolved = resolve_research_report_path(saved)
+            if resolved:
+                files.append(resolved)
+    deduped = {}
+    for path in files:
+        try:
+            deduped[str(path.resolve())] = path
+        except Exception:
+            deduped[str(path)] = path
+    return list(deduped.values())[:file_limit]
+
+
+def backfill_autopilot_no_research_leads(file_limit: int = 250) -> dict:
+    before = autopilot_memory_branch_map(load_autopilot_memory())
+    scanned = 0
+    no_lead_reports = 0
+    errors = []
+    for path in autopilot_backfill_source_files(file_limit):
+        scanned += 1
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+            continue
+        if (payload.get("recommendation") or {}).get("action") != "NO_RESEARCH_LEAD":
+            continue
+        no_lead_reports += 1
+        update_autopilot_memory_from_report(payload, autopilot_display_path(path))
+    after_memory = load_autopilot_memory()
+    after = autopilot_memory_branch_map(after_memory)
+    backfilled_keys = sorted(
+        key for key, row in after.items()
+        if row.get("reasonCategory") == "NO_RESEARCH_LEAD" and before.get(key, {}).get("reasonCategory") != "NO_RESEARCH_LEAD"
+    )
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "scannedReports": scanned,
+        "noResearchLeadReports": no_lead_reports,
+        "backfilledBranches": len(backfilled_keys),
+        "backfilledBranchKeys": backfilled_keys[:25],
+        "branchesBefore": len(before),
+        "branchesAfter": len(after),
+        "errors": errors[:10],
+        "memorySummary": {"branches": len(after_memory.get("branches", [])), "candidates": len(after_memory.get("candidates", [])), "sourceReports": len(after_memory.get("sourceReports", []))},
+        "safety": autopilot_safety_payload(),
+    }
+
+
+def load_autopilot_memory_after_backfill() -> tuple[dict, dict]:
+    backfill = backfill_autopilot_no_research_leads()
+    return load_autopilot_memory(), backfill
 
 
 def autopilot_branch_rejected(memory: dict, strategy: str, symbol: str, timeframe: str, period: str) -> bool:
@@ -9260,6 +9372,15 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
                     reason = "recently_tested_rejected_branch" if autopilot_branch_was_recent(branch) else "rejected_branch"
                     skipped.append(autopilot_skip_record(job, reason, f"Skipped because branch {key} is {branch.get('reasonCategory')}.", key, branch))
                     return False
+                if branch and branch.get("reasonCategory") in AUTOPILOT_NO_LEAD_CATEGORIES:
+                    skipped.append(autopilot_skip_record(
+                        job,
+                        "already_tested_no_research_lead",
+                        f"Skipped {branch.get('strategy') or '-'} {branch.get('symbol') or '-'} {branch.get('timeframe') or '-'} {branch.get('period') or '-'} because this exact branch was already tested and produced NO_RESEARCH_LEAD.",
+                        key,
+                        branch,
+                    ))
+                    return False
                 if branch and not autopilot_branch_is_eligible_or_stable(branch):
                     skipped.append(autopilot_skip_record(
                         job,
@@ -9378,7 +9499,7 @@ def autopilot_plan_jobs(memory: dict, queue: dict, max_jobs: int = 12, include_c
 def build_research_autopilot_status() -> dict:
     queue = load_autopilot_queue()
     recovered = recover_stale_autopilot_running_jobs(queue)
-    memory = load_autopilot_memory()
+    memory, backfill = load_autopilot_memory_after_backfill()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
     skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
@@ -9398,6 +9519,7 @@ def build_research_autopilot_status() -> dict:
         "queuePath": autopilot_display_path(RESEARCH_AUTOPILOT_QUEUE_PATH),
         "memoryPath": autopilot_display_path(RESEARCH_AUTOPILOT_MEMORY_PATH),
         "queue": {"counts": counts, "length": len(queue.get("jobs", [])), "nextJobs": next_jobs, "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized, "lastPlanSkippedJobs": queue.get("lastPlanSkippedJobs", []), "lastPlanWarnings": queue.get("lastPlanWarnings", [])},
+        "backfill": backfill,
         "memory": {
             "branchesTested": len(memory.get("branches", [])),
             "candidates": len(memory.get("candidates", [])),
@@ -9414,7 +9536,7 @@ def build_research_autopilot_status() -> dict:
 def build_research_autopilot_plan(args) -> tuple[dict, int]:
     queue = load_autopilot_queue()
     recovered = recover_stale_autopilot_running_jobs(queue)
-    memory = load_autopilot_memory()
+    memory, backfill = load_autopilot_memory_after_backfill()
     if not memory.get("branches") and candidate_ledger_source_files(20):
         memory = rebuild_autopilot_memory_from_saved_reports(40)
     skipped_deprioritized = skip_deprioritized_autopilot_queue_jobs(queue, memory)
@@ -9435,12 +9557,20 @@ def build_research_autopilot_plan(args) -> tuple[dict, int]:
         "addedJobs": added,
         "skippedJobs": skipped,
         "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", [])), "recoveredStaleJobs": recovered, "skippedDeprioritizedJobs": skipped_deprioritized},
+        "backfill": backfill,
         "memorySummary": {"branches": len(memory.get("branches", [])), "candidates": len(memory.get("candidates", []))},
         "plannerOptions": {"includeCooled": include_cooled, "forceStrategy": force_strategy, "forceBranch": force_branch, "planningMode": planning_mode, "maxJobs": max_jobs},
         "strategyFamilies": autopilot_family_summary(memory, planning_mode=planning_mode),
         "warnings": warnings,
         "safety": autopilot_safety_payload(),
     }, 200
+
+
+def build_research_autopilot_backfill_memory(args) -> tuple[dict, int]:
+    file_limit = max(1, min(int(safe_float(args.get("fileLimit", args.get("file_limit", 250)), 250)), 1000))
+    payload = backfill_autopilot_no_research_leads(file_limit=file_limit)
+    payload["fileLimit"] = file_limit
+    return payload, 200
 
 
 def autopilot_campaign_args(job: dict) -> dict:
@@ -9510,10 +9640,12 @@ def build_research_autopilot_run_next() -> tuple[dict, int]:
 
 
 def build_research_autopilot_run_batch(args) -> tuple[dict, int]:
-    max_jobs = max(1, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 3)), 3)), 3))
+    max_jobs_requested = max(1, int(safe_float(args.get("maxJobs", args.get("max_jobs", 3)), 3)))
+    max_jobs_effective = min(max_jobs_requested, 3)
+    cap_reason = "safety cap" if max_jobs_effective < max_jobs_requested else None
     results = []
     errors = 0
-    for _ in range(max_jobs):
+    for _ in range(max_jobs_effective):
         payload, status = build_research_autopilot_run_next()
         if status == 404:
             break
@@ -9524,7 +9656,10 @@ def build_research_autopilot_run_batch(args) -> tuple[dict, int]:
     return {
         "ok": errors == 0,
         "generatedAt": autopilot_now(),
-        "maxJobs": max_jobs,
+        "maxJobs": max_jobs_effective,
+        "maxJobsRequested": max_jobs_requested,
+        "maxJobsEffective": max_jobs_effective,
+        "capReason": cap_reason,
         "jobsAttempted": len(results),
         "results": results,
         "queue": {"counts": autopilot_queue_counts(queue), "length": len(queue.get("jobs", []))},

@@ -103,11 +103,13 @@ def main() -> int:
     plan.add_argument("--force-branch")
     sub.add_parser("run-next")
     batch = sub.add_parser("run-batch")
-    batch.add_argument("--max-jobs", type=int, default=3)
+    batch.add_argument("--max-jobs", type=int, default=3, help="Requested batch size. The API applies a safety cap of 3 jobs per batch.")
     summarize = sub.add_parser("summarize")
     summarize.add_argument("--json", action="store_true")
     reset = sub.add_parser("reset-queue")
     reset.add_argument("--confirm", action="store_true")
+    backfill = sub.add_parser("backfill-memory")
+    backfill.add_argument("--file-limit", type=int, default=250)
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -129,6 +131,8 @@ def main() -> int:
             payload, status = get_json(client, "/api/research/autopilot/summary")
         elif args.command == "reset-queue":
             payload, status = post_json(client, "/api/research/autopilot/reset-queue", {"confirm": args.confirm})
+        elif args.command == "backfill-memory":
+            payload, status = post_json(client, "/api/research/autopilot/backfill-memory", {"fileLimit": args.file_limit})
         else:
             payload, status = {"ok": False, "error": "Unknown command."}, 2
     if args.command == "status" and not args.json:
