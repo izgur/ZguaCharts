@@ -136,6 +136,8 @@ def branch(strategy, symbol, timeframe, category, period="365d", pf=0.8, ret=-2,
 def stable_branch(strategy="EmaBounceV2", symbol="BTCUSDT", timeframe="4h", period="730d", pf=2.5385, ret=8.1011, trades=49, seen="2026-06-12T00:00:00+00:00"):
     row = branch(strategy, symbol, timeframe, "PROMISING_STABLE", period=period, pf=pf, ret=ret, trades=trades, stress="SURVIVES_MODERATE_STRESS", recent="RECENTLY_CONSISTENT", seen=seen)
     row.update({
+        "candidateKey": f"candidate-identity-v1|{strategy}|{symbol}|{timeframe}|params-{period}|exec",
+        "paramsHash": f"params-{period}",
         "eligibilityStatus": "CHALLENGER_ELIGIBLE",
         "bestTier": "CHALLENGER_ELIGIBLE",
         "foldPassCount": 4,
@@ -144,6 +146,62 @@ def stable_branch(strategy="EmaBounceV2", symbol="BTCUSDT", timeframe="4h", peri
         "failedGates": [],
     })
     return row
+
+
+def detailed_source_report(candidate):
+    return {
+        "ok": True,
+        "generatedAt": "2026-06-12T00:00:00+00:00",
+        "search": {"period": candidate["period"], "strategies": candidate["strategy"], "symbols": [candidate["symbol"]], "timeframes": [candidate["timeframe"]]},
+        "modules": {
+            "stabilityFirstSearch": {
+                "summary": {
+                    "search": {"reproducibilityAudited": 3},
+                    "benchmark": {
+                        "strategy": "SimpleAtrTrendV2",
+                        "symbol": "ETHUSDT",
+                        "timeframe": "1h",
+                        "stabilityScore": -10,
+                        "negativeFoldCount": 3,
+                    },
+                    "bestEligibleChallenger": {
+                        "strategy": candidate["strategy"],
+                        "symbol": candidate["symbol"],
+                        "timeframe": candidate["timeframe"],
+                        "candidateKey": candidate["candidateKey"],
+                        "paramsHash": candidate["paramsHash"],
+                        "params": {"emaBounceAtr": 0.8, "rsiReclaimLevel": 53},
+                        "stabilityScore": 44,
+                        "negativeFoldCount": 0,
+                        "returnConcentrationPct": 42.5,
+                        "stressStatus": "SURVIVES_MODERATE_STRESS",
+                        "recentWindowStatus": "RECENTLY_CONSISTENT",
+                        "reproducibilityStatus": "REPRODUCIBLE",
+                        "failedGates": [],
+                    },
+                    "topCandidates": [],
+                }
+            },
+            "deepValidation": [{
+                "candidateKey": candidate["candidateKey"],
+                "paramsHash": candidate["paramsHash"],
+                "feeSlippageStress": {
+                    "status": "RESILIENT",
+                    "baseline": {"totalReturnPct": 8.1, "profitFactor": 2.5, "trades": 49},
+                    "worstPassingScenario": {"scenario": "highStress", "totalReturnPct": 6.4, "profitFactor": 2.1, "trades": 49, "degradationVsBaseline": {"returnDiffPct": -1.7}},
+                    "firstFailureScenario": None,
+                    "recommendation": {"action": "KEEP_CURRENT_COST_MODEL"},
+                },
+                "walkForward": {
+                    "folds": [{"fold": 1, "startTime": "2025-01-01", "endTime": "2025-06-01", "status": "PASS", "trades": 12, "totalReturnPct": 1.2, "profitFactor": 1.8, "maxDrawdownPct": 0.9}],
+                    "recentWindows": [{"label": "90d", "status": "PASS", "trades": 8, "totalReturnPct": 0.7, "profitFactor": 1.6, "maxDrawdownPct": 0.4}],
+                    "stability": {"status": "PASS"},
+                },
+                "warnings": [],
+            }],
+        },
+        "recommendation": {"action": "REVIEW_STABLE_CHALLENGER"},
+    }
 
 
 FORBIDDEN_AUTOPILOT_CALLS = [
@@ -549,6 +607,44 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertTrue(all(row["symbol"] == "BTCUSDT" for row in payload["branches"]))
         self.assertNotIn("ETHUSDT", payload["markdown"])
         self.assertNotIn("SOLUSDT", payload["markdown"])
+
+    def test_candidate_dossier_loads_source_reports_and_populates_details(self):
+        b730 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d")
+        b1095 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d")
+        p730 = zgua_app.RESEARCH_AUTOPILOT_DIR / "source-730.json"
+        p1095 = zgua_app.RESEARCH_AUTOPILOT_DIR / "source-1095.json"
+        p730.parent.mkdir(parents=True, exist_ok=True)
+        p730.write_text(json.dumps(detailed_source_report(b730)), encoding="utf-8")
+        p1095.write_text(json.dumps(detailed_source_report(b1095)), encoding="utf-8")
+        b730["sourceReport"] = zgua_app.autopilot_display_path(p730)
+        b1095["sourceReport"] = zgua_app.autopilot_display_path(p1095)
+        zgua_app.save_autopilot_memory({"branches": [b730, b1095], "candidates": [], "sourceReports": []})
+        payload, status = zgua_app.build_research_autopilot_candidate_dossier({"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 200)
+        self.assertTrue(all(detail["sourceReportLoaded"] for detail in payload["details"]))
+        markdown = payload["markdown"]
+        self.assertIn('"emaBounceAtr": 0.8', markdown)
+        self.assertIn("| 730d | 1 | 2025-01-01/2025-06-01 | 1.2 | 1.8 | 12 | 0.9 | PASS |", markdown)
+        self.assertIn("| 730d | highStress | RESILIENT | 6.4 | 2.1 | 49 | -1.7 |", markdown)
+        self.assertIn("| 730d | 90d | RECENTLY_CONSISTENT | 0.7 | 1.6 | 8 | 0.4 | PASS |", markdown)
+        self.assertIn("| 730d | REPRODUCIBLE | 3 | True | No reproducibility diff recorded. |", markdown)
+        self.assertIn("| 730d | 49 | 42.5 | No concentration gate failure recorded. | PASS |", markdown)
+        self.assertIn("| 730d | SimpleAtrTrendV2 | -10 | 3 | 44 | 0 | 54.0 |", markdown)
+        self.assert_autopilot_safety(payload)
+
+    def test_candidate_dossier_marks_unknown_only_when_source_detail_missing(self):
+        b730 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d")
+        b1095 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d")
+        p730 = zgua_app.RESEARCH_AUTOPILOT_DIR / "source-730.json"
+        p730.parent.mkdir(parents=True, exist_ok=True)
+        p730.write_text(json.dumps({"ok": True, "modules": {"stabilityFirstSearch": {"summary": {}}, "deepValidation": []}}), encoding="utf-8")
+        b730["sourceReport"] = zgua_app.autopilot_display_path(p730)
+        b1095["sourceReport"] = "reports/research-snapshots/missing.json"
+        zgua_app.save_autopilot_memory({"branches": [b730, b1095], "candidates": [], "sourceReports": []})
+        payload, status = zgua_app.build_research_autopilot_candidate_dossier({"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 200)
+        self.assertIn("UNKNOWN", payload["markdown"])
+        self.assertTrue(any(not detail["sourceReportLoaded"] for detail in payload["details"]))
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

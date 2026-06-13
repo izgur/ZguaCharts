@@ -9704,6 +9704,136 @@ def autopilot_branch_metric_row(branch: dict) -> dict:
     }
 
 
+def autopilot_source_report_payload(branch: dict) -> tuple[dict | None, str | None]:
+    raw = branch.get("sourceReport")
+    if not raw:
+        return None, None
+    path = resolve_research_report_path(str(raw))
+    if not path or not path.exists():
+        return None, None
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), autopilot_display_path(path)
+    except Exception:
+        return None, autopilot_display_path(path)
+
+
+def autopilot_candidate_match(row: dict | None, branch: dict) -> bool:
+    if not isinstance(row, dict):
+        return False
+    if branch.get("candidateKey") and row.get("candidateKey") == branch.get("candidateKey"):
+        return True
+    if branch.get("paramsHash") and row.get("paramsHash") == branch.get("paramsHash"):
+        return True
+    return (
+        str(row.get("strategy") or "") == str(branch.get("strategy") or "")
+        and str(row.get("symbol") or "").upper() == str(branch.get("symbol") or "").upper()
+        and str(row.get("timeframe") or "").lower() == str(branch.get("timeframe") or "").lower()
+    )
+
+
+def autopilot_stability_candidates_from_report(report: dict) -> list[dict]:
+    summary = (((report.get("modules") or {}).get("stabilityFirstSearch") or {}).get("summary") or {})
+    rows = []
+    for key in ("bestEligibleChallenger", "bestStableCandidate", "bestResearchedCandidate", "benchmark"):
+        value = summary.get(key)
+        if isinstance(value, dict) and value:
+            rows.append(value)
+    rows.extend(row for row in (summary.get("topCandidates") or []) if isinstance(row, dict))
+    return rows
+
+
+def autopilot_deep_validations_from_report(report: dict) -> list[dict]:
+    validations = ((report.get("modules") or {}).get("deepValidation") or [])
+    return [row for row in validations if isinstance(row, dict)]
+
+
+def autopilot_find_report_candidate(report: dict | None, branch: dict) -> dict:
+    if not report:
+        return {}
+    matches = [row for row in autopilot_stability_candidates_from_report(report) if autopilot_candidate_match(row, branch)]
+    return matches[0] if matches else {}
+
+
+def autopilot_find_report_validation(report: dict | None, branch: dict, candidate: dict) -> dict:
+    if not report:
+        return {}
+    for row in autopilot_deep_validations_from_report(report):
+        if branch.get("candidateKey") and row.get("candidateKey") == branch.get("candidateKey"):
+            return row
+        if branch.get("paramsHash") and row.get("paramsHash") == branch.get("paramsHash"):
+            return row
+        if candidate.get("candidateKey") and row.get("candidateKey") == candidate.get("candidateKey"):
+            return row
+    return {}
+
+
+def autopilot_concentration_threshold(candidate: dict) -> str:
+    for gate in format_failed_gates(candidate.get("failedGates") or []):
+        detail = gate.get("detail") or ""
+        if gate.get("name") == "concentration" or "concentration" in detail.lower():
+            return detail
+    return "No concentration gate failure recorded."
+
+
+def autopilot_branch_source_details(branch: dict) -> dict:
+    report, source_path = autopilot_source_report_payload(branch)
+    candidate = autopilot_find_report_candidate(report, branch)
+    validation = autopilot_find_report_validation(report, branch, candidate)
+    wf = validation.get("walkForward") or {}
+    fee = validation.get("feeSlippageStress") or {}
+    benchmark = ((((report or {}).get("modules") or {}).get("stabilityFirstSearch") or {}).get("summary") or {}).get("benchmark") or {}
+    search = ((((report or {}).get("modules") or {}).get("stabilityFirstSearch") or {}).get("summary") or {}).get("search") or {}
+    return {
+        "sourceReport": branch.get("sourceReport"),
+        "sourceReportResolved": source_path,
+        "sourceReportLoaded": bool(report),
+        "candidate": candidate,
+        "validation": validation,
+        "params": candidate.get("params") or candidate.get("normalizedParams") or {},
+        "walkForward": {
+            "full": wf.get("full") or {},
+            "folds": wf.get("folds") or [],
+            "recentWindows": wf.get("recentWindows") or [],
+            "stability": wf.get("stability") or {},
+        },
+        "stress": {
+            "status": fee.get("status") or candidate.get("stressStatus") or branch.get("stressStatus") or "UNKNOWN",
+            "baseline": fee.get("baseline") or {},
+            "worstPassingScenario": fee.get("worstPassingScenario") or {},
+            "firstFailureScenario": fee.get("firstFailureScenario") or {},
+            "survivingScenarios": fee.get("survivingScenarios") or [],
+            "failedScenarios": fee.get("failedScenarios") or [],
+            "recommendation": fee.get("recommendation") or {},
+        },
+        "recent": {
+            "status": candidate.get("recentWindowStatus") or branch.get("recentWindowStatus") or "UNKNOWN",
+            "windows": wf.get("recentWindows") or [],
+        },
+        "repro": {
+            "status": candidate.get("reproducibilityStatus") or branch.get("reproducibilityStatus") or "UNKNOWN",
+            "rerunCount": search.get("reproducibilityAudited"),
+            "stable": candidate.get("reproducibilityStatus") == "REPRODUCIBLE",
+            "diff": candidate.get("reproducibilityDiff") or "No reproducibility diff recorded.",
+        },
+        "concentration": {
+            "returnConcentrationPct": candidate.get("returnConcentrationPct"),
+            "threshold": autopilot_concentration_threshold(candidate),
+            "status": "PASS" if candidate.get("returnConcentrationPct") is not None and not any((gate.get("name") == "concentration" or "concentration" in (gate.get("detail") or "").lower()) for gate in format_failed_gates(candidate.get("failedGates") or [])) else ("UNKNOWN" if candidate.get("returnConcentrationPct") is None else "FAIL"),
+        },
+        "benchmark": {
+            "strategy": benchmark.get("strategy"),
+            "symbol": benchmark.get("symbol"),
+            "timeframe": benchmark.get("timeframe"),
+            "stabilityScore": benchmark.get("stabilityScore"),
+            "negativeFoldCount": benchmark.get("negativeFoldCount"),
+            "candidateStabilityScore": candidate.get("stabilityScore"),
+            "candidateNegativeFoldCount": candidate.get("negativeFoldCount"),
+            "candidateVsBenchmarkStabilityDelta": safe_float(candidate.get("stabilityScore"), 0) - safe_float(benchmark.get("stabilityScore"), 0) if candidate.get("stabilityScore") is not None and benchmark.get("stabilityScore") is not None else None,
+        },
+        "warnings": validation.get("warnings") or [],
+    }
+
+
 def autopilot_table(headers: list[str], rows: list[list]) -> str:
     lines = [
         "| " + " | ".join(headers) + " |",
@@ -9717,6 +9847,7 @@ def autopilot_table(headers: list[str], rows: list[list]) -> str:
 def render_autopilot_candidate_dossier_markdown(dossier: dict) -> str:
     chain = dossier.get("confirmedChain") or {}
     branches = dossier.get("branches") or []
+    details = dossier.get("details") or []
     metrics = dossier.get("metrics") or []
     identity = dossier.get("identity") or {}
     safety = dossier.get("safety") or {}
@@ -9741,12 +9872,41 @@ def render_autopilot_candidate_dossier_markdown(dossier: dict) -> str:
             gate_rows.append([branch.get("period"), "none", "No failed gates recorded."])
         else:
             gate_rows.extend([[branch.get("period"), gate.get("name"), gate.get("detail")] for gate in gates])
-    wf_rows = [[branch.get("period"), branch.get("foldPassCount", "-"), branch.get("negativeFolds", branch.get("negativeFoldCount", "-")), (branch.get("worstFold") or {}).get("returnPct", "-")] for branch in branches]
-    stress_rows = [[branch.get("period"), branch.get("stressStatus") or "UNKNOWN", branch.get("stressDetail") or branch.get("stressSummary") or "Stored branch summary only."] for branch in branches]
-    recent_rows = [[branch.get("period"), branch.get("recentWindowStatus") or "UNKNOWN", branch.get("recentWindowDetail") or branch.get("recentWindowSummary") or "Stored branch summary only."] for branch in branches]
-    repro_rows = [[branch.get("period"), branch.get("reproducibilityStatus") or "UNKNOWN", branch.get("reproducibilityDetail") or "No detailed repro audit stored in branch memory."] for branch in branches]
-    concentration_rows = [[branch.get("period"), branch.get("fullTrades", 0), branch.get("returnConcentration", branch.get("concentration", "UNKNOWN"))] for branch in branches]
-    benchmark_rows = [[branch.get("period"), branch.get("benchmarkStatus") or "UNKNOWN", branch.get("benchmarkComparison") or "No benchmark comparison stored in branch memory."] for branch in branches]
+    param_rows = []
+    wf_rows = []
+    stress_rows = []
+    recent_rows = []
+    repro_rows = []
+    concentration_rows = []
+    benchmark_rows = []
+    for detail in details:
+        branch = detail.get("branch") or {}
+        period = branch.get("period")
+        params = detail.get("params") or {}
+        param_rows.append([period, json.dumps(params, sort_keys=True) if params else "UNKNOWN"])
+        for fold in ((detail.get("walkForward") or {}).get("folds") or []):
+            wf_rows.append([period, fold.get("fold", fold.get("index", "-")), f"{fold.get('startTime', '-')}/{fold.get('endTime', '-')}", fold.get("totalReturnPct", fold.get("returnPct", "-")), fold.get("profitFactor", "-"), fold.get("trades", "-"), fold.get("maxDrawdownPct", "-"), fold.get("status", "-")])
+        if not ((detail.get("walkForward") or {}).get("folds") or []):
+            wf_rows.append([period, "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"])
+        stress = detail.get("stress") or {}
+        baseline = stress.get("baseline") or {}
+        worst = stress.get("worstPassingScenario") or {}
+        first_failure = stress.get("firstFailureScenario") or {}
+        stress_rows.append([period, "baseline", stress.get("status", "UNKNOWN"), baseline.get("totalReturnPct", "UNKNOWN"), baseline.get("profitFactor", "UNKNOWN"), baseline.get("trades", "UNKNOWN"), "base"])
+        stress_rows.append([period, worst.get("scenario") or "worstPassing", stress.get("status", "UNKNOWN"), worst.get("totalReturnPct", "UNKNOWN"), worst.get("profitFactor", "UNKNOWN"), worst.get("trades", "UNKNOWN"), (worst.get("degradationVsBaseline") or {}).get("returnDiffPct", "UNKNOWN")])
+        if first_failure:
+            stress_rows.append([period, first_failure.get("scenario") or "firstFailure", "FAIL", first_failure.get("totalReturnPct", "UNKNOWN"), first_failure.get("profitFactor", "UNKNOWN"), first_failure.get("trades", "UNKNOWN"), first_failure.get("mainFailureReason", "UNKNOWN")])
+        recent = detail.get("recent") or {}
+        for window in recent.get("windows") or []:
+            recent_rows.append([period, window.get("label", "-"), recent.get("status", "UNKNOWN"), window.get("totalReturnPct", "UNKNOWN"), window.get("profitFactor", "UNKNOWN"), window.get("trades", "UNKNOWN"), window.get("maxDrawdownPct", "UNKNOWN"), window.get("status", "UNKNOWN")])
+        if not (recent.get("windows") or []):
+            recent_rows.append([period, "UNKNOWN", recent.get("status", "UNKNOWN"), "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN", "UNKNOWN"])
+        repro = detail.get("repro") or {}
+        repro_rows.append([period, repro.get("status", "UNKNOWN"), repro.get("rerunCount", "UNKNOWN"), repro.get("stable", "UNKNOWN"), repro.get("diff", "UNKNOWN")])
+        concentration = detail.get("concentration") or {}
+        concentration_rows.append([period, branch.get("fullTrades", 0), concentration.get("returnConcentrationPct", "UNKNOWN"), concentration.get("threshold", "UNKNOWN"), concentration.get("status", "UNKNOWN")])
+        benchmark = detail.get("benchmark") or {}
+        benchmark_rows.append([period, benchmark.get("strategy", "UNKNOWN"), benchmark.get("stabilityScore", "UNKNOWN"), benchmark.get("negativeFoldCount", "UNKNOWN"), benchmark.get("candidateStabilityScore", "UNKNOWN"), benchmark.get("candidateNegativeFoldCount", "UNKNOWN"), benchmark.get("candidateVsBenchmarkStabilityDelta", "UNKNOWN")])
     warnings = dossier.get("warnings") or ["Manual review required before any paper or live action."]
     lines = [
         f"# {chain.get('label') or identity.get('label') or 'Research Autopilot Candidate Dossier'}",
@@ -9767,6 +9927,10 @@ def render_autopilot_candidate_dossier_markdown(dossier: dict) -> str:
         f"- Params hash: {identity.get('paramsHash') or '-'}",
         f"- Candidate key: {identity.get('candidateKey') or '-'}",
         "",
+        "## Full Parameters",
+        "",
+        autopilot_table(["Period", "Parameters"], param_rows),
+        "",
         "## Confirmed Chain",
         "",
         f"- Periods: {' + '.join(chain.get('periods') or [])}",
@@ -9781,27 +9945,27 @@ def render_autopilot_candidate_dossier_markdown(dossier: dict) -> str:
         "",
         "## Walk Forward",
         "",
-        autopilot_table(["Period", "Fold pass", "Negative folds", "Worst fold return"], wf_rows),
+        autopilot_table(["Period", "Fold", "Window", "Return", "PF", "Trades", "Drawdown", "Status"], wf_rows),
         "",
         "## Stress",
         "",
-        autopilot_table(["Period", "Status", "Detail"], stress_rows),
+        autopilot_table(["Period", "Scenario", "Stress status", "Return", "PF", "Trades", "Change"], stress_rows),
         "",
         "## Recent Windows",
         "",
-        autopilot_table(["Period", "Status", "Detail"], recent_rows),
+        autopilot_table(["Period", "Window", "Recent status", "Return", "PF", "Trades", "Drawdown", "Window status"], recent_rows),
         "",
         "## Repro Audit",
         "",
-        autopilot_table(["Period", "Status", "Detail"], repro_rows),
+        autopilot_table(["Period", "Status", "Reruns audited", "Stable", "Diff"], repro_rows),
         "",
         "## Trade Count And Concentration",
         "",
-        autopilot_table(["Period", "Trades", "Concentration"], concentration_rows),
+        autopilot_table(["Period", "Trades", "Return concentration", "Threshold", "Status"], concentration_rows),
         "",
         "## Benchmark Comparison",
         "",
-        autopilot_table(["Period", "Status", "Comparison"], benchmark_rows),
+        autopilot_table(["Period", "Benchmark", "Benchmark stability", "Benchmark negative folds", "Candidate stability", "Candidate negative folds", "Stability delta"], benchmark_rows),
         "",
         "## Warnings And Known Weaknesses",
         "",
@@ -9835,17 +9999,25 @@ def build_research_autopilot_candidate_dossier(args) -> tuple[dict, int]:
         "candidateKey": best.get("candidateKey") or next((branch.get("candidateKey") for branch in branches if branch.get("candidateKey")), None),
         "label": chain.get("label"),
     }
+    details = [{**autopilot_branch_source_details(branch), "branch": branch} for branch in branches]
+    detailed_warnings = []
+    for detail in details:
+        branch = detail.get("branch") or {}
+        if not detail.get("sourceReportLoaded"):
+            detailed_warnings.append(f"{autopilot_branch_label(branch)} source report could not be loaded; detailed sections may show UNKNOWN.")
+        detailed_warnings.extend(detail.get("warnings") or [])
     dossier = {
         "ok": True,
         "generatedAt": autopilot_now(),
         "identity": identity,
         "confirmedChain": chain,
         "branches": branches,
+        "details": details,
         "metrics": [autopilot_branch_metric_row(branch) for branch in branches],
         "warnings": [
             "Stored branch memory may not include detailed walk-forward, stress, recent-window, reproducibility, concentration, or benchmark internals for every historical report.",
             "Manual review only; no config, paper, or live trading changes were made.",
-        ],
+        ] + detailed_warnings,
         "backfill": backfill,
         "safety": autopilot_safety_payload(),
     }
@@ -10186,6 +10358,7 @@ def approved_research_report_roots() -> list[Path]:
         Path(app.root_path) / "reports" / "research-batches",
         Path(app.root_path) / "reports" / "research-drilldowns",
         Path(app.root_path) / "reports" / "research-leads",
+        RESEARCH_AUTOPILOT_DIR,
     ]
 
 
