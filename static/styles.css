@@ -1324,6 +1324,122 @@ button:hover {
   margin-bottom: 10px;
 }
 
+.paper-review-card {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.paper-review-card-header,
+.paper-review-safety,
+.paper-review-columns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.paper-review-card-header {
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.paper-review-title {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.paper-review-subtitle {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.paper-review-badge,
+.paper-review-flag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 4px 8px;
+  border: 1px solid rgba(245, 184, 75, 0.45);
+  border-radius: 8px;
+  background: rgba(245, 184, 75, 0.1);
+  color: #ffe8a3;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.paper-review-flag.positive {
+  border-color: rgba(63, 209, 142, 0.35);
+  background: rgba(63, 209, 142, 0.08);
+  color: #93f0bf;
+}
+
+.paper-review-flag.negative {
+  border-color: rgba(255, 107, 129, 0.45);
+  background: rgba(255, 107, 129, 0.08);
+  color: #ff9fb0;
+}
+
+.paper-review-identity {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.paper-review-identity div {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+.paper-review-identity span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.paper-review-identity strong,
+.paper-review-paths code {
+  overflow-wrap: anywhere;
+}
+
+.paper-review-columns > section {
+  flex: 1 1 260px;
+}
+
+.paper-review-list,
+.paper-review-paths {
+  margin: 0 0 10px;
+  padding: 8px 12px 8px 28px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+
+.paper-review-list.positive {
+  border: 1px solid rgba(63, 209, 142, 0.35);
+  background: rgba(63, 209, 142, 0.08);
+  color: #bff7d7;
+}
+
+.paper-review-list.caution {
+  border: 1px solid rgba(245, 184, 75, 0.35);
+  background: rgba(245, 184, 75, 0.08);
+  color: #ffe8a3;
+}
+
+.paper-review-paths {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--muted);
+}
+
 .paper-warning {
   margin-bottom: 12px;
   padding: 10px 12px;
