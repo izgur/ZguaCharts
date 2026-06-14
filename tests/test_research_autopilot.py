@@ -1169,6 +1169,38 @@ class ResearchAutopilotTests(unittest.TestCase):
             return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
         return fake_run
 
+    def fresh_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600):
+        latest = int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "cachedCandles": candles,
+            "lastCandleTime": latest,
+            "status": "OK",
+            "warnings": [],
+        }
+
+    def stale_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600):
+        latest = int(datetime.now(timezone.utc).timestamp()) - 24 * 60 * 60
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "cachedCandles": candles,
+            "lastCandleTime": latest,
+            "status": "STALE",
+            "warnings": ["Cached latest candle is stale."],
+        }
+
+    def missing_cache_payload(self, symbol="BTCUSDT", timeframe="4h"):
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "cachedCandles": 0,
+            "lastCandleTime": None,
+            "status": "MISSING",
+            "warnings": ["No cached candles found."],
+        }
+
     def test_preview_paper_tick_refuses_if_paper_disabled(self):
         self.write_active_paper_config(enabled=False)
         payload, status = zgua_app.build_research_preview_paper_tick({})
@@ -1198,7 +1230,7 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(journal_path.exists())
         state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
         config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
-        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads()):
+        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload()), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads()):
             payload, status = zgua_app.build_research_preview_paper_tick({})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
@@ -1220,6 +1252,96 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["proposedAction"], "would open long")
         self.assertEqual(payload["proposedOrder"]["side"], "long")
         self.assertGreater(payload["proposedOrder"]["notional"], 0)
+
+    def test_paper_freshness_returns_stale_structure(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.stale_cache_payload()):
+            payload, status = zgua_app.build_research_paper_freshness({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(payload["timeframe"], "4h")
+        self.assertEqual(payload["freshnessStatus"], "STALE")
+        self.assertTrue(payload["blockingForPaperTick"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+
+    def test_paper_freshness_returns_missing_structure(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.missing_cache_payload()):
+            payload, status = zgua_app.build_research_paper_freshness({})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["freshnessStatus"], "MISSING")
+        self.assertTrue(payload["blockingForPaperTick"])
+
+    def test_preview_paper_tick_blocks_stale_data_without_tick_dry_run(self):
+        self.write_active_paper_config()
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.stale_cache_payload()), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["previewOnly"])
+        self.assertEqual(payload["proposedAction"], "blocked_by_stale_data")
+        self.assertTrue(payload["blockingForPaperTick"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
+        run_mock.assert_not_called()
+
+    def test_stale_data_blocks_real_paper_tick_wrapper(self):
+        self.write_active_paper_config()
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.stale_cache_payload()), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.run_paper_tick_once({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertEqual(payload["freshness"]["freshnessStatus"], "STALE")
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        run_mock.assert_not_called()
+
+    def test_refresh_active_paper_data_does_not_mutate_paper_files(self):
+        self.write_active_paper_config()
+        journal_path = zgua_app.PAPER_STATE_PATH.parent / "reports" / "paper-journal.jsonl"
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
+        cache_payloads = [
+            self.stale_cache_payload(candles=500),
+            self.stale_cache_payload(candles=500),
+            self.fresh_cache_payload(candles=620),
+            self.fresh_cache_payload(candles=620),
+            self.fresh_cache_payload(candles=620),
+        ]
+        def fake_fetch(source, symbol, timeframe, limit=240, visible_charts=None):
+            self.assertEqual(source, "bybit")
+            self.assertEqual(symbol, "BTCUSDT")
+            self.assertEqual(timeframe, "4h")
+            return {"candles": [{"time": self.fresh_cache_payload()["lastCandleTime"], "close": 50000}]}
+        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", side_effect=cache_payloads), patch.object(zgua_app, "fetch_candles", side_effect=fake_fetch):
+            payload, status = zgua_app.build_research_refresh_active_paper_data({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["refreshed"])
+        self.assertEqual(payload["freshnessBefore"]["freshnessStatus"], "STALE")
+        self.assertEqual(payload["freshnessAfter"]["freshnessStatus"], "FRESH")
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertTrue(payload["stateUnchanged"])
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
+        self.assertFalse(journal_path.exists())
 
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
@@ -1261,6 +1383,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn("plan-paper-enable-candidate", script)
         self.assertNotIn("preview-paper-tick", template)
         self.assertNotIn("preview-paper-tick", script)
+        self.assertNotIn("paper:refresh-active-data", template)
+        self.assertNotIn("paper:refresh-active-data", script)
         self.assertNotIn("research-paper-candidates-enable", template)
         self.assertNotIn("research-paper-candidates-run", template)
         self.assertNotIn("research-paper-candidates-paper-tick", template)

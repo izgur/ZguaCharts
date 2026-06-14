@@ -10646,11 +10646,164 @@ def hash_file_for_preview(path: Path) -> str:
 
 
 def preview_file_hashes() -> dict:
+    journal_csv_path = PAPER_JOURNAL_PATH.with_suffix(".csv")
     return {
         "config": hash_file_for_preview(PAPER_CANDIDATE_LOCAL_PATH),
         "state": hash_file_for_preview(PAPER_STATE_PATH),
         "journal": hash_file_for_preview(PAPER_JOURNAL_PATH),
+        "journalCsv": hash_file_for_preview(journal_csv_path),
     }
+
+
+def paper_safety_snapshot(real_enabled: bool | None = None) -> dict:
+    if real_enabled is None:
+        real_enabled = paper_real_trading_enabled()[0]
+    return {
+        "paperStateChanged": False,
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+    }
+
+
+def active_paper_market_freshness(args=None) -> dict:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    source = candidate.get("source") or "bybit"
+    symbol = active.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe")
+    now = datetime.now(timezone.utc)
+    now_epoch = now.timestamp()
+    interval_seconds = paper_interval_seconds(timeframe)
+    max_allowed_seconds = int(safe_float(args.get("maxAllowedAgeSeconds"), interval_seconds * 2 + 30 * 60))
+    latest = None
+    candles = None
+    warnings = []
+    cache_status = None
+    if source == "bybit" and symbol and timeframe:
+        cache = inspect_bybit_cache(symbol, timeframe)
+        latest = cache.get("lastCandleTime")
+        candles = cache.get("cachedCandles")
+        warnings = cache.get("warnings") or []
+        cache_status = cache.get("status")
+    latest_epoch = safe_float(latest, 0)
+    age_seconds = max(0, int(now_epoch - latest_epoch)) if latest_epoch else None
+    if not symbol or not timeframe or not latest_epoch:
+        freshness_status = "MISSING"
+    elif age_seconds is not None and age_seconds > max_allowed_seconds:
+        freshness_status = "STALE"
+    else:
+        freshness_status = "FRESH"
+    blocking = freshness_status in {"STALE", "MISSING"}
+    if freshness_status == "FRESH":
+        message = f"Active paper market {symbol} {timeframe} has fresh enough candle data."
+    elif freshness_status == "STALE":
+        message = f"Active paper market {symbol} {timeframe} candle data is stale."
+    else:
+        message = "Active paper market candle data is missing."
+    real_enabled, _real_detail = paper_real_trading_enabled()
+    return {
+        "ok": True,
+        "source": source,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "latestCandleTime": int(latest_epoch) if latest_epoch else None,
+        "latestCandleAt": epoch_to_iso(latest_epoch),
+        "nowUtc": now.isoformat(),
+        "candleAgeMinutes": round(age_seconds / 60, 2) if age_seconds is not None else None,
+        "expectedIntervalMinutes": round(interval_seconds / 60, 2),
+        "freshnessStatus": freshness_status,
+        "maxAllowedAgeMinutes": round(max_allowed_seconds / 60, 2),
+        "blockingForPaperTick": blocking,
+        "paperTickAllowed": not blocking and not real_enabled,
+        "cachedCandles": candles,
+        "cacheStatus": cache_status,
+        "warnings": warnings,
+        "message": message,
+        "safety": paper_safety_snapshot(real_enabled),
+    }
+
+
+def paper_tick_blocked_by_freshness(args=None) -> tuple[bool, dict]:
+    freshness = active_paper_market_freshness(args)
+    return bool(freshness.get("blockingForPaperTick")), freshness
+
+
+def build_research_paper_freshness(args=None) -> tuple[dict, int]:
+    freshness = active_paper_market_freshness(args)
+    return freshness, 200
+
+
+def build_research_refresh_active_paper_data(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    source = candidate.get("source") or "bybit"
+    symbol = active.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe")
+    real_enabled, real_detail = paper_real_trading_enabled()
+    before_hashes = preview_file_hashes()
+    before_freshness = active_paper_market_freshness(args)
+    before_cache = cache_snapshot_for_market(active, source) if active else {}
+    fetch_error = None
+    fetch_attempts = 0
+    refresh_attempted = False
+    if real_enabled:
+        fetch_error = real_detail
+    elif not symbol or not timeframe:
+        fetch_error = "No active paper market is configured."
+    else:
+        try:
+            limit = int(safe_float(args.get("limit", 600), 600))
+            fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)
+            fetch_attempts += 1
+            refresh_attempted = True
+            interim_freshness = active_paper_market_freshness(args)
+            if interim_freshness.get("freshnessStatus") in {"STALE", "MISSING"}:
+                fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)
+                fetch_attempts += 1
+        except Exception as exc:
+            fetch_error = str(exc)
+    after_freshness = active_paper_market_freshness(args)
+    after_cache = cache_snapshot_for_market(active, source) if active else {}
+    after_hashes = preview_file_hashes()
+    state_unchanged = before_hashes == after_hashes
+    cache_improved = (
+        safe_float(after_cache.get("latestCandleTime"), 0) > safe_float(before_cache.get("latestCandleTime"), 0)
+        or safe_float(after_cache.get("cachedCandles"), 0) > safe_float(before_cache.get("cachedCandles"), 0)
+    )
+    freshness_improved = before_freshness.get("freshnessStatus") != "FRESH" and after_freshness.get("freshnessStatus") == "FRESH"
+    refreshed = bool(refresh_attempted and (cache_improved or freshness_improved or before_freshness.get("freshnessStatus") == "FRESH"))
+    payload = {
+        "ok": bool(refreshed and state_unchanged and not real_enabled and not fetch_error),
+        "refreshAttempted": refresh_attempted,
+        "refreshed": refreshed,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candlesBefore": before_cache.get("cachedCandles"),
+        "candlesAfter": after_cache.get("cachedCandles"),
+        "latestCandleTimeBefore": before_cache.get("latestCandleTime"),
+        "latestCandleTimeAfter": after_cache.get("latestCandleTime"),
+        "freshnessBefore": before_freshness,
+        "freshnessAfter": after_freshness,
+        "fetchAttempts": fetch_attempts,
+        "paperStateChanged": False,
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+        "stateUnchanged": state_unchanged,
+        "fileHashesBefore": before_hashes,
+        "fileHashesAfter": after_hashes,
+    }
+    if fetch_error:
+        payload["error"] = fetch_error
+    elif refresh_attempted and not refreshed:
+        payload["error"] = "Active paper data refresh did not update stale or missing cache."
+    if not state_unchanged:
+        payload["ok"] = False
+        payload["error"] = "Refresh changed paper config/state/journal hashes."
+    return payload, 200 if payload.get("ok") else 400
 
 
 def preview_estimated_order(candidate: dict, signal: str, latest_candle: dict | None, current_position: dict | None, reason: str) -> tuple[str, dict | None]:
@@ -10730,6 +10883,42 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
         }, 400
 
     before = preview_file_hashes()
+    freshness_blocked, freshness = paper_tick_blocked_by_freshness(args)
+    if freshness_blocked:
+        after = preview_file_hashes()
+        state_unchanged = before == after
+        return {
+            "ok": bool(state_unchanged),
+            "previewOnly": True,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "strategy": candidate.get("strategy"),
+            "symbol": freshness.get("symbol") or candidate.get("symbol"),
+            "timeframe": freshness.get("timeframe") or candidate.get("timeframe"),
+            "lastCandleTime": freshness.get("latestCandleTime"),
+            "signal": None,
+            "signalReason": "Signal diagnostics skipped because active paper-market data is stale or missing.",
+            "currentPaperPosition": None,
+            "proposedAction": "blocked_by_stale_data",
+            "proposedOrder": None,
+            "blockingForPaperTick": True,
+            "paperTickAllowed": False,
+            "freshness": freshness,
+            "blockers": [freshness.get("message") or "Active paper-market data is stale or missing."],
+            "warnings": freshness.get("warnings") or [],
+            "stateHashBefore": before["state"],
+            "stateHashAfter": after["state"],
+            "configHashBefore": before["config"],
+            "configHashAfter": after["config"],
+            "journalHashBefore": before["journal"],
+            "journalHashAfter": after["journal"],
+            "journalCsvHashBefore": before["journalCsv"],
+            "journalCsvHashAfter": after["journalCsv"],
+            "stateUnchanged": state_unchanged,
+        }, 200 if state_unchanged else 400
     timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
     diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20))]
     diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
@@ -10759,6 +10948,9 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
         "paperTickRan": False,
         "paperStateChanged": False,
         "liveOrdersTouched": False,
+        "blockingForPaperTick": False,
+        "paperTickAllowed": True,
+        "freshness": freshness,
         "strategy": candidate.get("strategy"),
         "symbol": active_market.get("symbol") or candidate.get("symbol"),
         "timeframe": active_market.get("timeframe") or active_market.get("interval") or candidate.get("timeframe"),
@@ -10776,6 +10968,8 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
         "configHashAfter": after["config"],
         "journalHashBefore": before["journal"],
         "journalHashAfter": after["journal"],
+        "journalCsvHashBefore": before["journalCsv"],
+        "journalCsvHashAfter": after["journalCsv"],
         "stateUnchanged": state_unchanged,
         "tickDryRun": {
             "status": tick_payload.get("status"),
@@ -15721,6 +15915,20 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
             "paperEnabled": False,
             "realTradingEnabled": False,
             "tickReadinessBefore": tick_readiness_before,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
+        }, 400
+    freshness_blocked, freshness = paper_tick_blocked_by_freshness(args)
+    if freshness_blocked:
+        return {
+            "ok": False,
+            "error": freshness.get("message") or "Active paper-market data is stale or missing; paper tick was not run.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "tickReadinessBefore": tick_readiness_before,
+            "freshness": freshness,
             "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         }, 400
     readiness = build_paper_readiness_report(args)

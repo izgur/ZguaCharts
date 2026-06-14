@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_enable_paper_candidate, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
+from app import app, build_research_enable_paper_candidate, build_research_paper_freshness, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -132,6 +132,8 @@ def main() -> int:
     enable_paper.add_argument("--timeframe", required=True)
     enable_paper.add_argument("--confirm", required=True)
     sub.add_parser("preview-paper-tick")
+    sub.add_parser("paper:freshness")
+    sub.add_parser("paper:refresh-active-data")
     sub.add_parser("paper:status")
     args = parser.parse_args()
 
@@ -199,6 +201,10 @@ def main() -> int:
             }, 200
         elif args.command == "preview-paper-tick":
             payload, status = build_research_preview_paper_tick({})
+        elif args.command == "paper:freshness":
+            payload, status = build_research_paper_freshness({})
+        elif args.command == "paper:refresh-active-data":
+            payload, status = build_research_refresh_active_paper_data({})
         else:
             payload, status = {"ok": False, "error": "Unknown command."}, 2
     if args.command == "status" and not args.json:
