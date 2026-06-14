@@ -18,6 +18,9 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_MEMORY_PATH", root / "research-memory.json"),
         patch.object(zgua_app, "RESEARCH_DOSSIER_DIR", root / "research-dossiers"),
         patch.object(zgua_app, "PAPER_CANDIDATE_REVIEW_DIR", root / "paper-candidates"),
+        patch.object(zgua_app, "PAPER_CANDIDATE_LOCAL_PATH", root / "config" / "local" / "paper-candidate.json"),
+        patch.object(zgua_app, "PAPER_STATE_PATH", root / "paper-state.json"),
+        patch.object(zgua_app, "PAPER_CANDIDATE_ENABLE_AUDIT_DIR", root / "paper-candidates" / "enable-audits"),
         patch.object(zgua_app, "DEPLOY_REVIEW_CANDIDATE_DIR", root / "review-candidates"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
@@ -253,6 +256,22 @@ class ResearchAutopilotTests(unittest.TestCase):
 
     def run_with_forbidden_boundaries(self, func, *args, **kwargs):
         patches = self.forbidden_boundary_patches()
+        started = [item.start() for item in patches]
+        try:
+            return func(*args, **kwargs)
+        finally:
+            for mocked in started:
+                self.assertFalse(mocked.called)
+            for item in reversed(patches):
+                item.stop()
+
+    def run_with_live_boundaries(self, func, *args, **kwargs):
+        patches = []
+        for name in FORBIDDEN_AUTOPILOT_CALLS:
+            if name in {"write_candidate_config", "write_paper_candidate_config"}:
+                continue
+            if hasattr(zgua_app, name):
+                patches.append(patch.object(zgua_app, name, side_effect=AssertionError(f"Paper enable must not call {name}")))
         started = [item.start() for item in patches]
         try:
             return func(*args, **kwargs)
@@ -975,6 +994,125 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertTrue(payload["dryRun"])
         self.assertIn("Full params are required", payload["error"])
         self.assert_autopilot_safety(payload)
+
+    def paper_enable_confirmation(self):
+        return "ENABLE PAPER ONLY EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2"
+
+    def test_enable_paper_candidate_fails_without_exact_confirmation(self):
+        self.write_disabled_candidate_package()
+        payload, status = self.run_with_live_boundaries(zgua_app.build_research_enable_paper_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "confirm": "WRONG",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["enabled"])
+        self.assertFalse(payload["configWritten"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.exists())
+        self.assertFalse(zgua_app.PAPER_STATE_PATH.exists())
+
+    def test_enable_paper_candidate_fails_with_wrong_candidate_key(self):
+        self.write_disabled_candidate_package()
+        payload, status = self.run_with_live_boundaries(zgua_app.build_research_enable_paper_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "confirm": "ENABLE PAPER ONLY other-key",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["enabled"])
+        self.assertFalse(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.exists())
+
+    def test_enable_paper_candidate_fails_if_package_lacks_full_params(self):
+        package = self.disabled_candidate_package()
+        package.pop("params", None)
+        self.write_disabled_candidate_package()
+        (zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json").write_text(json.dumps(package), encoding="utf-8")
+        payload, status = self.run_with_live_boundaries(zgua_app.build_research_enable_paper_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "confirm": self.paper_enable_confirmation(),
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["enabled"])
+        self.assertFalse(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.exists())
+
+    def test_enable_paper_candidate_fails_if_unsafe_flags_present(self):
+        self.write_disabled_candidate_package(safety={
+            "researchOnly": True,
+            "paperEnabled": False,
+            "realTradingEnabled": True,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "paperTickRan": False,
+        })
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_enable_paper_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "confirm": self.paper_enable_confirmation(),
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["enabled"])
+        self.assertIn("realTradingEnabled", payload["dryRunPlan"]["error"])
+        self.assertFalse(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.exists())
+
+    def test_enable_paper_candidate_succeeds_with_exact_confirmation(self):
+        package = self.disabled_candidate_package()
+        package["warnings"] = [
+            "730d has 1 non-passing walk-forward fold(s).",
+            "1095d has 2 non-passing walk-forward fold(s).",
+            "730d recent windows need review: 90d, 180d.",
+            "730d regime dependence is unknown or not fully recorded.",
+        ]
+        self.write_disabled_candidate_package()
+        (zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json").write_text(json.dumps(package), encoding="utf-8")
+        payload, status = self.run_with_live_boundaries(zgua_app.build_research_enable_paper_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "confirm": self.paper_enable_confirmation(),
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["enabled"])
+        self.assertEqual(payload["mode"], "PAPER_ONLY")
+        self.assertTrue(payload["configWritten"])
+        self.assertTrue(payload["paperStateChanged"])
+        self.assertTrue(payload["paperEnabled"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["exchangeOrders"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertIn("live trading", payload["nextForbiddenActions"])
+        config = json.loads(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(config["enabled"])
+        self.assertEqual(config["mode"], "PAPER_ONLY")
+        self.assertEqual(config["strategy"], "EmaBounceV2")
+        self.assertEqual(config["symbols"], [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}])
+        self.assertEqual(config["params"]["emaBounceAtr"], 0.8)
+        loaded = zgua_app.load_paper_candidate_config()
+        self.assertEqual(loaded["params"]["emaBounceAtr"], 0.8)
+        self.assertNotIn("emaFast", loaded["params"])
+        self.assertFalse(config["realTradingEnabled"])
+        self.assertFalse(config["exchangeOrders"])
+        self.assertFalse(config["paperTickRan"])
+        self.assertFalse(config["liveOrdersTouched"])
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        self.assertTrue(state["paperEnabled"])
+        self.assertEqual(state["mode"], "PAPER_ONLY")
+        self.assertFalse(state["paperTickRan"])
+        self.assertFalse(state["liveOrdersTouched"])
+        audits = list(zgua_app.PAPER_CANDIDATE_ENABLE_AUDIT_DIR.glob("*.json"))
+        self.assertEqual(len(audits), 1)
+        audit = json.loads(audits[0].read_text(encoding="utf-8"))
+        self.assertTrue(audit["confirmationMatched"])
+        self.assertEqual(audit["paramsHash"], "f09aabfcd7a47bd2")
+        self.assertFalse(audit["safety"]["apiKeyPathCreated"])
+        self.assertIn("weak walk-forward folds", payload["warnings"])
 
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:

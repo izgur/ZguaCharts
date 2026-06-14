@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_plan_paper_enable_candidate, build_research_publish_review_candidate  # noqa: E402
+from app import app, build_research_enable_paper_candidate, build_research_plan_paper_enable_candidate, build_research_publish_review_candidate, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -126,6 +126,12 @@ def main() -> int:
     plan_paper.add_argument("--strategy", required=True)
     plan_paper.add_argument("--symbol", required=True)
     plan_paper.add_argument("--timeframe", required=True)
+    enable_paper = sub.add_parser("enable-paper-candidate")
+    enable_paper.add_argument("--strategy", required=True)
+    enable_paper.add_argument("--symbol", required=True)
+    enable_paper.add_argument("--timeframe", required=True)
+    enable_paper.add_argument("--confirm", required=True)
+    sub.add_parser("paper:status")
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -173,6 +179,23 @@ def main() -> int:
                 "symbol": args.symbol,
                 "timeframe": args.timeframe,
             })
+        elif args.command == "enable-paper-candidate":
+            payload, status = build_research_enable_paper_candidate({
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+                "confirm": args.confirm,
+            })
+        elif args.command == "paper:status":
+            candidate = load_paper_candidate_config()
+            real_enabled, real_detail = paper_real_trading_enabled()
+            payload, status = {
+                "ok": True,
+                "candidate": candidate_summary(candidate),
+                "realTradingEnabled": real_enabled,
+                "realTradingDetail": real_detail,
+                "message": "Read-only paper status snapshot. No paper tick was run.",
+            }, 200
         else:
             payload, status = {"ok": False, "error": "Unknown command."}, 2
     if args.command == "status" and not args.json:

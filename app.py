@@ -41,6 +41,7 @@ CONFIG_DIR = Path(app.root_path) / "config"
 LOCAL_CONFIG_DIR = CONFIG_DIR / "local"
 PAPER_CANDIDATE_DEFAULT_PATH = CONFIG_DIR / "paper-candidate.default.json"
 PAPER_CANDIDATE_LOCAL_PATH = LOCAL_CONFIG_DIR / "paper-candidate.json"
+PAPER_STATE_PATH = Path(app.root_path) / "data" / "paper-state.json"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
 LEARNING_CONFIG_DEFAULT_PATH = CONFIG_DIR / "learning-runner.default.json"
 LEARNING_CONFIG_LOCAL_PATH = LOCAL_CONFIG_DIR / "learning-runner.json"
@@ -51,6 +52,7 @@ RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
 RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
 PAPER_CANDIDATE_REVIEW_DIR = Path(app.root_path) / "reports" / "paper-candidates"
+PAPER_CANDIDATE_ENABLE_AUDIT_DIR = PAPER_CANDIDATE_REVIEW_DIR / "enable-audits"
 DEPLOY_REVIEW_CANDIDATE_DIR = Path(app.root_path) / "data" / "review-candidates"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
@@ -2220,6 +2222,9 @@ def read_json_file(path: str, fallback):
 def shallow_merge_config(defaults: dict, local: dict) -> dict:
     merged = dict(defaults)
     for key, value in (local or {}).items():
+        if key == "params" and local.get("_replaceParams") is True:
+            merged[key] = value
+            continue
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             nested = dict(merged[key])
             nested.update(value)
@@ -10456,6 +10461,176 @@ def build_research_plan_paper_enable_candidate(args) -> tuple[dict, int]:
         "paperStateChanged": False,
         "paperTickRan": False,
         "liveOrdersTouched": False,
+    }, 200
+
+
+def paper_only_confirmation_phrase(identity: dict) -> str:
+    return f"ENABLE PAPER ONLY {identity.get('candidateKey') or ''}"
+
+
+def build_paper_only_candidate_config(plan: dict) -> dict:
+    market = plan.get("proposedPaperMarket") or {}
+    risk = plan.get("proposedRiskPlaceholders") or {}
+    safety = plan.get("proposedSafetySettings") or {}
+    identity = plan.get("candidateIdentity") or {}
+    now = autopilot_now()
+    return normalize_promoted_candidate_config({
+        "enabled": True,
+        "_replaceParams": True,
+        "paperEnabled": True,
+        "mode": "PAPER_ONLY",
+        "source": "bybit",
+        "strategy": market.get("strategy"),
+        "preset": market.get("strategy"),
+        "symbol": market.get("symbol"),
+        "timeframe": market.get("timeframe"),
+        "paramsHash": plan.get("paramsHash"),
+        "candidateKey": identity.get("candidateKey"),
+        "candidateIdentity": identity,
+        "params": plan.get("params") or {},
+        "symbols": [{"symbol": market.get("symbol"), "interval": market.get("timeframe"), "mode": "active"}],
+        "fillModel": "next-open",
+        "makerFeePct": risk.get("makerFeePct", 0.02),
+        "takerFeePct": risk.get("takerFeePct", 0.055),
+        "slippageBps": risk.get("slippageBps", 2),
+        "accountEquity": risk.get("initialEquity", 10000),
+        "maxPositionPct": risk.get("maxPositionPct", 10),
+        "maxDailyLossPct": risk.get("maxDailyLossPct", 2),
+        "maxOpenTrades": 1 if safety.get("maxOnePosition") else 1,
+        "realTradingEnabled": False,
+        "exchangeOrders": False,
+        "liveOrdersTouched": False,
+        "paperTickRan": False,
+        "requireManualConfirmation": True,
+        "maxOnePosition": True,
+        "noLiveOrderFunctions": True,
+        "enabledAt": now,
+        "enabledBy": "research_autopilot_enable_paper_candidate",
+    })
+
+
+def paper_only_state_payload(plan: dict) -> dict:
+    identity = plan.get("candidateIdentity") or {}
+    market = plan.get("proposedPaperMarket") or {}
+    return {
+        "paperEnabled": True,
+        "mode": "PAPER_ONLY",
+        "candidateKey": identity.get("candidateKey"),
+        "paramsHash": plan.get("paramsHash"),
+        "strategy": market.get("strategy"),
+        "symbol": market.get("symbol"),
+        "timeframe": market.get("timeframe"),
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": False,
+        "exchangeOrders": False,
+        "activatedAt": autopilot_now(),
+        "note": "Paper candidate selected only. No tick was run and no live order path was touched.",
+    }
+
+
+def write_paper_only_enable_audit(plan: dict, confirmation_matched: bool) -> Path:
+    PAPER_CANDIDATE_ENABLE_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    identity = plan.get("candidateIdentity") or {}
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = PAPER_CANDIDATE_ENABLE_AUDIT_DIR / f"{autopilot_review_candidate_filename(identity.get('strategy'), identity.get('symbol'), identity.get('timeframe')).replace('-disabled.json', '')}-enable-{timestamp}.json"
+    phrase = paper_only_confirmation_phrase(identity)
+    audit = {
+        "timestamp": autopilot_now(),
+        "candidateKey": identity.get("candidateKey"),
+        "paramsHash": plan.get("paramsHash"),
+        "confirmationMatched": confirmation_matched,
+        "confirmationPhraseSha256": hashlib.sha256(phrase.encode("utf-8")).hexdigest(),
+        "dryRunSourcePath": plan.get("sourcePath"),
+        "safety": {
+            "paperEnabled": True,
+            "realTradingEnabled": False,
+            "exchangeOrders": False,
+            "configWritten": True,
+            "paperStateChanged": True,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "apiKeyPathCreated": False,
+            "noLiveOrderFunctions": True,
+        },
+        "warnings": plan.get("blockingWarnings") or [],
+    }
+    path.write_text(json.dumps(audit, indent=2, sort_keys=True), encoding="utf-8")
+    return path
+
+
+def build_research_enable_paper_candidate(args) -> tuple[dict, int]:
+    plan, status = build_research_plan_paper_enable_candidate(args)
+    if status >= 400 or not plan.get("ok"):
+        return {
+            "ok": False,
+            "enabled": False,
+            "error": plan.get("error") or "Paper enable dry-run validation failed.",
+            "dryRunPlan": plan,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+            "exchangeOrders": False,
+        }, status
+    identity = plan.get("candidateIdentity") or {}
+    expected = paper_only_confirmation_phrase(identity)
+    confirm = str(args.get("confirm") or "")
+    if confirm != expected:
+        return {
+            "ok": False,
+            "enabled": False,
+            "error": "Exact confirmation phrase is required; paper candidate was not enabled.",
+            "expectedConfirmation": expected,
+            "confirmationMatched": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+            "exchangeOrders": False,
+        }, 400
+    safety = plan.get("proposedSafetySettings") or {}
+    if safety.get("realTradingEnabled") or safety.get("exchangeOrders") or not safety.get("noLiveOrderFunctions"):
+        return {
+            "ok": False,
+            "enabled": False,
+            "error": "Dry-run safety settings conflict with paper-only enablement.",
+            "configWritten": False,
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+            "exchangeOrders": False,
+        }, 400
+
+    config = build_paper_only_candidate_config(plan)
+    write_candidate_config(config)
+    PAPER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PAPER_STATE_PATH.write_text(json.dumps(paper_only_state_payload(plan), indent=2, sort_keys=True), encoding="utf-8")
+    audit_path = write_paper_only_enable_audit(plan, True)
+    fresh = load_paper_candidate_config()
+    return {
+        "ok": True,
+        "enabled": True,
+        "mode": "PAPER_ONLY",
+        "candidateIdentity": identity,
+        "paramsHash": plan.get("paramsHash"),
+        "configWritten": True,
+        "paperStateChanged": True,
+        "paperEnabled": canonical_paper_enabled(fresh),
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": False,
+        "exchangeOrders": False,
+        "warnings": plan.get("blockingWarnings") or [],
+        "nextAllowedCommand": "paper status / refresh only",
+        "nextForbiddenActions": ["live trading", "real orders", "API keys", "auto tick"],
+        "writtenPath": autopilot_display_path(PAPER_CANDIDATE_LOCAL_PATH),
+        "paperStatePath": autopilot_display_path(PAPER_STATE_PATH),
+        "auditPath": autopilot_display_path(audit_path),
+        "disableStatus": "Use npm run paper:disable to roll back paperEnabled if needed; npm run paper:status remains read-only.",
     }, 200
 
 
