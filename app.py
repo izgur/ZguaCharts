@@ -51,6 +51,7 @@ RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
 RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
 PAPER_CANDIDATE_REVIEW_DIR = Path(app.root_path) / "reports" / "paper-candidates"
+DEPLOY_REVIEW_CANDIDATE_DIR = Path(app.root_path) / "data" / "review-candidates"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
 MAX_LEARNING_REPORTS = 100
@@ -97,6 +98,7 @@ LEARNING_OPTIMIZER_STRATEGY_OPTIONS = [
 @app.get("/dashboard")
 @app.get("/charts")
 @app.get("/research")
+@app.get("/research/paper-review")
 @app.get("/candidate")
 @app.get("/paper")
 @app.get("/backtest")
@@ -10177,31 +10179,152 @@ def autopilot_disabled_paper_candidate_summary(path: Path, payload: dict) -> dic
             "configWritten": False,
             "paperStateChanged": False,
             "liveOrdersTouched": False,
+            "paperTickRan": False,
         },
     }
 
 
+PAPER_REVIEW_FALSE_SAFETY_FLAGS = (
+    "paperEnabled",
+    "realTradingEnabled",
+    "configWritten",
+    "paperStateChanged",
+    "liveOrdersTouched",
+    "paperTickRan",
+)
+
+
+def autopilot_review_candidate_filename(strategy: str, symbol: str, timeframe: str) -> str:
+    return f"{autopilot_dossier_slug(strategy)}-{autopilot_dossier_slug(symbol)}-{autopilot_dossier_slug(timeframe)}-disabled.json"
+
+
+def autopilot_review_candidate_dedupe_key(candidate: dict) -> str:
+    identity = candidate.get("candidateIdentity") or {}
+    return identity.get("candidateKey") or "|".join(str(identity.get(key) or candidate.get(key) or "") for key in ("strategy", "symbol", "timeframe", "paramsHash"))
+
+
+def autopilot_validate_disabled_review_package(payload: dict) -> tuple[bool, str]:
+    if not isinstance(payload, dict):
+        return False, "package is not a JSON object"
+    if payload.get("status") != "DISABLED_REVIEW_ONLY":
+        return False, "status is not DISABLED_REVIEW_ONLY"
+    identity = payload.get("candidateIdentity") or {}
+    if not all(identity.get(key) for key in ("strategy", "symbol", "timeframe")):
+        return False, "candidate identity is incomplete"
+    safety = payload.get("safety") or {}
+    for flag in PAPER_REVIEW_FALSE_SAFETY_FLAGS:
+        if safety.get(flag) is not False:
+            return False, f"safety flag {flag} is not false"
+    return True, "safe disabled review package"
+
+
+def autopilot_sanitized_review_candidate_package(path: Path, payload: dict) -> dict | None:
+    ok, _reason = autopilot_validate_disabled_review_package(payload)
+    if not ok:
+        return None
+    identity = payload.get("candidateIdentity") or {}
+    safety = payload.get("safety") or {}
+    return {
+        "ok": True,
+        "schemaVersion": "paper-review-candidate-v1",
+        "generatedAt": payload.get("generatedAt") or autopilot_now(),
+        "publishedAt": autopilot_now(),
+        "status": "DISABLED_REVIEW_ONLY",
+        "reviewBanner": payload.get("reviewBanner") or "Confirmed candidate available for manual paper review; disabled by default.",
+        "candidateIdentity": {
+            "strategy": identity.get("strategy"),
+            "symbol": identity.get("symbol"),
+            "timeframe": identity.get("timeframe"),
+            "paramsHash": identity.get("paramsHash") or payload.get("paramsHash"),
+            "candidateKey": identity.get("candidateKey"),
+            "label": identity.get("label"),
+        },
+        "paramsHash": identity.get("paramsHash") or payload.get("paramsHash"),
+        "confirmedChainPeriods": autopilot_list(payload.get("confirmedChainPeriods")),
+        "strengths": autopilot_list(payload.get("strengths")),
+        "warnings": autopilot_list(payload.get("warnings")),
+        "dossierPath": str(payload.get("dossierPath") or ""),
+        "sourceReports": [str(item) for item in autopilot_list(payload.get("sourceReports"))],
+        "sourcePackage": autopilot_display_path(path),
+        "safety": {
+            "researchOnly": True,
+            **{flag: False for flag in PAPER_REVIEW_FALSE_SAFETY_FLAGS},
+            "promotionAttempted": False,
+            "realOrderFunctionsCalled": False,
+            "activePaperCandidateMutated": False,
+            "riskSettingsChanged": False,
+            "apiKeyPathCreated": False,
+        },
+    }
+
+
+def build_research_publish_review_candidate(args) -> tuple[dict, int]:
+    strategy = str(args.get("strategy") or "").strip()
+    symbol = str(args.get("symbol") or "").strip()
+    timeframe = str(args.get("timeframe") or "").strip()
+    if not strategy or not symbol or not timeframe:
+        return {"ok": False, "error": "strategy, symbol, and timeframe are required.", "safety": autopilot_safety_payload()}, 400
+    source_path = PAPER_CANDIDATE_REVIEW_DIR / autopilot_review_candidate_filename(strategy, symbol, timeframe)
+    if not source_path.exists():
+        return {
+            "ok": False,
+            "error": f"Disabled local package not found: {autopilot_display_path(source_path)}",
+            "safety": autopilot_safety_payload(),
+        }, 404
+    try:
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read disabled local package: {exc}", "safety": autopilot_safety_payload()}, 400
+    sanitized = autopilot_sanitized_review_candidate_package(source_path, payload)
+    if not sanitized:
+        ok, reason = autopilot_validate_disabled_review_package(payload)
+        return {"ok": False, "error": f"Package cannot be published: {reason}", "safety": autopilot_safety_payload()}, 400
+    DEPLOY_REVIEW_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+    target_path = DEPLOY_REVIEW_CANDIDATE_DIR / autopilot_review_candidate_filename(strategy, symbol, timeframe)
+    sanitized["savedPath"] = autopilot_display_path(target_path)
+    target_path.write_text(json.dumps(sanitized, indent=2, sort_keys=True), encoding="utf-8")
+    return {
+        "ok": True,
+        "published": sanitized,
+        "savedPath": sanitized["savedPath"],
+        "sourcePath": autopilot_display_path(source_path),
+        "safety": autopilot_safety_payload(),
+    }, 200
+
+
 def build_research_paper_candidates() -> dict:
-    candidates = []
+    candidates_by_key = {}
     ignored_packages = []
-    if PAPER_CANDIDATE_REVIEW_DIR.exists():
-        for path in sorted(PAPER_CANDIDATE_REVIEW_DIR.glob("*.json")):
+    sources = [
+        ("deploy", DEPLOY_REVIEW_CANDIDATE_DIR),
+        ("local", PAPER_CANDIDATE_REVIEW_DIR),
+    ]
+    for source_type, directory in sources:
+        if directory.exists():
+            paths = sorted(directory.glob("*.json"))
+        else:
+            paths = []
+        for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
             except Exception as exc:
                 ignored_packages.append({
                     "path": autopilot_display_path(path),
                     "reason": f"malformed package: {exc}",
+                    "sourceType": source_type,
                 })
                 continue
             summary = autopilot_disabled_paper_candidate_summary(path, payload)
             if summary:
-                candidates.append(summary)
+                summary["sourceType"] = source_type
+                candidates_by_key[autopilot_review_candidate_dedupe_key(summary)] = summary
             else:
                 ignored_packages.append({
                     "path": autopilot_display_path(path),
                     "reason": "not a safe disabled review package",
+                    "sourceType": source_type,
                 })
+    candidates = list(candidates_by_key.values())
     return {
         "ok": True,
         "generatedAt": autopilot_now(),
@@ -10215,6 +10338,7 @@ def build_research_paper_candidates() -> dict:
             "configWritten": False,
             "paperStateChanged": False,
             "liveOrdersTouched": False,
+            "paperTickRan": False,
         },
         "notes": [
             "Review only - not paper enabled.",

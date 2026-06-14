@@ -1,0 +1,61 @@
+{
+  "candidateIdentity": {
+    "candidateKey": "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca",
+    "label": "EmaBounceV2 BTCUSDT 4h confirmed chain: 730d + 1095d",
+    "paramsHash": "f09aabfcd7a47bd2",
+    "strategy": "EmaBounceV2",
+    "symbol": "BTCUSDT",
+    "timeframe": "4h"
+  },
+  "confirmedChainPeriods": [
+    "730d",
+    "1095d"
+  ],
+  "dossierPath": "reports/research-dossiers/EmaBounceV2-BTCUSDT-4h-confirmed-chain.md",
+  "generatedAt": "2026-06-14T12:23:57.178475+00:00",
+  "ok": true,
+  "paramsHash": "f09aabfcd7a47bd2",
+  "publishedAt": "2026-06-14T12:49:58.879982+00:00",
+  "reviewBanner": "Confirmed candidate available for manual paper review; disabled by default.",
+  "safety": {
+    "activePaperCandidateMutated": false,
+    "apiKeyPathCreated": false,
+    "configWritten": false,
+    "liveOrdersTouched": false,
+    "paperEnabled": false,
+    "paperStateChanged": false,
+    "paperTickRan": false,
+    "promotionAttempted": false,
+    "realOrderFunctionsCalled": false,
+    "realTradingEnabled": false,
+    "researchOnly": true,
+    "riskSettingsChanged": false
+  },
+  "savedPath": "data/review-candidates/EmaBounceV2-BTCUSDT-4h-disabled.json",
+  "schemaVersion": "paper-review-candidate-v1",
+  "sourcePackage": "reports/paper-candidates/EmaBounceV2-BTCUSDT-4h-disabled.json",
+  "sourceReports": [
+    "reports/research-snapshots/research-snapshot-20260613-220214.json",
+    "reports/research-snapshots/research-snapshot-20260613-220942.json"
+  ],
+  "status": "DISABLED_REVIEW_ONLY",
+  "strengths": [
+    "730d and 1095d branches are CHALLENGER_ELIGIBLE.",
+    "Confirmed branches survive moderate stress.",
+    "Source reports show fee/slippage stress survival.",
+    "Source reports mark the candidate reproducible.",
+    "Return concentration passes stored gates."
+  ],
+  "warnings": [
+    "Manual review only; package is disabled by default.",
+    "Paper and live trading remain disabled.",
+    "730d has 1 non-passing walk-forward fold(s).",
+    "730d recent windows need review: 90d, 180d.",
+    "730d regime dependence is unknown or not fully recorded.",
+    "1095d has 2 non-passing walk-forward fold(s).",
+    "1095d recent windows need review: 90d, 180d.",
+    "1095d regime dependence is unknown or not fully recorded.",
+    "Stored branch memory may not include detailed walk-forward, stress, recent-window, reproducibility, concentration, or benchmark internals for every historical report.",
+    "Manual review only; no config, paper, or live trading changes were made."
+  ]
+}

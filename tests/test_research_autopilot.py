@@ -18,6 +18,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_MEMORY_PATH", root / "research-memory.json"),
         patch.object(zgua_app, "RESEARCH_DOSSIER_DIR", root / "research-dossiers"),
         patch.object(zgua_app, "PAPER_CANDIDATE_REVIEW_DIR", root / "paper-candidates"),
+        patch.object(zgua_app, "DEPLOY_REVIEW_CANDIDATE_DIR", root / "review-candidates"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
     for item in patches:
@@ -786,12 +787,89 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(len(payload["ignoredPackages"]), 2)
         self.assert_autopilot_safety(payload)
 
+    def test_publish_review_candidate_creates_deploy_safe_package(self):
+        self.write_disabled_candidate_package()
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_publish_review_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+        })
+        self.assertEqual(status, 200)
+        saved = zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        self.assertTrue(saved.exists())
+        package = json.loads(saved.read_text(encoding="utf-8"))
+        self.assertEqual(package["status"], "DISABLED_REVIEW_ONLY")
+        self.assertEqual(package["candidateIdentity"]["symbol"], "BTCUSDT")
+        self.assertEqual(package["paramsHash"], "f09aabfcd7a47bd2")
+        self.assertEqual(package["confirmedChainPeriods"], ["730d", "1095d"])
+        self.assertIn("dossierPath", package)
+        self.assertIn("sourceReports", package)
+        self.assertNotIn("params", package)
+        self.assertFalse(package["safety"]["paperEnabled"])
+        self.assertFalse(package["safety"]["realTradingEnabled"])
+        self.assertFalse(package["safety"]["configWritten"])
+        self.assertFalse(package["safety"]["paperStateChanged"])
+        self.assertFalse(package["safety"]["liveOrdersTouched"])
+        self.assertFalse(package["safety"]["paperTickRan"])
+        self.assert_autopilot_safety(payload)
+
+    def test_publish_review_candidate_rejects_unsafe_package(self):
+        self.write_disabled_candidate_package(safety={
+            "researchOnly": True,
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "paperTickRan": True,
+        })
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_publish_review_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("paperTickRan", payload["error"])
+        self.assertFalse((zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json").exists())
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_candidates_reads_deploy_safe_package_without_reports(self):
+        zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+        deploy_path = zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        deploy_path.write_text(json.dumps(self.disabled_candidate_package()), encoding="utf-8")
+        payload = self.run_with_forbidden_boundaries(zgua_app.build_research_paper_candidates)
+        self.assertEqual(payload["candidateCount"], 1)
+        self.assertEqual(payload["candidates"][0]["sourceType"], "deploy")
+        self.assertEqual(payload["candidates"][0]["candidateIdentity"]["symbol"], "BTCUSDT")
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_candidates_dedupes_local_and_deploy_packages(self):
+        self.write_disabled_candidate_package()
+        zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+        deploy_path = zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        deploy_path.write_text(json.dumps(self.disabled_candidate_package()), encoding="utf-8")
+        payload = self.run_with_forbidden_boundaries(zgua_app.build_research_paper_candidates)
+        self.assertEqual(payload["candidateCount"], 1)
+        self.assertEqual(payload["candidates"][0]["candidateIdentity"]["symbol"], "BTCUSDT")
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_review_route_renders_main_page(self):
+        with zgua_app.app.test_client() as client:
+            response = client.get("/research/paper-review")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Manual Paper Review Candidates", html)
+        self.assertIn("Review disabled paper candidates", html)
+
     def test_research_paper_candidates_ui_is_display_only_and_fetches_read_only_api(self):
         template = (Path(zgua_app.app.root_path) / "templates" / "index.html").read_text(encoding="utf-8")
         script = (Path(zgua_app.app.root_path) / "static" / "app.js").read_text(encoding="utf-8")
         self.assertIn("Manual Paper Review Candidates", template)
         self.assertIn("research-paper-candidates-panel", template)
         self.assertIn('apiGet("/api/research/paper-candidates")', script)
+        self.assertIn("/research/paper-review", script)
+        self.assertIn("Review disabled paper candidates", template)
         self.assertIn("DISABLED / REVIEW ONLY", script)
         self.assertIn("Paper OFF", script)
         self.assertIn("Live OFF", script)

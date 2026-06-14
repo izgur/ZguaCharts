@@ -8,7 +8,11 @@ server.out.log
 server.err.log
 server.pid
 .research-cache/
-data/
+data/*
+!data/review-candidates/
+data/review-candidates/*
+!data/review-candidates/.gitkeep
+!data/review-candidates/*.json
 reports/
 reports/research-autopilot/
 reports/research-snapshots/

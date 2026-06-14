@@ -242,6 +242,7 @@ function pathToPage(pathname) {
   if (pathname === "/" || pathname === "/dashboard") return "dashboard";
   if (pathname === "/backtest") return "backtest";
   if (pathname === "/analysis" || pathname === "/research") return "research";
+  if (pathname === "/research/paper-review") return "research";
   if (pathname === "/candidate") return "candidate";
   if (pathname === "/paper") return "paper";
   if (pathname === "/learning") return "research";
@@ -387,7 +388,13 @@ function renderWorkflowPage(page) {
   ensureWorkflowControls();
   if (page === "candidate") loadCandidateWorkflowSummary();
   if (page === "paper") loadPaperWorkflowSummary();
-  if (page === "research") loadResearchWorkflowSummary();
+  if (page === "research") {
+    loadResearchWorkflowSummary();
+    if (window.location.pathname === "/research/paper-review") {
+      loadResearchPaperCandidates();
+      window.setTimeout(() => document.querySelector("#research-paper-candidates-panel")?.scrollIntoView({ block: "start" }), 0);
+    }
+  }
 }
 
 function statusBadgeClass(status) {
