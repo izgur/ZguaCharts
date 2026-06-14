@@ -718,7 +718,12 @@ class ResearchAutopilotTests(unittest.TestCase):
                 "reports/research-snapshots/research-snapshot-20260613-220942.json",
             ],
             "dossierPath": "reports/research-dossiers/EmaBounceV2-BTCUSDT-4h-confirmed-chain.md",
-            "strengths": ["730d and 1095d branches are CHALLENGER_ELIGIBLE."],
+            "strengths": [
+                "730d and 1095d branches are CHALLENGER_ELIGIBLE.",
+                "Confirmed branches survive moderate stress.",
+                "Source reports mark the candidate reproducible.",
+                "Return concentration passes stored gates.",
+            ],
             "warnings": ["Manual review only; package is disabled by default."],
             "safety": safety or {
                 "researchOnly": True,
@@ -760,6 +765,13 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(candidate["safety"]["configWritten"])
         self.assertFalse(candidate["safety"]["paperStateChanged"])
         self.assertFalse(candidate["safety"]["liveOrdersTouched"])
+        readiness = candidate["readiness"]
+        self.assertIn(readiness["verdict"], {"REVIEW_READY_BUT_DISABLED", "WATCH_BEFORE_ENABLE"})
+        self.assertNotEqual(readiness["verdict"], "LIVE_READY")
+        self.assertTrue(any("Confirmed chain exists" in item for item in readiness["passItems"]))
+        self.assertTrue(any("Stress survives" in item for item in readiness["passItems"]))
+        self.assertTrue(any("Reproducible" in item for item in readiness["passItems"]))
+        self.assertTrue(any("Concentration passes" in item for item in readiness["passItems"]))
         self.assert_autopilot_safety(payload)
 
     def test_research_paper_candidates_ignores_malformed_packages_safely(self):
@@ -854,6 +866,31 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["candidates"][0]["candidateIdentity"]["symbol"], "BTCUSDT")
         self.assert_autopilot_safety(payload)
 
+    def test_research_paper_candidate_readiness_warns_on_known_review_risks(self):
+        package = self.disabled_candidate_package()
+        package["warnings"] = [
+            "730d has 1 non-passing walk-forward fold(s).",
+            "1095d has 2 non-passing walk-forward fold(s).",
+            "730d recent windows need review: 90d, 180d.",
+            "1095d recent windows need review: 90d, 180d.",
+            "730d regime dependence is unknown or not fully recorded.",
+        ]
+        zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
+        (zgua_app.DEPLOY_REVIEW_CANDIDATE_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json").write_text(json.dumps(package), encoding="utf-8")
+        payload = self.run_with_forbidden_boundaries(zgua_app.build_research_paper_candidates)
+        readiness = payload["candidates"][0]["readiness"]
+        self.assertEqual(readiness["verdict"], "REVIEW_READY_BUT_DISABLED")
+        self.assertNotEqual(readiness["verdict"], "LIVE_READY")
+        self.assertTrue(any("730d has 1 non-passing" in item for item in readiness["warnItems"]))
+        self.assertTrue(any("1095d has 2 non-passing" in item for item in readiness["warnItems"]))
+        self.assertTrue(any("90d and 180d recent windows" in item for item in readiness["warnItems"]))
+        self.assertTrue(any("Regime dependence unknown" in item for item in readiness["warnItems"]))
+        self.assertTrue(any("Low recent trade count" in item for item in readiness["warnItems"]))
+        self.assertTrue(any("Paper/live disabled by design" in item for item in readiness["warnItems"]))
+        self.assertFalse(payload["candidates"][0]["safety"]["paperEnabled"])
+        self.assertFalse(payload["candidates"][0]["safety"]["realTradingEnabled"])
+        self.assert_autopilot_safety(payload)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")
@@ -875,6 +912,10 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("Live OFF", script)
         self.assertIn("Config write OFF", script)
         self.assertIn("Paper tick OFF", script)
+        self.assertIn("Paper Candidate Readiness Checklist", script)
+        self.assertIn("Required Before Enabling Paper", script)
+        self.assertIn("Still disabled:", script)
+        self.assertIn("readiness.verdict", script)
         self.assertIn("No disabled paper-review candidates found.", script)
         self.assertIn("Could not load review candidates.", script)
         self.assertIn('renderPaperCandidateList(candidate.strengths, "positive")', script)

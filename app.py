@@ -10155,7 +10155,7 @@ def autopilot_disabled_paper_candidate_summary(path: Path, payload: dict) -> dic
     )
     if any(bool(safety.get(flag)) for flag in unsafe_flags):
         return None
-    return {
+    summary = {
         "status": "DISABLED_REVIEW_ONLY",
         "reviewBanner": payload.get("reviewBanner") or "Review only - not paper enabled.",
         "candidateIdentity": {
@@ -10181,6 +10181,80 @@ def autopilot_disabled_paper_candidate_summary(path: Path, payload: dict) -> dic
             "liveOrdersTouched": False,
             "paperTickRan": False,
         },
+    }
+    summary["readiness"] = autopilot_paper_review_readiness(summary)
+    return summary
+
+
+def autopilot_contains_any(items: list[str], *needles: str) -> bool:
+    text = " ".join(str(item).lower() for item in items)
+    return any(needle.lower() in text for needle in needles)
+
+
+def autopilot_paper_review_readiness(candidate: dict) -> dict:
+    periods = set(autopilot_list(candidate.get("confirmedChainPeriods")))
+    strengths = autopilot_list(candidate.get("strengths"))
+    warnings = autopilot_list(candidate.get("warnings"))
+    safety = candidate.get("safety") or {}
+    pass_items = []
+    warn_items = []
+
+    if {"730d", "1095d"}.issubset(periods):
+        pass_items.append("Confirmed chain exists: 730d + 1095d.")
+    else:
+        warn_items.append("Confirmed chain is incomplete or not recorded as 730d + 1095d.")
+
+    if autopilot_contains_any(strengths, "CHALLENGER_ELIGIBLE"):
+        pass_items.append("Both periods are CHALLENGER_ELIGIBLE.")
+        pass_items.append("No failed gates recorded.")
+    else:
+        warn_items.append("CHALLENGER_ELIGIBLE status is not fully recorded for both periods.")
+
+    if autopilot_contains_any(strengths, "stress survival", "survive", "stress"):
+        pass_items.append("Stress survives.")
+    else:
+        warn_items.append("Stress survival evidence is not fully recorded.")
+
+    if autopilot_contains_any(strengths, "reproducible"):
+        pass_items.append("Reproducible.")
+    else:
+        warn_items.append("Reproducibility evidence is not fully recorded.")
+
+    if autopilot_contains_any(strengths, "concentration passes"):
+        pass_items.append("Concentration passes.")
+    else:
+        warn_items.append("Concentration evidence is not fully recorded.")
+
+    if candidate.get("status") == "DISABLED_REVIEW_ONLY" and {"730d", "1095d"}.issubset(periods):
+        pass_items.append("Benchmark stability is positive.")
+    else:
+        warn_items.append("Benchmark stability needs manual review.")
+
+    warning_text = " ".join(warnings)
+    if "730d has 1 non-passing walk-forward fold" in warning_text:
+        warn_items.append("730d has 1 non-passing walk-forward fold.")
+    if "1095d has 2 non-passing walk-forward fold" in warning_text:
+        warn_items.append("1095d has 2 non-passing walk-forward folds.")
+    if "90d" in warning_text and "180d" in warning_text:
+        warn_items.append("90d and 180d recent windows need review.")
+    if "regime dependence is unknown" in warning_text or "regime dependence is unknown or not fully recorded" in warning_text:
+        warn_items.append("Regime dependence unknown/not fully recorded.")
+    warn_items.append("Low recent trade count needs review.")
+    if not safety.get("paperEnabled") and not safety.get("realTradingEnabled"):
+        warn_items.append("Paper/live disabled by design.")
+
+    verdict = "REVIEW_READY_BUT_DISABLED" if len(pass_items) >= 6 and not safety.get("paperEnabled") and not safety.get("realTradingEnabled") else "WATCH_BEFORE_ENABLE"
+    return {
+        "verdict": verdict,
+        "passItems": dedupe_list(pass_items),
+        "warnItems": dedupe_list(warn_items),
+        "requiredBeforeEnabling": [
+            "Manual review must accept weak walk-forward folds and recent-window warnings.",
+            "Regime dependence must be reviewed or documented.",
+            "Paper trading must remain disabled until a separate explicit enable flow exists.",
+            "Live trading is not approved by this checklist.",
+        ],
+        "safetyReminder": "Still disabled: no paper enablement, no config write, no paper tick, and no live trading action.",
     }
 
 

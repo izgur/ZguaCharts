@@ -1440,6 +1440,24 @@ button:hover {
   color: var(--muted);
 }
 
+.paper-readiness-checklist {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.paper-readiness-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.paper-readiness-header .modal-section-title {
+  margin-top: 0;
+}
+
 .paper-warning {
   margin-bottom: 12px;
   padding: 10px 12px;

@@ -5625,6 +5625,30 @@ function renderPaperCandidateSafety(safety = {}) {
   return `<div class="paper-review-safety">${rows.map(([label, value, offLabel]) => `<span class="paper-review-flag ${value ? "negative" : "positive"}">${escapeHtml(value ? `${label} ON` : offLabel)}</span>`).join("")}</div>`;
 }
 
+function renderPaperCandidateReadiness(readiness = {}) {
+  return `
+    <section class="paper-readiness-checklist">
+      <div class="paper-readiness-header">
+        <h4 class="modal-section-title">Paper Candidate Readiness Checklist</h4>
+        <span class="paper-review-badge">${escapeHtml(readiness.verdict || "WATCH_BEFORE_ENABLE")}</span>
+      </div>
+      <div class="paper-review-columns">
+        <section>
+          <h4 class="modal-section-title">PASS</h4>
+          ${renderPaperCandidateList(readiness.passItems, "positive")}
+        </section>
+        <section>
+          <h4 class="modal-section-title">WARN</h4>
+          ${renderPaperCandidateList(readiness.warnItems, "caution")}
+        </section>
+      </div>
+      <h4 class="modal-section-title">Required Before Enabling Paper</h4>
+      ${renderPaperCandidateList(readiness.requiredBeforeEnabling, "caution")}
+      <p class="modal-note"><strong>Still disabled:</strong> ${escapeHtml(readiness.safetyReminder || "No paper enablement, config write, paper tick, or live trading action is available here.")}</p>
+    </section>
+  `;
+}
+
 function renderResearchPaperCandidate(candidate) {
   const identity = candidate.candidateIdentity || {};
   const periods = (candidate.confirmedChainPeriods || []).join(" + ");
@@ -5659,6 +5683,7 @@ function renderResearchPaperCandidate(candidate) {
       <h4 class="modal-section-title">Source Paths</h4>
       <p class="modal-note"><strong>Dossier:</strong> <code>${escapeHtml(candidate.dossierPath || "-")}</code></p>
       ${renderPaperCandidateReports(candidate.sourceReports)}
+      ${renderPaperCandidateReadiness(candidate.readiness)}
     </article>
   `;
 }
