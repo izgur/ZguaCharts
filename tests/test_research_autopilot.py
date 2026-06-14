@@ -718,6 +718,11 @@ class ResearchAutopilotTests(unittest.TestCase):
                 "reports/research-snapshots/research-snapshot-20260613-220942.json",
             ],
             "dossierPath": "reports/research-dossiers/EmaBounceV2-BTCUSDT-4h-confirmed-chain.md",
+            "params": {
+                "emaBounceAtr": 0.8,
+                "rsiReclaimLevel": 53,
+                "atrMultiplier": 3.3,
+            },
             "strengths": [
                 "730d and 1095d branches are CHALLENGER_ELIGIBLE.",
                 "Confirmed branches survive moderate stress.",
@@ -894,6 +899,83 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["candidates"][0]["safety"]["realTradingEnabled"])
         self.assert_autopilot_safety(payload)
 
+    def test_plan_paper_enable_candidate_dry_run_returns_full_params(self):
+        package = self.disabled_candidate_package()
+        package["warnings"] = [
+            "730d has 1 non-passing walk-forward fold(s).",
+            "1095d has 2 non-passing walk-forward fold(s).",
+            "730d recent windows need review: 90d, 180d.",
+            "730d regime dependence is unknown or not fully recorded.",
+        ]
+        self.write_disabled_candidate_package()
+        path = zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        path.write_text(json.dumps(package), encoding="utf-8")
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_plan_paper_enable_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["dryRun"])
+        self.assertEqual(payload["params"]["emaBounceAtr"], 0.8)
+        self.assertEqual(payload["paramsHash"], "f09aabfcd7a47bd2")
+        self.assertEqual(payload["proposedPaperMarket"]["mode"], "PAPER_ONLY")
+        self.assertFalse(payload["proposedSafetySettings"]["realTradingEnabled"])
+        self.assertFalse(payload["proposedSafetySettings"]["exchangeOrders"])
+        self.assertTrue(payload["proposedSafetySettings"]["requireManualConfirmation"])
+        self.assertEqual(payload["proposedRiskPlaceholders"]["initialEquity"], 10000)
+        self.assertEqual(payload["proposedRiskPlaceholders"]["maxPositionPct"], 10)
+        self.assertIn("weak walk-forward folds", payload["blockingWarnings"])
+        self.assertIn("90d/180d recent windows", payload["blockingWarnings"])
+        self.assertIn("regime dependence unknown", payload["blockingWarnings"])
+        self.assertIn("low recent trade count", payload["blockingWarnings"])
+        self.assertIn("live trading not approved", payload["blockingWarnings"])
+        self.assertFalse(payload["safety"]["paperEnabled"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertFalse(payload["configWritten"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assert_autopilot_safety(payload)
+
+    def test_plan_paper_enable_candidate_refuses_unsafe_package(self):
+        self.write_disabled_candidate_package(safety={
+            "researchOnly": True,
+            "paperEnabled": True,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "paperTickRan": False,
+        })
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_plan_paper_enable_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["dryRun"])
+        self.assertIn("paperEnabled", payload["error"])
+        self.assert_autopilot_safety(payload)
+
+    def test_plan_paper_enable_candidate_refuses_missing_params(self):
+        package = self.disabled_candidate_package()
+        package.pop("params", None)
+        self.write_disabled_candidate_package()
+        path = zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        path.write_text(json.dumps(package), encoding="utf-8")
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_plan_paper_enable_candidate, {
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+        })
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["dryRun"])
+        self.assertIn("Full params are required", payload["error"])
+        self.assert_autopilot_safety(payload)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")
@@ -930,6 +1012,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn('apiPost("/api/research/paper-candidates"', script)
         self.assertNotIn('apiPut("/api/research/paper-candidates"', script)
         self.assertNotIn('apiDelete("/api/research/paper-candidates"', script)
+        self.assertNotIn("plan-paper-enable-candidate", template)
+        self.assertNotIn("plan-paper-enable-candidate", script)
         self.assertNotIn("research-paper-candidates-enable", template)
         self.assertNotIn("research-paper-candidates-run", template)
         self.assertNotIn("research-paper-candidates-paper-tick", template)

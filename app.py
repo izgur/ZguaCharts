@@ -10366,6 +10366,99 @@ def build_research_publish_review_candidate(args) -> tuple[dict, int]:
     }, 200
 
 
+def autopilot_paper_enable_blocking_warnings(payload: dict, readiness: dict) -> list[str]:
+    warnings = autopilot_list(payload.get("warnings"))
+    readiness_warnings = autopilot_list((readiness or {}).get("warnItems"))
+    combined = " ".join(warnings + readiness_warnings).lower()
+    blocking = []
+    if "non-passing walk-forward fold" in combined:
+        blocking.append("weak walk-forward folds")
+    if "90d" in combined and "180d" in combined:
+        blocking.append("90d/180d recent windows")
+    if "regime dependence" in combined:
+        blocking.append("regime dependence unknown")
+    if "low recent trade count" in combined:
+        blocking.append("low recent trade count")
+    blocking.append("live trading not approved")
+    return dedupe_list(blocking)
+
+
+def build_research_plan_paper_enable_candidate(args) -> tuple[dict, int]:
+    strategy = str(args.get("strategy") or "").strip()
+    symbol = str(args.get("symbol") or "").strip()
+    timeframe = str(args.get("timeframe") or "").strip()
+    if not strategy or not symbol or not timeframe:
+        return {"ok": False, "error": "strategy, symbol, and timeframe are required.", "dryRun": True, "safety": autopilot_safety_payload()}, 400
+    source_path = PAPER_CANDIDATE_REVIEW_DIR / autopilot_review_candidate_filename(strategy, symbol, timeframe)
+    if not source_path.exists():
+        return {
+            "ok": False,
+            "error": f"Full local disabled package is required for params and was not found: {autopilot_display_path(source_path)}",
+            "dryRun": True,
+            "safety": autopilot_safety_payload(),
+        }, 404
+    try:
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read full local disabled package: {exc}", "dryRun": True, "safety": autopilot_safety_payload()}, 400
+    ok, reason = autopilot_validate_disabled_review_package(payload)
+    if not ok:
+        return {"ok": False, "error": f"Package is not safe for paper-enable planning: {reason}", "dryRun": True, "safety": autopilot_safety_payload()}, 400
+    params = payload.get("params")
+    if not isinstance(params, dict) or not params:
+        return {"ok": False, "error": "Full params are required; deploy-safe registry packages cannot be used for this dry-run plan.", "dryRun": True, "safety": autopilot_safety_payload()}, 400
+    summary = autopilot_disabled_paper_candidate_summary(source_path, payload)
+    readiness = (summary or {}).get("readiness") or autopilot_paper_review_readiness(payload)
+    if readiness.get("verdict") not in {"REVIEW_READY_BUT_DISABLED", "WATCH_BEFORE_ENABLE"}:
+        return {"ok": False, "error": f"Readiness verdict is not eligible for dry-run planning: {readiness.get('verdict')}", "dryRun": True, "safety": autopilot_safety_payload()}, 400
+    identity = payload.get("candidateIdentity") or {}
+    return {
+        "ok": True,
+        "dryRun": True,
+        "generatedAt": autopilot_now(),
+        "sourcePath": autopilot_display_path(source_path),
+        "candidateIdentity": identity,
+        "paramsHash": identity.get("paramsHash") or payload.get("paramsHash"),
+        "params": params,
+        "readiness": readiness,
+        "proposedPaperMarket": {
+            "strategy": strategy,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "mode": "PAPER_ONLY",
+        },
+        "proposedSafetySettings": {
+            "realTradingEnabled": False,
+            "exchangeOrders": False,
+            "requireManualConfirmation": True,
+            "maxOnePosition": True,
+            "noLiveOrderFunctions": True,
+        },
+        "proposedRiskPlaceholders": {
+            "initialEquity": 10000,
+            "maxPositionPct": 10,
+            "maxDailyLossPct": 2,
+            "takerFeePct": 0.055,
+            "makerFeePct": 0.02,
+            "slippageBps": 2,
+        },
+        "blockingWarnings": autopilot_paper_enable_blocking_warnings(payload, readiness),
+        "safety": {
+            **autopilot_safety_payload(),
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+        },
+        "configWritten": False,
+        "paperStateChanged": False,
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+    }, 200
+
+
 def build_research_paper_candidates() -> dict:
     candidates_by_key = {}
     ignored_packages = []

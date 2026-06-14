@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_publish_review_candidate  # noqa: E402
+from app import app, build_research_plan_paper_enable_candidate, build_research_publish_review_candidate  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -122,6 +122,10 @@ def main() -> int:
     publish.add_argument("--strategy", required=True)
     publish.add_argument("--symbol", required=True)
     publish.add_argument("--timeframe", required=True)
+    plan_paper = sub.add_parser("plan-paper-enable-candidate")
+    plan_paper.add_argument("--strategy", required=True)
+    plan_paper.add_argument("--symbol", required=True)
+    plan_paper.add_argument("--timeframe", required=True)
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -159,6 +163,12 @@ def main() -> int:
             })
         elif args.command == "publish-review-candidate":
             payload, status = build_research_publish_review_candidate({
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+            })
+        elif args.command == "plan-paper-enable-candidate":
+            payload, status = build_research_plan_paper_enable_candidate({
                 "strategy": args.strategy,
                 "symbol": args.symbol,
                 "timeframe": args.timeframe,
