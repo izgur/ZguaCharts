@@ -29,6 +29,24 @@ function candles(count, stepSeconds) {
   return out;
 }
 
+function alreadyClosedTailCandles(count, stepSeconds) {
+  const out = [];
+  let price = 100;
+  const base = fixedNowSeconds - count * stepSeconds;
+  for (let i = 0; i < count; i += 1) {
+    price += 0.2;
+    out.push({
+      time: base + i * stepSeconds,
+      open: price - 0.25,
+      high: price + 1.4,
+      low: price - 1.4,
+      close: price,
+      volume: 1000
+    });
+  }
+  return out;
+}
+
 const originalFetch = data.fetchCandles;
 data.fetchCandles = function (options) {
   if (options.symbol === "BTCUSDT" && options.interval === "4h") return Promise.resolve(candles(320, 14400));
@@ -193,6 +211,27 @@ async function testEnableDisableAfterInit() {
   assert.strictEqual(disabled.enabled, false, "paper:disable should work");
 }
 
+async function testAlreadyClosedTailIsNotDiscarded() {
+  const activeCandles = alreadyClosedTailCandles(40, 14400);
+  const expectedLatest = activeCandles[activeCandles.length - 1].time;
+  data.fetchCandles = function (options) {
+    if (options.symbol === "BTCUSDT" && options.interval === "4h") return Promise.resolve(candles(320, 14400));
+    return Promise.resolve(activeCandles);
+  };
+  writeConfig({
+    ...baseConfig("active"),
+    symbols: [{ symbol: "TESTUSDT", interval: "4h", mode: "active", limit: 40 }]
+  });
+  await paper.initializePaper({ configPath, statePath, reportDir });
+  const state = readState();
+  assert.strictEqual(state.lastProcessedCandleTime["TESTUSDT:4h"], expectedLatest, "init should keep already-closed tail candle");
+  const diagnostics = await paper.activeSignalDiagnostics({ configPath, statePath, reportDir, limit: 5 });
+  assert.strictEqual(diagnostics.latestCandle.time, expectedLatest, "signal diagnostics should use already-closed tail candle");
+  const dry = await paper.runPaperTick({ configPath, statePath, reportDir, dryRun: true });
+  assert.strictEqual(dry.freshness["TESTUSDT:4h"].latestCandleTime, expectedLatest, "dry-run tick freshness should use already-closed tail candle");
+  data.fetchCandles = originalFetch;
+}
+
 async function main() {
   await expectEnableRefusesBeforeInit();
   await testInitAndNoHistoricalImport();
@@ -202,6 +241,7 @@ async function main() {
   await testMaxOpenTradesAndDryRun();
   await testStaleAndRefresh();
   await testEnableDisableAfterInit();
+  await testAlreadyClosedTailIsNotDiscarded();
   const rebuilt = paper.rebuildStateFromJournal(baseConfig("active"), path.join(reportDir, "paper-journal.jsonl"));
   assert.strictEqual(typeof rebuilt.accountEquity, "number", "paper state can be rebuilt from journal");
   data.fetchCandles = originalFetch;

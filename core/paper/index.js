@@ -121,7 +121,7 @@ function initializePaper(options) {
   state.lastProcessedCandleTime = {};
   const freshness = {};
   const jobs = markets.map((market) => () => fetchMarketCandles(config, market, { forceRefresh: options.forceRefresh === true }).then((payload) => {
-    const candles = payload.candles.slice(0, -1);
+    const candles = latestClosedCandles(payload.candles, market.interval);
     freshness[marketKey(market)] = freshnessForMarket(market, candles, payload.metadata);
     if (candles.length) state.lastProcessedCandleTime[marketKey(market)] = candles[candles.length - 1].time;
   }));
@@ -151,7 +151,7 @@ function refreshPaperCandles(options) {
   const markets = normalizeMarkets(config).filter((market) => !options.activeOnly || market.mode !== "watch");
   const freshness = {};
   const jobs = markets.map((market) => () => fetchMarketCandles(config, market, { forceRefresh: true }).then((payload) => {
-    const candles = payload.candles.slice(0, -1);
+    const candles = latestClosedCandles(payload.candles, market.interval);
     freshness[marketKey(market)] = freshnessForMarket(market, candles, payload.metadata);
     if (options.advanceBaseline && candles.length) state.lastProcessedCandleTime[marketKey(market)] = candles[candles.length - 1].time;
   }));
@@ -249,8 +249,7 @@ function activeSignalDiagnostics(options) {
       forceRefresh: options.refresh === true
     })
   ]).then(([payload, regimeCandles]) => {
-    let candles = payload.candles || [];
-    if (candles.length) candles = candles.slice(0, -1);
+    let candles = latestClosedCandles(payload.candles || [], active.interval);
     const freshness = freshnessForMarket(active, candles, payload.metadata);
     const params = Object.assign({}, config.params || {}, {
       regimeMode: canonicalRegimeMode(config),
@@ -366,8 +365,7 @@ function blockerAnalytics(options) {
       forceRefresh: options.refresh === true
     })
   ]).then(([payload, regimeCandles]) => {
-    let candles = payload.candles || [];
-    if (candles.length) candles = candles.slice(0, -1);
+    let candles = latestClosedCandles(payload.candles || [], market.interval);
     const freshness = freshnessForMarket(market, candles, payload.metadata);
     if (!candles.length) warnings.push("No closed candles were available for blocker analytics.");
     if (freshness.isStale) warnings.push("Selected market candle data is stale; blocker analytics may not reflect the latest closed candle.");
@@ -767,7 +765,7 @@ function processMarket(config, state, market, regimeCandles, options) {
   return fetchMarketCandles(config, market, { forceRefresh: options.forceRefresh === true }).then((payload) => {
     let candles = payload.candles;
     const warnings = [];
-    if (!options.includeOpenCandle && candles.length) candles = candles.slice(0, -1);
+    if (!options.includeOpenCandle) candles = latestClosedCandles(candles, market.interval);
     const freshness = freshnessForMarket(market, candles, payload.metadata);
     state.freshness = state.freshness || {};
     state.freshness[marketKey(market)] = freshness;
@@ -972,6 +970,12 @@ function fetchMarketCandles(config, market, options) {
     if (Array.isArray(payload)) return { candles: data.normalizeCandles(payload), metadata: {} };
     return { candles: data.normalizeCandles(payload.candles), metadata: payload.metadata || {} };
   });
+}
+
+function latestClosedCandles(candles, interval) {
+  const intervalSeconds = data.intervalToMs(interval) / 1000;
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  return (candles || []).filter((candle) => Number(candle.time || 0) + intervalSeconds <= nowSeconds);
 }
 
 function freshnessForMarket(market, candles, metadata) {
