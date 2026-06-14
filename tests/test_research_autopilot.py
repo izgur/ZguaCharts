@@ -881,6 +881,9 @@ class ResearchAutopilotTests(unittest.TestCase):
         readiness = payload["candidates"][0]["readiness"]
         self.assertEqual(readiness["verdict"], "REVIEW_READY_BUT_DISABLED")
         self.assertNotEqual(readiness["verdict"], "LIVE_READY")
+        self.assertEqual(readiness["safetyReminder"].count("Still disabled:"), 0)
+        rendered_disabled_text = f"Still disabled: {readiness['safetyReminder']}"
+        self.assertEqual(rendered_disabled_text.count("Still disabled:"), 1)
         self.assertTrue(any("730d has 1 non-passing" in item for item in readiness["warnItems"]))
         self.assertTrue(any("1095d has 2 non-passing" in item for item in readiness["warnItems"]))
         self.assertTrue(any("90d and 180d recent windows" in item for item in readiness["warnItems"]))

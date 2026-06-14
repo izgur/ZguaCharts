@@ -10254,7 +10254,7 @@ def autopilot_paper_review_readiness(candidate: dict) -> dict:
             "Paper trading must remain disabled until a separate explicit enable flow exists.",
             "Live trading is not approved by this checklist.",
         ],
-        "safetyReminder": "Still disabled: no paper enablement, no config write, no paper tick, and no live trading action.",
+        "safetyReminder": "no paper enablement, no config write, no paper tick, and no live trading action.",
     }
 
 
