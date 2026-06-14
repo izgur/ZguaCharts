@@ -50,6 +50,7 @@ RESEARCH_AUTOPILOT_DIR = Path(app.root_path) / "reports" / "research-autopilot"
 RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
 RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
+PAPER_CANDIDATE_REVIEW_DIR = Path(app.root_path) / "reports" / "paper-candidates"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
 MAX_LEARNING_REPORTS = 100
@@ -1545,6 +1546,16 @@ def research_autopilot_candidate_dossier():
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not build research autopilot candidate dossier: {exc}"}), 502
+
+
+@app.post("/api/research/autopilot/prepare-paper-candidate")
+def research_autopilot_prepare_paper_candidate():
+    try:
+        args = {**request.args.to_dict(), **(request.get_json(silent=True) or {})}
+        payload, status_code = build_research_autopilot_prepare_paper_candidate(args)
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not prepare disabled paper candidate package: {exc}"}), 502
 
 
 @app.get("/api/research/autopilot/summary")
@@ -10029,6 +10040,87 @@ def build_research_autopilot_candidate_dossier(args) -> tuple[dict, int]:
     dossier["markdown"] = markdown
     dossier["savedPath"] = autopilot_display_path(path)
     return dossier, 200
+
+
+def autopilot_review_strengths_from_dossier(dossier: dict) -> list[str]:
+    strengths = []
+    metrics = dossier.get("metrics") or []
+    if metrics and all(row.get("eligibilityStatus") == "CHALLENGER_ELIGIBLE" for row in metrics):
+        strengths.append("730d and 1095d branches are CHALLENGER_ELIGIBLE.")
+    if metrics and all(row.get("stressStatus") == "SURVIVES_MODERATE_STRESS" for row in metrics):
+        strengths.append("Confirmed branches survive moderate stress.")
+    details = dossier.get("details") or []
+    if details and all((detail.get("stress") or {}).get("status") in {"RESILIENT", "SURVIVES_MODERATE_STRESS"} for detail in details):
+        strengths.append("Source reports show fee/slippage stress survival.")
+    if details and all((detail.get("repro") or {}).get("status") == "REPRODUCIBLE" for detail in details):
+        strengths.append("Source reports mark the candidate reproducible.")
+    if details and all((detail.get("concentration") or {}).get("status") == "PASS" for detail in details):
+        strengths.append("Return concentration passes stored gates.")
+    return strengths or ["Confirmed challenger chain is available for manual review."]
+
+
+def autopilot_review_warnings_from_dossier(dossier: dict) -> list[str]:
+    warnings = [
+        "Manual review only; package is disabled by default.",
+        "Paper and live trading remain disabled.",
+    ]
+    details = dossier.get("details") or []
+    for detail in details:
+        branch = detail.get("branch") or {}
+        period = branch.get("period") or "-"
+        folds = ((detail.get("walkForward") or {}).get("folds") or [])
+        failed_folds = [fold for fold in folds if str(fold.get("status") or "").upper() not in {"PASS", "OK"}]
+        if failed_folds:
+            warnings.append(f"{period} has {len(failed_folds)} non-passing walk-forward fold(s).")
+        recent_windows = ((detail.get("recent") or {}).get("windows") or [])
+        warn_windows = [window.get("label") for window in recent_windows if str(window.get("status") or "").upper() == "WARN"]
+        if warn_windows:
+            warnings.append(f"{period} recent windows need review: {', '.join(str(item) for item in warn_windows)}.")
+        regime = ((detail.get("validation") or {}).get("regimeBreakdown") or {})
+        if not regime or str((regime.get("summary") or {}).get("regimeDependencyStatus") or regime.get("status") or "").upper() in {"", "UNKNOWN", "NOT_RUN"}:
+            warnings.append(f"{period} regime dependence is unknown or not fully recorded.")
+    return dedupe_list(warnings + (dossier.get("warnings") or []))
+
+
+def build_research_autopilot_prepare_paper_candidate(args) -> tuple[dict, int]:
+    dossier, status = build_research_autopilot_candidate_dossier(args)
+    if status >= 400 or not dossier.get("ok"):
+        return {
+            "ok": False,
+            "error": dossier.get("error") or "Confirmed candidate dossier is required before preparing a disabled paper package.",
+            "safety": autopilot_safety_payload(),
+        }, status
+    identity = dossier.get("identity") or {}
+    details = dossier.get("details") or []
+    params = next(((detail.get("params") or {}) for detail in details if detail.get("params")), {})
+    source_reports = [detail.get("sourceReportResolved") or detail.get("sourceReport") for detail in details if detail.get("sourceReportResolved") or detail.get("sourceReport")]
+    package = {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "status": "DISABLED_REVIEW_ONLY",
+        "reviewBanner": "Confirmed candidate available for manual paper review; disabled by default.",
+        "candidateIdentity": identity,
+        "params": params,
+        "confirmedChainPeriods": (dossier.get("confirmedChain") or {}).get("periods") or [],
+        "sourceReports": source_reports,
+        "dossierPath": dossier.get("savedPath"),
+        "strengths": autopilot_review_strengths_from_dossier(dossier),
+        "warnings": autopilot_review_warnings_from_dossier(dossier),
+        "safety": {
+            **autopilot_safety_payload(),
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+        },
+    }
+    PAPER_CANDIDATE_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{autopilot_dossier_slug(identity.get('strategy'))}-{autopilot_dossier_slug(identity.get('symbol'))}-{autopilot_dossier_slug(identity.get('timeframe'))}-disabled.json"
+    path = PAPER_CANDIDATE_REVIEW_DIR / filename
+    path.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
+    package["savedPath"] = autopilot_display_path(path)
+    return package, 200
 
 
 def autopilot_campaign_args(job: dict) -> dict:

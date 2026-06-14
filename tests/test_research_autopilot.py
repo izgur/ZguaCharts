@@ -17,6 +17,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_QUEUE_PATH", root / "research-queue.json"),
         patch.object(zgua_app, "RESEARCH_AUTOPILOT_MEMORY_PATH", root / "research-memory.json"),
         patch.object(zgua_app, "RESEARCH_DOSSIER_DIR", root / "research-dossiers"),
+        patch.object(zgua_app, "PAPER_CANDIDATE_REVIEW_DIR", root / "paper-candidates"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
     for item in patches:
@@ -645,6 +646,58 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("UNKNOWN", payload["markdown"])
         self.assertTrue(any(not detail["sourceReportLoaded"] for detail in payload["details"]))
+
+    def test_prepare_paper_candidate_creates_disabled_package_for_confirmed_chain(self):
+        b730 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d")
+        b1095 = stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d")
+        p730 = zgua_app.RESEARCH_AUTOPILOT_DIR / "source-730.json"
+        p1095 = zgua_app.RESEARCH_AUTOPILOT_DIR / "source-1095.json"
+        p730.parent.mkdir(parents=True, exist_ok=True)
+        p730.write_text(json.dumps(detailed_source_report(b730)), encoding="utf-8")
+        p1095.write_text(json.dumps(detailed_source_report(b1095)), encoding="utf-8")
+        b730["sourceReport"] = zgua_app.autopilot_display_path(p730)
+        b1095["sourceReport"] = zgua_app.autopilot_display_path(p1095)
+        zgua_app.save_autopilot_memory({"branches": [b730, b1095], "candidates": [], "sourceReports": []})
+        payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_autopilot_prepare_paper_candidate, {"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "DISABLED_REVIEW_ONLY")
+        self.assertEqual(payload["confirmedChainPeriods"], ["730d", "1095d"])
+        self.assertFalse(payload["safety"]["paperEnabled"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertFalse(payload["safety"]["configWritten"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertTrue(payload["dossierPath"].endswith("EmaBounceV2-BTCUSDT-4h-confirmed-chain.md"))
+        self.assertTrue(payload["savedPath"].endswith("EmaBounceV2-BTCUSDT-4h-disabled.json"))
+        saved = zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json"
+        self.assertTrue(saved.exists())
+        package = json.loads(saved.read_text(encoding="utf-8"))
+        self.assertEqual(package["status"], "DISABLED_REVIEW_ONLY")
+        self.assertEqual(package["params"]["emaBounceAtr"], 0.8)
+        self.assert_autopilot_safety(payload)
+
+    def test_prepare_paper_candidate_requires_confirmed_chain(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        payload, status = zgua_app.build_research_autopilot_prepare_paper_candidate({"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 404)
+        self.assertFalse(payload["ok"])
+        self.assertFalse((zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-BTCUSDT-4h-disabled.json").exists())
+
+    def test_prepare_paper_candidate_rejected_other_symbols_cannot_create_package(self):
+        memory = {"branches": [
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "730d"),
+            stable_branch("EmaBounceV2", "BTCUSDT", "4h", "1095d"),
+            branch("EmaBounceV2", "ETHUSDT", "4h", "REJECTED", period="730d", pf=3, ret=8, trades=45),
+            branch("EmaBounceV2", "SOLUSDT", "4h", "REJECTED", period="1095d", pf=2, ret=5, trades=50),
+        ], "candidates": [], "sourceReports": []}
+        zgua_app.save_autopilot_memory(memory)
+        payload, status = zgua_app.build_research_autopilot_prepare_paper_candidate({"strategy": "EmaBounceV2", "symbol": "ETHUSDT", "timeframe": "4h"})
+        self.assertEqual(status, 404)
+        self.assertFalse(payload["ok"])
+        self.assertFalse((zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-ETHUSDT-4h-disabled.json").exists())
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

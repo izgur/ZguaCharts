@@ -114,6 +114,10 @@ def main() -> int:
     dossier.add_argument("--strategy", required=True)
     dossier.add_argument("--symbol", required=True)
     dossier.add_argument("--timeframe", required=True)
+    prepare = sub.add_parser("prepare-paper-candidate")
+    prepare.add_argument("--strategy", required=True)
+    prepare.add_argument("--symbol", required=True)
+    prepare.add_argument("--timeframe", required=True)
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -139,6 +143,12 @@ def main() -> int:
             payload, status = post_json(client, "/api/research/autopilot/backfill-memory", {"fileLimit": args.file_limit})
         elif args.command == "candidate-dossier":
             payload, status = post_json(client, "/api/research/autopilot/candidate-dossier", {
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+            })
+        elif args.command == "prepare-paper-candidate":
+            payload, status = post_json(client, "/api/research/autopilot/prepare-paper-candidate", {
                 "strategy": args.strategy,
                 "symbol": args.symbol,
                 "timeframe": args.timeframe,
