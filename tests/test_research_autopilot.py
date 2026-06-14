@@ -699,6 +699,103 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertFalse((zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "EmaBounceV2-ETHUSDT-4h-disabled.json").exists())
 
+    def disabled_candidate_package(self, symbol="BTCUSDT", status="DISABLED_REVIEW_ONLY", safety=None):
+        return {
+            "ok": True,
+            "status": status,
+            "reviewBanner": "Confirmed candidate available for manual paper review; disabled by default.",
+            "candidateIdentity": {
+                "strategy": "EmaBounceV2",
+                "symbol": symbol,
+                "timeframe": "4h",
+                "paramsHash": "f09aabfcd7a47bd2",
+                "candidateKey": f"EmaBounceV2|{symbol}|4h|f09aabfcd7a47bd2",
+            },
+            "confirmedChainPeriods": ["730d", "1095d"],
+            "sourceReports": [
+                "reports/research-snapshots/research-snapshot-20260613-220214.json",
+                "reports/research-snapshots/research-snapshot-20260613-220942.json",
+            ],
+            "dossierPath": "reports/research-dossiers/EmaBounceV2-BTCUSDT-4h-confirmed-chain.md",
+            "strengths": ["730d and 1095d branches are CHALLENGER_ELIGIBLE."],
+            "warnings": ["Manual review only; package is disabled by default."],
+            "safety": safety or {
+                "researchOnly": True,
+                "paperEnabled": False,
+                "realTradingEnabled": False,
+                "configWritten": False,
+                "paperStateChanged": False,
+                "liveOrdersTouched": False,
+                "paperTickRan": False,
+                "promotionAttempted": False,
+                "realOrderFunctionsCalled": False,
+                "activePaperCandidateMutated": False,
+                "riskSettingsChanged": False,
+                "apiKeyPathCreated": False,
+            },
+        }
+
+    def write_disabled_candidate_package(self, filename="EmaBounceV2-BTCUSDT-4h-disabled.json", **kwargs):
+        zgua_app.PAPER_CANDIDATE_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        path = zgua_app.PAPER_CANDIDATE_REVIEW_DIR / filename
+        path.write_text(json.dumps(self.disabled_candidate_package(**kwargs)), encoding="utf-8")
+        return path
+
+    def test_research_paper_candidates_api_lists_disabled_packages(self):
+        self.write_disabled_candidate_package()
+        with zgua_app.app.test_client() as client:
+            response = client.get("/api/research/paper-candidates")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["candidateCount"], 1)
+        candidate = payload["candidates"][0]
+        self.assertEqual(candidate["status"], "DISABLED_REVIEW_ONLY")
+        self.assertEqual(candidate["candidateIdentity"]["strategy"], "EmaBounceV2")
+        self.assertEqual(candidate["candidateIdentity"]["symbol"], "BTCUSDT")
+        self.assertEqual(candidate["confirmedChainPeriods"], ["730d", "1095d"])
+        self.assertEqual(candidate["paramsHash"], "f09aabfcd7a47bd2")
+        self.assertFalse(candidate["safety"]["paperEnabled"])
+        self.assertFalse(candidate["safety"]["realTradingEnabled"])
+        self.assertFalse(candidate["safety"]["configWritten"])
+        self.assertFalse(candidate["safety"]["paperStateChanged"])
+        self.assertFalse(candidate["safety"]["liveOrdersTouched"])
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_candidates_ignores_malformed_packages_safely(self):
+        self.write_disabled_candidate_package()
+        zgua_app.PAPER_CANDIDATE_REVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        (zgua_app.PAPER_CANDIDATE_REVIEW_DIR / "bad.json").write_text("{not json", encoding="utf-8")
+        payload = self.run_with_forbidden_boundaries(zgua_app.build_research_paper_candidates)
+        self.assertEqual(payload["candidateCount"], 1)
+        self.assertTrue(any("malformed package" in item["reason"] for item in payload["ignoredPackages"]))
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_candidates_excludes_rejected_or_non_disabled_packages(self):
+        self.write_disabled_candidate_package("EmaBounceV2-ETHUSDT-4h-disabled.json", symbol="ETHUSDT", status="REJECTED")
+        self.write_disabled_candidate_package("EmaBounceV2-SOLUSDT-4h-disabled.json", symbol="SOLUSDT", safety={
+            "researchOnly": True,
+            "paperEnabled": True,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+        })
+        payload = self.run_with_forbidden_boundaries(zgua_app.build_research_paper_candidates)
+        self.assertEqual(payload["candidateCount"], 0)
+        self.assertFalse(any((item.get("candidateIdentity") or {}).get("symbol") in {"ETHUSDT", "SOLUSDT"} for item in payload["candidates"]))
+        self.assertEqual(len(payload["ignoredPackages"]), 2)
+        self.assert_autopilot_safety(payload)
+
+    def test_research_paper_candidates_ui_is_display_only_and_fetches_read_only_api(self):
+        template = (Path(zgua_app.app.root_path) / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (Path(zgua_app.app.root_path) / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Manual Paper Review Candidates", template)
+        self.assertIn("research-paper-candidates-panel", template)
+        self.assertIn('apiGet("/api/research/paper-candidates")', script)
+        self.assertIn("Review only - not paper enabled", script)
+        self.assertIn("loadResearchPaperCandidates", script)
+        self.assertNotIn("research-paper-candidates-enable", template)
+
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [
             branch("PullbackTrend", "BTCUSDT", "1h", "NEGATIVE_RETURN"),

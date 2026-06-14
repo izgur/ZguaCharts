@@ -1558,6 +1558,14 @@ def research_autopilot_prepare_paper_candidate():
         return jsonify({"error": f"Could not prepare disabled paper candidate package: {exc}"}), 502
 
 
+@app.get("/api/research/paper-candidates")
+def research_paper_candidates():
+    try:
+        return jsonify(build_research_paper_candidates())
+    except Exception as exc:
+        return jsonify({"error": f"Could not list disabled paper candidates: {exc}"}), 502
+
+
 @app.get("/api/research/autopilot/summary")
 def research_autopilot_summary():
     try:
@@ -10121,6 +10129,98 @@ def build_research_autopilot_prepare_paper_candidate(args) -> tuple[dict, int]:
     path.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
     package["savedPath"] = autopilot_display_path(path)
     return package, 200
+
+
+def autopilot_disabled_paper_candidate_summary(path: Path, payload: dict) -> dict | None:
+    if not isinstance(payload, dict) or payload.get("status") != "DISABLED_REVIEW_ONLY":
+        return None
+    identity = payload.get("candidateIdentity") or {}
+    if not all(identity.get(key) for key in ("strategy", "symbol", "timeframe")):
+        return None
+    safety = payload.get("safety") or {}
+    unsafe_flags = (
+        "paperEnabled",
+        "realTradingEnabled",
+        "configWritten",
+        "paperStateChanged",
+        "liveOrdersTouched",
+        "paperTickRan",
+        "promotionAttempted",
+        "realOrderFunctionsCalled",
+        "activePaperCandidateMutated",
+        "riskSettingsChanged",
+        "apiKeyPathCreated",
+    )
+    if any(bool(safety.get(flag)) for flag in unsafe_flags):
+        return None
+    return {
+        "status": "DISABLED_REVIEW_ONLY",
+        "reviewBanner": payload.get("reviewBanner") or "Review only - not paper enabled.",
+        "candidateIdentity": {
+            "strategy": identity.get("strategy"),
+            "symbol": identity.get("symbol"),
+            "timeframe": identity.get("timeframe"),
+            "paramsHash": identity.get("paramsHash") or payload.get("paramsHash"),
+            "candidateKey": identity.get("candidateKey"),
+        },
+        "paramsHash": identity.get("paramsHash") or payload.get("paramsHash"),
+        "confirmedChainPeriods": autopilot_list(payload.get("confirmedChainPeriods")),
+        "dossierPath": payload.get("dossierPath"),
+        "sourceReports": autopilot_list(payload.get("sourceReports")),
+        "strengths": autopilot_list(payload.get("strengths")),
+        "warnings": autopilot_list(payload.get("warnings")),
+        "savedPath": autopilot_display_path(path),
+        "safety": {
+            **autopilot_safety_payload(),
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+        },
+    }
+
+
+def build_research_paper_candidates() -> dict:
+    candidates = []
+    ignored_packages = []
+    if PAPER_CANDIDATE_REVIEW_DIR.exists():
+        for path in sorted(PAPER_CANDIDATE_REVIEW_DIR.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                ignored_packages.append({
+                    "path": autopilot_display_path(path),
+                    "reason": f"malformed package: {exc}",
+                })
+                continue
+            summary = autopilot_disabled_paper_candidate_summary(path, payload)
+            if summary:
+                candidates.append(summary)
+            else:
+                ignored_packages.append({
+                    "path": autopilot_display_path(path),
+                    "reason": "not a safe disabled review package",
+                })
+    return {
+        "ok": True,
+        "generatedAt": autopilot_now(),
+        "candidates": candidates,
+        "ignoredPackages": ignored_packages,
+        "candidateCount": len(candidates),
+        "safety": {
+            **autopilot_safety_payload(),
+            "paperEnabled": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+        },
+        "notes": [
+            "Review only - not paper enabled.",
+            "This endpoint reads disabled candidate packages and does not write config, mutate paper state, start paper ticks, or touch live orders.",
+        ],
+    }
 
 
 def autopilot_campaign_args(job: dict) -> dict:

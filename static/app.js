@@ -316,6 +316,7 @@ function organizeWorkflowPages() {
     ["research-stability-first-challenger-search-panel", "research-search"],
     ["research-campaign-runner-panel", "research-overview"],
     ["research-autopilot-panel", "research-overview"],
+    ["research-paper-candidates-panel", "research-overview"],
     ["research-candidate-evidence-ledger-panel", "research-overview"],
     ["research-result-diff-panel", "research-overview"],
     ["research-promotion-checklist-v2-panel", "research-overview"],
@@ -3853,6 +3854,7 @@ function setupLearningControls() {
   document.querySelector("#research-autopilot-run-batch")?.addEventListener("click", () => loadResearchAutopilot("runBatch"));
   document.querySelector("#research-autopilot-summary")?.addEventListener("click", () => loadResearchAutopilot("summary"));
   document.querySelector("#research-autopilot-journal")?.addEventListener("click", () => loadResearchAutopilot("journal"));
+  document.querySelector("#research-paper-candidates-refresh")?.addEventListener("click", loadResearchPaperCandidates);
   document.querySelector("#research-candidate-evidence-ledger-refresh")?.addEventListener("click", loadResearchCandidateEvidenceLedger);
   document.querySelector("#research-result-diff-refresh")?.addEventListener("click", loadResearchResultDiff);
   document.querySelector("#research-promotion-checklist-v2-refresh")?.addEventListener("click", loadResearchPromotionChecklistV2);
@@ -5580,6 +5582,87 @@ function renderResearchAutopilot(payload, action = "status") {
     <table class="trade-table"><thead><tr><th>Category</th><th>Strategy</th><th>Market</th><th>Period</th><th>Trades</th><th>PF</th><th>Return</th><th>Neg Folds</th><th>Stress</th></tr></thead><tbody>${rejected || `<tr><td colspan="9">No rejected branches in memory.</td></tr>`}</tbody></table>
     <p class="modal-note">Autopilot is research-only. It may save reports and queue state under ignored reports directories, but it cannot promote candidates, write config, enable paper, run paper ticks, or touch live orders.</p>
     ${warnings ? `<ul class="backtest-warnings">${warnings}</ul>` : ""}
+  `;
+}
+
+async function loadResearchPaperCandidates() {
+  const host = document.querySelector("#research-paper-candidates-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading disabled paper candidates...</p>`;
+    const payload = await apiGet("/api/research/paper-candidates");
+    host.innerHTML = renderResearchPaperCandidates(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Disabled paper candidates could not load: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderPaperCandidateList(items) {
+  const list = (items || []).filter(Boolean).slice(0, 8);
+  return list.length ? `<ul class="backtest-warnings">${list.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>` : `<p class="modal-note">None recorded.</p>`;
+}
+
+function renderPaperCandidateReports(items) {
+  const list = (items || []).filter(Boolean).slice(0, 8);
+  return list.length ? list.map((item) => `<div class="metric"><span>Source report</span><strong>${escapeHtml(item)}</strong></div>`).join("") : `<div class="metric"><span>Source reports</span><strong>-</strong></div>`;
+}
+
+function renderPaperCandidateSafety(safety) {
+  const flags = safety || {};
+  const rows = [
+    ["Paper enabled", flags.paperEnabled],
+    ["Real trading", flags.realTradingEnabled],
+    ["Config written", flags.configWritten],
+    ["Paper state changed", flags.paperStateChanged],
+    ["Live orders touched", flags.liveOrdersTouched],
+  ];
+  return rows.map(([label, value]) => `<div class="metric"><span>${escapeHtml(label)}</span><strong>${value ? "yes" : "false"}</strong></div>`).join("");
+}
+
+function renderResearchPaperCandidate(candidate) {
+  const identity = candidate.candidateIdentity || {};
+  const periods = (candidate.confirmedChainPeriods || []).join(" + ");
+  return `
+    <details class="paper-validation-result" open>
+      <summary><strong>${escapeHtml(identity.strategy || "-")}</strong> ${escapeHtml(identity.symbol || "-")} ${escapeHtml(identity.timeframe || "-")} <span class="neutral">Review only - not paper enabled</span></summary>
+      <div class="metric-grid">
+        <div class="metric"><span>Status</span><strong>${escapeHtml(candidate.status || "DISABLED_REVIEW_ONLY")}</strong></div>
+        <div class="metric"><span>Strategy</span><strong>${escapeHtml(identity.strategy || "-")}</strong></div>
+        <div class="metric"><span>Symbol</span><strong>${escapeHtml(identity.symbol || "-")}</strong></div>
+        <div class="metric"><span>Timeframe</span><strong>${escapeHtml(identity.timeframe || "-")}</strong></div>
+        <div class="metric"><span>Confirmed chain</span><strong>${escapeHtml(periods || "-")}</strong></div>
+        <div class="metric"><span>Params hash</span><strong>${escapeHtml(candidate.paramsHash || identity.paramsHash || "-")}</strong></div>
+        <div class="metric"><span>Dossier</span><strong>${escapeHtml(candidate.dossierPath || "-")}</strong></div>
+        <div class="metric"><span>Package</span><strong>${escapeHtml(candidate.savedPath || "-")}</strong></div>
+        ${renderPaperCandidateReports(candidate.sourceReports)}
+        ${renderPaperCandidateSafety(candidate.safety)}
+      </div>
+      <p class="modal-note"><strong>Review banner:</strong> ${escapeHtml(candidate.reviewBanner || "Review only - not paper enabled.")}</p>
+      <h4 class="modal-section-title">Strengths</h4>
+      ${renderPaperCandidateList(candidate.strengths)}
+      <h4 class="modal-section-title">Warnings</h4>
+      ${renderPaperCandidateList(candidate.warnings)}
+    </details>
+  `;
+}
+
+function renderResearchPaperCandidates(payload) {
+  const candidates = (payload.candidates || []).map(renderResearchPaperCandidate).join("");
+  const ignored = (payload.ignoredPackages || []).slice(0, 6).map((item) => `<li>${escapeHtml(item.path || "-")}: ${escapeHtml(item.reason || "ignored")}</li>`).join("");
+  return `
+    <h3 class="modal-section-title">Manual Paper Review Candidates <span class="neutral">Review only - not paper enabled</span></h3>
+    <div class="metric-grid">
+      <div class="metric"><span>Candidates</span><strong>${payload.candidateCount ?? (payload.candidates || []).length}</strong></div>
+      <div class="metric"><span>Research only</span><strong>${payload.safety?.researchOnly ? "yes" : "no"}</strong></div>
+      <div class="metric"><span>Paper enabled</span><strong>${payload.safety?.paperEnabled ? "yes" : "false"}</strong></div>
+      <div class="metric"><span>Real trading</span><strong>${payload.safety?.realTradingEnabled ? "enabled" : "false"}</strong></div>
+      <div class="metric"><span>Config written</span><strong>${payload.safety?.configWritten ? "yes" : "false"}</strong></div>
+      <div class="metric"><span>Paper state changed</span><strong>${payload.safety?.paperStateChanged ? "yes" : "false"}</strong></div>
+      <div class="metric"><span>Live orders touched</span><strong>${payload.safety?.liveOrdersTouched ? "yes" : "false"}</strong></div>
+    </div>
+    ${candidates || `<p class="modal-note">No disabled paper candidate packages are available for review.</p>`}
+    <p class="modal-note">Display-only panel. It reads disabled review packages and cannot enable paper trading, write active config, mutate paper state, start paper ticks, or touch live orders.</p>
+    ${ignored ? `<h4 class="modal-section-title">Ignored Packages</h4><ul class="backtest-warnings">${ignored}</ul>` : ""}
   `;
 }
 
