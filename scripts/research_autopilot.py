@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_freshness, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
+from app import app, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_freshness, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -133,6 +133,7 @@ def main() -> int:
     enable_paper.add_argument("--confirm", required=True)
     sub.add_parser("preview-paper-tick")
     sub.add_parser("paper:freshness")
+    sub.add_parser("paper:candle-alignment")
     sub.add_parser("paper:refresh-active-data")
     init_active = sub.add_parser("paper:init-active-candidate")
     init_active.add_argument("--confirm", required=True)
@@ -205,6 +206,8 @@ def main() -> int:
             payload, status = build_research_preview_paper_tick({})
         elif args.command == "paper:freshness":
             payload, status = build_research_paper_freshness({})
+        elif args.command == "paper:candle-alignment":
+            payload, status = build_research_paper_candle_alignment({})
         elif args.command == "paper:refresh-active-data":
             payload, status = build_research_refresh_active_paper_data({})
         elif args.command == "paper:init-active-candidate":

@@ -1152,11 +1152,12 @@ class ResearchAutopilotTests(unittest.TestCase):
         zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return config
 
-    def preview_subprocess_payloads(self):
+    def preview_subprocess_payloads(self, latest_time=None):
+        latest_time = latest_time or int(datetime.now(timezone.utc).timestamp()) - 60 * 60
         diagnostics = {
             "ok": True,
             "activeMarket": {"symbol": "BTCUSDT", "timeframe": "4h"},
-            "latestCandle": {"time": 123456, "close": 50000},
+            "latestCandle": {"time": latest_time, "close": 50000},
             "diagnostics": {
                 "strategy": "EmaBounceV2",
                 "signal": "BUY",
@@ -1165,14 +1166,27 @@ class ResearchAutopilotTests(unittest.TestCase):
             },
             "warnings": [],
         }
-        tick = {"ok": True, "status": "dry-run", "events": 1, "openPositions": 0, "closedTrades": 0, "warnings": []}
+        tick = {
+            "ok": True,
+            "status": "dry-run",
+            "events": 1,
+            "openPositions": 0,
+            "closedTrades": 0,
+            "warnings": [],
+            "freshness": {
+                "BTCUSDT:4h": {"latestCandleTime": latest_time}
+            },
+        }
         def fake_run(command, text, capture_output, cwd, timeout):
             payload = diagnostics if "paper_signal_diagnostics.js" in " ".join(command) else tick
             return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
         return fake_run
 
-    def fresh_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600):
-        latest = int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+    def recent_closed_time(self):
+        return int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+
+    def fresh_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600, latest=None):
+        latest = latest or int(datetime.now(timezone.utc).timestamp()) - 60 * 60
         return {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -1245,7 +1259,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(journal_path.exists())
         state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
         config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
-        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload()), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads()):
+        latest = self.recent_closed_time()
+        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads(latest)):
             payload, status = zgua_app.build_research_preview_paper_tick({})
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
@@ -1265,8 +1280,80 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(journal_path.exists())
         self.assertEqual(payload["signal"], "BUY")
         self.assertEqual(payload["proposedAction"], "would open long")
+        self.assertEqual(payload["candleAlignment"]["candleAlignmentStatus"], "ALIGNED")
         self.assertEqual(payload["proposedOrder"]["side"], "long")
         self.assertGreater(payload["proposedOrder"]["notional"], 0)
+
+    def alignment_subprocess_payloads(self, signal_time, tick_time=None):
+        tick_time = signal_time if tick_time is None else tick_time
+        diagnostics = {
+            "ok": True,
+            "activeMarket": {"symbol": "BTCUSDT", "timeframe": "4h"},
+            "latestCandle": {"time": signal_time, "close": 50000},
+            "diagnostics": {"signal": "HOLD", "reason": "No entry signal.", "positionState": {"hasOpenPosition": False}},
+            "warnings": [],
+        }
+        tick = {
+            "ok": True,
+            "status": "dry-run",
+            "events": 0,
+            "openPositions": 0,
+            "closedTrades": 0,
+            "warnings": [],
+            "freshness": {"BTCUSDT:4h": {"latestCandleTime": tick_time}},
+        }
+        def fake_run(command, text, capture_output, cwd, timeout):
+            payload = diagnostics if "paper_signal_diagnostics.js" in " ".join(command) else tick
+            return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
+        return fake_run
+
+    def test_paper_candle_alignment_returns_all_timestamps(self):
+        self.write_active_paper_config()
+        latest = self.recent_closed_time()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=self.alignment_subprocess_payloads(latest, latest)):
+            payload, status = zgua_app.build_research_paper_candle_alignment({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["freshnessLatestCandleTime"], latest)
+        self.assertEqual(payload["signalEvaluationCandleTime"], latest)
+        self.assertEqual(payload["tickDryRunCandleTime"], latest)
+        self.assertEqual(payload["expectedLatestClosedCandleTime"], latest)
+        self.assertEqual(payload["candleAlignmentStatus"], "ALIGNED")
+        self.assertFalse(payload["blockingForPaperTick"])
+        self.assertTrue(payload["paperTickAllowed"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+
+    def test_candle_mismatch_blocks_preview(self):
+        self.write_active_paper_config()
+        latest = self.recent_closed_time()
+        lagged = latest - 4 * 60 * 60
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=self.alignment_subprocess_payloads(lagged, lagged)):
+            payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["proposedAction"], "blocked_by_candle_mismatch")
+        self.assertTrue(payload["blockingForPaperTick"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertEqual(payload["candleAlignment"]["candleAlignmentStatus"], "MISMATCH")
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+
+    def test_candle_mismatch_blocks_one_shot_paper_tick_wrapper(self):
+        self.write_active_paper_config()
+        latest = self.recent_closed_time()
+        lagged = latest - 4 * 60 * 60
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=self.alignment_subprocess_payloads(lagged, lagged)):
+            payload, status = zgua_app.run_paper_tick_once({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertEqual(payload["candleAlignment"]["candleAlignmentStatus"], "MISMATCH")
 
     def test_paper_freshness_returns_stale_structure(self):
         self.write_active_paper_config()
@@ -1407,6 +1494,7 @@ class ResearchAutopilotTests(unittest.TestCase):
         with patch.object(zgua_app, "fetch_candles", return_value=self.init_candles_payload()):
             payload, status = zgua_app.build_research_init_active_paper_candidate({"confirm": self.init_confirm_text()})
         self.assertEqual(status, 200)
+        latest = self.recent_closed_time()
         def fake_run(command, text, capture_output, cwd, timeout):
             state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
             initialized = bool((state.get("lastProcessedCandleTime") or {}).get("BTCUSDT:4h"))
@@ -1414,7 +1502,7 @@ class ResearchAutopilotTests(unittest.TestCase):
                 result = {
                     "ok": True,
                     "activeMarket": {"symbol": "BTCUSDT", "timeframe": "4h"},
-                    "latestCandle": {"time": 123456, "close": 50000},
+                    "latestCandle": {"time": latest, "close": 50000},
                     "diagnostics": {"signal": "HOLD", "reason": "No entry signal.", "positionState": {"hasOpenPosition": False}},
                     "warnings": [],
                 }
@@ -1426,9 +1514,10 @@ class ResearchAutopilotTests(unittest.TestCase):
                     "openPositions": 0,
                     "closedTrades": 0,
                     "warnings": [] if initialized else ["BTCUSDT 4h: Market not initialized. Run npm run paper:init first."],
+                    "freshness": {"BTCUSDT:4h": {"latestCandleTime": latest}},
                 }
             return type("Completed", (), {"stdout": json.dumps(result), "stderr": "", "returncode": 0})()
-        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload()), patch.object(zgua_app.subprocess, "run", side_effect=fake_run):
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=fake_run):
             preview, preview_status = zgua_app.build_research_preview_paper_tick({})
         self.assertEqual(preview_status, 200)
         self.assertTrue(preview["ok"])
@@ -1474,6 +1563,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn("plan-paper-enable-candidate", script)
         self.assertNotIn("preview-paper-tick", template)
         self.assertNotIn("preview-paper-tick", script)
+        self.assertNotIn("paper:candle-alignment", template)
+        self.assertNotIn("paper:candle-alignment", script)
         self.assertNotIn("paper:refresh-active-data", template)
         self.assertNotIn("paper:refresh-active-data", script)
         self.assertNotIn("research-paper-candidates-enable", template)

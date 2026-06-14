@@ -10962,6 +10962,94 @@ def run_preview_node_json(command: list[str], timeout_seconds: int) -> tuple[dic
     return payload, completed.returncode
 
 
+def tick_dry_run_candle_time(tick_payload: dict, candidate: dict) -> int | None:
+    active = primary_active_market(candidate)
+    key = paper_market_key(active)
+    freshness = tick_payload.get("freshness") if isinstance(tick_payload.get("freshness"), dict) else {}
+    item = freshness.get(key) if key else None
+    if isinstance(item, dict):
+        value = item.get("latestCandleTime")
+        return int(safe_float(value, 0)) if safe_float(value, 0) else None
+    return None
+
+
+def candle_alignment_status(freshness_time, signal_time, tick_time, interval_seconds: int) -> tuple[str, str, bool]:
+    times = [int(safe_float(value, 0)) for value in [freshness_time, signal_time, tick_time] if safe_float(value, 0)]
+    if len(times) == 3 and len(set(times)) == 1:
+        return "ALIGNED", "Freshness, signal evaluation, and paper tick dry-run use the same latest closed candle.", False
+    if freshness_time and signal_time and int(safe_float(freshness_time, 0)) - int(safe_float(signal_time, 0)) == interval_seconds:
+        if not tick_time or int(safe_float(tick_time, 0)) == int(safe_float(signal_time, 0)):
+            return "MISMATCH", "Freshness sees a newer closed candle than signal evaluation and tick dry-run; this one-candle offset is not approved for paper ticks.", True
+    return "MISMATCH", "Freshness, signal evaluation, and paper tick dry-run candle timestamps do not align.", True
+
+
+def build_research_paper_candle_alignment(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    symbol = active.get("symbol") or candidate.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    interval_seconds = paper_interval_seconds(timeframe)
+    before = preview_file_hashes()
+    freshness = active_paper_market_freshness(args)
+    timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
+    diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20))]
+    diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
+    tick_command = package_node_script_args("paper:tick") + ["--dry-run"]
+    tick_payload, tick_code = run_preview_node_json(tick_command, timeout_seconds)
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    signal_candle_time = safe_float((diagnostics.get("latestCandle") or {}).get("time"), 0)
+    signal_candle_time = int(signal_candle_time) if signal_candle_time else None
+    tick_candle_time = tick_dry_run_candle_time(tick_payload, candidate)
+    if tick_candle_time is None and tick_code == 0:
+        tick_candle_time = signal_candle_time
+    freshness_time = freshness.get("latestCandleTime")
+    expected_time = freshness_time
+    status, explanation, blocking = candle_alignment_status(freshness_time, signal_candle_time, tick_candle_time, interval_seconds)
+    real_enabled, _ = paper_real_trading_enabled()
+    payload = {
+        "ok": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "freshnessLatestCandleTime": freshness_time,
+        "freshnessLatestCandleAt": epoch_to_iso(freshness_time),
+        "signalEvaluationCandleTime": signal_candle_time,
+        "signalEvaluationCandleAt": epoch_to_iso(signal_candle_time),
+        "tickDryRunCandleTime": tick_candle_time,
+        "tickDryRunCandleAt": epoch_to_iso(tick_candle_time),
+        "expectedLatestClosedCandleTime": expected_time,
+        "expectedLatestClosedCandleAt": epoch_to_iso(expected_time),
+        "candleAlignmentStatus": status,
+        "explanation": explanation,
+        "blockingForPaperTick": bool(blocking),
+        "paperTickAllowed": bool(not blocking and not real_enabled),
+        "freshness": freshness,
+        "stateUnchanged": state_unchanged,
+        "stateHashBefore": before["state"],
+        "stateHashAfter": after["state"],
+        "configHashBefore": before["config"],
+        "configHashAfter": after["config"],
+        "journalHashBefore": before["journal"],
+        "journalHashAfter": after["journal"],
+        "journalCsvHashBefore": before["journalCsv"],
+        "journalCsvHashAfter": after["journalCsv"],
+        "safety": paper_safety_snapshot(real_enabled),
+        "diagnosticReturnCode": diagnostic_code,
+        "tickDryRunReturnCode": tick_code,
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+        payload["blockingForPaperTick"] = True
+        payload["paperTickAllowed"] = False
+        payload["explanation"] = "Candle alignment check changed paper config/state/journal hashes."
+    if diagnostic_code != 0 or tick_code != 0:
+        payload["blockingForPaperTick"] = True
+        payload["paperTickAllowed"] = False
+        payload["error"] = diagnostics.get("error") or tick_payload.get("error") or "Candle alignment helper failed."
+    return payload, 200 if payload.get("ok") else 400
+
+
 def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
     args = args or {}
     candidate = load_paper_candidate_config()
@@ -11028,6 +11116,43 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
             "journalCsvHashAfter": after["journalCsv"],
             "stateUnchanged": state_unchanged,
         }, 200 if state_unchanged else 400
+    candle_alignment, alignment_status_code = build_research_paper_candle_alignment(args)
+    if candle_alignment.get("candleAlignmentStatus") == "MISMATCH" or candle_alignment.get("blockingForPaperTick"):
+        after = preview_file_hashes()
+        state_unchanged = before == after
+        return {
+            "ok": bool(state_unchanged and alignment_status_code < 400),
+            "previewOnly": True,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "strategy": candidate.get("strategy"),
+            "symbol": candle_alignment.get("symbol") or candidate.get("symbol"),
+            "timeframe": candle_alignment.get("timeframe") or candidate.get("timeframe"),
+            "lastCandleTime": candle_alignment.get("signalEvaluationCandleTime"),
+            "signal": None,
+            "signalReason": "Signal preview blocked because candle alignment failed.",
+            "currentPaperPosition": None,
+            "proposedAction": "blocked_by_candle_mismatch",
+            "proposedOrder": None,
+            "blockingForPaperTick": True,
+            "paperTickAllowed": False,
+            "freshness": freshness,
+            "candleAlignment": candle_alignment,
+            "blockers": [candle_alignment.get("explanation") or "Candle alignment mismatch."],
+            "warnings": [],
+            "stateHashBefore": before["state"],
+            "stateHashAfter": after["state"],
+            "configHashBefore": before["config"],
+            "configHashAfter": after["config"],
+            "journalHashBefore": before["journal"],
+            "journalHashAfter": after["journal"],
+            "journalCsvHashBefore": before["journalCsv"],
+            "journalCsvHashAfter": after["journalCsv"],
+            "stateUnchanged": state_unchanged,
+        }, 200 if state_unchanged and alignment_status_code < 400 else 400
     timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
     diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20))]
     diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
@@ -11060,6 +11185,7 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
         "blockingForPaperTick": False,
         "paperTickAllowed": True,
         "freshness": freshness,
+        "candleAlignment": candle_alignment,
         "strategy": candidate.get("strategy"),
         "symbol": active_market.get("symbol") or candidate.get("symbol"),
         "timeframe": active_market.get("timeframe") or active_market.get("interval") or candidate.get("timeframe"),
@@ -16038,6 +16164,20 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
             "liveOrdersTouched": False,
             "tickReadinessBefore": tick_readiness_before,
             "freshness": freshness,
+            "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
+        }, 400
+    candle_alignment, alignment_status = build_research_paper_candle_alignment(args)
+    if alignment_status >= 400 or candle_alignment.get("candleAlignmentStatus") == "MISMATCH" or candle_alignment.get("blockingForPaperTick"):
+        return {
+            "ok": False,
+            "error": candle_alignment.get("explanation") or "Candle alignment mismatch; paper tick was not run.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "tickReadinessBefore": tick_readiness_before,
+            "candleAlignment": candle_alignment,
             "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
         }, 400
     readiness = build_paper_readiness_report(args)
