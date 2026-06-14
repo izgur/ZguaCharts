@@ -20,6 +20,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "PAPER_CANDIDATE_REVIEW_DIR", root / "paper-candidates"),
         patch.object(zgua_app, "PAPER_CANDIDATE_LOCAL_PATH", root / "config" / "local" / "paper-candidate.json"),
         patch.object(zgua_app, "PAPER_STATE_PATH", root / "paper-state.json"),
+        patch.object(zgua_app, "PAPER_JOURNAL_PATH", root / "reports" / "paper-journal.jsonl"),
         patch.object(zgua_app, "PAPER_CANDIDATE_ENABLE_AUDIT_DIR", root / "paper-candidates" / "enable-audits"),
         patch.object(zgua_app, "DEPLOY_REVIEW_CANDIDATE_DIR", root / "review-candidates"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
@@ -1114,6 +1115,112 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(audit["safety"]["apiKeyPathCreated"])
         self.assertIn("weak walk-forward folds", payload["warnings"])
 
+    def write_active_paper_config(self, enabled=True, real=False, exchange=False):
+        zgua_app.PAPER_CANDIDATE_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        config = {
+            "_replaceParams": True,
+            "enabled": enabled,
+            "paperEnabled": enabled,
+            "mode": "PAPER_ONLY",
+            "source": "bybit",
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "symbols": [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}],
+            "paramsHash": "f09aabfcd7a47bd2",
+            "params": {"emaBounceAtr": 0.8, "rsiReclaimLevel": 53},
+            "accountEquity": 10000,
+            "maxPositionPct": 10,
+            "takerFeePct": 0.055,
+            "makerFeePct": 0.02,
+            "slippageBps": 2,
+            "maxOpenTrades": 1,
+            "realTradingEnabled": real,
+            "exchangeOrders": exchange,
+            "liveOrdersTouched": False,
+        }
+        zgua_app.PAPER_CANDIDATE_LOCAL_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps({
+            "accountEquity": 10000,
+            "openPositions": [],
+            "closedTrades": [],
+            "lastProcessedCandleTime": {"BTCUSDT:4h": 1000},
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+        }, indent=2), encoding="utf-8")
+        return config
+
+    def preview_subprocess_payloads(self):
+        diagnostics = {
+            "ok": True,
+            "activeMarket": {"symbol": "BTCUSDT", "timeframe": "4h"},
+            "latestCandle": {"time": 123456, "close": 50000},
+            "diagnostics": {
+                "strategy": "EmaBounceV2",
+                "signal": "BUY",
+                "reason": "Entry signal matched.",
+                "positionState": {"hasOpenPosition": False},
+            },
+            "warnings": [],
+        }
+        tick = {"ok": True, "status": "dry-run", "events": 1, "openPositions": 0, "closedTrades": 0, "warnings": []}
+        def fake_run(command, text, capture_output, cwd, timeout):
+            payload = diagnostics if "paper_signal_diagnostics.js" in " ".join(command) else tick
+            return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
+        return fake_run
+
+    def test_preview_paper_tick_refuses_if_paper_disabled(self):
+        self.write_active_paper_config(enabled=False)
+        payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("paperEnabled must be true", payload["blockers"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+
+    def test_preview_paper_tick_refuses_if_real_trading_enabled(self):
+        self.write_active_paper_config(real=True)
+        payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(any("realTradingEnabled" in item for item in payload["blockers"]))
+
+    def test_preview_paper_tick_refuses_if_exchange_orders_enabled(self):
+        self.write_active_paper_config(exchange=True)
+        payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertIn("exchangeOrders must be false", payload["blockers"])
+
+    def test_preview_paper_tick_is_read_only_and_returns_action(self):
+        self.write_active_paper_config()
+        journal_path = zgua_app.PAPER_STATE_PATH.parent / "reports" / "paper-journal.jsonl"
+        self.assertFalse(journal_path.exists())
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads()):
+            payload, status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["previewOnly"])
+        self.assertTrue(payload["paperEnabled"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertTrue(payload["stateUnchanged"])
+        self.assertEqual(payload["stateHashBefore"], payload["stateHashAfter"])
+        self.assertEqual(payload["configHashBefore"], payload["configHashAfter"])
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
+        self.assertEqual(payload["journalHashBefore"], "missing")
+        self.assertEqual(payload["journalHashAfter"], "missing")
+        self.assertFalse(journal_path.exists())
+        self.assertEqual(payload["signal"], "BUY")
+        self.assertEqual(payload["proposedAction"], "would open long")
+        self.assertEqual(payload["proposedOrder"]["side"], "long")
+        self.assertGreater(payload["proposedOrder"]["notional"], 0)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")
@@ -1152,6 +1259,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn('apiDelete("/api/research/paper-candidates"', script)
         self.assertNotIn("plan-paper-enable-candidate", template)
         self.assertNotIn("plan-paper-enable-candidate", script)
+        self.assertNotIn("preview-paper-tick", template)
+        self.assertNotIn("preview-paper-tick", script)
         self.assertNotIn("research-paper-candidates-enable", template)
         self.assertNotIn("research-paper-candidates-run", template)
         self.assertNotIn("research-paper-candidates-paper-tick", template)

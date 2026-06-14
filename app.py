@@ -42,6 +42,7 @@ LOCAL_CONFIG_DIR = CONFIG_DIR / "local"
 PAPER_CANDIDATE_DEFAULT_PATH = CONFIG_DIR / "paper-candidate.default.json"
 PAPER_CANDIDATE_LOCAL_PATH = LOCAL_CONFIG_DIR / "paper-candidate.json"
 PAPER_STATE_PATH = Path(app.root_path) / "data" / "paper-state.json"
+PAPER_JOURNAL_PATH = Path(app.root_path) / "reports" / "paper-journal.jsonl"
 RESEARCH_RUNS_PATH = Path(app.root_path) / "data" / "research-runs.json"
 LEARNING_CONFIG_DEFAULT_PATH = CONFIG_DIR / "learning-runner.default.json"
 LEARNING_CONFIG_LOCAL_PATH = LOCAL_CONFIG_DIR / "learning-runner.json"
@@ -10632,6 +10633,164 @@ def build_research_enable_paper_candidate(args) -> tuple[dict, int]:
         "auditPath": autopilot_display_path(audit_path),
         "disableStatus": "Use npm run paper:disable to roll back paperEnabled if needed; npm run paper:status remains read-only.",
     }, 200
+
+
+def hash_file_for_preview(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def preview_file_hashes() -> dict:
+    return {
+        "config": hash_file_for_preview(PAPER_CANDIDATE_LOCAL_PATH),
+        "state": hash_file_for_preview(PAPER_STATE_PATH),
+        "journal": hash_file_for_preview(PAPER_JOURNAL_PATH),
+    }
+
+
+def preview_estimated_order(candidate: dict, signal: str, latest_candle: dict | None, current_position: dict | None, reason: str) -> tuple[str, dict | None]:
+    signal = str(signal or "NONE").upper()
+    price = safe_float((latest_candle or {}).get("close"), 0)
+    equity = safe_float(candidate.get("accountEquity"), 10000)
+    max_position_pct = safe_float(candidate.get("maxPositionPct"), 10)
+    notional = round(equity * max_position_pct / 100, 4)
+    size = round(notional / price, 8) if price > 0 and notional > 0 else 0
+    fee = round(notional * safe_float(candidate.get("takerFeePct"), 0.055) / 100, 4)
+    slippage = round(notional * safe_float(candidate.get("slippageBps"), 2) / 10000, 4)
+    if current_position and signal == "EXIT":
+        return "would close position", {
+            "side": current_position.get("side") or "long",
+            "entryExitType": "exit",
+            "size": current_position.get("size") or size,
+            "notional": current_position.get("notional") or notional,
+            "estimatedFee": fee,
+            "estimatedSlippage": slippage,
+            "reason": reason or "Exit signal in diagnostics.",
+        }
+    if current_position:
+        return "would hold position", None
+    if signal in {"BUY", "LONG", "SHORT"}:
+        return f"would open {'short' if signal == 'SHORT' else 'long'}", {
+            "side": "short" if signal == "SHORT" else "long",
+            "entryExitType": "entry",
+            "size": size,
+            "notional": notional,
+            "estimatedFee": fee,
+            "estimatedSlippage": slippage,
+            "reason": reason or "Entry signal in diagnostics.",
+        }
+    return "no action", None
+
+
+def run_preview_node_json(command: list[str], timeout_seconds: int) -> tuple[dict, int]:
+    completed = subprocess.run(command, text=True, capture_output=True, cwd=app.root_path, timeout=timeout_seconds)
+    payload = {}
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Preview helper returned non-JSON output.", "stdout": completed.stdout.strip()}
+    elif completed.stderr.strip():
+        payload = {"ok": False, "error": completed.stderr.strip()}
+    return payload, completed.returncode
+
+
+def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    blockers = []
+    if not paper_enabled:
+        blockers.append("paperEnabled must be true")
+    if real_enabled or candidate.get("realTradingEnabled"):
+        blockers.append("realTradingEnabled must be false")
+    if candidate.get("mode") != "PAPER_ONLY":
+        blockers.append("mode must be PAPER_ONLY")
+    if candidate.get("exchangeOrders"):
+        blockers.append("exchangeOrders must be false")
+    if candidate.get("liveOrdersTouched"):
+        blockers.append("liveOrdersTouched must be false")
+    if blockers:
+        return {
+            "ok": False,
+            "previewOnly": True,
+            "error": "; ".join(blockers),
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": bool(real_enabled or candidate.get("realTradingEnabled")),
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "blockers": blockers + ([real_detail] if real_enabled else []),
+        }, 400
+
+    before = preview_file_hashes()
+    timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
+    diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20))]
+    diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
+    tick_command = package_node_script_args("paper:tick") + ["--dry-run"]
+    tick_payload, tick_code = run_preview_node_json(tick_command, timeout_seconds)
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    diagnostics_payload = diagnostics.get("diagnostics") or {}
+    active_market = diagnostics.get("activeMarket") or primary_active_market(candidate)
+    latest_candle = diagnostics.get("latestCandle") or {}
+    position_state = diagnostics_payload.get("positionState") or {}
+    current_position = None
+    if position_state.get("hasOpenPosition"):
+        current_position = {
+            "side": position_state.get("side"),
+            "barsHeld": position_state.get("barsHeld"),
+        }
+    signal = diagnostics_payload.get("signal") or "UNKNOWN"
+    reason = diagnostics_payload.get("reason") or (diagnostics.get("nextAction") or {}).get("reason") or "No signal diagnostics reason returned."
+    proposed_action, proposed_order = preview_estimated_order(candidate, signal, latest_candle, current_position, reason)
+    warnings = dedupe_list((diagnostics.get("warnings") or []) + (tick_payload.get("warnings") or []))
+    payload = {
+        "ok": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0 and diagnostics.get("ok", True) is not False),
+        "previewOnly": True,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": False,
+        "paperTickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "strategy": candidate.get("strategy"),
+        "symbol": active_market.get("symbol") or candidate.get("symbol"),
+        "timeframe": active_market.get("timeframe") or active_market.get("interval") or candidate.get("timeframe"),
+        "lastCandleTime": latest_candle.get("time"),
+        "signal": signal,
+        "signalReason": reason,
+        "currentPaperPosition": current_position,
+        "proposedAction": proposed_action,
+        "proposedOrder": proposed_order,
+        "blockers": [] if diagnostics.get("ok", True) is not False else [diagnostics.get("error") or "Signal diagnostics failed."],
+        "warnings": warnings,
+        "stateHashBefore": before["state"],
+        "stateHashAfter": after["state"],
+        "configHashBefore": before["config"],
+        "configHashAfter": after["config"],
+        "journalHashBefore": before["journal"],
+        "journalHashAfter": after["journal"],
+        "stateUnchanged": state_unchanged,
+        "tickDryRun": {
+            "status": tick_payload.get("status"),
+            "events": tick_payload.get("events"),
+            "openPositions": tick_payload.get("openPositions"),
+            "closedTrades": tick_payload.get("closedTrades"),
+            "returnCode": tick_code,
+        },
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+        payload.setdefault("blockers", []).append("Preview changed config/state/journal hashes.")
+    if not payload["ok"] and not payload.get("blockers"):
+        payload["blockers"] = [diagnostics.get("error") or tick_payload.get("error") or "Preview helper failed."]
+    return payload, 200 if payload.get("ok") else 400
 
 
 def build_research_paper_candidates() -> dict:
