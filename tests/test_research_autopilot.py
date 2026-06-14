@@ -1115,7 +1115,7 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(audit["safety"]["apiKeyPathCreated"])
         self.assertIn("weak walk-forward folds", payload["warnings"])
 
-    def write_active_paper_config(self, enabled=True, real=False, exchange=False):
+    def write_active_paper_config(self, enabled=True, real=False, exchange=False, initialized=True):
         zgua_app.PAPER_CANDIDATE_LOCAL_PATH.parent.mkdir(parents=True, exist_ok=True)
         config = {
             "_replaceParams": True,
@@ -1126,6 +1126,7 @@ class ResearchAutopilotTests(unittest.TestCase):
             "strategy": "EmaBounceV2",
             "symbol": "BTCUSDT",
             "timeframe": "4h",
+            "candidateKey": "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca",
             "symbols": [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}],
             "paramsHash": "f09aabfcd7a47bd2",
             "params": {"emaBounceAtr": 0.8, "rsiReclaimLevel": 53},
@@ -1140,14 +1141,15 @@ class ResearchAutopilotTests(unittest.TestCase):
             "liveOrdersTouched": False,
         }
         zgua_app.PAPER_CANDIDATE_LOCAL_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        zgua_app.PAPER_STATE_PATH.write_text(json.dumps({
+        state = {
             "accountEquity": 10000,
             "openPositions": [],
             "closedTrades": [],
-            "lastProcessedCandleTime": {"BTCUSDT:4h": 1000},
+            "lastProcessedCandleTime": {"BTCUSDT:4h": 1000} if initialized else {},
             "paperTickRan": False,
             "liveOrdersTouched": False,
-        }, indent=2), encoding="utf-8")
+        }
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return config
 
     def preview_subprocess_payloads(self):
@@ -1199,6 +1201,19 @@ class ResearchAutopilotTests(unittest.TestCase):
             "lastCandleTime": None,
             "status": "MISSING",
             "warnings": ["No cached candles found."],
+        }
+
+    def init_confirm_text(self):
+        return "INIT PAPER ONLY candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca"
+
+    def init_candles_payload(self):
+        now = int(datetime.now(timezone.utc).timestamp())
+        return {
+            "candles": [
+                {"time": now - 8 * 60 * 60, "open": 49000, "high": 50000, "low": 48000, "close": 49500},
+                {"time": now - 4 * 60 * 60, "open": 49500, "high": 51000, "low": 49000, "close": 50500},
+                {"time": now, "open": 50500, "high": 50600, "low": 50400, "close": 50550},
+            ]
         }
 
     def test_preview_paper_tick_refuses_if_paper_disabled(self):
@@ -1342,6 +1357,82 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
         self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
         self.assertFalse(journal_path.exists())
+
+    def test_init_active_paper_candidate_wrong_confirmation_fails_without_writes(self):
+        self.write_active_paper_config()
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "fetch_candles") as fetch_mock:
+            payload, status = zgua_app.build_research_init_active_paper_candidate({"confirm": "wrong"})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        fetch_mock.assert_not_called()
+
+    def test_init_active_paper_candidate_initializes_only_btc_4h_and_preserves_params(self):
+        config = self.write_active_paper_config(initialized=False)
+        config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "fetch_candles", return_value=self.init_candles_payload()):
+            payload, status = zgua_app.build_research_init_active_paper_candidate({"confirm": self.init_confirm_text()})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["initializedMarkets"], ["BTCUSDT:4h"])
+        self.assertFalse(payload["alreadyInitialized"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertTrue(payload["paramsUnchanged"])
+        self.assertTrue(payload["configUnchanged"])
+        self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(state["lastProcessedCandleTime"].keys()), ["BTCUSDT:4h"])
+        self.assertEqual(state["strategy"], "EmaBounceV2")
+        self.assertEqual(state["paramsHash"], config["paramsHash"])
+        self.assertEqual(json.loads(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"))["params"], config["params"])
+
+    def test_init_active_paper_candidate_is_idempotent(self):
+        self.write_active_paper_config(initialized=False)
+        with patch.object(zgua_app, "fetch_candles", return_value=self.init_candles_payload()) as fetch_mock:
+            first, first_status = zgua_app.build_research_init_active_paper_candidate({"confirm": self.init_confirm_text()})
+            second, second_status = zgua_app.build_research_init_active_paper_candidate({"confirm": self.init_confirm_text()})
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertFalse(first["alreadyInitialized"])
+        self.assertTrue(second["alreadyInitialized"])
+        self.assertEqual(second["initializedMarkets"], ["BTCUSDT:4h"])
+        self.assertFalse(second["paperTickRan"])
+        self.assertEqual(fetch_mock.call_count, 1)
+
+    def test_preview_warning_removed_after_active_init(self):
+        self.write_active_paper_config(initialized=False)
+        with patch.object(zgua_app, "fetch_candles", return_value=self.init_candles_payload()):
+            payload, status = zgua_app.build_research_init_active_paper_candidate({"confirm": self.init_confirm_text()})
+        self.assertEqual(status, 200)
+        def fake_run(command, text, capture_output, cwd, timeout):
+            state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            initialized = bool((state.get("lastProcessedCandleTime") or {}).get("BTCUSDT:4h"))
+            if "paper_signal_diagnostics.js" in " ".join(command):
+                result = {
+                    "ok": True,
+                    "activeMarket": {"symbol": "BTCUSDT", "timeframe": "4h"},
+                    "latestCandle": {"time": 123456, "close": 50000},
+                    "diagnostics": {"signal": "HOLD", "reason": "No entry signal.", "positionState": {"hasOpenPosition": False}},
+                    "warnings": [],
+                }
+            else:
+                result = {
+                    "ok": True,
+                    "status": "dry-run",
+                    "events": 0,
+                    "openPositions": 0,
+                    "closedTrades": 0,
+                    "warnings": [] if initialized else ["BTCUSDT 4h: Market not initialized. Run npm run paper:init first."],
+                }
+            return type("Completed", (), {"stdout": json.dumps(result), "stderr": "", "returncode": 0})()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload()), patch.object(zgua_app.subprocess, "run", side_effect=fake_run):
+            preview, preview_status = zgua_app.build_research_preview_paper_tick({})
+        self.assertEqual(preview_status, 200)
+        self.assertTrue(preview["ok"])
+        self.assertFalse(any("Market not initialized" in warning for warning in preview["warnings"]))
 
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:

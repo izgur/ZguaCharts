@@ -10806,6 +10806,115 @@ def build_research_refresh_active_paper_data(args=None) -> tuple[dict, int]:
     return payload, 200 if payload.get("ok") else 400
 
 
+def expected_active_paper_init_confirmation(candidate: dict) -> str:
+    return f"INIT PAPER ONLY {candidate.get('candidateKey') or ''}"
+
+
+def build_research_init_active_paper_candidate(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    expected_confirm = expected_active_paper_init_confirmation(candidate)
+    provided_confirm = str(args.get("confirm") or "")
+    before_config_hash = hash_file_for_preview(PAPER_CANDIDATE_LOCAL_PATH)
+    before_params = json.dumps(candidate.get("params") or {}, sort_keys=True, separators=(",", ":"))
+    if provided_confirm != expected_confirm:
+        return {
+            "ok": False,
+            "error": "Exact confirmation required; no paper state was initialized.",
+            "expectedConfirm": expected_confirm,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": paper_real_trading_enabled()[0],
+        }, 400
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    if not paper_enabled:
+        return {"ok": False, "error": "paperEnabled must be true before initializing the active paper candidate.", "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": real_enabled}, 400
+    if real_enabled or candidate.get("realTradingEnabled"):
+        return {"ok": False, "error": real_detail, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": True}, 400
+    if candidate.get("mode") != "PAPER_ONLY" or candidate.get("exchangeOrders"):
+        return {"ok": False, "error": "Active candidate must be PAPER_ONLY with exchangeOrders=false.", "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False}, 400
+    active = primary_active_market(candidate)
+    symbol = active.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe")
+    if not symbol or not timeframe:
+        return {"ok": False, "error": "No active paper market is configured.", "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False}, 400
+    market_key = paper_market_key(active)
+    state_before = read_json_file(str(PAPER_STATE_PATH), {}) if PAPER_STATE_PATH.exists() else {}
+    last_processed = state_before.get("lastProcessedCandleTime") if isinstance(state_before.get("lastProcessedCandleTime"), dict) else {}
+    already_initialized = bool(last_processed.get(market_key))
+    initialized_time = last_processed.get(market_key)
+    candles = []
+    if not already_initialized:
+        payload = fetch_candles(candidate.get("source") or "bybit", symbol, timeframe, limit=int(safe_float(args.get("limit", 600), 600)), visible_charts=1)
+        candles = payload.get("candles") or []
+        closed_candles = candles[:-1] if len(candles) > 1 else candles
+        if not closed_candles:
+            return {"ok": False, "error": f"No closed candles available for {symbol} {timeframe}; active paper market was not initialized.", "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False}, 400
+        initialized_time = int(safe_float(closed_candles[-1].get("time"), 0))
+        state = dict(state_before)
+        state.setdefault("accountEquity", safe_float(candidate.get("accountEquity"), 10000))
+        state.setdefault("openPositions", [])
+        state.setdefault("closedTrades", [])
+        state.setdefault("pendingSignals", [])
+        state.setdefault("skippedSignals", 0)
+        state.setdefault("cumulativeFees", 0)
+        state.setdefault("cumulativeSlippage", 0)
+        state.setdefault("realizedPnl", 0)
+        state.setdefault("unrealizedPnl", 0)
+        state.setdefault("equityCurve", [])
+        state.setdefault("processedCandles", 0)
+        state.setdefault("startedAt", datetime.now(timezone.utc).isoformat())
+        state.setdefault("paperEnabled", True)
+        state.setdefault("realTradingEnabled", False)
+        state.setdefault("liveOrdersTouched", False)
+        state.setdefault("paperTickRan", False)
+        state.setdefault("strategy", candidate.get("strategy"))
+        state.setdefault("symbol", symbol)
+        state.setdefault("timeframe", timeframe)
+        state.setdefault("paramsHash", candidate.get("paramsHash"))
+        state.setdefault("candidateKey", candidate.get("candidateKey"))
+        state.setdefault("mode", "PAPER_ONLY")
+        state.setdefault("warnings", [])
+        state["lastProcessedCandleTime"] = {market_key: initialized_time}
+        state["freshness"] = state.get("freshness") if isinstance(state.get("freshness"), dict) else {}
+        state["freshness"][market_key] = {
+            "latestCandleTime": initialized_time,
+            "expectedIntervalSeconds": paper_interval_seconds(timeframe),
+            "latestClosedCandleAgeSeconds": max(0, int(datetime.now(timezone.utc).timestamp()) - initialized_time),
+            "staleThresholdSeconds": paper_interval_seconds(timeframe) * 2 + 30 * 60,
+            "isStale": False,
+            "initializedBy": "paper:init-active-candidate",
+        }
+        state["updatedAt"] = datetime.now(timezone.utc).isoformat()
+        PAPER_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PAPER_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    final_candidate = load_paper_candidate_config()
+    after_config_hash = hash_file_for_preview(PAPER_CANDIDATE_LOCAL_PATH)
+    after_params = json.dumps(final_candidate.get("params") or {}, sort_keys=True, separators=(",", ":"))
+    final_state = read_json_file(str(PAPER_STATE_PATH), {})
+    final_last_processed = final_state.get("lastProcessedCandleTime") if isinstance(final_state.get("lastProcessedCandleTime"), dict) else {}
+    initialized_markets = sorted(final_last_processed.keys())
+    return {
+        "ok": True,
+        "strategy": candidate.get("strategy"),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candidateKey": candidate.get("candidateKey"),
+        "paramsHash": candidate.get("paramsHash"),
+        "initializedMarkets": initialized_markets,
+        "activeInitializedMarket": market_key,
+        "initializedCandleTime": final_last_processed.get(market_key),
+        "alreadyInitialized": already_initialized,
+        "candlesRead": len(candles),
+        "paramsUnchanged": before_params == after_params,
+        "configUnchanged": before_config_hash == after_config_hash,
+        "paperTickRan": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": False,
+    }, 200
+
+
 def preview_estimated_order(candidate: dict, signal: str, latest_candle: dict | None, current_position: dict | None, reason: str) -> tuple[str, dict | None]:
     signal = str(signal or "NONE").upper()
     price = safe_float((latest_candle or {}).get("close"), 0)
