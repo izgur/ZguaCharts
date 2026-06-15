@@ -1733,6 +1733,50 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["paperStateChanged"])
         run_mock.assert_not_called()
 
+    def test_paper_status_shows_processed_tick_history_without_mutation(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 1781524800}
+        state["processedCandles"] = 1
+        state["accountEquity"] = 10000
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        audit = {
+            "candidateIdentity": "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca",
+            "previewSignal": "HOLD",
+            "previewProposedAction": "no action",
+            "openedTrade": False,
+            "closedTrade": False,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+        }
+        zgua_app.PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        (zgua_app.PAPER_TICK_AUDIT_DIR / "tick-audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        payload, status = zgua_app.build_research_paper_status({})
+        after = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["statusSnapshotOnly"])
+        self.assertFalse(payload["statusCommandRanTick"])
+        self.assertEqual(payload["message"], "Read-only paper status snapshot. This command did not run a paper tick.")
+        self.assertNotIn("No paper tick was run", payload["message"])
+        self.assertEqual(payload["paperTickHistory"]["lastProcessedCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["paperTickHistory"]["lastProcessedCandleTime"], 1781524800)
+        self.assertEqual(payload["paperTickHistory"]["processedCandleCount"], 1)
+        self.assertEqual(payload["paperTickHistory"]["lastTickSignal"], "HOLD")
+        self.assertEqual(payload["paperTickHistory"]["lastTickAction"], "no action")
+        self.assertFalse(payload["paperTickHistory"]["lastTickOpenedTrade"])
+        self.assertFalse(payload["paperTickHistory"]["lastTickClosedTrade"])
+        self.assertEqual(payload["paperTickHistory"]["lastTickEquityBefore"], 10000)
+        self.assertEqual(payload["paperTickHistory"]["lastTickEquityAfter"], 10000)
+        self.assertTrue(payload["paperTickHistory"]["lastTickAuditPath"])
+        self.assertEqual(payload["duplicateGuard"]["lastProcessedCandidateKey"], audit["candidateIdentity"])
+        self.assertEqual(payload["duplicateGuard"]["lastProcessedSymbol"], "BTCUSDT")
+        self.assertEqual(payload["duplicateGuard"]["lastProcessedTimeframe"], "4h")
+        self.assertTrue(payload["duplicateGuard"]["duplicateGuardActive"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertEqual(before, after)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")

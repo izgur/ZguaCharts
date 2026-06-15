@@ -11304,6 +11304,64 @@ def write_confirmed_tick_audit(payload: dict) -> Path:
     return path
 
 
+def latest_confirmed_tick_audit(candidate_key: str | None = None) -> tuple[dict, Path | None]:
+    if not PAPER_TICK_AUDIT_DIR.exists():
+        return {}, None
+    audits = sorted(PAPER_TICK_AUDIT_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in audits:
+        payload = read_json_file(str(path), {})
+        if not isinstance(payload, dict):
+            continue
+        if candidate_key and payload.get("candidateIdentity") not in {None, candidate_key}:
+            continue
+        return payload, path
+    return {}, None
+
+
+def build_research_paper_status(args=None) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    market_key = paper_market_key(active)
+    state = read_json_file(str(PAPER_STATE_PATH), {}) if PAPER_STATE_PATH.exists() else {}
+    last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
+    last_processed_time = last_processed.get(market_key) if market_key else None
+    audit, audit_path = latest_confirmed_tick_audit(candidate.get("candidateKey"))
+    audit_mtime = datetime.fromtimestamp(audit_path.stat().st_mtime, timezone.utc).isoformat() if audit_path else None
+    real_enabled, real_detail = paper_real_trading_enabled()
+    tick_result = audit.get("tickResult") if isinstance(audit.get("tickResult"), dict) else {}
+    paper_tick_history = {
+        "lastProcessedCandleAt": epoch_to_iso(last_processed_time),
+        "lastProcessedCandleTime": last_processed_time,
+        "lastTickAt": audit.get("generatedAt") or audit.get("tickAt") or audit.get("createdAt") or audit_mtime,
+        "lastTickAuditPath": autopilot_display_path(audit_path) if audit_path else None,
+        "processedCandleCount": state.get("processedCandles"),
+        "lastTickSignal": audit.get("previewSignal") or tick_result.get("signal"),
+        "lastTickAction": audit.get("previewProposedAction") or tick_result.get("action") or tick_result.get("proposedAction"),
+        "lastTickOpenedTrade": audit.get("openedTrade"),
+        "lastTickClosedTrade": audit.get("closedTrade"),
+        "lastTickEquityBefore": audit.get("equityBefore"),
+        "lastTickEquityAfter": audit.get("equityAfter"),
+    }
+    duplicate_guard = {
+        "lastProcessedCandidateKey": candidate.get("candidateKey") if last_processed_time else None,
+        "lastProcessedSymbol": active.get("symbol") if last_processed_time else None,
+        "lastProcessedTimeframe": (active.get("interval") or active.get("timeframe")) if last_processed_time else None,
+        "duplicateGuardActive": bool(market_key and last_processed_time),
+    }
+    return {
+        "ok": True,
+        "statusSnapshotOnly": True,
+        "statusCommandRanTick": False,
+        "candidate": candidate_summary(candidate),
+        "paperTickHistory": paper_tick_history,
+        "duplicateGuard": duplicate_guard,
+        "realTradingEnabled": real_enabled,
+        "realTradingDetail": real_detail,
+        "liveOrdersTouched": False,
+        "message": "Read-only paper status snapshot. This command did not run a paper tick.",
+    }, 200
+
+
 def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
     args = args or {}
     candidate = load_paper_candidate_config()
