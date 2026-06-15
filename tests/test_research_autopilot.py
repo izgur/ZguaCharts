@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -1879,6 +1880,59 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["safety"]["liveOrdersTouched"])
         self.assertFalse(payload["safety"]["realTradingEnabled"])
 
+    def operator_due_payload(self, due=False, reason=None, confirmation=None):
+        confirmation = confirmation or "RUN ONE PAPER TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca 1970-01-01T00:33:20+00:00"
+        return {
+            "ok": True,
+            "schedulerEnabled": False,
+            "autoTickEnabled": False,
+            "tickDue": due,
+            "reason": reason or ("New closed candle available." if due else "No new closed candle since last processed candle."),
+            "strategy": "EmaBounceV2",
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "lastProcessedCandleAt": "2026-06-15T16:00:00+00:00",
+            "lastProcessedCandleTime": 1781539200,
+            "latestClosedCandleAt": "2026-06-15T16:00:00+00:00",
+            "latestClosedCandleTime": 1781539200,
+            "latestOpenCandleAt": None,
+            "latestCachedCandleAt": "2026-06-15T16:00:00+00:00",
+            "freshnessStatus": "FRESH",
+            "candleAlignmentStatus": "ALIGNED",
+            "paperTickAllowed": due,
+            "requiredConfirmation": confirmation if due else None,
+            "nextSafeCommand": f'python scripts\\research_autopilot.py paper:tick-once --confirm "{confirmation}"' if due else None,
+            "safety": {"paperStateChanged": False, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False},
+        }
+
+    def operator_preview_payload(self, signal="HOLD", action="no action", order=None, blockers=None):
+        return {
+            "ok": True,
+            "signal": signal,
+            "proposedAction": action,
+            "proposedOrder": order,
+            "currentPaperPosition": None,
+            "blockers": blockers or [],
+            "warnings": [],
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+        }
+
+    def operator_patch_common(self, due_payload=None, freshness=None, alignment=None, preview=None):
+        freshness = freshness or self.tick_due_freshness(1781539200)
+        alignment = alignment or self.tick_alignment_payload(expected_at="2026-06-15T16:00:00+00:00", expected_time=1781539200)
+        due_payload = due_payload or self.operator_due_payload(False)
+        patches = [
+            patch.object(zgua_app, "active_paper_market_freshness", return_value=freshness),
+            patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(alignment, 200)),
+            patch.object(zgua_app, "build_research_paper_tick_due", return_value=(due_payload, 200)),
+        ]
+        if preview is not None:
+            patches.append(patch.object(zgua_app, "build_research_preview_paper_tick", return_value=(preview, 200)))
+        return patches
+
     def test_paper_tick_due_false_when_latest_closed_equals_last_processed(self):
         self.write_active_paper_config()
         state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
@@ -1949,6 +2003,123 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["reason"], "Paper tick blocked because candle alignment is not safe.")
         self.assertIsNone(payload["requiredConfirmation"])
         self.assert_tick_due_safety(payload)
+
+    def test_paper_operator_check_without_refresh_waits_and_does_not_mutate(self):
+        self.write_active_paper_config()
+        before = zgua_app.preview_file_hashes()
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=self.operator_due_payload(False)):
+                stack.enter_context(item)
+            refresh_mock = stack.enter_context(patch.object(zgua_app, "build_research_refresh_active_paper_data"))
+            preview_mock = stack.enter_context(patch.object(zgua_app, "build_research_preview_paper_tick"))
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["operatorCheckOnly"])
+        self.assertFalse(payload["refreshAttempted"])
+        self.assertFalse(payload["refreshed"])
+        self.assertEqual(payload["nextHumanAction"], "WAIT_FOR_NEXT_CLOSED_CANDLE")
+        self.assertFalse(payload["dueSummary"]["tickDue"])
+        self.assertIsNone(payload["previewSummary"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertFalse(payload["safety"]["autoTickEnabled"])
+        self.assertFalse(payload["safety"]["schedulerEnabled"])
+        refresh_mock.assert_not_called()
+        preview_mock.assert_not_called()
+        self.assertEqual(before, after)
+
+    def test_paper_operator_check_refresh_does_not_mutate_paper_files(self):
+        self.write_active_paper_config()
+        before = zgua_app.preview_file_hashes()
+        refresh_payload = {
+            "ok": True,
+            "refreshed": True,
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+        }
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=self.operator_due_payload(False)):
+                stack.enter_context(item)
+            refresh_mock = stack.enter_context(patch.object(zgua_app, "build_research_refresh_active_paper_data", return_value=(refresh_payload, 200)))
+            payload, status = zgua_app.build_research_paper_operator_check({"refresh": True})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["refreshAttempted"])
+        self.assertTrue(payload["refreshed"])
+        self.assertEqual(payload["nextHumanAction"], "WAIT_FOR_NEXT_CLOSED_CANDLE")
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        refresh_mock.assert_called_once()
+        self.assertEqual(before, after)
+
+    def test_paper_operator_check_due_hold_is_safe_to_run_single_confirmed_tick(self):
+        self.write_active_paper_config()
+        due = self.operator_due_payload(True)
+        preview = self.operator_preview_payload(signal="HOLD", action="no action")
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=due, preview=preview):
+                stack.enter_context(item)
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["nextHumanAction"], "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK")
+        self.assertTrue(payload["dueSummary"]["tickDue"])
+        self.assertTrue(payload["dueSummary"]["nextSafeCommand"])
+        self.assertEqual(payload["previewSummary"]["signal"], "HOLD")
+        self.assertEqual(payload["previewSummary"]["proposedAction"], "no action")
+        self.assertFalse(payload["safety"]["paperTickRan"])
+
+    def test_paper_operator_check_due_order_requires_preview_review(self):
+        self.write_active_paper_config()
+        due = self.operator_due_payload(True)
+        preview = self.operator_preview_payload(signal="BUY", action="would open long", order={"side": "buy", "notional": 100})
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=due, preview=preview):
+                stack.enter_context(item)
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["nextHumanAction"], "REVIEW_PREVIEW_BEFORE_TICK")
+        self.assertEqual(payload["previewSummary"]["proposedOrder"]["side"], "buy")
+        self.assertFalse(payload["safety"]["paperTickRan"])
+
+    def test_paper_operator_check_stale_freshness_is_blocked(self):
+        self.write_active_paper_config()
+        stale = self.tick_due_freshness(1781539200, status="STALE", blocking=True)
+        due = self.operator_due_payload(False, reason="Paper tick blocked because freshness is not safe.")
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=due, freshness=stale):
+                stack.enter_context(item)
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["nextHumanAction"], "BLOCKED")
+        self.assertEqual(payload["freshnessSummary"]["freshnessStatus"], "STALE")
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+
+    def test_paper_operator_check_candle_mismatch_is_blocked(self):
+        self.write_active_paper_config()
+        mismatch = self.tick_alignment_payload(status="MISMATCH", expected_time=1781539200)
+        due = self.operator_due_payload(False, reason="Paper tick blocked because candle alignment is not safe.")
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=due, alignment=mismatch):
+                stack.enter_context(item)
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["nextHumanAction"], "BLOCKED")
+        self.assertEqual(payload["alignmentSummary"]["candleAlignmentStatus"], "MISMATCH")
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
 
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:

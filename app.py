@@ -11472,6 +11472,114 @@ def build_research_paper_tick_due(args=None) -> tuple[dict, int]:
     return payload, 200 if payload.get("ok") else 500
 
 
+def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
+    args = args or {}
+    refresh_requested = bool(args.get("refresh"))
+    before = preview_file_hashes()
+    refresh_payload = None
+    if refresh_requested:
+        refresh_payload, refresh_status = build_research_refresh_active_paper_data(args)
+    status_payload, _status_code = build_research_paper_status(args)
+    freshness = active_paper_market_freshness(args)
+    alignment, alignment_status = build_research_paper_candle_alignment(args)
+    due, due_status = build_research_paper_tick_due(args)
+    preview = None
+    if due.get("tickDue"):
+        preview, _preview_status = build_research_preview_paper_tick(args)
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    candidate = status_payload.get("candidate") or {}
+    active = (candidate.get("activeSymbols") or [{}])[0]
+    history = status_payload.get("paperTickHistory") or {}
+    status_summary = {
+        "paperEnabled": candidate.get("paperEnabled"),
+        "strategy": candidate.get("strategy"),
+        "symbol": active.get("symbol"),
+        "timeframe": active.get("interval") or active.get("timeframe"),
+        "equity": candidate.get("accountEquity"),
+        "openPositions": len((paper_state_snapshot().get("openPositions") or [])),
+        "lastProcessedCandleAt": history.get("lastProcessedCandleAt"),
+        "lastProcessedTickSignal": history.get("lastProcessedTickSignal") or history.get("lastTickSignal"),
+        "lastProcessedTickAction": history.get("lastProcessedTickAction") or history.get("lastTickAction"),
+        "lastProcessedTickOpenedTrade": history.get("lastProcessedTickOpenedTrade") if "lastProcessedTickOpenedTrade" in history else history.get("lastTickOpenedTrade"),
+        "lastProcessedTickClosedTrade": history.get("lastProcessedTickClosedTrade") if "lastProcessedTickClosedTrade" in history else history.get("lastTickClosedTrade"),
+    }
+    freshness_summary = {
+        "freshnessStatus": freshness.get("freshnessStatus"),
+        "latestCachedCandleAt": freshness.get("latestCachedCandleAt"),
+        "latestCachedCandleIsOpen": freshness.get("latestCachedCandleIsOpen"),
+        "latestClosedCandleAt": freshness.get("latestClosedCandleAt"),
+        "latestOpenCandleAt": freshness.get("latestOpenCandleAt"),
+    }
+    alignment_summary = {
+        "candleAlignmentStatus": alignment.get("candleAlignmentStatus"),
+        "openTailIgnored": alignment.get("openTailIgnored"),
+        "expectedLatestClosedCandleAt": alignment.get("expectedLatestClosedCandleAt"),
+        "signalEvaluationCandleAt": alignment.get("signalEvaluationCandleAt"),
+        "tickDryRunCandleAt": alignment.get("tickDryRunCandleAt"),
+    }
+    due_summary = {
+        "tickDue": due.get("tickDue"),
+        "reason": due.get("reason"),
+        "requiredConfirmation": due.get("requiredConfirmation"),
+        "nextSafeCommand": due.get("nextSafeCommand"),
+    }
+    preview_summary = None
+    if preview is not None:
+        preview_summary = {
+            "signal": preview.get("signal"),
+            "proposedAction": preview.get("proposedAction"),
+            "proposedOrder": preview.get("proposedOrder"),
+            "currentPaperPosition": preview.get("currentPaperPosition"),
+            "blockers": preview.get("blockers") or [],
+            "warnings": preview.get("warnings") or [],
+        }
+    blocked = (
+        not state_unchanged
+        or due_status >= 400
+        or alignment_status >= 400
+        or freshness.get("blockingForPaperTick")
+        or alignment.get("blockingForPaperTick")
+        or status_payload.get("realTradingEnabled")
+        or bool((preview_summary or {}).get("blockers"))
+    )
+    if blocked:
+        next_human_action = "BLOCKED"
+    elif not due.get("tickDue"):
+        next_human_action = "WAIT_FOR_NEXT_CLOSED_CANDLE"
+    elif str((preview or {}).get("proposedAction") or "").strip().lower() in {"", "no action", "hold"}:
+        next_human_action = "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK"
+    else:
+        next_human_action = "REVIEW_PREVIEW_BEFORE_TICK"
+    real_enabled, _real_detail = paper_real_trading_enabled()
+    safety = paper_safety_snapshot(real_enabled)
+    safety.update({"autoTickEnabled": False, "schedulerEnabled": False})
+    payload = {
+        "ok": bool(state_unchanged and not status_payload.get("realTradingEnabled")),
+        "operatorCheckOnly": True,
+        "refreshAttempted": refresh_requested,
+        "refreshed": bool(refresh_payload.get("refreshed")) if isinstance(refresh_payload, dict) else False,
+        "statusSummary": status_summary,
+        "safety": safety,
+        "freshnessSummary": freshness_summary,
+        "alignmentSummary": alignment_summary,
+        "dueSummary": due_summary,
+        "previewSummary": preview_summary,
+        "nextHumanAction": next_human_action,
+        "status": status_payload,
+        "freshness": freshness,
+        "candleAlignment": alignment,
+        "tickDue": due,
+        "refresh": refresh_payload,
+        "fileHashesBefore": before,
+        "fileHashesAfter": after,
+        "stateUnchanged": state_unchanged,
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+    return payload, 200 if payload.get("ok") else 500
+
+
 def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
     args = args or {}
     candidate = load_paper_candidate_config()
