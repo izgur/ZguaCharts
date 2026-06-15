@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1742,6 +1743,9 @@ class ResearchAutopilotTests(unittest.TestCase):
         zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
         audit = {
             "candidateIdentity": "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca",
+            "paperTickRan": True,
+            "paperStateChanged": True,
+            "confirmationMatched": True,
             "previewSignal": "HOLD",
             "previewProposedAction": "no action",
             "openedTrade": False,
@@ -1762,6 +1766,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["paperTickHistory"]["lastProcessedCandleAt"], "2026-06-15T12:00:00+00:00")
         self.assertEqual(payload["paperTickHistory"]["lastProcessedCandleTime"], 1781524800)
         self.assertEqual(payload["paperTickHistory"]["processedCandleCount"], 1)
+        self.assertEqual(payload["paperTickHistory"]["lastProcessedTickSignal"], "HOLD")
+        self.assertEqual(payload["paperTickHistory"]["lastProcessedTickAction"], "no action")
         self.assertEqual(payload["paperTickHistory"]["lastTickSignal"], "HOLD")
         self.assertEqual(payload["paperTickHistory"]["lastTickAction"], "no action")
         self.assertFalse(payload["paperTickHistory"]["lastTickOpenedTrade"])
@@ -1769,12 +1775,83 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["paperTickHistory"]["lastTickEquityBefore"], 10000)
         self.assertEqual(payload["paperTickHistory"]["lastTickEquityAfter"], 10000)
         self.assertTrue(payload["paperTickHistory"]["lastTickAuditPath"])
+        self.assertEqual(payload["paperTickHistory"]["lastTickAuditPath"], payload["paperTickHistory"]["lastProcessedTickAuditPath"])
+        self.assertFalse(payload["paperTickLastAttempt"]["skipped"])
+        self.assertFalse(payload["paperTickLastAttempt"]["alreadyProcessed"])
+        self.assertTrue(payload["paperTickLastAttempt"]["paperTickRan"])
         self.assertEqual(payload["duplicateGuard"]["lastProcessedCandidateKey"], audit["candidateIdentity"])
         self.assertEqual(payload["duplicateGuard"]["lastProcessedSymbol"], "BTCUSDT")
         self.assertEqual(payload["duplicateGuard"]["lastProcessedTimeframe"], "4h")
         self.assertTrue(payload["duplicateGuard"]["duplicateGuardActive"])
         self.assertFalse(payload["realTradingEnabled"])
         self.assertFalse(payload["liveOrdersTouched"])
+        self.assertEqual(before, after)
+
+    def test_paper_status_keeps_processed_tick_separate_from_skipped_duplicate_attempt(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 1781539200}
+        state["processedCandles"] = 2
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        candidate_key = "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca"
+        processed = {
+            "candidateIdentity": candidate_key,
+            "paperTickRan": True,
+            "paperStateChanged": True,
+            "confirmationMatched": True,
+            "expectedLatestClosedCandleAt": "2026-06-15T16:00:00+00:00",
+            "processedCandleAt": 1781539200,
+            "previewSignal": "HOLD",
+            "previewProposedAction": "no action",
+            "openedTrade": False,
+            "closedTrade": False,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+        }
+        skipped = {
+            "candidateIdentity": candidate_key,
+            "alreadyProcessed": True,
+            "skipped": True,
+            "confirmationMatched": True,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "expectedLatestClosedCandleAt": "2026-06-15T16:00:00+00:00",
+            "processedCandleAt": 1781539200,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+        }
+        zgua_app.PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        processed_path = zgua_app.PAPER_TICK_AUDIT_DIR / "processed.json"
+        skipped_path = zgua_app.PAPER_TICK_AUDIT_DIR / "skipped.json"
+        processed_path.write_text(json.dumps(processed, indent=2), encoding="utf-8")
+        skipped_path.write_text(json.dumps(skipped, indent=2), encoding="utf-8")
+        os.utime(processed_path, (1000, 1000))
+        os.utime(skipped_path, (2000, 2000))
+        before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        payload, status = zgua_app.build_research_paper_status({})
+        after = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        history = payload["paperTickHistory"]
+        attempt = payload["paperTickLastAttempt"]
+        self.assertEqual(status, 200)
+        self.assertEqual(history["lastProcessedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(history["lastProcessedTickSignal"], "HOLD")
+        self.assertEqual(history["lastProcessedTickAction"], "no action")
+        self.assertEqual(history["lastTickSignal"], "HOLD")
+        self.assertEqual(history["lastTickAction"], "no action")
+        self.assertTrue(history["lastProcessedTickAuditPath"].endswith("processed.json"))
+        self.assertEqual(history["lastTickAuditPath"], history["lastProcessedTickAuditPath"])
+        self.assertTrue(attempt["lastAttemptAuditPath"].endswith("skipped.json"))
+        self.assertTrue(attempt["skipped"])
+        self.assertTrue(attempt["alreadyProcessed"])
+        self.assertTrue(attempt["confirmationMatched"])
+        self.assertFalse(attempt["paperTickRan"])
+        self.assertFalse(attempt["paperStateChanged"])
+        self.assertEqual(attempt["attemptedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(attempt["attemptedCandleTime"], 1781539200)
+        self.assertTrue(payload["duplicateGuard"]["duplicateGuardActive"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["statusCommandRanTick"])
         self.assertEqual(before, after)
 
     def tick_due_freshness(self, latest_time=2000, status="FRESH", blocking=False):

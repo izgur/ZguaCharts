@@ -11304,7 +11304,23 @@ def write_confirmed_tick_audit(payload: dict) -> Path:
     return path
 
 
-def latest_confirmed_tick_audit(candidate_key: str | None = None) -> tuple[dict, Path | None]:
+def tick_audit_time(payload: dict, path: Path | None) -> str | None:
+    if payload:
+        value = payload.get("generatedAt") or payload.get("tickAt") or payload.get("createdAt")
+        if value:
+            return value
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat() if path else None
+
+
+def tick_audit_attempt_candle(payload: dict) -> tuple[int | None, str | None]:
+    candle_time = safe_float(payload.get("expectedLatestClosedCandleTime"), 0)
+    if not candle_time:
+        candle_time = safe_float(payload.get("processedCandleAt"), 0)
+    candle_at = payload.get("expectedLatestClosedCandleAt") or epoch_to_iso(candle_time)
+    return (int(candle_time) if candle_time else None), candle_at
+
+
+def latest_confirmed_tick_audit(candidate_key: str | None = None, processed_only: bool = False) -> tuple[dict, Path | None]:
     if not PAPER_TICK_AUDIT_DIR.exists():
         return {}, None
     audits = sorted(PAPER_TICK_AUDIT_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
@@ -11313,6 +11329,8 @@ def latest_confirmed_tick_audit(candidate_key: str | None = None) -> tuple[dict,
         if not isinstance(payload, dict):
             continue
         if candidate_key and payload.get("candidateIdentity") not in {None, candidate_key}:
+            continue
+        if processed_only and (payload.get("skipped") or payload.get("alreadyProcessed") or payload.get("paperTickRan") is not True):
             continue
         return payload, path
     return {}, None
@@ -11325,15 +11343,26 @@ def build_research_paper_status(args=None) -> tuple[dict, int]:
     state = read_json_file(str(PAPER_STATE_PATH), {}) if PAPER_STATE_PATH.exists() else {}
     last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
     last_processed_time = last_processed.get(market_key) if market_key else None
-    audit, audit_path = latest_confirmed_tick_audit(candidate.get("candidateKey"))
-    audit_mtime = datetime.fromtimestamp(audit_path.stat().st_mtime, timezone.utc).isoformat() if audit_path else None
+    audit, audit_path = latest_confirmed_tick_audit(candidate.get("candidateKey"), processed_only=True)
+    attempt, attempt_path = latest_confirmed_tick_audit(candidate.get("candidateKey"))
     real_enabled, real_detail = paper_real_trading_enabled()
     tick_result = audit.get("tickResult") if isinstance(audit.get("tickResult"), dict) else {}
+    attempt_time, attempt_at = tick_audit_attempt_candle(attempt)
+    processed_tick_at = tick_audit_time(audit, audit_path)
+    processed_audit_path = autopilot_display_path(audit_path) if audit_path else None
     paper_tick_history = {
         "lastProcessedCandleAt": epoch_to_iso(last_processed_time),
         "lastProcessedCandleTime": last_processed_time,
-        "lastTickAt": audit.get("generatedAt") or audit.get("tickAt") or audit.get("createdAt") or audit_mtime,
-        "lastTickAuditPath": autopilot_display_path(audit_path) if audit_path else None,
+        "lastProcessedTickAt": processed_tick_at,
+        "lastProcessedTickAuditPath": processed_audit_path,
+        "lastProcessedTickSignal": audit.get("previewSignal") or tick_result.get("signal"),
+        "lastProcessedTickAction": audit.get("previewProposedAction") or tick_result.get("action") or tick_result.get("proposedAction"),
+        "lastProcessedTickOpenedTrade": audit.get("openedTrade"),
+        "lastProcessedTickClosedTrade": audit.get("closedTrade"),
+        "lastProcessedTickEquityBefore": audit.get("equityBefore"),
+        "lastProcessedTickEquityAfter": audit.get("equityAfter"),
+        "lastTickAt": processed_tick_at,
+        "lastTickAuditPath": processed_audit_path,
         "processedCandleCount": state.get("processedCandles"),
         "lastTickSignal": audit.get("previewSignal") or tick_result.get("signal"),
         "lastTickAction": audit.get("previewProposedAction") or tick_result.get("action") or tick_result.get("proposedAction"),
@@ -11341,6 +11370,17 @@ def build_research_paper_status(args=None) -> tuple[dict, int]:
         "lastTickClosedTrade": audit.get("closedTrade"),
         "lastTickEquityBefore": audit.get("equityBefore"),
         "lastTickEquityAfter": audit.get("equityAfter"),
+    }
+    paper_tick_last_attempt = {
+        "lastAttemptAt": tick_audit_time(attempt, attempt_path),
+        "lastAttemptAuditPath": autopilot_display_path(attempt_path) if attempt_path else None,
+        "skipped": attempt.get("skipped"),
+        "alreadyProcessed": attempt.get("alreadyProcessed"),
+        "confirmationMatched": attempt.get("confirmationMatched"),
+        "paperTickRan": attempt.get("paperTickRan"),
+        "paperStateChanged": attempt.get("paperStateChanged"),
+        "attemptedCandleAt": attempt_at,
+        "attemptedCandleTime": attempt_time,
     }
     duplicate_guard = {
         "lastProcessedCandidateKey": candidate.get("candidateKey") if last_processed_time else None,
@@ -11354,6 +11394,7 @@ def build_research_paper_status(args=None) -> tuple[dict, int]:
         "statusCommandRanTick": False,
         "candidate": candidate_summary(candidate),
         "paperTickHistory": paper_tick_history,
+        "paperTickLastAttempt": paper_tick_last_attempt,
         "duplicateGuard": duplicate_guard,
         "realTradingEnabled": real_enabled,
         "realTradingDetail": real_detail,
