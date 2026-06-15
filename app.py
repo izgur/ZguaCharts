@@ -54,6 +54,7 @@ RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
 PAPER_CANDIDATE_REVIEW_DIR = Path(app.root_path) / "reports" / "paper-candidates"
 PAPER_CANDIDATE_ENABLE_AUDIT_DIR = PAPER_CANDIDATE_REVIEW_DIR / "enable-audits"
+PAPER_TICK_AUDIT_DIR = PAPER_CANDIDATE_REVIEW_DIR / "tick-audits"
 DEPLOY_REVIEW_CANDIDATE_DIR = Path(app.root_path) / "data" / "review-candidates"
 MAX_RESEARCH_RUNS = 200
 MAX_RESEARCH_ROWS = 50
@@ -11220,6 +11221,158 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
     if not payload["ok"] and not payload.get("blockers"):
         payload["blockers"] = [diagnostics.get("error") or tick_payload.get("error") or "Preview helper failed."]
     return payload, 200 if payload.get("ok") else 400
+
+
+def active_candidate_confirmation_phrase(candidate: dict, candle_at: str | None) -> str:
+    return f"RUN ONE PAPER TICK {candidate.get('candidateKey') or ''} {candle_at or ''}"
+
+
+def paper_state_market_snapshot(candidate: dict) -> dict:
+    state = read_json_file(str(PAPER_STATE_PATH), {}) if PAPER_STATE_PATH.exists() else {}
+    active = primary_active_market(candidate)
+    key = paper_market_key(active)
+    last_processed = state.get("lastProcessedCandleTime") if isinstance(state.get("lastProcessedCandleTime"), dict) else {}
+    return {
+        "state": state,
+        "marketKey": key,
+        "lastProcessedCandleTime": last_processed.get(key),
+        "accountEquity": safe_float(state.get("accountEquity"), safe_float(candidate.get("accountEquity"), 10000)),
+        "openPositions": state.get("openPositions", []) or [],
+        "closedTrades": state.get("closedTrades", []) or [],
+    }
+
+
+def write_confirmed_tick_audit(payload: dict) -> Path:
+    PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(payload.get("candidateIdentity") or "candidate")).strip("-")
+    path = PAPER_TICK_AUDIT_DIR / f"{safe_key}-tick-{timestamp}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    return path
+
+
+def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    symbol = active.get("symbol") or candidate.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    candidate_key = candidate.get("candidateKey")
+    real_enabled, real_detail = paper_real_trading_enabled()
+    freshness = active_paper_market_freshness(args)
+    alignment, alignment_status = build_research_paper_candle_alignment(args)
+    expected_at = alignment.get("expectedLatestClosedCandleAt")
+    expected_time = alignment.get("expectedLatestClosedCandleTime")
+    expected_confirm = active_candidate_confirmation_phrase(candidate, expected_at)
+    confirm = str(args.get("confirm") or "")
+    base = {
+        "ok": False,
+        "command": "paper:tick-once",
+        "candidateIdentity": candidate_key,
+        "expectedLatestClosedCandleAt": expected_at,
+        "confirmationMatched": confirm == expected_confirm,
+        "freshnessStatus": freshness.get("freshnessStatus"),
+        "candleAlignmentStatus": alignment.get("candleAlignmentStatus"),
+        "previewSignal": None,
+        "previewProposedAction": None,
+        "tickRan": False,
+        "paperTickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled or candidate.get("realTradingEnabled")),
+        "openedTrade": False,
+        "closedTrade": False,
+        "equityBefore": None,
+        "equityAfter": None,
+        "openPositionsBefore": None,
+        "openPositionsAfter": None,
+        "processedCandleAt": None,
+        "auditPath": None,
+        "warnings": [],
+    }
+    def refused(message: str, status: int = 400, extra: dict | None = None):
+        payload = {**base, "error": message, "requiredConfirmation": expected_confirm}
+        if extra:
+            payload.update(extra)
+        return payload, status
+    if confirm != expected_confirm:
+        return refused("Exact confirmation required; no paper tick was run.")
+    if not canonical_paper_enabled(candidate):
+        return refused("paperEnabled must be true before running one confirmed paper tick.")
+    if candidate.get("strategy") != "EmaBounceV2" or symbol != "BTCUSDT" or timeframe != "4h":
+        return refused("Active paper candidate must be EmaBounceV2 BTCUSDT 4h.")
+    if real_enabled or candidate.get("realTradingEnabled"):
+        return refused(real_detail if real_enabled else "Candidate realTradingEnabled must be false.", extra={"realTradingEnabled": True})
+    if candidate.get("exchangeOrders"):
+        return refused("exchangeOrders must be false.")
+    if candidate.get("liveOrdersTouched"):
+        return refused("liveOrdersTouched must be false.")
+    if candidate.get("mode") != "PAPER_ONLY":
+        return refused("mode must be PAPER_ONLY.")
+    if freshness.get("freshnessStatus") != "FRESH" or freshness.get("blockingForPaperTick"):
+        return refused("Freshness must be FRESH before running one paper tick.", extra={"freshness": freshness})
+    if alignment_status >= 400 or alignment.get("candleAlignmentStatus") not in {"ALIGNED", "EXPLAINED_OFFSET"} or alignment.get("blockingForPaperTick"):
+        return refused("Candle alignment must be ALIGNED or explicitly safe before running one paper tick.", extra={"candleAlignment": alignment})
+    before_market = paper_state_market_snapshot(candidate)
+    if not before_market.get("lastProcessedCandleTime"):
+        return refused("Active paper market is not initialized.")
+    if safe_float(before_market.get("lastProcessedCandleTime"), 0) >= safe_float(expected_time, 0):
+        audit_payload = {**base, "ok": True, "alreadyProcessed": True, "skipped": True, "processedCandleAt": before_market.get("lastProcessedCandleTime"), "equityBefore": before_market.get("accountEquity"), "equityAfter": before_market.get("accountEquity"), "openPositionsBefore": len(before_market.get("openPositions") or []), "openPositionsAfter": len(before_market.get("openPositions") or []), "confirmationMatched": True, "realTradingEnabled": False}
+        audit_path = write_confirmed_tick_audit(audit_payload)
+        audit_payload["auditPath"] = autopilot_display_path(audit_path)
+        return audit_payload, 200
+    preview, preview_status = build_research_preview_paper_tick(args)
+    base["previewSignal"] = preview.get("signal")
+    base["previewProposedAction"] = preview.get("proposedAction")
+    if preview_status >= 400 or not preview.get("ok") or preview.get("blockingForPaperTick") or not preview.get("paperTickAllowed"):
+        return refused("Preview blocked paper tick; no paper tick was run.", extra={"preview": preview})
+    before_hashes = preview_file_hashes()
+    before_snapshot = paper_state_snapshot()
+    completed = subprocess.run(
+        package_node_script_args("paper:tick"),
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
+    )
+    stdout_payload = {}
+    if completed.stdout.strip():
+        try:
+            stdout_payload = json.loads(completed.stdout)
+        except Exception:
+            stdout_payload = {"raw": completed.stdout.strip()}
+    after_hashes = preview_file_hashes()
+    after_snapshot = paper_state_snapshot()
+    after_market = paper_state_market_snapshot(candidate)
+    opened = len(after_snapshot.get("openPositions") or []) > len(before_snapshot.get("openPositions") or [])
+    closed = len(after_snapshot.get("closedTrades") or []) > len(before_snapshot.get("closedTrades") or [])
+    payload = {
+        **base,
+        "ok": completed.returncode == 0,
+        "confirmationMatched": True,
+        "tickRan": completed.returncode == 0,
+        "paperTickRan": completed.returncode == 0,
+        "paperStateChanged": before_hashes.get("state") != after_hashes.get("state"),
+        "liveOrdersTouched": False,
+        "realTradingEnabled": False,
+        "openedTrade": opened,
+        "closedTrade": closed,
+        "equityBefore": before_snapshot.get("updatedAt") and before_market.get("accountEquity") or before_market.get("accountEquity"),
+        "equityAfter": after_market.get("accountEquity"),
+        "openPositionsBefore": len(before_snapshot.get("openPositions") or []),
+        "openPositionsAfter": len(after_snapshot.get("openPositions") or []),
+        "processedCandleAt": after_market.get("lastProcessedCandleTime"),
+        "tickResult": stdout_payload,
+        "returnCode": completed.returncode,
+        "warnings": dedupe_list((preview.get("warnings") or []) + (stdout_payload.get("warnings") or [])),
+        "fileHashesBefore": before_hashes,
+        "fileHashesAfter": after_hashes,
+    }
+    if completed.returncode != 0:
+        payload["error"] = completed.stderr.strip() or "paper:tick command failed."
+    audit_path = write_confirmed_tick_audit(payload)
+    payload["auditPath"] = autopilot_display_path(audit_path)
+    return payload, 200 if payload.get("ok") else 502
 
 
 def build_research_paper_candidates() -> dict:

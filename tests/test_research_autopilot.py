@@ -22,6 +22,7 @@ def patch_autopilot_paths(testcase):
         patch.object(zgua_app, "PAPER_STATE_PATH", root / "paper-state.json"),
         patch.object(zgua_app, "PAPER_JOURNAL_PATH", root / "reports" / "paper-journal.jsonl"),
         patch.object(zgua_app, "PAPER_CANDIDATE_ENABLE_AUDIT_DIR", root / "paper-candidates" / "enable-audits"),
+        patch.object(zgua_app, "PAPER_TICK_AUDIT_DIR", root / "paper-candidates" / "tick-audits"),
         patch.object(zgua_app, "DEPLOY_REVIEW_CANDIDATE_DIR", root / "review-candidates"),
         patch.object(zgua_app, "candidate_ledger_source_files", return_value=[]),
     ]
@@ -1220,6 +1221,69 @@ class ResearchAutopilotTests(unittest.TestCase):
     def init_confirm_text(self):
         return "INIT PAPER ONLY candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca"
 
+    def tick_confirm_text(self, candle_at="2026-06-14T16:00:00+00:00"):
+        return f"RUN ONE PAPER TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca {candle_at}"
+
+    def tick_alignment_payload(self, status="ALIGNED", expected_at="2026-06-14T16:00:00+00:00", expected_time=2000):
+        blocking = status == "MISMATCH"
+        return {
+            "ok": True,
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "freshnessLatestCandleTime": expected_time,
+            "freshnessLatestCandleAt": expected_at,
+            "signalEvaluationCandleTime": expected_time if not blocking else expected_time - 14400,
+            "signalEvaluationCandleAt": expected_at if not blocking else "2026-06-14T12:00:00+00:00",
+            "tickDryRunCandleTime": expected_time if not blocking else expected_time - 14400,
+            "tickDryRunCandleAt": expected_at if not blocking else "2026-06-14T12:00:00+00:00",
+            "expectedLatestClosedCandleTime": expected_time,
+            "expectedLatestClosedCandleAt": expected_at,
+            "candleAlignmentStatus": status,
+            "blockingForPaperTick": blocking,
+            "paperTickAllowed": not blocking,
+            "safety": {"paperStateChanged": False, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False},
+        }
+
+    def fresh_payload_for_tick(self):
+        return {
+            "ok": True,
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "latestCandleTime": 2000,
+            "latestCandleAt": "2026-06-14T16:00:00+00:00",
+            "freshnessStatus": "FRESH",
+            "blockingForPaperTick": False,
+            "paperTickAllowed": True,
+            "safety": {"paperStateChanged": False, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False},
+        }
+
+    def preview_allowed_payload(self, signal="HOLD", action="no action"):
+        return {
+            "ok": True,
+            "previewOnly": True,
+            "paperEnabled": True,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "blockingForPaperTick": False,
+            "paperTickAllowed": True,
+            "signal": signal,
+            "proposedAction": action,
+            "warnings": [],
+        }
+
+    def fake_confirmed_tick_run(self, expected_time=2000):
+        def fake_run(command, text, capture_output, cwd, timeout):
+            state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            state["lastProcessedCandleTime"] = {"BTCUSDT:4h": expected_time}
+            state["processedCandles"] = int(state.get("processedCandles") or 0) + 1
+            state["updatedAt"] = "2026-06-14T16:01:00+00:00"
+            zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            payload = {"status": "processed", "events": 0, "openPositions": 0, "closedTrades": 0, "warnings": [], "freshness": {"BTCUSDT:4h": {"latestCandleTime": expected_time}}}
+            return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
+        return fake_run
+
     def init_candles_payload(self):
         now = int(datetime.now(timezone.utc).timestamp())
         return {
@@ -1523,6 +1587,104 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertTrue(preview["ok"])
         self.assertFalse(any("Market not initialized" in warning for warning in preview["warnings"]))
 
+    def test_confirmed_tick_once_fails_with_missing_confirmation(self):
+        self.write_active_paper_config()
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": ""})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["confirmationMatched"])
+        self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
+        run_mock.assert_not_called()
+
+    def test_confirmed_tick_once_fails_with_wrong_candidate_or_candle(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            wrong_candidate, candidate_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": "RUN ONE PAPER TICK wrong 2026-06-14T16:00:00+00:00"})
+            wrong_candle, candle_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text("2026-06-14T20:00:00+00:00")})
+        self.assertEqual(candidate_status, 400)
+        self.assertEqual(candle_status, 400)
+        self.assertFalse(wrong_candidate["confirmationMatched"])
+        self.assertFalse(wrong_candle["confirmationMatched"])
+        run_mock.assert_not_called()
+
+    def test_confirmed_tick_once_fails_if_freshness_stale_or_alignment_mismatch(self):
+        self.write_active_paper_config()
+        stale = {**self.fresh_payload_for_tick(), "freshnessStatus": "STALE", "blockingForPaperTick": True, "paperTickAllowed": False}
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=stale), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            stale_payload, stale_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload("MISMATCH"), 200)), patch.object(zgua_app.subprocess, "run") as run_mock_2:
+            mismatch_payload, mismatch_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.assertEqual(stale_status, 400)
+        self.assertEqual(mismatch_status, 400)
+        self.assertFalse(stale_payload["paperTickRan"])
+        self.assertFalse(mismatch_payload["paperTickRan"])
+        run_mock.assert_not_called()
+        run_mock_2.assert_not_called()
+
+    def test_confirmed_tick_once_fails_if_market_uninitialized_or_unsafe_flags(self):
+        self.write_active_paper_config(initialized=False)
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)):
+            uninit, uninit_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.write_active_paper_config(real=True)
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)):
+            real, real_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.write_active_paper_config(exchange=True)
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)):
+            exchange, exchange_status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.assertEqual(uninit_status, 400)
+        self.assertEqual(real_status, 400)
+        self.assertEqual(exchange_status, 400)
+        self.assertFalse(uninit["paperTickRan"])
+        self.assertTrue(real["realTradingEnabled"])
+        self.assertFalse(exchange["paperTickRan"])
+
+    def test_confirmed_tick_once_succeeds_once_for_hold_without_trade_or_equity_change(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 1000}
+        state["accountEquity"] = 10000
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)), patch.object(zgua_app, "build_research_preview_paper_tick", return_value=(self.preview_allowed_payload(), 200)), patch.object(zgua_app, "package_node_script_args", return_value=["node", "cli/paper_tick.js"]), patch.object(zgua_app.subprocess, "run", side_effect=self.fake_confirmed_tick_run()) as run_mock:
+            payload, status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["confirmationMatched"])
+        self.assertTrue(payload["tickRan"])
+        self.assertTrue(payload["paperTickRan"])
+        def command_for_call(call):
+            positional, keyword = tuple(call)
+            command = positional[0] if positional else keyword.get("args") or []
+            return command if isinstance(command, list) else [str(command)]
+        mutating_ticks = [
+            call for call in run_mock.call_args_list
+            if "paper_tick.js" in " ".join(command_for_call(call)) and "--dry-run" not in command_for_call(call)
+        ]
+        self.assertEqual(len(mutating_ticks), 1)
+        self.assertFalse(payload["openedTrade"])
+        self.assertFalse(payload["closedTrade"])
+        self.assertEqual(payload["equityBefore"], payload["equityAfter"])
+        self.assertEqual(payload["openPositionsBefore"], payload["openPositionsAfter"])
+        self.assertEqual(payload["processedCandleAt"], 2000)
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertTrue(payload["auditPath"])
+
+    def test_confirmed_tick_once_duplicate_same_candle_is_skipped(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 2000}
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.fresh_payload_for_tick()), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(), 200)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": self.tick_confirm_text()})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["alreadyProcessed"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        run_mock.assert_not_called()
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")
@@ -1565,6 +1727,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn("preview-paper-tick", script)
         self.assertNotIn("paper:candle-alignment", template)
         self.assertNotIn("paper:candle-alignment", script)
+        self.assertNotIn("paper:tick-once", template)
+        self.assertNotIn("paper:tick-once", script)
         self.assertNotIn("paper:refresh-active-data", template)
         self.assertNotIn("paper:refresh-active-data", script)
         self.assertNotIn("research-paper-candidates-enable", template)

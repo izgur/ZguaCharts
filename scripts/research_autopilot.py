@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_freshness, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
+from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_freshness, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data, candidate_summary, load_paper_candidate_config, paper_real_trading_enabled  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -137,6 +137,8 @@ def main() -> int:
     sub.add_parser("paper:refresh-active-data")
     init_active = sub.add_parser("paper:init-active-candidate")
     init_active.add_argument("--confirm", required=True)
+    tick_once = sub.add_parser("paper:tick-once")
+    tick_once.add_argument("--confirm", required=True)
     sub.add_parser("paper:status")
     args = parser.parse_args()
 
@@ -212,6 +214,8 @@ def main() -> int:
             payload, status = build_research_refresh_active_paper_data({})
         elif args.command == "paper:init-active-candidate":
             payload, status = build_research_init_active_paper_candidate({"confirm": args.confirm})
+        elif args.command == "paper:tick-once":
+            payload, status = build_research_confirmed_paper_tick_once({"confirm": args.confirm})
         else:
             payload, status = {"ok": False, "error": "Unknown command."}, 2
     if args.command == "status" and not args.json:
