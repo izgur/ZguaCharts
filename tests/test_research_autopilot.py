@@ -1777,6 +1777,102 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["liveOrdersTouched"])
         self.assertEqual(before, after)
 
+    def tick_due_freshness(self, latest_time=2000, status="FRESH", blocking=False):
+        return {
+            "ok": True,
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "latestClosedCandleTime": latest_time,
+            "latestClosedCandleAt": zgua_app.epoch_to_iso(latest_time),
+            "latestOpenCandleTime": 2400,
+            "latestOpenCandleAt": zgua_app.epoch_to_iso(2400),
+            "latestCachedCandleTime": 2400,
+            "latestCachedCandleAt": zgua_app.epoch_to_iso(2400),
+            "freshnessStatus": status,
+            "blockingForPaperTick": blocking,
+            "paperTickAllowed": not blocking,
+            "safety": {"paperStateChanged": False, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False},
+        }
+
+    def assert_tick_due_safety(self, payload):
+        self.assertFalse(payload["schedulerEnabled"])
+        self.assertFalse(payload["autoTickEnabled"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+
+    def test_paper_tick_due_false_when_latest_closed_equals_last_processed(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 2000}
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(2000)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_time=2000), 200)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["tickDue"])
+        self.assertEqual(payload["reason"], "No new closed candle since last processed candle.")
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertIsNone(payload["requiredConfirmation"])
+        self.assertIsNone(payload["nextSafeCommand"])
+        self.assertEqual(payload["lastProcessedCandleTime"], 2000)
+        self.assertEqual(payload["latestClosedCandleTime"], 2000)
+        self.assert_tick_due_safety(payload)
+        self.assertEqual(before, after)
+
+    def test_paper_tick_due_true_when_newer_closed_candle_is_safe(self):
+        self.write_active_paper_config()
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": 1000}
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        before = zgua_app.preview_file_hashes()
+        self.assertFalse(zgua_app.PAPER_TICK_AUDIT_DIR.exists())
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(2000)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_time=2000), 200)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["tickDue"])
+        self.assertEqual(payload["reason"], "New closed candle available.")
+        self.assertTrue(payload["paperTickAllowed"])
+        self.assertEqual(payload["requiredConfirmation"], "RUN ONE PAPER TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca 1970-01-01T00:33:20+00:00")
+        self.assertIn('paper:tick-once --confirm "RUN ONE PAPER TICK', payload["nextSafeCommand"])
+        self.assertEqual(payload["strategy"], "EmaBounceV2")
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(payload["timeframe"], "4h")
+        self.assertEqual(payload["freshnessStatus"], "FRESH")
+        self.assertEqual(payload["candleAlignmentStatus"], "ALIGNED")
+        self.assert_tick_due_safety(payload)
+        self.assertEqual(before, after)
+        self.assertFalse(zgua_app.PAPER_TICK_AUDIT_DIR.exists())
+
+    def test_paper_tick_due_false_when_freshness_is_stale(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(2000, status="STALE", blocking=True)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_time=2000), 200)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["tickDue"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertEqual(payload["reason"], "Paper tick blocked because freshness is not safe.")
+        self.assertIsNone(payload["requiredConfirmation"])
+        self.assert_tick_due_safety(payload)
+
+    def test_paper_tick_due_false_when_candle_alignment_mismatch(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(2000)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(status="MISMATCH", expected_time=2000), 200)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["tickDue"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertEqual(payload["reason"], "Paper tick blocked because candle alignment is not safe.")
+        self.assertIsNone(payload["requiredConfirmation"])
+        self.assert_tick_due_safety(payload)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")

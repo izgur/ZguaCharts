@@ -11362,6 +11362,75 @@ def build_research_paper_status(args=None) -> tuple[dict, int]:
     }, 200
 
 
+def build_research_paper_tick_due(args=None) -> tuple[dict, int]:
+    args = args or {}
+    before = preview_file_hashes()
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    symbol = active.get("symbol") or candidate.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    status_payload, _status_code = build_research_paper_status(args)
+    freshness = active_paper_market_freshness(args)
+    alignment, alignment_status = build_research_paper_candle_alignment(args)
+    history = status_payload.get("paperTickHistory") or {}
+    last_processed_time = safe_float(history.get("lastProcessedCandleTime"), 0)
+    latest_closed_time = safe_float(freshness.get("latestClosedCandleTime") or alignment.get("expectedLatestClosedCandleTime"), 0)
+    freshness_safe = freshness.get("freshnessStatus") == "FRESH" and not freshness.get("blockingForPaperTick")
+    alignment_safe = alignment_status < 400 and alignment.get("candleAlignmentStatus") in {"ALIGNED", "EXPLAINED_OFFSET"} and not alignment.get("blockingForPaperTick")
+    tick_due = bool(latest_closed_time and latest_closed_time > last_processed_time and freshness_safe and alignment_safe)
+    if not latest_closed_time:
+        reason = "No latest closed candle is available."
+    elif freshness.get("freshnessStatus") != "FRESH" or freshness.get("blockingForPaperTick"):
+        reason = "Paper tick blocked because freshness is not safe."
+    elif alignment_status >= 400 or alignment.get("candleAlignmentStatus") not in {"ALIGNED", "EXPLAINED_OFFSET"} or alignment.get("blockingForPaperTick"):
+        reason = "Paper tick blocked because candle alignment is not safe."
+    elif latest_closed_time <= last_processed_time:
+        reason = "No new closed candle since last processed candle."
+    else:
+        reason = "New closed candle available."
+    required_confirmation = active_candidate_confirmation_phrase(candidate, epoch_to_iso(latest_closed_time)) if tick_due else None
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    real_enabled, _real_detail = paper_real_trading_enabled()
+    payload = {
+        "ok": bool(state_unchanged),
+        "schedulerEnabled": False,
+        "autoTickEnabled": False,
+        "tickDue": tick_due,
+        "reason": reason,
+        "strategy": candidate.get("strategy"),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "lastProcessedCandleAt": history.get("lastProcessedCandleAt"),
+        "lastProcessedCandleTime": history.get("lastProcessedCandleTime"),
+        "latestClosedCandleAt": epoch_to_iso(latest_closed_time),
+        "latestClosedCandleTime": int(latest_closed_time) if latest_closed_time else None,
+        "latestOpenCandleAt": freshness.get("latestOpenCandleAt"),
+        "latestOpenCandleTime": freshness.get("latestOpenCandleTime"),
+        "latestCachedCandleAt": freshness.get("latestCachedCandleAt"),
+        "latestCachedCandleTime": freshness.get("latestCachedCandleTime"),
+        "freshnessStatus": freshness.get("freshnessStatus"),
+        "candleAlignmentStatus": alignment.get("candleAlignmentStatus"),
+        "paperTickAllowed": bool(tick_due),
+        "requiredConfirmation": required_confirmation,
+        "nextSafeCommand": f'python scripts\\research_autopilot.py paper:tick-once --confirm "{required_confirmation}"' if required_confirmation else None,
+        "status": status_payload,
+        "freshness": freshness,
+        "candleAlignment": alignment,
+        "stateUnchanged": state_unchanged,
+        "fileHashesBefore": before,
+        "fileHashesAfter": after,
+        "safety": paper_safety_snapshot(real_enabled),
+    }
+    if not state_unchanged:
+        payload["reason"] = "Tick due check changed config/state/journal hashes."
+        payload["tickDue"] = False
+        payload["paperTickAllowed"] = False
+        payload["requiredConfirmation"] = None
+        payload["nextSafeCommand"] = None
+    return payload, 200 if payload.get("ok") else 500
+
+
 def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
     args = args or {}
     candidate = load_paper_candidate_config()

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_freshness, build_research_paper_status, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
+from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_freshness, build_research_paper_status, build_research_paper_tick_due, build_research_plan_paper_enable_candidate, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -140,6 +140,7 @@ def main() -> int:
     tick_once = sub.add_parser("paper:tick-once")
     tick_once.add_argument("--confirm", required=True)
     sub.add_parser("paper:status")
+    sub.add_parser("paper:tick-due")
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -196,6 +197,8 @@ def main() -> int:
             })
         elif args.command == "paper:status":
             payload, status = build_research_paper_status({})
+        elif args.command == "paper:tick-due":
+            payload, status = build_research_paper_tick_due({})
         elif args.command == "preview-paper-tick":
             payload, status = build_research_preview_paper_tick({})
         elif args.command == "paper:freshness":
