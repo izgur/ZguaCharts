@@ -242,7 +242,7 @@ function pathToPage(pathname) {
   if (pathname === "/" || pathname === "/dashboard") return "dashboard";
   if (pathname === "/backtest") return "backtest";
   if (pathname === "/analysis" || pathname === "/research") return "research";
-  if (pathname === "/research/paper-review") return "research";
+  if (pathname === "/research/paper-review" || pathname === "/research/paper-operator") return "research";
   if (pathname === "/candidate") return "candidate";
   if (pathname === "/paper") return "paper";
   if (pathname === "/learning") return "research";
@@ -318,6 +318,7 @@ function organizeWorkflowPages() {
     ["research-campaign-runner-panel", "research-overview"],
     ["research-autopilot-panel", "research-overview"],
     ["research-paper-candidates-panel", "research-overview"],
+    ["research-paper-operator-panel", "research-overview"],
     ["research-candidate-evidence-ledger-panel", "research-overview"],
     ["research-result-diff-panel", "research-overview"],
     ["research-promotion-checklist-v2-panel", "research-overview"],
@@ -392,7 +393,12 @@ function renderWorkflowPage(page) {
     loadResearchWorkflowSummary();
     if (window.location.pathname === "/research/paper-review") {
       loadResearchPaperCandidates();
+      loadResearchPaperOperator();
       window.setTimeout(() => document.querySelector("#research-paper-candidates-panel")?.scrollIntoView({ block: "start" }), 0);
+    }
+    if (window.location.pathname === "/research/paper-operator") {
+      loadResearchPaperOperator();
+      window.setTimeout(() => document.querySelector("#research-paper-operator-panel")?.scrollIntoView({ block: "start" }), 0);
     }
   }
 }
@@ -5602,6 +5608,143 @@ async function loadResearchPaperCandidates() {
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Could not load review candidates.</p>`;
   }
+}
+
+async function loadResearchPaperOperator() {
+  const host = document.querySelector("#research-paper-operator-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading paper operator status...</p>`;
+    const payload = await apiGet("/api/research/paper-operator-check");
+    host.innerHTML = renderResearchPaperOperator(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Could not load paper operator status.</p>`;
+  }
+}
+
+function renderPaperOperatorValue(label, value) {
+  const shown = value === true ? "true" : value === false ? "false" : value ?? "-";
+  return `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(shown)}</strong></div>`;
+}
+
+function paperOperatorBadgeClass(value) {
+  const normalized = String(value || "").toUpperCase();
+  if (["FRESH", "ALIGNED", "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK"].includes(normalized)) return "positive";
+  if (["WAIT_FOR_NEXT_CLOSED_CANDLE", "HOLD", "NO ACTION"].includes(normalized)) return "neutral";
+  if (["BLOCKED", "STALE", "MISSING", "MISMATCH"].includes(normalized)) return "negative";
+  return "neutral";
+}
+
+function renderPaperOperatorSafety(safety = {}) {
+  const rows = [
+    ["Paper tick", safety.paperTickRan, "Paper tick OFF"],
+    ["Paper state", safety.paperStateChanged, "Paper state unchanged"],
+    ["Live orders", safety.liveOrdersTouched, "Live orders OFF"],
+    ["Real trading", safety.realTradingEnabled, "Real trading OFF"],
+    ["Auto tick", safety.autoTickEnabled, "Auto tick OFF"],
+    ["Scheduler", safety.schedulerEnabled, "Scheduler OFF"],
+  ];
+  return `<div class="paper-review-safety paper-operator-safety">${rows.map(([label, value, offLabel]) => `<span class="paper-review-flag ${value ? "negative" : "positive"}">${escapeHtml(value ? `${label} ON` : offLabel)}</span>`).join("")}</div>`;
+}
+
+function renderPaperOperatorCard(title, rows) {
+  return `
+    <section class="paper-operator-card">
+      <h4 class="modal-section-title">${escapeHtml(title)}</h4>
+      <div class="paper-review-identity paper-operator-grid">
+        ${rows.join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderResearchPaperOperator(payload = {}) {
+  const status = payload.statusSummary || {};
+  const freshness = payload.freshnessSummary || {};
+  const alignment = payload.alignmentSummary || {};
+  const due = payload.dueSummary || {};
+  const preview = payload.previewSummary || null;
+  const safety = payload.safety || {};
+  const action = payload.nextHumanAction || "WAIT_FOR_NEXT_CLOSED_CANDLE";
+  const actionLabel = action === "WAIT_FOR_NEXT_CLOSED_CANDLE"
+    ? "Waiting"
+    : action === "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK"
+      ? "Manual CLI tick available"
+      : action === "BLOCKED"
+        ? "Blocked"
+        : "Review preview";
+  const candidateCard = renderPaperOperatorCard("Candidate", [
+    renderPaperOperatorValue("Strategy", status.strategy),
+    renderPaperOperatorValue("Symbol", status.symbol),
+    renderPaperOperatorValue("Timeframe", status.timeframe),
+    renderPaperOperatorValue("Paper enabled", status.paperEnabled),
+    renderPaperOperatorValue("Equity", status.equity),
+    renderPaperOperatorValue("Open positions", status.openPositions),
+  ]);
+  const lastTickCard = renderPaperOperatorCard("Last Processed Tick", [
+    renderPaperOperatorValue("Last processed candle", status.lastProcessedCandleAt),
+    renderPaperOperatorValue("Signal", status.lastProcessedTickSignal),
+    renderPaperOperatorValue("Action", status.lastProcessedTickAction),
+    renderPaperOperatorValue("Opened trade", status.lastProcessedTickOpenedTrade),
+    renderPaperOperatorValue("Closed trade", status.lastProcessedTickClosedTrade),
+  ]);
+  const dataCard = renderPaperOperatorCard("Current Data", [
+    renderPaperOperatorValue("Freshness", freshness.freshnessStatus),
+    renderPaperOperatorValue("Latest cached candle", freshness.latestCachedCandleAt),
+    renderPaperOperatorValue("Cached candle open", freshness.latestCachedCandleIsOpen),
+    renderPaperOperatorValue("Latest closed candle", freshness.latestClosedCandleAt),
+    renderPaperOperatorValue("Latest open candle", freshness.latestOpenCandleAt),
+  ]);
+  const alignmentCard = renderPaperOperatorCard("Alignment", [
+    renderPaperOperatorValue("Status", alignment.candleAlignmentStatus),
+    renderPaperOperatorValue("Expected closed candle", alignment.expectedLatestClosedCandleAt),
+    renderPaperOperatorValue("Signal candle", alignment.signalEvaluationCandleAt),
+    renderPaperOperatorValue("Tick dry-run candle", alignment.tickDryRunCandleAt),
+    renderPaperOperatorValue("Open tail ignored", alignment.openTailIgnored),
+  ]);
+  const dueRows = [
+    renderPaperOperatorValue("Tick due", due.tickDue),
+    renderPaperOperatorValue("Reason", due.reason),
+    renderPaperOperatorValue("Next human action", action),
+  ];
+  const dueCard = `
+    <section class="paper-operator-card">
+      <h4 class="modal-section-title">Due / Next Action</h4>
+      <div class="paper-review-identity paper-operator-grid">${dueRows.join("")}</div>
+      ${due.requiredConfirmation ? `<p class="modal-note"><strong>Required confirmation:</strong> <code>${escapeHtml(due.requiredConfirmation)}</code></p>` : ""}
+      ${due.nextSafeCommand ? `<p class="modal-note"><strong>Next safe CLI command:</strong> <code>${escapeHtml(due.nextSafeCommand)}</code></p>` : ""}
+    </section>
+  `;
+  const previewCard = preview ? renderPaperOperatorCard("Preview", [
+    renderPaperOperatorValue("Signal", preview.signal),
+    renderPaperOperatorValue("Proposed action", preview.proposedAction),
+    renderPaperOperatorValue("Proposed order", preview.proposedOrder ? JSON.stringify(preview.proposedOrder) : null),
+    renderPaperOperatorValue("Current position", preview.currentPaperPosition ? JSON.stringify(preview.currentPaperPosition) : null),
+    renderPaperOperatorValue("Blockers", (preview.blockers || []).join(", ") || "-"),
+    renderPaperOperatorValue("Warnings", (preview.warnings || []).join(", ") || "-"),
+  ]) : "";
+  return `
+    <section class="paper-operator-panel">
+      <div class="paper-operator-banner">Read-only paper operator view. This page cannot run paper ticks or live orders.</div>
+      <div class="paper-review-card-header">
+        <div>
+          <h3 class="modal-section-title">Paper Operator <span class="neutral">Display only</span></h3>
+          <p class="modal-note">Operator check only: refreshAttempted=${escapeHtml(payload.refreshAttempted)}, operatorCheckOnly=${escapeHtml(payload.operatorCheckOnly)}</p>
+        </div>
+        <span class="paper-review-badge ${paperOperatorBadgeClass(action)}">${escapeHtml(actionLabel)}</span>
+      </div>
+      <div class="paper-operator-cards">
+        ${candidateCard}
+        ${lastTickCard}
+        ${dataCard}
+        ${alignmentCard}
+        ${dueCard}
+        ${previewCard}
+      </div>
+      <h4 class="modal-section-title">Safety</h4>
+      ${renderPaperOperatorSafety(safety)}
+    </section>
+  `;
 }
 
 function renderPaperCandidateList(items, tone = "caution") {

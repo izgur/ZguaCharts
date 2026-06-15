@@ -1458,6 +1458,41 @@ button:hover {
   margin-top: 0;
 }
 
+.paper-operator-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.paper-operator-banner {
+  padding: 10px 12px;
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  border-radius: 8px;
+  background: rgba(59, 130, 246, 0.08);
+  color: var(--text);
+  font-weight: 700;
+}
+
+.paper-operator-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.paper-operator-card {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.paper-operator-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.paper-operator-safety {
+  justify-content: flex-start;
+}
+
 .paper-warning {
   margin-bottom: 12px;
   padding: 10px 12px;

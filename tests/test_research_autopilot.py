@@ -2121,6 +2121,40 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["safety"]["paperTickRan"])
         self.assertFalse(payload["safety"]["liveOrdersTouched"])
 
+    def test_paper_operator_check_api_is_get_only_and_read_only(self):
+        self.write_active_paper_config()
+        before = zgua_app.preview_file_hashes()
+        with zgua_app.app.test_client() as client, ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=self.operator_due_payload(False)):
+                stack.enter_context(item)
+            response = client.get("/api/research/paper-operator-check")
+            post_response = client.post("/api/research/paper-operator-check")
+            put_response = client.put("/api/research/paper-operator-check")
+            delete_response = client.delete("/api/research/paper-operator-check")
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["operatorCheckOnly"])
+        self.assertFalse(payload["refreshAttempted"])
+        self.assertFalse(payload["refreshed"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertEqual(post_response.status_code, 405)
+        self.assertEqual(put_response.status_code, 405)
+        self.assertEqual(delete_response.status_code, 405)
+        self.assertEqual(before, after)
+
+    def test_research_paper_operator_route_renders_main_page(self):
+        with zgua_app.app.test_client() as client:
+            response = client.get("/research/paper-operator")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Paper Operator", html)
+        self.assertIn("research-paper-operator-panel", html)
+
     def test_research_paper_review_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-review")
@@ -2171,6 +2205,37 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn("research-paper-candidates-run", template)
         self.assertNotIn("research-paper-candidates-paper-tick", template)
         self.assertNotIn("research-paper-candidates-live", template)
+
+    def test_research_paper_operator_ui_is_read_only_and_get_only(self):
+        template = (Path(zgua_app.app.root_path) / "templates" / "index.html").read_text(encoding="utf-8")
+        script = (Path(zgua_app.app.root_path) / "static" / "app.js").read_text(encoding="utf-8")
+        styles = (Path(zgua_app.app.root_path) / "static" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn("Paper Operator", template)
+        self.assertIn("research-paper-operator-panel", template)
+        self.assertIn("/research/paper-operator", template)
+        self.assertIn('apiGet("/api/research/paper-operator-check")', script)
+        self.assertIn("Read-only paper operator view. This page cannot run paper ticks or live orders.", script)
+        self.assertIn("nextHumanAction", script)
+        self.assertIn("Tick due", script)
+        self.assertIn("lastProcessedCandleAt", script)
+        self.assertIn("Paper tick OFF", script)
+        self.assertIn("Live orders OFF", script)
+        self.assertIn("Real trading OFF", script)
+        self.assertIn("Auto tick OFF", script)
+        self.assertIn("Scheduler OFF", script)
+        self.assertIn(".paper-operator-panel", styles)
+        operator_template = template.split('id="research-paper-operator-panel"', 1)[1].split("Candidate Evidence Ledger", 1)[0]
+        operator_script = script.split("function renderResearchPaperOperator", 1)[1].split("function renderPaperCandidateList", 1)[0]
+        self.assertNotIn("<button", operator_template.lower())
+        self.assertNotIn("<button", operator_script.lower())
+        self.assertNotIn('apiPost("/api/research/paper-operator-check"', script)
+        self.assertNotIn('apiPut("/api/research/paper-operator-check"', script)
+        self.assertNotIn('apiDelete("/api/research/paper-operator-check"', script)
+        self.assertNotIn("paper-operator-refresh", template)
+        self.assertNotIn("paper-operator-enable", template)
+        self.assertNotIn("paper-operator-run", template)
+        self.assertNotIn("paper-operator-schedule", template)
+        self.assertNotIn("paper-operator-auto", template)
 
     def test_include_cooled_and_force_strategy_can_plan_cooled_family(self):
         memory = {"branches": [

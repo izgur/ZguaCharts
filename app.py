@@ -104,6 +104,7 @@ LEARNING_OPTIMIZER_STRATEGY_OPTIONS = [
 @app.get("/charts")
 @app.get("/research")
 @app.get("/research/paper-review")
+@app.get("/research/paper-operator")
 @app.get("/candidate")
 @app.get("/paper")
 @app.get("/backtest")
@@ -1571,6 +1572,15 @@ def research_paper_candidates():
         return jsonify(build_research_paper_candidates())
     except Exception as exc:
         return jsonify({"error": f"Could not list disabled paper candidates: {exc}"}), 502
+
+
+@app.get("/api/research/paper-operator-check")
+def research_paper_operator_check():
+    try:
+        payload, status_code = build_research_paper_operator_check({"refresh": False})
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper operator check: {exc}"}), 502
 
 
 @app.get("/api/research/autopilot/summary")
