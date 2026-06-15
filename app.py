@@ -24,6 +24,7 @@ from data_source import (
     fetch_historical_candles,
     inspect_all_bybit_cache,
     inspect_bybit_cache,
+    load_bybit_disk_cache,
     parse_period_to_days,
     historical_limit_for_period,
     research_data_readiness,
@@ -10674,23 +10675,47 @@ def active_paper_market_freshness(args=None) -> dict:
     source = candidate.get("source") or "bybit"
     symbol = active.get("symbol")
     timeframe = active.get("interval") or active.get("timeframe")
-    now = datetime.now(timezone.utc)
+    now = parse_iso_timestamp(args.get("nowUtc")) if args.get("nowUtc") else datetime.now(timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
     now_epoch = now.timestamp()
     interval_seconds = paper_interval_seconds(timeframe)
     max_allowed_seconds = int(safe_float(args.get("maxAllowedAgeSeconds"), interval_seconds * 2 + 30 * 60))
-    latest = None
+    latest_cached = None
+    latest_closed = None
+    latest_open = None
     candles = None
     warnings = []
     cache_status = None
     if source == "bybit" and symbol and timeframe:
         cache = inspect_bybit_cache(symbol, timeframe)
-        latest = cache.get("lastCandleTime")
         candles = cache.get("cachedCandles")
         warnings = cache.get("warnings") or []
         cache_status = cache.get("status")
-    latest_epoch = safe_float(latest, 0)
-    age_seconds = max(0, int(now_epoch - latest_epoch)) if latest_epoch else None
-    if not symbol or not timeframe or not latest_epoch:
+        summary_latest = safe_float(cache.get("lastCandleTime"), 0)
+        cached_rows = load_bybit_disk_cache(symbol, timeframe)
+        cached_times = [int(row.get("time")) for row in cached_rows if row.get("time") is not None]
+        disk_latest = max(cached_times) if cached_times else None
+        has_reported_candles = safe_float(candles, 0) > 0 and cache_status != "MISSING"
+        if has_reported_candles and cached_times and (not summary_latest or int(summary_latest) == disk_latest):
+            latest_cached = max(cached_times)
+            closed_times = [time for time in cached_times if time + interval_seconds <= now_epoch]
+            open_times = [time for time in cached_times if time + interval_seconds > now_epoch]
+            latest_closed = max(closed_times) if closed_times else None
+            latest_open = max(open_times) if open_times else None
+        else:
+            latest_cached = cache.get("lastCandleTime")
+            cached_epoch = safe_float(latest_cached, 0)
+            if cached_epoch and cached_epoch + interval_seconds <= now_epoch:
+                latest_closed = int(cached_epoch)
+            elif cached_epoch:
+                latest_open = int(cached_epoch)
+    latest_cached_epoch = safe_float(latest_cached, 0)
+    latest_closed_epoch = safe_float(latest_closed, 0)
+    latest_open_epoch = safe_float(latest_open, 0)
+    latest_cached_is_open = bool(latest_cached_epoch and latest_open_epoch and int(latest_cached_epoch) == int(latest_open_epoch))
+    age_seconds = max(0, int(now_epoch - latest_closed_epoch)) if latest_closed_epoch else None
+    if not symbol or not timeframe or not latest_closed_epoch:
         freshness_status = "MISSING"
     elif age_seconds is not None and age_seconds > max_allowed_seconds:
         freshness_status = "STALE"
@@ -10703,14 +10728,24 @@ def active_paper_market_freshness(args=None) -> dict:
         message = f"Active paper market {symbol} {timeframe} candle data is stale."
     else:
         message = "Active paper market candle data is missing."
+    explanations = []
+    if latest_cached_is_open and latest_closed_epoch:
+        explanations.append("Latest cached candle is open; paper tick uses latest closed candle.")
     real_enabled, _real_detail = paper_real_trading_enabled()
     return {
         "ok": True,
         "source": source,
         "symbol": symbol,
         "timeframe": timeframe,
-        "latestCandleTime": int(latest_epoch) if latest_epoch else None,
-        "latestCandleAt": epoch_to_iso(latest_epoch),
+        "latestCachedCandleTime": int(latest_cached_epoch) if latest_cached_epoch else None,
+        "latestCachedCandleAt": epoch_to_iso(latest_cached_epoch),
+        "latestCachedCandleIsOpen": latest_cached_is_open,
+        "latestOpenCandleTime": int(latest_open_epoch) if latest_open_epoch else None,
+        "latestOpenCandleAt": epoch_to_iso(latest_open_epoch),
+        "latestClosedCandleTime": int(latest_closed_epoch) if latest_closed_epoch else None,
+        "latestClosedCandleAt": epoch_to_iso(latest_closed_epoch),
+        "latestCandleTime": int(latest_closed_epoch) if latest_closed_epoch else None,
+        "latestCandleAt": epoch_to_iso(latest_closed_epoch),
         "nowUtc": now.isoformat(),
         "candleAgeMinutes": round(age_seconds / 60, 2) if age_seconds is not None else None,
         "expectedIntervalMinutes": round(interval_seconds / 60, 2),
@@ -10722,6 +10757,8 @@ def active_paper_market_freshness(args=None) -> dict:
         "cacheStatus": cache_status,
         "warnings": warnings,
         "message": message,
+        "explanation": " ".join(explanations) if explanations else message,
+        "explanations": explanations,
         "safety": paper_safety_snapshot(real_enabled),
     }
 
@@ -11005,9 +11042,17 @@ def build_research_paper_candle_alignment(args=None) -> tuple[dict, int]:
     tick_candle_time = tick_dry_run_candle_time(tick_payload, candidate)
     if tick_candle_time is None and tick_code == 0:
         tick_candle_time = signal_candle_time
-    freshness_time = freshness.get("latestCandleTime")
+    freshness_time = freshness.get("latestClosedCandleTime") or freshness.get("latestCandleTime")
     expected_time = freshness_time
     status, explanation, blocking = candle_alignment_status(freshness_time, signal_candle_time, tick_candle_time, interval_seconds)
+    open_tail_ignored = bool(
+        status == "ALIGNED"
+        and freshness.get("latestCachedCandleIsOpen")
+        and freshness.get("latestCachedCandleTime")
+        and freshness.get("latestCachedCandleTime") != freshness_time
+    )
+    if open_tail_ignored:
+        explanation = "Freshness cache includes an open tail candle; signal and tick use the latest closed candle."
     real_enabled, _ = paper_real_trading_enabled()
     payload = {
         "ok": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0),
@@ -11015,6 +11060,13 @@ def build_research_paper_candle_alignment(args=None) -> tuple[dict, int]:
         "timeframe": timeframe,
         "freshnessLatestCandleTime": freshness_time,
         "freshnessLatestCandleAt": epoch_to_iso(freshness_time),
+        "latestCachedCandleTime": freshness.get("latestCachedCandleTime"),
+        "latestCachedCandleAt": freshness.get("latestCachedCandleAt"),
+        "latestCachedCandleIsOpen": freshness.get("latestCachedCandleIsOpen"),
+        "latestOpenCandleTime": freshness.get("latestOpenCandleTime"),
+        "latestOpenCandleAt": freshness.get("latestOpenCandleAt"),
+        "latestClosedCandleTime": freshness.get("latestClosedCandleTime"),
+        "latestClosedCandleAt": freshness.get("latestClosedCandleAt"),
         "signalEvaluationCandleTime": signal_candle_time,
         "signalEvaluationCandleAt": epoch_to_iso(signal_candle_time),
         "tickDryRunCandleTime": tick_candle_time,
@@ -11023,6 +11075,7 @@ def build_research_paper_candle_alignment(args=None) -> tuple[dict, int]:
         "expectedLatestClosedCandleAt": epoch_to_iso(expected_time),
         "candleAlignmentStatus": status,
         "explanation": explanation,
+        "openTailIgnored": open_tail_ignored,
         "blockingForPaperTick": bool(blocking),
         "paperTickAllowed": bool(not blocking and not real_enabled),
         "freshness": freshness,

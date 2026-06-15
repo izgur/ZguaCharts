@@ -1184,10 +1184,10 @@ class ResearchAutopilotTests(unittest.TestCase):
         return fake_run
 
     def recent_closed_time(self):
-        return int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+        return int(datetime.now(timezone.utc).timestamp()) - 5 * 60 * 60
 
     def fresh_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600, latest=None):
-        latest = latest or int(datetime.now(timezone.utc).timestamp()) - 60 * 60
+        latest = latest or self.recent_closed_time()
         return {
             "symbol": symbol,
             "timeframe": timeframe,
@@ -1196,6 +1196,12 @@ class ResearchAutopilotTests(unittest.TestCase):
             "status": "OK",
             "warnings": [],
         }
+
+    def cached_4h_rows(self):
+        return [
+            {"time": 1781524800, "open": 50000, "high": 50100, "low": 49900, "close": 50050},
+            {"time": 1781539200, "open": 50050, "high": 50200, "low": 50000, "close": 50100},
+        ]
 
     def stale_cache_payload(self, symbol="BTCUSDT", timeframe="4h", candles=600):
         latest = int(datetime.now(timezone.utc).timestamp()) - 24 * 60 * 60
@@ -1389,6 +1395,48 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["safety"]["paperTickRan"])
         self.assertFalse(payload["safety"]["liveOrdersTouched"])
         self.assertFalse(payload["safety"]["realTradingEnabled"])
+
+    def test_freshness_distinguishes_open_cached_tail_at_1700(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=1781539200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.cached_4h_rows()):
+            payload, status = zgua_app.build_research_paper_freshness({"nowUtc": "2026-06-15T17:00:00+00:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["latestCachedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertTrue(payload["latestCachedCandleIsOpen"])
+        self.assertEqual(payload["latestOpenCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(payload["latestClosedCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["latestCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["freshnessStatus"], "FRESH")
+        self.assertIn("Latest cached candle is open", payload["explanation"])
+
+    def test_candle_alignment_ignores_open_tail_when_signal_and_tick_use_latest_closed(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=1781539200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.cached_4h_rows()), patch.object(zgua_app.subprocess, "run", side_effect=self.alignment_subprocess_payloads(1781524800, 1781524800)):
+            payload, status = zgua_app.build_research_paper_candle_alignment({"nowUtc": "2026-06-15T17:00:00+00:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["latestCachedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertTrue(payload["latestCachedCandleIsOpen"])
+        self.assertEqual(payload["latestClosedCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["signalEvaluationCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["tickDryRunCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["expectedLatestClosedCandleAt"], "2026-06-15T12:00:00+00:00")
+        self.assertEqual(payload["candleAlignmentStatus"], "ALIGNED")
+        self.assertTrue(payload["openTailIgnored"])
+        self.assertFalse(payload["blockingForPaperTick"])
+        self.assertTrue(payload["paperTickAllowed"])
+
+    def test_candle_alignment_uses_1600_after_it_closes_at_2100(self):
+        self.write_active_paper_config()
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=1781539200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.cached_4h_rows()), patch.object(zgua_app.subprocess, "run", side_effect=self.alignment_subprocess_payloads(1781539200, 1781539200)):
+            payload, status = zgua_app.build_research_paper_candle_alignment({"nowUtc": "2026-06-15T21:00:00+00:00"})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["latestCachedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertFalse(payload["latestCachedCandleIsOpen"])
+        self.assertEqual(payload["latestClosedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(payload["signalEvaluationCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(payload["tickDryRunCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(payload["candleAlignmentStatus"], "ALIGNED")
+        self.assertFalse(payload["openTailIgnored"])
 
     def test_candle_mismatch_blocks_preview(self):
         self.write_active_paper_config()
