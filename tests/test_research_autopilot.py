@@ -1332,6 +1332,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
         config_before = zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8")
         latest = self.recent_closed_time()
+        self.set_last_processed_candle(latest - 4 * 60 * 60)
+        state_before = zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8")
         with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", return_value=self.fresh_cache_payload(latest=latest)), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads(latest)):
             payload, status = zgua_app.build_research_preview_paper_tick({})
         self.assertEqual(status, 200)
@@ -2012,6 +2014,14 @@ class ResearchAutopilotTests(unittest.TestCase):
             "safety": {"paperStateChanged": False, "paperTickRan": False, "liveOrdersTouched": False, "realTradingEnabled": False},
         }
 
+    def set_last_processed_candle(self, candle_time):
+        state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        state["lastProcessedCandleTime"] = {"BTCUSDT:4h": candle_time}
+        zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+    def candle_cache_rows(self, *times):
+        return [{"time": time, "open": 1, "high": 1, "low": 1, "close": 1} for time in times]
+
     def assert_tick_due_safety(self, payload):
         self.assertFalse(payload["schedulerEnabled"])
         self.assertFalse(payload["autoTickEnabled"])
@@ -2119,6 +2129,97 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assert_tick_due_safety(payload)
         self.assertEqual(before, after)
         self.assertFalse(zgua_app.PAPER_TICK_AUDIT_DIR.exists())
+
+    def test_paper_tick_due_allows_one_missed_closed_candle(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        next_candle = last_processed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(next_candle)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_at=zgua_app.epoch_to_iso(next_candle), expected_time=next_candle), 200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, next_candle)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["tickDue"])
+        self.assertTrue(payload["paperTickAllowed"])
+        self.assertFalse(payload["catchUpRequired"])
+        self.assertEqual(payload["missedClosedCandleCount"], 1)
+        self.assertEqual(payload["nextDueCandleAt"], "2026-06-15T20:00:00+00:00")
+        self.assertEqual(payload["requiredConfirmation"], "RUN ONE PAPER TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca 2026-06-15T20:00:00+00:00")
+        self.assertIn("2026-06-15T20:00:00+00:00", payload["nextSafeCommand"])
+        self.assertEqual(before, after)
+
+    def test_paper_tick_due_blocks_multiple_missed_closed_candles(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        latest_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(latest_missed)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_at=zgua_app.epoch_to_iso(latest_missed), expected_time=latest_missed), 200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, latest_missed)):
+            payload, status = zgua_app.build_research_paper_tick_due({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["tickDue"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertTrue(payload["catchUpRequired"])
+        self.assertFalse(payload["catchUpModeAvailable"])
+        self.assertEqual(payload["reason"], "Multiple closed candles are pending; sequential catch-up is required.")
+        self.assertEqual(payload["missedClosedCandleCount"], 2)
+        self.assertEqual(payload["firstMissedCandleAt"], "2026-06-15T20:00:00+00:00")
+        self.assertEqual(payload["latestMissedCandleAt"], "2026-06-16T00:00:00+00:00")
+        self.assertEqual(payload["missedClosedCandles"], ["2026-06-15T20:00:00+00:00", "2026-06-16T00:00:00+00:00"])
+        self.assertIsNone(payload["requiredConfirmation"])
+        self.assertIsNone(payload["nextSafeCommand"])
+        self.assert_tick_due_safety(payload)
+        self.assertEqual(before, after)
+
+    def test_preview_paper_tick_blocks_multiple_missed_closed_candles(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        latest_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(latest_missed)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_at=zgua_app.epoch_to_iso(latest_missed), expected_time=latest_missed), 200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, latest_missed)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_preview_paper_tick({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["proposedAction"], "blocked_by_missed_candle_gap")
+        self.assertTrue(payload["blockingForPaperTick"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertTrue(payload["catchUpRequired"])
+        self.assertEqual(payload["missedClosedCandleCount"], 2)
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        run_mock.assert_not_called()
+        self.assertEqual(before, after)
+
+    def test_confirmed_tick_once_refuses_multiple_missed_closed_candles(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        latest_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        confirm = self.tick_confirm_text(zgua_app.epoch_to_iso(latest_missed))
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(latest_missed)), patch.object(zgua_app, "build_research_paper_candle_alignment", return_value=(self.tick_alignment_payload(expected_at=zgua_app.epoch_to_iso(latest_missed), expected_time=latest_missed), 200)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, latest_missed)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_confirmed_paper_tick_once({"confirm": confirm})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "Multiple closed candles are pending; sequential catch-up is required.")
+        self.assertTrue(payload["catchUpRequired"])
+        self.assertFalse(payload["paperTickAllowed"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertIsNone(payload["requiredConfirmation"])
+        run_mock.assert_not_called()
+        self.assertEqual(before, after)
 
     def test_paper_tick_due_false_when_freshness_is_stale(self):
         self.write_active_paper_config()
@@ -2261,6 +2362,40 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["safety"]["paperTickRan"])
         self.assertFalse(payload["safety"]["liveOrdersTouched"])
 
+    def test_paper_operator_check_catch_up_required(self):
+        self.write_active_paper_config()
+        due = {
+            **self.operator_due_payload(False, reason="Multiple closed candles are pending; sequential catch-up is required."),
+            "paperTickAllowed": False,
+            "catchUpRequired": True,
+            "catchUpModeAvailable": False,
+            "missedClosedCandleCount": 2,
+            "firstMissedCandleAt": "2026-06-15T20:00:00+00:00",
+            "latestMissedCandleAt": "2026-06-16T00:00:00+00:00",
+            "missedClosedCandles": ["2026-06-15T20:00:00+00:00", "2026-06-16T00:00:00+00:00"],
+            "requiredConfirmation": None,
+            "nextSafeCommand": None,
+        }
+        before = zgua_app.preview_file_hashes()
+        with ExitStack() as stack:
+            for item in self.operator_patch_common(due_payload=due):
+                stack.enter_context(item)
+            preview_mock = stack.enter_context(patch.object(zgua_app, "build_research_preview_paper_tick"))
+            payload, status = zgua_app.build_research_paper_operator_check({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["nextHumanAction"], "CATCH_UP_REQUIRED")
+        self.assertTrue(payload["dueSummary"]["catchUpRequired"])
+        self.assertEqual(payload["dueSummary"]["missedClosedCandleCount"], 2)
+        self.assertIsNone(payload["dueSummary"]["nextSafeCommand"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        preview_mock.assert_not_called()
+        self.assertEqual(before, after)
+
     def test_paper_operator_check_api_is_get_only_and_read_only(self):
         self.write_active_paper_config()
         before = zgua_app.preview_file_hashes()
@@ -2362,6 +2497,11 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("Paper Tick Audit History", script)
         self.assertIn("SKIPPED_DUPLICATE", script)
         self.assertIn("PROCESSED", script)
+        self.assertIn("CATCH_UP_REQUIRED", script)
+        self.assertIn("Multiple closed candles are pending. Sequential catch-up is required before paper ticking can continue.", script)
+        self.assertIn("Missed closed candles", script)
+        self.assertIn("First missed candle", script)
+        self.assertIn("Latest missed candle", script)
         self.assertIn("Audit path", script)
         self.assertIn("paper-audit-skipped", script)
         self.assertIn("Paper tick OFF", script)

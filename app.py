@@ -10787,6 +10787,69 @@ def paper_tick_blocked_by_freshness(args=None) -> tuple[bool, dict]:
     return bool(freshness.get("blockingForPaperTick")), freshness
 
 
+def active_paper_missed_closed_candles(candidate: dict, freshness: dict, status_payload: dict | None = None) -> dict:
+    active = primary_active_market(candidate)
+    source = candidate.get("source") or "bybit"
+    symbol = active.get("symbol") or candidate.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    interval_seconds = paper_interval_seconds(timeframe)
+    latest_closed_time = int(safe_float(freshness.get("latestClosedCandleTime") or freshness.get("latestCandleTime"), 0))
+    history = (status_payload or {}).get("paperTickHistory") if isinstance(status_payload, dict) else {}
+    if not isinstance(history, dict):
+        history = {}
+    last_processed_time = int(safe_float(history.get("lastProcessedCandleTime"), 0))
+    if not last_processed_time:
+        market = paper_state_market_snapshot(candidate)
+        last_processed_time = int(safe_float(market.get("lastProcessedCandleTime"), 0))
+    cached_times = []
+    if source == "bybit" and symbol and timeframe:
+        try:
+            cached_times = sorted({
+                int(row.get("time"))
+                for row in load_bybit_disk_cache(symbol, timeframe)
+                if row.get("time") is not None
+            })
+        except Exception:
+            cached_times = []
+    missed_times = [
+        time
+        for time in cached_times
+        if latest_closed_time and last_processed_time and last_processed_time < time <= latest_closed_time
+    ]
+    if not missed_times and latest_closed_time and last_processed_time and latest_closed_time > last_processed_time:
+        expected_next = last_processed_time + interval_seconds
+        if expected_next == latest_closed_time:
+            missed_times = [latest_closed_time]
+        elif latest_closed_time < expected_next:
+            missed_times = [latest_closed_time]
+    missed_at = [epoch_to_iso(time) for time in missed_times]
+    catch_up_required = len(missed_times) > 1
+    return {
+        "lastProcessedCandleTime": last_processed_time or None,
+        "lastProcessedCandleAt": epoch_to_iso(last_processed_time),
+        "latestClosedCandleTime": latest_closed_time or None,
+        "latestClosedCandleAt": epoch_to_iso(latest_closed_time),
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "expectedIntervalMinutes": round(interval_seconds / 60, 2),
+        "nextExpectedCandleTime": (last_processed_time + interval_seconds) if last_processed_time else None,
+        "nextExpectedCandleAt": epoch_to_iso(last_processed_time + interval_seconds) if last_processed_time else None,
+        "missedClosedCandleCount": len(missed_times),
+        "firstMissedCandleTime": missed_times[0] if missed_times else None,
+        "firstMissedCandleAt": missed_at[0] if missed_at else None,
+        "latestMissedCandleTime": missed_times[-1] if missed_times else None,
+        "latestMissedCandleAt": missed_at[-1] if missed_at else None,
+        "nextDueCandleTime": missed_times[0] if len(missed_times) == 1 else None,
+        "nextDueCandleAt": missed_at[0] if len(missed_at) == 1 else None,
+        "missedClosedCandles": missed_at[:20],
+        "missedClosedCandlesTruncated": len(missed_at) > 20,
+        "catchUpRequired": catch_up_required,
+        "catchUpModeAvailable": False,
+        "paperTickAllowed": not catch_up_required,
+        "reason": "Multiple closed candles are pending; sequential catch-up is required." if catch_up_required else None,
+    }
+
+
 def build_research_paper_freshness(args=None) -> tuple[dict, int]:
     freshness = active_paper_market_freshness(args)
     return freshness, 200
@@ -11226,6 +11289,51 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
             "journalCsvHashAfter": after["journalCsv"],
             "stateUnchanged": state_unchanged,
         }, 200 if state_unchanged and alignment_status_code < 400 else 400
+    status_payload, _status_code = build_research_paper_status(args)
+    gap_guard = active_paper_missed_closed_candles(candidate, freshness, status_payload)
+    if gap_guard.get("catchUpRequired"):
+        after = preview_file_hashes()
+        state_unchanged = before == after
+        return {
+            "ok": bool(state_unchanged),
+            "previewOnly": True,
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": False,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "strategy": candidate.get("strategy"),
+            "symbol": gap_guard.get("symbol") or freshness.get("symbol") or candidate.get("symbol"),
+            "timeframe": gap_guard.get("timeframe") or freshness.get("timeframe") or candidate.get("timeframe"),
+            "lastCandleTime": candle_alignment.get("signalEvaluationCandleTime"),
+            "signal": None,
+            "signalReason": "Signal preview blocked because multiple closed candles are pending.",
+            "currentPaperPosition": None,
+            "proposedAction": "blocked_by_missed_candle_gap",
+            "proposedOrder": None,
+            "blockingForPaperTick": True,
+            "paperTickAllowed": False,
+            "freshness": freshness,
+            "candleAlignment": candle_alignment,
+            "missedCandleGap": gap_guard,
+            "catchUpRequired": True,
+            "catchUpModeAvailable": False,
+            "missedClosedCandleCount": gap_guard.get("missedClosedCandleCount"),
+            "firstMissedCandleAt": gap_guard.get("firstMissedCandleAt"),
+            "latestMissedCandleAt": gap_guard.get("latestMissedCandleAt"),
+            "missedClosedCandles": gap_guard.get("missedClosedCandles"),
+            "blockers": [gap_guard.get("reason") or "Multiple closed candles are pending; sequential catch-up is required."],
+            "warnings": [],
+            "stateHashBefore": before["state"],
+            "stateHashAfter": after["state"],
+            "configHashBefore": before["config"],
+            "configHashAfter": after["config"],
+            "journalHashBefore": before["journal"],
+            "journalHashAfter": after["journal"],
+            "journalCsvHashBefore": before["journalCsv"],
+            "journalCsvHashAfter": after["journalCsv"],
+            "stateUnchanged": state_unchanged,
+        }, 200 if state_unchanged else 400
     timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
     diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20))]
     diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
@@ -11259,6 +11367,10 @@ def build_research_preview_paper_tick(args=None) -> tuple[dict, int]:
         "paperTickAllowed": True,
         "freshness": freshness,
         "candleAlignment": candle_alignment,
+        "missedCandleGap": gap_guard,
+        "catchUpRequired": False,
+        "catchUpModeAvailable": False,
+        "missedClosedCandleCount": gap_guard.get("missedClosedCandleCount"),
         "strategy": candidate.get("strategy"),
         "symbol": active_market.get("symbol") or candidate.get("symbol"),
         "timeframe": active_market.get("timeframe") or active_market.get("interval") or candidate.get("timeframe"),
@@ -11531,20 +11643,25 @@ def build_research_paper_tick_due(args=None) -> tuple[dict, int]:
     history = status_payload.get("paperTickHistory") or {}
     last_processed_time = safe_float(history.get("lastProcessedCandleTime"), 0)
     latest_closed_time = safe_float(freshness.get("latestClosedCandleTime") or alignment.get("expectedLatestClosedCandleTime"), 0)
+    gap_guard = active_paper_missed_closed_candles(candidate, freshness, status_payload)
+    missed_count = int(safe_float(gap_guard.get("missedClosedCandleCount"), 0))
+    next_due_time = safe_float(gap_guard.get("nextDueCandleTime"), 0)
     freshness_safe = freshness.get("freshnessStatus") == "FRESH" and not freshness.get("blockingForPaperTick")
     alignment_safe = alignment_status < 400 and alignment.get("candleAlignmentStatus") in {"ALIGNED", "EXPLAINED_OFFSET"} and not alignment.get("blockingForPaperTick")
-    tick_due = bool(latest_closed_time and latest_closed_time > last_processed_time and freshness_safe and alignment_safe)
+    tick_due = bool(missed_count == 1 and next_due_time and freshness_safe and alignment_safe)
     if not latest_closed_time:
         reason = "No latest closed candle is available."
     elif freshness.get("freshnessStatus") != "FRESH" or freshness.get("blockingForPaperTick"):
         reason = "Paper tick blocked because freshness is not safe."
     elif alignment_status >= 400 or alignment.get("candleAlignmentStatus") not in {"ALIGNED", "EXPLAINED_OFFSET"} or alignment.get("blockingForPaperTick"):
         reason = "Paper tick blocked because candle alignment is not safe."
+    elif gap_guard.get("catchUpRequired"):
+        reason = "Multiple closed candles are pending; sequential catch-up is required."
     elif latest_closed_time <= last_processed_time:
         reason = "No new closed candle since last processed candle."
     else:
         reason = "New closed candle available."
-    required_confirmation = active_candidate_confirmation_phrase(candidate, epoch_to_iso(latest_closed_time)) if tick_due else None
+    required_confirmation = active_candidate_confirmation_phrase(candidate, epoch_to_iso(next_due_time)) if tick_due else None
     after = preview_file_hashes()
     state_unchanged = before == after
     real_enabled, _real_detail = paper_real_trading_enabled()
@@ -11565,6 +11682,20 @@ def build_research_paper_tick_due(args=None) -> tuple[dict, int]:
         "latestOpenCandleTime": freshness.get("latestOpenCandleTime"),
         "latestCachedCandleAt": freshness.get("latestCachedCandleAt"),
         "latestCachedCandleTime": freshness.get("latestCachedCandleTime"),
+        "expectedIntervalMinutes": gap_guard.get("expectedIntervalMinutes"),
+        "nextExpectedCandleAt": gap_guard.get("nextExpectedCandleAt"),
+        "nextExpectedCandleTime": gap_guard.get("nextExpectedCandleTime"),
+        "nextDueCandleAt": gap_guard.get("nextDueCandleAt"),
+        "nextDueCandleTime": gap_guard.get("nextDueCandleTime"),
+        "missedClosedCandleCount": gap_guard.get("missedClosedCandleCount"),
+        "firstMissedCandleAt": gap_guard.get("firstMissedCandleAt"),
+        "firstMissedCandleTime": gap_guard.get("firstMissedCandleTime"),
+        "latestMissedCandleAt": gap_guard.get("latestMissedCandleAt"),
+        "latestMissedCandleTime": gap_guard.get("latestMissedCandleTime"),
+        "missedClosedCandles": gap_guard.get("missedClosedCandles"),
+        "missedClosedCandlesTruncated": gap_guard.get("missedClosedCandlesTruncated"),
+        "catchUpRequired": gap_guard.get("catchUpRequired"),
+        "catchUpModeAvailable": gap_guard.get("catchUpModeAvailable"),
         "freshnessStatus": freshness.get("freshnessStatus"),
         "candleAlignmentStatus": alignment.get("candleAlignmentStatus"),
         "paperTickAllowed": bool(tick_due),
@@ -11638,6 +11769,15 @@ def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
         "reason": due.get("reason"),
         "requiredConfirmation": due.get("requiredConfirmation"),
         "nextSafeCommand": due.get("nextSafeCommand"),
+        "paperTickAllowed": due.get("paperTickAllowed"),
+        "catchUpRequired": due.get("catchUpRequired"),
+        "catchUpModeAvailable": due.get("catchUpModeAvailable"),
+        "missedClosedCandleCount": due.get("missedClosedCandleCount"),
+        "firstMissedCandleAt": due.get("firstMissedCandleAt"),
+        "latestMissedCandleAt": due.get("latestMissedCandleAt"),
+        "missedClosedCandles": due.get("missedClosedCandles"),
+        "nextExpectedCandleAt": due.get("nextExpectedCandleAt"),
+        "nextDueCandleAt": due.get("nextDueCandleAt"),
     }
     preview_summary = None
     if preview is not None:
@@ -11658,7 +11798,9 @@ def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
         or status_payload.get("realTradingEnabled")
         or bool((preview_summary or {}).get("blockers"))
     )
-    if blocked:
+    if due.get("catchUpRequired"):
+        next_human_action = "CATCH_UP_REQUIRED"
+    elif blocked:
         next_human_action = "BLOCKED"
     elif not due.get("tickDue"):
         next_human_action = "WAIT_FOR_NEXT_CLOSED_CANDLE"
@@ -11757,6 +11899,23 @@ def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
         return refused("Freshness must be FRESH before running one paper tick.", extra={"freshness": freshness})
     if alignment_status >= 400 or alignment.get("candleAlignmentStatus") not in {"ALIGNED", "EXPLAINED_OFFSET"} or alignment.get("blockingForPaperTick"):
         return refused("Candle alignment must be ALIGNED or explicitly safe before running one paper tick.", extra={"candleAlignment": alignment})
+    status_payload, _status_code = build_research_paper_status(args)
+    gap_guard = active_paper_missed_closed_candles(candidate, freshness, status_payload)
+    if gap_guard.get("catchUpRequired"):
+        return refused(
+            "Multiple closed candles are pending; sequential catch-up is required.",
+            extra={
+                "missedCandleGap": gap_guard,
+                "catchUpRequired": True,
+                "catchUpModeAvailable": False,
+                "missedClosedCandleCount": gap_guard.get("missedClosedCandleCount"),
+                "firstMissedCandleAt": gap_guard.get("firstMissedCandleAt"),
+                "latestMissedCandleAt": gap_guard.get("latestMissedCandleAt"),
+                "missedClosedCandles": gap_guard.get("missedClosedCandles"),
+                "paperTickAllowed": False,
+                "requiredConfirmation": None,
+            },
+        )
     before_market = paper_state_market_snapshot(candidate)
     if not before_market.get("lastProcessedCandleTime"):
         return refused("Active paper market is not initialized.")

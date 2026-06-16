@@ -5634,7 +5634,7 @@ function paperOperatorBadgeClass(value) {
   const normalized = String(value || "").toUpperCase();
   if (["FRESH", "ALIGNED", "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK"].includes(normalized)) return "positive";
   if (["WAIT_FOR_NEXT_CLOSED_CANDLE", "HOLD", "NO ACTION"].includes(normalized)) return "neutral";
-  if (["BLOCKED", "STALE", "MISSING", "MISMATCH"].includes(normalized)) return "negative";
+  if (["BLOCKED", "CATCH_UP_REQUIRED", "STALE", "MISSING", "MISMATCH"].includes(normalized)) return "negative";
   return "neutral";
 }
 
@@ -5728,9 +5728,11 @@ function renderResearchPaperOperator(payload = {}, audits = {}) {
     ? "Waiting"
     : action === "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK"
       ? "Manual CLI tick available"
-      : action === "BLOCKED"
-        ? "Blocked"
-        : "Review preview";
+      : action === "CATCH_UP_REQUIRED"
+        ? "Catch-up required"
+        : action === "BLOCKED"
+          ? "Blocked"
+          : "Review preview";
   const candidateCard = renderPaperOperatorCard("Candidate", [
     renderPaperOperatorValue("Strategy", status.strategy),
     renderPaperOperatorValue("Symbol", status.symbol),
@@ -5764,13 +5766,17 @@ function renderResearchPaperOperator(payload = {}, audits = {}) {
     renderPaperOperatorValue("Tick due", due.tickDue),
     renderPaperOperatorValue("Reason", due.reason),
     renderPaperOperatorValue("Next human action", action),
+    renderPaperOperatorValue("Missed closed candles", due.missedClosedCandleCount),
+    renderPaperOperatorValue("First missed candle", due.firstMissedCandleAt),
+    renderPaperOperatorValue("Latest missed candle", due.latestMissedCandleAt),
   ];
   const dueCard = `
     <section class="paper-operator-card">
       <h4 class="modal-section-title">Due / Next Action</h4>
+      ${due.catchUpRequired ? `<p class="paper-warning">Multiple closed candles are pending. Sequential catch-up is required before paper ticking can continue.</p>` : ""}
       <div class="paper-review-identity paper-operator-grid">${dueRows.join("")}</div>
-      ${due.requiredConfirmation ? `<p class="modal-note"><strong>Required confirmation:</strong> <code>${escapeHtml(due.requiredConfirmation)}</code></p>` : ""}
-      ${due.nextSafeCommand ? `<p class="modal-note"><strong>Next safe CLI command:</strong> <code>${escapeHtml(due.nextSafeCommand)}</code></p>` : ""}
+      ${due.requiredConfirmation && !due.catchUpRequired ? `<p class="modal-note"><strong>Required confirmation:</strong> <code>${escapeHtml(due.requiredConfirmation)}</code></p>` : ""}
+      ${due.nextSafeCommand && !due.catchUpRequired ? `<p class="modal-note"><strong>Next safe CLI command:</strong> <code>${escapeHtml(due.nextSafeCommand)}</code></p>` : ""}
     </section>
   `;
   const previewCard = preview ? renderPaperOperatorCard("Preview", [
