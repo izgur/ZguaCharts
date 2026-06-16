@@ -23,7 +23,10 @@ const BLOCKERS = [
   "adxNotRising",
   "meanReversionFailed",
   "momentumStrengthFailed"
-  ,"relativeStrengthFailed"
+  ,"relativeStrengthFailed",
+  "fibPullbackFailed",
+  "structureBreakFailed",
+  "vwapConfirmationFailed"
 ];
 
 function run(options) {
@@ -274,6 +277,20 @@ function defaultParams(strategyName) {
     base.cooldownBars = 0;
     base.minHoldBars = 1;
   }
+  if (strategyName === "FibPullbackContinuationV1") {
+    base.regimeMode = "symbolFastTrend";
+    base.volumeFilter = false;
+    base.useAdx = false;
+    base.atrMultiplier = 1.8;
+    base.takeProfitAtr = 2.8;
+    base.rsiPullbackLevel = 45;
+    base.rsiReclaimLevel = 53;
+    base.goldenPocketTolerancePct = 0.35;
+    base.requireAnchoredVwap = true;
+    base.cooldownBars = 4;
+    base.minHoldBars = 2;
+    base.donchianExit = 20;
+  }
   return base;
 }
 
@@ -308,6 +325,7 @@ function entrySignal(frame, index, state, params) {
   if (params.strategyName === "RangeExpansionV2") return rangeExpansionV2Entry(frame, index, state, params);
   if (params.strategyName === "RelativeStrengthV2") return relativeStrengthV2Entry(frame, index, state, params);
   if (params.strategyName === "SimpleAtrTrendV2") return simpleAtrTrendV2Entry(frame, index, state, params);
+  if (params.strategyName === "FibPullbackContinuationV1") return fibPullbackContinuationEntry(frame, index, state, params);
   var row = frame[index];
   var previous = index > 0 ? frame[index - 1] : row;
   var blockers = [];
@@ -542,6 +560,21 @@ function simpleAtrTrendV2Entry(frame, index, state, params) {
   return signalFromBlockers(blockers);
 }
 
+function fibPullbackContinuationEntry(frame, index, state, params) {
+  var row = frame[index];
+  var previous = index > 0 ? frame[index - 1] : row;
+  var blockers = baseV2Blockers(row, state, params);
+  if (params.regimeMode === "noRegime") blockers.push("regimeNotBullish");
+  if (!(row.marketStructureTrend === "up" || row.structureBreakUp || row.higherLow)) blockers.push("structureBreakFailed");
+  var hasPocket = row.goldenPocketLow !== null && row.goldenPocketLow !== undefined && row.goldenPocketHigh !== null && row.goldenPocketHigh !== undefined;
+  var inPocket = hasPocket && row.low <= row.goldenPocketHigh + row.atr14 * 0.15 && row.close >= row.goldenPocketLow;
+  var nearPocket = hasPocket && row.nearGoldenPocket === true;
+  var reclaim = row.close > row.open && row.close > row.ema20 && row.rsi14 >= params.rsiReclaimLevel && previous.rsi14 <= params.rsiPullbackLevel;
+  if (!((inPocket || nearPocket) && reclaim)) blockers.push("fibPullbackFailed");
+  if (params.requireAnchoredVwap && !(row.anchoredVwapFromSwingLow && row.close >= row.anchoredVwapFromSwingLow)) blockers.push("vwapConfirmationFailed");
+  return signalFromBlockers(blockers);
+}
+
 function averageRange(frame, index, period) {
   if (index < period) return Infinity;
   var sum = 0;
@@ -589,7 +622,8 @@ function exitSignal(position, frame, index, params) {
     if (row.low <= position.trailingStop) return { price: position.trailingStop, reason: "ATR trailing stop", kind: "stop" };
     var barsHeld = row.__index - position.entryIndex;
     var canRuleExit = barsHeld >= Number(params.minHoldBars || 0);
-    if (canRuleExit && ["RegimePullbackTrend", "EmaPullbackContinuation", "MeanReversionInBullRegime", "MomentumContinuation", "PullbackReclaimV2", "RangeExpansionV2", "RelativeStrengthV2", "SimpleAtrTrendV2"].includes(params.strategyName) && row.close < row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
+    if (position.takeProfit && row.high >= position.takeProfit) return { price: position.takeProfit, reason: "ATR take profit", kind: "take-profit" };
+    if (canRuleExit && ["RegimePullbackTrend", "EmaPullbackContinuation", "MeanReversionInBullRegime", "MomentumContinuation", "PullbackReclaimV2", "RangeExpansionV2", "RelativeStrengthV2", "SimpleAtrTrendV2", "FibPullbackContinuationV1"].includes(params.strategyName) && row.close < row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
     if (params.strategyName === "EmaBounceV2" && row.close < row.ema100) return { price: row.close, reason: "EMA100 exit", kind: "close-signal" };
     if (crossesBelowDonchian(row, previous, params.donchianExit)) return { price: row.close, reason: "Donchian exit", kind: "close-signal" };
   } else {
@@ -636,7 +670,9 @@ function openPosition(state, frame, signalIndex, fillIndex, side, params) {
     notional: notional,
     stopDistance: stopDistance,
     trailingStop: side === "long" ? rawEntry - stopDistance : rawEntry + stopDistance,
+    takeProfit: params.strategyName === "FibPullbackContinuationV1" ? rawEntry + signalRow.atr14 * Number(params.takeProfitAtr || 2.8) : null,
     bestClose: fillRow.close,
+    strategyName: params.strategyName,
     entryFee: fee,
     entrySlippage: slippagePaid
   };

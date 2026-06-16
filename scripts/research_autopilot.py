@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
+from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -142,6 +142,8 @@ def main() -> int:
     tick_once.add_argument("--confirm", required=True)
     sub.add_parser("paper:status")
     sub.add_parser("paper:tick-due")
+    observation_summary = sub.add_parser("paper:observation-summary")
+    observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
     catch_up_plan.add_argument("--refresh", action="store_true")
     catch_up_next = sub.add_parser("paper:catch-up-next")
@@ -206,6 +208,8 @@ def main() -> int:
             payload, status = build_research_paper_status({})
         elif args.command == "paper:tick-due":
             payload, status = build_research_paper_tick_due({})
+        elif args.command == "paper:observation-summary":
+            payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
             payload, status = build_research_paper_operator_check({"refresh": args.refresh})
         elif args.command == "preview-paper-tick":

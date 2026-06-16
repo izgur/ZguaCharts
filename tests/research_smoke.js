@@ -1,5 +1,6 @@
 const assert = require("assert");
 const backtest = require("../core/backtest");
+const indicators = require("../core/indicators");
 const tradeAudit = require("../core/backtest/tradeAudit");
 const optimizer = require("../core/optimizer");
 const reporting = require("../core/reporting");
@@ -48,6 +49,40 @@ assert.ok(alwaysLong.diagnostics.debug.entrySignalsCount > 0, "AlwaysLongTest sh
 const alwaysAudit = tradeAudit.auditTrades(alwaysLong, syntheticCandles(160));
 assert.ok(alwaysAudit.ok, "AlwaysLongTest lifecycle audit must pass: " + alwaysAudit.errors.join("; "));
 
+const featureFrame = indicators.buildIndicatorFrame(syntheticCandles(220), {
+  swingLeft: 2,
+  swingRight: 2,
+  goldenPocketTolerancePct: 1
+});
+const featureRows = featureFrame.filter((row) => row.lastSwingHigh && row.lastSwingLow);
+assert.ok(featureRows.length > 0, "indicator frame should expose confirmed swing context");
+assert.ok(featureRows.some((row) => row.fib618 !== null), "indicator frame should expose fibonacci retracement levels");
+assert.ok(featureRows.some((row) => row.fibExt1618 !== null), "indicator frame should expose fibonacci extension levels");
+assert.ok(featureRows.some((row) => row.pivot !== null), "indicator frame should expose pivot levels");
+assert.ok(featureRows.some((row) => row.anchoredVwapFromSwingLow !== null), "indicator frame should expose anchored VWAP from swing low");
+assert.ok(featureRows.some((row) => ["up", "down", "unknown"].includes(row.marketStructureTrend)), "indicator frame should expose market structure flags");
+
+const fibResult = backtest.runBacktestOnCandles({
+  symbol: "TEST",
+  interval: "15m",
+  strategy: "FibPullbackContinuationV1",
+  candles: syntheticCandles(900),
+  params: {
+    regimeMode: "symbolFastTrend",
+    swingLeft: 2,
+    swingRight: 2,
+    goldenPocketTolerancePct: 1,
+    rsiPullbackLevel: 48,
+    rsiReclaimLevel: 50,
+    requireAnchoredVwap: false,
+    fillModel: "next-open"
+  },
+  debug: true
+});
+assert.strictEqual(fibResult.strategy, "FibPullbackContinuationV1");
+assert.strictEqual(fibResult.interval, "15m");
+assert.ok(fibResult.diagnostics.blockerCounts.fibPullbackFailed >= 0, "Fib strategy diagnostics should include fib blockers");
+
 const loose = backtest.runBacktestOnCandles({
   symbol: "TEST",
   interval: "1h",
@@ -65,6 +100,11 @@ assert.ok(grids.some((grid) => grid.gridName === "V2 ATR trend"), "optimizer sho
 const v2Grid = optimizer.selectOptimizerGrid("SimpleAtrTrendV2", null, 25);
 assert.strictEqual(v2Grid.metadata.gridName, "V2 ATR trend");
 assert.ok(v2Grid.metadata.candidateCountTested <= 25, "optimizer grid must respect max combo limit");
+const fibGrid = optimizer.selectOptimizerGrid("FibPullbackContinuationV1", null, 20);
+assert.strictEqual(fibGrid.metadata.gridName, "Fib pullback continuation 15m");
+assert.strictEqual(fibGrid.metadata.timeframeHint, "15m");
+assert.strictEqual(fibGrid.metadata.acceptanceNotes.minFullTrades, 100);
+assert.ok(fibGrid.combos.every((combo) => combo.fillModel === "next-open"), "Fib grid should use next-open fills");
 const fallbackGrid = optimizer.selectOptimizerGrid("AlwaysLongTest", null, 5);
 assert.strictEqual(fallbackGrid.metadata.gridName, "Default fallback");
 const qualityPolicy = optimizer.optimizerQualityPolicy();

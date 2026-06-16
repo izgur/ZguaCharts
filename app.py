@@ -1592,6 +1592,15 @@ def research_paper_tick_audits():
         return jsonify({"error": f"Could not list paper tick audits: {exc}"}), 502
 
 
+@app.get("/api/research/paper-observation-summary")
+def research_paper_observation_summary():
+    try:
+        payload, status_code = build_research_paper_observation_summary(request.args.to_dict())
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not build paper observation summary: {exc}"}), 502
+
+
 @app.get("/api/research/autopilot/summary")
 def research_autopilot_summary():
     try:
@@ -11545,6 +11554,7 @@ def paper_tick_audit_row(payload: dict, path: Path) -> dict:
         "paperStateChanged": payload.get("paperStateChanged"),
         "previewSignal": payload.get("previewSignal") or tick_result.get("signal"),
         "previewProposedAction": payload.get("previewProposedAction") or tick_result.get("action") or tick_result.get("proposedAction"),
+        "signalReason": payload.get("signalReason") or payload.get("previewSignalReason") or (payload.get("preview") or {}).get("signalReason") or tick_result.get("reason"),
         "openedTrade": payload.get("openedTrade"),
         "closedTrade": payload.get("closedTrade"),
         "openPositionsBefore": payload.get("openPositionsBefore"),
@@ -11612,6 +11622,92 @@ def build_research_paper_tick_audits(args=None) -> tuple[dict, int]:
         "audits": returned,
         "safety": paper_safety_snapshot(real_enabled),
     }, 200
+
+
+def build_research_paper_observation_summary(args=None) -> tuple[dict, int]:
+    args = args or {}
+    before = preview_file_hashes()
+    limit = int(max(1, min(100, safe_float(args.get("limit"), 20))))
+    status_payload, _status_code = build_research_paper_status({})
+    due_payload, _due_status = build_research_paper_tick_due({})
+    audits_payload, _audits_status = build_research_paper_tick_audits({"limit": limit})
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    candidate = status_payload.get("candidate") or {}
+    active = (candidate.get("activeSymbols") or [{}])[0]
+    history = status_payload.get("paperTickHistory") or {}
+    audits = audits_payload.get("audits") or []
+    processed = [row for row in audits if (row.get("paperTickRan") or row.get("tickRan")) and not row.get("skipped") and not row.get("alreadyProcessed")]
+    signal_rows = [
+        row for row in processed
+        if str(row.get("previewSignal") or "").upper() not in ("", "-", "UNKNOWN", "HOLD", "NONE")
+        or str(row.get("previewProposedAction") or "").lower() not in ("", "-", "no action")
+    ]
+    hold_streak = 0
+    for row in processed:
+        signal = str(row.get("previewSignal") or "").upper()
+        action = str(row.get("previewProposedAction") or "").lower()
+        if signal == "HOLD" and action in ("no action", "-", ""):
+            hold_streak += 1
+            continue
+        break
+    reason_counts = {}
+    for row in processed:
+        reason = str(row.get("signalReason") or "").strip()
+        if not reason:
+            reason = "HOLD/no action" if str(row.get("previewSignal") or "").upper() == "HOLD" else "UNKNOWN"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    initial_equity = safe_float(candidate.get("accountEquity"), 10000)
+    current_equity = safe_float(history.get("lastProcessedTickEquityAfter"), initial_equity)
+    open_positions = paper_state_snapshot().get("openPositions") or []
+    next_human_action = "CATCH_UP_REQUIRED" if due_payload.get("catchUpRequired") else ("SAFE_TO_RUN_SINGLE_CONFIRMED_TICK" if due_payload.get("tickDue") else "WAIT_FOR_NEXT_CLOSED_CANDLE")
+    safety = {
+        "liveOrdersTouched": bool(status_payload.get("liveOrdersTouched")),
+        "realTradingEnabled": bool(status_payload.get("realTradingEnabled")),
+        "schedulerEnabled": False,
+        "autoTickEnabled": False,
+        "paperTickRan": False,
+        "paperStateChanged": not state_unchanged,
+    }
+    payload = {
+        "ok": bool(state_unchanged and not safety["realTradingEnabled"]),
+        "observationSummaryOnly": True,
+        "candidate": {
+            "strategy": candidate.get("strategy"),
+            "symbol": active.get("symbol"),
+            "timeframe": active.get("interval") or active.get("timeframe"),
+            "paperEnabled": candidate.get("paperEnabled"),
+        },
+        "totalProcessedPaperTicks": (audits_payload.get("summary") or {}).get("processedCount"),
+        "processedCandleCount": history.get("processedCandleCount"),
+        "lastProcessedCandleAt": history.get("lastProcessedCandleAt"),
+        "lastProcessedCandleTime": history.get("lastProcessedCandleTime"),
+        "nextExpectedCandleAt": due_payload.get("nextExpectedCandleAt"),
+        "nextExpectedCandleTime": due_payload.get("nextExpectedCandleTime"),
+        "tickDue": due_payload.get("tickDue"),
+        "catchUpRequired": due_payload.get("catchUpRequired"),
+        "nextHumanAction": next_human_action,
+        "equity": current_equity,
+        "initialEquity": initial_equity,
+        "equityDrift": round(current_equity - initial_equity, 6),
+        "equityDriftPct": round(((current_equity - initial_equity) / initial_equity * 100), 6) if initial_equity else 0,
+        "openPositionsCount": len(open_positions),
+        "openedTradesCount": (audits_payload.get("summary") or {}).get("openedTradeCount"),
+        "closedTradesCount": (audits_payload.get("summary") or {}).get("closedTradeCount"),
+        "holdStreak": hold_streak,
+        "signalsCount": len(signal_rows),
+        "signalsPer10Candles": round(len(signal_rows) / max(1, len(processed)) * 10, 4),
+        "noTradeReasonCounts": reason_counts,
+        "lastAudits": audits[:limit],
+        "safety": safety,
+        "fileHashesBefore": before,
+        "fileHashesAfter": after,
+        "stateUnchanged": state_unchanged,
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+        payload["error"] = "Observation summary changed config/state/journal hashes."
+    return payload, 200 if payload.get("ok") else 500
 
 
 def build_research_paper_status(args=None) -> tuple[dict, int]:

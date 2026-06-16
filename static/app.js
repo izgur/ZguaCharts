@@ -5615,11 +5615,12 @@ async function loadResearchPaperOperator() {
   if (!host) return;
   try {
     host.innerHTML = `<p class="pane-status">Loading paper operator status...</p>`;
-    const [payload, audits] = await Promise.all([
+    const [payload, audits, observation] = await Promise.all([
       apiGet("/api/research/paper-operator-check"),
       apiGet("/api/research/paper-tick-audits"),
+      apiGet("/api/research/paper-observation-summary"),
     ]);
-    host.innerHTML = renderResearchPaperOperator(payload, audits);
+    host.innerHTML = renderResearchPaperOperator(payload, audits, observation);
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Could not load paper operator status.</p>`;
   }
@@ -5657,6 +5658,39 @@ function renderPaperOperatorCard(title, rows) {
       <div class="paper-review-identity paper-operator-grid">
         ${rows.join("")}
       </div>
+    </section>
+  `;
+}
+
+function renderPaperObservationSummary(payload = {}) {
+  const reasons = Object.entries(payload.noTradeReasonCounts || {}).slice(0, 6).map(([reason, count]) => `
+    <tr><td>${escapeHtml(reason)}</td><td>${escapeHtml(count)}</td></tr>
+  `).join("");
+  const rows = [
+    renderPaperOperatorValue("Processed ticks", payload.totalProcessedPaperTicks),
+    renderPaperOperatorValue("Processed candles", payload.processedCandleCount),
+    renderPaperOperatorValue("Last candle", payload.lastProcessedCandleAt),
+    renderPaperOperatorValue("Next expected", payload.nextExpectedCandleAt),
+    renderPaperOperatorValue("Tick due", payload.tickDue),
+    renderPaperOperatorValue("Catch-up required", payload.catchUpRequired),
+    renderPaperOperatorValue("Next human action", payload.nextHumanAction),
+    renderPaperOperatorValue("Equity drift", `${payload.equityDrift ?? "-"} (${payload.equityDriftPct ?? "-"}%)`),
+    renderPaperOperatorValue("Open positions", payload.openPositionsCount),
+    renderPaperOperatorValue("Opened / closed", `${payload.openedTradesCount ?? 0} / ${payload.closedTradesCount ?? 0}`),
+    renderPaperOperatorValue("HOLD streak", payload.holdStreak),
+    renderPaperOperatorValue("Signals / 10 candles", payload.signalsPer10Candles),
+  ];
+  return `
+    <section class="paper-operator-card">
+      <h4 class="modal-section-title">Paper Observation Summary</h4>
+      <div class="paper-review-identity paper-operator-grid">${rows.join("")}</div>
+      <div class="table-scroll">
+        <table class="trade-table">
+          <thead><tr><th>No-trade reason</th><th>Count</th></tr></thead>
+          <tbody>${reasons || `<tr><td colspan="2">No no-trade reasons recorded yet.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <p class="modal-note">Read-only summary. stateUnchanged=${escapeHtml(payload.stateUnchanged)}, observationSummaryOnly=${escapeHtml(payload.observationSummaryOnly)}</p>
     </section>
   `;
 }
@@ -5716,7 +5750,7 @@ function renderPaperTickAuditHistory(payload = {}) {
   `;
 }
 
-function renderResearchPaperOperator(payload = {}, audits = {}) {
+function renderResearchPaperOperator(payload = {}, audits = {}, observation = {}) {
   const status = payload.statusSummary || {};
   const freshness = payload.freshnessSummary || {};
   const alignment = payload.alignmentSummary || {};
@@ -5789,6 +5823,7 @@ function renderResearchPaperOperator(payload = {}, audits = {}) {
     renderPaperOperatorValue("Blockers", (preview.blockers || []).join(", ") || "-"),
     renderPaperOperatorValue("Warnings", (preview.warnings || []).join(", ") || "-"),
   ]) : "";
+  const observationCard = renderPaperObservationSummary(observation);
   return `
     <section class="paper-operator-panel">
       <div class="paper-operator-banner">Read-only paper operator view. This page cannot run paper ticks or live orders.</div>
@@ -5806,6 +5841,7 @@ function renderResearchPaperOperator(payload = {}, audits = {}) {
         ${alignmentCard}
         ${dueCard}
         ${previewCard}
+        ${observationCard}
       </div>
       <h4 class="modal-section-title">Safety</h4>
       ${renderPaperOperatorSafety(safety)}

@@ -78,7 +78,8 @@ registerStrategy({
   "BreakoutRetestV2",
   "RangeExpansionV2",
   "RelativeStrengthV2",
-  "SimpleAtrTrendV2"
+  "SimpleAtrTrendV2",
+  "FibPullbackContinuationV1"
 ].forEach(function (name) {
   registerStrategy({
     name: name,

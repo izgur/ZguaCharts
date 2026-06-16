@@ -121,6 +121,157 @@ function vwap(candles) {
   return out;
 }
 
+function pivotLevels(candles) {
+  return candles.map(function (candle, index) {
+    var source = index > 0 ? candles[index - 1] : candle;
+    var pivot = (source.high + source.low + source.close) / 3;
+    var r1 = pivot * 2 - source.low;
+    var s1 = pivot * 2 - source.high;
+    return {
+      pivot: pivot,
+      pivotR1: r1,
+      pivotS1: s1,
+      pivotR2: pivot + (source.high - source.low),
+      pivotS2: pivot - (source.high - source.low)
+    };
+  });
+}
+
+function anchoredVwapFrom(candles, startIndex) {
+  var pv = 0;
+  var volume = 0;
+  for (var i = Math.max(0, startIndex); i < candles.length; i += 1) {
+    var typical = (candles[i].high + candles[i].low + candles[i].close) / 3;
+    pv += typical * candles[i].volume;
+    volume += candles[i].volume;
+  }
+  return volume ? pv / volume : null;
+}
+
+function swingFeatures(candles, options) {
+  options = options || {};
+  var left = Math.max(1, Number(options.left || options.swingLeft || 3));
+  var right = Math.max(1, Number(options.right || options.swingRight || 3));
+  var goldenTolerancePct = Number(options.goldenPocketTolerancePct || 0.25);
+  var rows = [];
+  var lastHigh = null;
+  var previousHigh = null;
+  var lastLow = null;
+  var previousLow = null;
+
+  function isSwingHigh(index) {
+    if (index < left || index + right >= candles.length) return false;
+    for (var offset = 1; offset <= left; offset += 1) {
+      if (candles[index].high <= candles[index - offset].high) return false;
+    }
+    for (var r = 1; r <= right; r += 1) {
+      if (candles[index].high < candles[index + r].high) return false;
+    }
+    return true;
+  }
+
+  function isSwingLow(index) {
+    if (index < left || index + right >= candles.length) return false;
+    for (var offset = 1; offset <= left; offset += 1) {
+      if (candles[index].low >= candles[index - offset].low) return false;
+    }
+    for (var r = 1; r <= right; r += 1) {
+      if (candles[index].low > candles[index + r].low) return false;
+    }
+    return true;
+  }
+
+  function emptyRow() {
+    return {
+      confirmedSwingHigh: false,
+      confirmedSwingLow: false,
+      lastSwingHigh: null,
+      lastSwingHighTime: null,
+      lastSwingLow: null,
+      lastSwingLowTime: null,
+      higherHigh: false,
+      lowerHigh: false,
+      higherLow: false,
+      lowerLow: false,
+      structureBreakUp: false,
+      structureBreakDown: false,
+      marketStructureTrend: "unknown",
+      fib382: null,
+      fib50: null,
+      fib618: null,
+      fib786: null,
+      fibExt1272: null,
+      fibExt1618: null,
+      goldenPocketLow: null,
+      goldenPocketHigh: null,
+      goldenPocketProximityPct: null,
+      nearGoldenPocket: false,
+      anchoredVwapFromSwingLow: null,
+      anchoredVwapFromSwingHigh: null
+    };
+  }
+
+  for (var i = 0; i < candles.length; i += 1) {
+    var row = emptyRow();
+    var candle = candles[i];
+    var brokeUpBeforeUpdate = lastHigh && candle.close > lastHigh.price;
+    var brokeDownBeforeUpdate = lastLow && candle.close < lastLow.price;
+    var candidate = i - right;
+
+    if (candidate >= 0 && isSwingHigh(candidate)) {
+      previousHigh = lastHigh;
+      lastHigh = { price: candles[candidate].high, time: candles[candidate].time, index: candidate };
+      row.confirmedSwingHigh = true;
+      row.higherHigh = !!(previousHigh && lastHigh.price > previousHigh.price);
+      row.lowerHigh = !!(previousHigh && lastHigh.price < previousHigh.price);
+    }
+    if (candidate >= 0 && isSwingLow(candidate)) {
+      previousLow = lastLow;
+      lastLow = { price: candles[candidate].low, time: candles[candidate].time, index: candidate };
+      row.confirmedSwingLow = true;
+      row.higherLow = !!(previousLow && lastLow.price > previousLow.price);
+      row.lowerLow = !!(previousLow && lastLow.price < previousLow.price);
+    }
+
+    row.lastSwingHigh = lastHigh ? lastHigh.price : null;
+    row.lastSwingHighTime = lastHigh ? lastHigh.time : null;
+    row.lastSwingLow = lastLow ? lastLow.price : null;
+    row.lastSwingLowTime = lastLow ? lastLow.time : null;
+    row.structureBreakUp = !!brokeUpBeforeUpdate;
+    row.structureBreakDown = !!brokeDownBeforeUpdate;
+    row.marketStructureTrend = row.structureBreakUp || (lastHigh && previousHigh && lastHigh.price > previousHigh.price && lastLow && previousLow && lastLow.price > previousLow.price)
+      ? "up"
+      : row.structureBreakDown || (lastHigh && previousHigh && lastHigh.price < previousHigh.price && lastLow && previousLow && lastLow.price < previousLow.price)
+        ? "down"
+        : "unknown";
+
+    if (lastHigh && lastLow && lastLow.index < lastHigh.index) {
+      var range = lastHigh.price - lastLow.price;
+      if (range > 0) {
+        row.fib382 = lastHigh.price - range * 0.382;
+        row.fib50 = lastHigh.price - range * 0.5;
+        row.fib618 = lastHigh.price - range * 0.618;
+        row.fib786 = lastHigh.price - range * 0.786;
+        row.fibExt1272 = lastHigh.price + range * 0.272;
+        row.fibExt1618 = lastHigh.price + range * 0.618;
+        row.goldenPocketLow = Math.min(row.fib618, row.fib786);
+        row.goldenPocketHigh = Math.max(row.fib618, row.fib786);
+        if (candle.close && row.goldenPocketLow !== null) {
+          var distance = candle.close >= row.goldenPocketLow && candle.close <= row.goldenPocketHigh
+            ? 0
+            : Math.min(Math.abs(candle.close - row.goldenPocketLow), Math.abs(candle.close - row.goldenPocketHigh));
+          row.goldenPocketProximityPct = distance / candle.close * 100;
+          row.nearGoldenPocket = row.goldenPocketProximityPct <= goldenTolerancePct;
+        }
+      }
+    }
+    if (lastLow) row.anchoredVwapFromSwingLow = anchoredVwapFrom(candles.slice(0, i + 1), lastLow.index);
+    if (lastHigh) row.anchoredVwapFromSwingHigh = anchoredVwapFrom(candles.slice(0, i + 1), lastHigh.index);
+    rows[i] = row;
+  }
+  return rows;
+}
+
 function macd(values, fast, slow, signal) {
   var fastEma = ema(values, fast);
   var slowEma = ema(values, slow);
@@ -190,10 +341,12 @@ function buildIndicatorFrame(candles, params) {
   var dc55 = donchian(candles, params.donchian55 || 55);
   var dc100 = donchian(candles, params.donchian100 || 100);
   var vwapValues = vwap(candles);
+  var pivots = pivotLevels(candles);
+  var swing = swingFeatures(candles, params);
   var volumeMa20 = sma(candles.map(function (c) { return c.volume; }), params.volumeMa || 20);
   var st = supertrend(candles, params.supertrendPeriod || 10, params.supertrendMultiplier || 3);
   return candles.map(function (candle, index) {
-    return Object.assign({}, candle, {
+    return Object.assign({}, candle, swing[index] || {}, pivots[index] || {}, {
       __index: index,
       ema9: ema9Values[index],
       ema20: ema20Values[index],
@@ -235,6 +388,8 @@ module.exports = {
   adx: adx,
   donchian: donchian,
   vwap: vwap,
+  pivotLevels: pivotLevels,
+  swingFeatures: swingFeatures,
   macd: macd,
   bollinger: bollinger,
   supertrend: supertrend,

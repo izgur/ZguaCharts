@@ -790,6 +790,41 @@ function optimizerGridCatalog() {
     notes: ["There is no dedicated Cipher B strategy yet; this grid only covers existing RSI/oscillator-like parameters."],
     riskLevel: "medium"
   };
+  var fibPullback15mGrid = {
+    strategyKey: "fib_pullback_continuation_v1_15m",
+    gridName: "Fib pullback continuation 15m",
+    humanName: "Fib Pullback Continuation V1 15m",
+    params: {
+      regimeMode: ["symbolFastTrend", "symbolTrend", "looseBtcBull"],
+      swingLeft: [2, 3, 4],
+      swingRight: [2, 3],
+      goldenPocketTolerancePct: [0.2, 0.35, 0.5],
+      rsiPullbackLevel: [42, 45, 48],
+      rsiReclaimLevel: [50, 53, 56],
+      atrMultiplier: [1.4, 1.8, 2.2],
+      takeProfitAtr: [2.2, 2.8, 3.4],
+      cooldownBars: [4, 8, 12],
+      minHoldBars: [1, 2, 4],
+      requireAnchoredVwap: [true],
+      volumeFilter: [false],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 450,
+    notes: [
+      "Research-only 15m grid; does not activate paper trading.",
+      "Designed for higher trade counts with stricter fees, slippage, walk-forward, and concentration review gates.",
+      "Requires regime/trend confirmation, a pullback into the golden pocket, reclaim confirmation, and next-open fills."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "15m",
+    acceptanceNotes: {
+      minFullTrades: 100,
+      minFoldPassCount: 4,
+      maxBestFoldContributionPct: 60,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+    }
+  };
   var fallbackGrid = {
     strategyKey: "default_fallback",
     gridName: "Default fallback",
@@ -873,6 +908,7 @@ function optimizerGridCatalog() {
         volumeFilter: [false]
       }
     }),
+    FibPullbackContinuationV1: fibPullback15mGrid,
     SimpleAtrTrendV2: v2TrendGrid
   };
 }
@@ -1027,7 +1063,9 @@ function gridMetadata(grid, ranges, planned, tested, sampled, fallbackUsed, fall
     warning: grid.warning || null,
     sampled: sampled === true,
     notes: grid.notes || [],
-    riskLevel: grid.riskLevel || "unknown"
+    riskLevel: grid.riskLevel || "unknown",
+    timeframeHint: grid.timeframeHint || null,
+    acceptanceNotes: grid.acceptanceNotes || null
   };
 }
 
