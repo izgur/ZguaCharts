@@ -2640,6 +2640,60 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(delete_response.status_code, 405)
         self.assertEqual(before, after)
 
+    def test_paper_observation_summary_is_read_only_and_counts_audits(self):
+        config = self.write_active_paper_config()
+        self.set_last_processed_candle(1781625600)
+        zgua_app.PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        processed_audit = {
+            "command": "paper:tick-once",
+            "candidateIdentity": config["candidateKey"],
+            "confirmationMatched": True,
+            "paperTickRan": True,
+            "tickRan": True,
+            "paperStateChanged": True,
+            "processedCandleAt": 1781625600,
+            "previewSignal": "HOLD",
+            "previewProposedAction": "no action",
+            "signalReason": "No entry signal because fibPullbackFailed.",
+            "openedTrade": False,
+            "closedTrade": False,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+            "realTradingEnabled": False,
+            "liveOrdersTouched": False,
+        }
+        (zgua_app.PAPER_TICK_AUDIT_DIR / "processed.json").write_text(json.dumps(processed_audit), encoding="utf-8")
+        before = zgua_app.preview_file_hashes()
+        due = {
+            **self.operator_due_payload(False, reason="No new closed candle since last processed candle."),
+            "nextExpectedCandleAt": "2026-06-16T20:00:00+00:00",
+            "nextExpectedCandleTime": 1781640000,
+        }
+        with patch.object(zgua_app, "build_research_paper_tick_due", return_value=(due, 200)):
+            payload, status = zgua_app.build_research_paper_observation_summary({})
+            with zgua_app.app.test_client() as client:
+                response = client.get("/api/research/paper-observation-summary")
+                post_response = client.post("/api/research/paper-observation-summary")
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["observationSummaryOnly"])
+        self.assertEqual(payload["totalProcessedPaperTicks"], 1)
+        self.assertEqual(payload["lastProcessedCandleAt"], "2026-06-16T16:00:00+00:00")
+        self.assertEqual(payload["nextExpectedCandleAt"], "2026-06-16T20:00:00+00:00")
+        self.assertEqual(payload["holdStreak"], 1)
+        self.assertEqual(payload["signalsPer10Candles"], 0)
+        self.assertEqual(payload["noTradeReasonCounts"]["No entry signal because fibPullbackFailed."], 1)
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertFalse(payload["safety"]["schedulerEnabled"])
+        self.assertFalse(payload["safety"]["autoTickEnabled"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(post_response.status_code, 405)
+        self.assertEqual(before, after)
+
     def test_research_paper_operator_route_renders_main_page(self):
         with zgua_app.app.test_client() as client:
             response = client.get("/research/paper-operator")
@@ -2708,7 +2762,11 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("/research/paper-operator", template)
         self.assertIn('apiGet("/api/research/paper-operator-check")', script)
         self.assertIn('apiGet("/api/research/paper-tick-audits")', script)
+        self.assertIn('apiGet("/api/research/paper-observation-summary")', script)
         self.assertIn("Read-only paper operator view. This page cannot run paper ticks or live orders.", script)
+        self.assertIn("Paper Observation Summary", script)
+        self.assertIn("Signals / 10 candles", script)
+        self.assertIn("No-trade reason", script)
         self.assertIn("nextHumanAction", script)
         self.assertIn("Tick due", script)
         self.assertIn("lastProcessedCandleAt", script)
@@ -2742,6 +2800,9 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn('apiPost("/api/research/paper-tick-audits"', script)
         self.assertNotIn('apiPut("/api/research/paper-tick-audits"', script)
         self.assertNotIn('apiDelete("/api/research/paper-tick-audits"', script)
+        self.assertNotIn('apiPost("/api/research/paper-observation-summary"', script)
+        self.assertNotIn('apiPut("/api/research/paper-observation-summary"', script)
+        self.assertNotIn('apiDelete("/api/research/paper-observation-summary"', script)
         self.assertNotIn("paper-operator-refresh", template)
         self.assertNotIn("paper-operator-enable", template)
         self.assertNotIn("paper-operator-run", template)
