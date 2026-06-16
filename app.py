@@ -11832,6 +11832,23 @@ def build_research_paper_catch_up_plan(args=None) -> tuple[dict, int]:
     return payload, 200 if payload.get("ok") else 500
 
 
+TARGET_REPLAY_STALE_WARNING_PARTS = [
+    "Active-market candle data is stale",
+    "Market data is stale; skipping paper processing",
+    "Candle cache may be stale",
+]
+
+
+def filter_target_replay_warnings(warnings: list) -> list:
+    filtered = []
+    for warning in warnings or []:
+        text = str(warning)
+        if any(part in text for part in TARGET_REPLAY_STALE_WARNING_PARTS):
+            continue
+        filtered.append(warning)
+    return dedupe_list(filtered)
+
+
 def build_research_preview_paper_catch_up_next(args=None) -> tuple[dict, int]:
     args = args or {}
     candidate = load_paper_candidate_config()
@@ -11840,12 +11857,17 @@ def build_research_preview_paper_catch_up_next(args=None) -> tuple[dict, int]:
     target_time = plan.get("targetCandleTime")
     target_at = plan.get("targetCandleAt")
     validation = plan.get("targetCacheValidation") or {}
+    next_open_time = validation.get("nextOpenCandleTime")
+    next_open_at = validation.get("nextOpenCandleAt")
     real_enabled, real_detail = paper_real_trading_enabled()
     base = {
         "ok": False,
         "catchUpPreviewOnly": True,
+        "targetReplayMode": True,
         "targetCandleAt": target_at,
         "targetCandleTime": target_time,
+        "nextOpenCandleAt": next_open_at,
+        "nextOpenCandleTime": next_open_time,
         "requiredConfirmation": plan.get("requiredConfirmation"),
         "paperTickRan": False,
         "paperStateChanged": False,
@@ -11901,7 +11923,7 @@ def build_research_preview_paper_catch_up_next(args=None) -> tuple[dict, int]:
     signal = diagnostics_payload.get("signal") or "UNKNOWN"
     reason = diagnostics_payload.get("reason") or (diagnostics.get("nextAction") or {}).get("reason") or "No signal diagnostics reason returned."
     proposed_action, proposed_order = preview_estimated_order(candidate, signal, latest_candle, current_position, reason)
-    warnings = dedupe_list((diagnostics.get("warnings") or []) + (tick_payload.get("warnings") or []))
+    warnings = filter_target_replay_warnings((diagnostics.get("warnings") or []) + (tick_payload.get("warnings") or []))
     payload = {
         **base,
         "ok": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0 and diagnostics.get("ok", True) is not False),
@@ -11917,6 +11939,8 @@ def build_research_preview_paper_catch_up_next(args=None) -> tuple[dict, int]:
         "equityBefore": paper_state_market_snapshot(candidate).get("accountEquity"),
         "openPositionsBefore": len(paper_state_market_snapshot(candidate).get("openPositions") or []),
         "targetCacheValidation": validation,
+        "nextOpenCandleAt": next_open_at,
+        "nextOpenCandleTime": next_open_time,
         "catchUpPlan": plan,
         "tickDryRun": {
             "status": tick_payload.get("status"),
@@ -12202,7 +12226,7 @@ def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
         "processedCandleAt": after_market.get("lastProcessedCandleTime"),
         "tickResult": stdout_payload,
         "returnCode": completed.returncode,
-        "warnings": dedupe_list((preview.get("warnings") or []) + (stdout_payload.get("warnings") or [])),
+        "warnings": filter_target_replay_warnings((preview.get("warnings") or []) + (stdout_payload.get("warnings") or [])),
         "fileHashesBefore": before_hashes,
         "fileHashesAfter": after_hashes,
     }

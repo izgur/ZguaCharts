@@ -1155,7 +1155,7 @@ class ResearchAutopilotTests(unittest.TestCase):
         zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
         return config
 
-    def preview_subprocess_payloads(self, latest_time=None):
+    def preview_subprocess_payloads(self, latest_time=None, diagnostic_warnings=None, tick_warnings=None):
         latest_time = latest_time or int(datetime.now(timezone.utc).timestamp()) - 60 * 60
         diagnostics = {
             "ok": True,
@@ -1167,7 +1167,7 @@ class ResearchAutopilotTests(unittest.TestCase):
                 "reason": "Entry signal matched.",
                 "positionState": {"hasOpenPosition": False},
             },
-            "warnings": [],
+            "warnings": diagnostic_warnings or [],
         }
         tick = {
             "ok": True,
@@ -1175,7 +1175,7 @@ class ResearchAutopilotTests(unittest.TestCase):
             "events": 1,
             "openPositions": 0,
             "closedTrades": 0,
-            "warnings": [],
+            "warnings": tick_warnings or [],
             "freshness": {
                 "BTCUSDT:4h": {"latestCandleTime": latest_time}
             },
@@ -2260,15 +2260,42 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["catchUpPreviewOnly"])
+        self.assertTrue(payload["targetReplayMode"])
         self.assertEqual(payload["targetCandleAt"], "2026-06-15T20:00:00+00:00")
+        self.assertEqual(payload["nextOpenCandleAt"], "2026-06-16T00:00:00+00:00")
         self.assertEqual(payload["signal"], "BUY")
         self.assertEqual(payload["proposedAction"], "would open long")
+        self.assertEqual(payload["warnings"], [])
         self.assertTrue(all(str(first_missed) in command for command in commands))
         self.assertTrue(all(str(latest_missed) not in command for command in commands))
         self.assertFalse(payload["paperTickRan"])
         self.assertFalse(payload["paperStateChanged"])
         self.assertFalse(payload["liveOrdersTouched"])
         self.assertEqual(before, after)
+
+    def test_preview_paper_catch_up_next_filters_target_replay_stale_warnings(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        latest_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        stale_warnings = [
+            "Active-market candle data is stale; refresh=true can attempt to refresh cache before diagnostics.",
+            "BTCUSDT 4h: Market data is stale; skipping paper processing.",
+            "Candle cache may be stale.",
+        ]
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(latest_missed)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, latest_missed)), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads(first_missed, diagnostic_warnings=stale_warnings[:1], tick_warnings=stale_warnings[1:])):
+            payload, status = zgua_app.build_research_preview_paper_catch_up_next({})
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["targetReplayMode"])
+        self.assertEqual(payload["targetCandleAt"], "2026-06-15T20:00:00+00:00")
+        self.assertEqual(payload["warnings"], [])
+        self.assertEqual(payload["blockers"], [])
+        self.assertTrue(payload["paperTickAllowed"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
 
     def test_preview_paper_catch_up_next_refuses_when_not_required_or_missing_next_open(self):
         self.write_active_paper_config()

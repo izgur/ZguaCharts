@@ -253,6 +253,14 @@ function activeSignalDiagnostics(options) {
     const targetCandleTime = Number(options.targetCandleTime || 0);
     if (targetCandleTime) candles = candles.filter((candle) => Number(candle.time || 0) <= targetCandleTime);
     const freshness = freshnessForMarket(active, candles, payload.metadata);
+    const targetReplayMode = !!targetCandleTime;
+    const effectiveFreshness = targetReplayMode
+      ? Object.assign({}, freshness, {
+          isStale: false,
+          targetReplayMode: true,
+          targetCandleTime
+        })
+      : freshness;
     const params = Object.assign({}, config.params || {}, {
       regimeMode: canonicalRegimeMode(config),
       fillModel: config.fillModel || "next-open",
@@ -287,7 +295,7 @@ function activeSignalDiagnostics(options) {
     const reason = latestReason(latestSignal, latestPreview, latestTrade, checks);
     const warnings = [];
     if (!candles.length) warnings.push("No closed active-market candles were available for diagnostics.");
-    if (freshness.isStale) warnings.push("Active-market candle data is stale; refresh=true can attempt to refresh cache before diagnostics.");
+    if (!targetReplayMode && freshness.isStale) warnings.push("Active-market candle data is stale; refresh=true can attempt to refresh cache before diagnostics.");
     return {
       ok: true,
       paperEnabled: !!config.enabled,
@@ -298,7 +306,7 @@ function activeSignalDiagnostics(options) {
         timeframe: active.interval,
         source: config.source || "bybit",
         marketKey: marketKey(active),
-        freshness
+        freshness: effectiveFreshness
       },
       latestCandle: latestRow ? compactCandle(latestRow) : null,
       diagnostics: {
@@ -317,7 +325,7 @@ function activeSignalDiagnostics(options) {
         primaryBlocker: (result.diagnostics || {}).primaryBlocker || null
       },
       recentCandles: recentRows,
-      nextAction: nextSignalDiagnosticAction(latestSignal, freshness, latestPreview),
+      nextAction: nextSignalDiagnosticAction(latestSignal, effectiveFreshness, latestPreview),
       warnings
     };
   });
@@ -780,16 +788,24 @@ function processMarket(config, state, market, regimeCandles, options) {
       processingCandleTime = targetCandleTime;
     }
     const freshness = freshnessForMarket(market, candles, payload.metadata);
+    const targetReplayMode = !!processingCandleTime;
+    const effectiveFreshness = targetReplayMode
+      ? Object.assign({}, freshness, {
+          isStale: false,
+          targetReplayMode: true,
+          targetCandleTime: processingCandleTime
+        })
+      : freshness;
     state.freshness = state.freshness || {};
-    state.freshness[marketKey(market)] = freshness;
+    state.freshness[marketKey(market)] = effectiveFreshness;
     if (!candles.length) return warningEvent(config, state, market, "No closed candles available.");
-    if (freshness.isStale && !options.allowStale) {
+    if (!targetReplayMode && freshness.isStale && !options.allowStale) {
       return warningEvent(config, state, market, "Market data is stale; skipping paper processing.");
     }
-    if (freshness.isStale && options.allowStale) {
+    if (!targetReplayMode && freshness.isStale && options.allowStale) {
       warnings.push("Market data is stale; --allow-stale override used.");
     }
-    warnOnGaps(candles, market, warnings);
+    if (!targetReplayMode) warnOnGaps(candles, market, warnings);
     const key = marketKey(market);
     const lastProcessed = Number(state.lastProcessedCandleTime[key] || 0);
     if (!lastProcessed && !options.allowBootstrapImport) {
