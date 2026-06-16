@@ -1583,6 +1583,15 @@ def research_paper_operator_check():
         return jsonify({"error": f"Could not build paper operator check: {exc}"}), 502
 
 
+@app.get("/api/research/paper-tick-audits")
+def research_paper_tick_audits():
+    try:
+        payload, status_code = build_research_paper_tick_audits(request.args.to_dict())
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not list paper tick audits: {exc}"}), 502
+
+
 @app.get("/api/research/autopilot/summary")
 def research_autopilot_summary():
     try:
@@ -11344,6 +11353,102 @@ def latest_confirmed_tick_audit(candidate_key: str | None = None, processed_only
             continue
         return payload, path
     return {}, None
+
+
+def paper_tick_audit_row(payload: dict, path: Path) -> dict:
+    tick_result = payload.get("tickResult") if isinstance(payload.get("tickResult"), dict) else {}
+    candidate = load_paper_candidate_config()
+    active = primary_active_market(candidate)
+    attempted_time, attempted_at = tick_audit_attempt_candle(payload)
+    processed_raw = payload.get("processedCandleAt")
+    processed_epoch = safe_float(processed_raw, 0)
+    processed_at = epoch_to_iso(processed_epoch) if processed_epoch else processed_raw
+    return {
+        "auditPath": autopilot_display_path(path),
+        "auditAt": tick_audit_time(payload, path),
+        "createdAt": tick_audit_time(payload, path),
+        "command": payload.get("command"),
+        "candidateIdentity": payload.get("candidateIdentity"),
+        "symbol": payload.get("symbol") or active.get("symbol") or candidate.get("symbol"),
+        "timeframe": payload.get("timeframe") or active.get("interval") or active.get("timeframe") or candidate.get("timeframe"),
+        "expectedLatestClosedCandleAt": payload.get("expectedLatestClosedCandleAt") or attempted_at,
+        "processedCandleAt": processed_at,
+        "processedCandleTime": int(processed_epoch) if processed_epoch else None,
+        "confirmationMatched": payload.get("confirmationMatched"),
+        "alreadyProcessed": payload.get("alreadyProcessed"),
+        "skipped": payload.get("skipped"),
+        "paperTickRan": payload.get("paperTickRan"),
+        "tickRan": payload.get("tickRan"),
+        "paperStateChanged": payload.get("paperStateChanged"),
+        "previewSignal": payload.get("previewSignal") or tick_result.get("signal"),
+        "previewProposedAction": payload.get("previewProposedAction") or tick_result.get("action") or tick_result.get("proposedAction"),
+        "openedTrade": payload.get("openedTrade"),
+        "closedTrade": payload.get("closedTrade"),
+        "openPositionsBefore": payload.get("openPositionsBefore"),
+        "openPositionsAfter": payload.get("openPositionsAfter"),
+        "equityBefore": payload.get("equityBefore"),
+        "equityAfter": payload.get("equityAfter"),
+        "realTradingEnabled": payload.get("realTradingEnabled"),
+        "liveOrdersTouched": payload.get("liveOrdersTouched"),
+        "returnCode": payload.get("returnCode"),
+        "warnings": payload.get("warnings") or [],
+        "_sortTime": path.stat().st_mtime,
+        "_processedTime": int(processed_epoch) if processed_epoch else attempted_time,
+    }
+
+
+def build_research_paper_tick_audits(args=None) -> tuple[dict, int]:
+    args = args or {}
+    limit = int(max(1, min(100, safe_float(args.get("limit"), 20))))
+    candidate = load_paper_candidate_config()
+    active_candidate_key = candidate.get("candidateKey")
+    real_enabled, _real_detail = paper_real_trading_enabled()
+    rows = []
+    malformed = 0
+    total_read = 0
+    if PAPER_TICK_AUDIT_DIR.exists():
+        for path in PAPER_TICK_AUDIT_DIR.glob("*.json"):
+            total_read += 1
+            try:
+                payload = read_json_file(str(path), None)
+            except Exception:
+                malformed += 1
+                continue
+            if not isinstance(payload, dict):
+                malformed += 1
+                continue
+            if active_candidate_key and payload.get("candidateIdentity") != active_candidate_key:
+                continue
+            rows.append(paper_tick_audit_row(payload, path))
+    rows.sort(key=lambda item: safe_float(item.get("_sortTime"), 0), reverse=True)
+    processed_rows = [row for row in rows if row.get("paperTickRan") is True and not row.get("skipped") and not row.get("alreadyProcessed")]
+    latest_processed = max(processed_rows, key=lambda item: safe_float(item.get("_processedTime"), 0), default={})
+    returned = rows[:limit]
+    for row in returned:
+        row.pop("_sortTime", None)
+        row.pop("_processedTime", None)
+    summary = {
+        "totalAuditsRead": total_read,
+        "returnedCount": len(returned),
+        "processedCount": len(processed_rows),
+        "skippedCount": len([row for row in rows if row.get("skipped") or row.get("alreadyProcessed")]),
+        "openedTradeCount": len([row for row in rows if row.get("openedTrade")]),
+        "closedTradeCount": len([row for row in rows if row.get("closedTrade")]),
+        "liveOrdersTouchedCount": len([row for row in rows if row.get("liveOrdersTouched")]),
+        "realTradingEnabledCount": len([row for row in rows if row.get("realTradingEnabled")]),
+        "malformedAuditCount": malformed,
+        "latestProcessedCandleAt": latest_processed.get("processedCandleAt"),
+        "latestProcessedTickAt": latest_processed.get("auditAt"),
+        "ok": True,
+    }
+    return {
+        "ok": True,
+        "candidateIdentity": active_candidate_key,
+        "limit": limit,
+        "summary": summary,
+        "audits": returned,
+        "safety": paper_safety_snapshot(real_enabled),
+    }, 200
 
 
 def build_research_paper_status(args=None) -> tuple[dict, int]:

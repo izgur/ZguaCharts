@@ -5615,8 +5615,11 @@ async function loadResearchPaperOperator() {
   if (!host) return;
   try {
     host.innerHTML = `<p class="pane-status">Loading paper operator status...</p>`;
-    const payload = await apiGet("/api/research/paper-operator-check");
-    host.innerHTML = renderResearchPaperOperator(payload);
+    const [payload, audits] = await Promise.all([
+      apiGet("/api/research/paper-operator-check"),
+      apiGet("/api/research/paper-tick-audits"),
+    ]);
+    host.innerHTML = renderResearchPaperOperator(payload, audits);
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Could not load paper operator status.</p>`;
   }
@@ -5658,7 +5661,62 @@ function renderPaperOperatorCard(title, rows) {
   `;
 }
 
-function renderResearchPaperOperator(payload = {}) {
+function paperAuditResult(row = {}) {
+  if (row.skipped || row.alreadyProcessed) return "SKIPPED_DUPLICATE";
+  if (row.paperTickRan || row.tickRan) return "PROCESSED";
+  return "ATTEMPT";
+}
+
+function paperAuditResultClass(row = {}) {
+  if (row.liveOrdersTouched || row.realTradingEnabled) return "negative";
+  if (row.skipped || row.alreadyProcessed) return "neutral";
+  if (row.paperTickRan || row.tickRan) return "positive";
+  return "neutral";
+}
+
+function renderPaperTickAuditHistory(payload = {}) {
+  const rows = payload.audits || [];
+  const summary = payload.summary || {};
+  const body = rows.map((row) => {
+    const result = paperAuditResult(row);
+    const trade = row.openedTrade ? "OPENED" : row.closedTrade ? "CLOSED" : "none";
+    const safety = row.liveOrdersTouched || row.realTradingEnabled ? "DANGER" : "paper only";
+    const equity = `${row.equityBefore ?? "-"} -> ${row.equityAfter ?? "-"}`;
+    return `
+      <tr class="${row.skipped || row.alreadyProcessed ? "paper-audit-skipped" : ""}">
+        <td>${escapeHtml(row.auditAt || "-")}</td>
+        <td>${escapeHtml(row.expectedLatestClosedCandleAt || row.processedCandleAt || "-")}</td>
+        <td><span class="paper-review-flag ${paperAuditResultClass(row)}">${escapeHtml(result)}</span></td>
+        <td>${escapeHtml(row.previewSignal || "-")}</td>
+        <td>${escapeHtml(row.previewProposedAction || "-")}</td>
+        <td>${escapeHtml(trade)}</td>
+        <td>${escapeHtml(equity)}</td>
+        <td><span class="paper-review-flag ${safety === "DANGER" ? "negative" : "positive"}">${escapeHtml(safety)}</span></td>
+        <td><code>${escapeHtml(row.auditPath || "-")}</code></td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <section class="paper-operator-card paper-audit-history">
+      <div class="paper-review-card-header">
+        <div>
+          <h4 class="modal-section-title">Paper Tick Audit History</h4>
+          <p class="modal-note">Read-only audit files for the active paper candidate. processed=${escapeHtml(summary.processedCount ?? 0)}, skipped=${escapeHtml(summary.skippedCount ?? 0)}, malformed=${escapeHtml(summary.malformedAuditCount ?? 0)}</p>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Time</th><th>Candle</th><th>Result</th><th>Signal</th><th>Action</th><th>Trade</th><th>Equity</th><th>Safety</th><th>Audit path</th></tr>
+          </thead>
+          <tbody>${body || `<tr><td colspan="9">No paper tick audits found.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderResearchPaperOperator(payload = {}, audits = {}) {
   const status = payload.statusSummary || {};
   const freshness = payload.freshnessSummary || {};
   const alignment = payload.alignmentSummary || {};
@@ -5743,6 +5801,7 @@ function renderResearchPaperOperator(payload = {}) {
       </div>
       <h4 class="modal-section-title">Safety</h4>
       ${renderPaperOperatorSafety(safety)}
+      ${renderPaperTickAuditHistory(audits)}
     </section>
   `;
 }

@@ -1493,6 +1493,19 @@ button:hover {
   justify-content: flex-start;
 }
 
+.paper-audit-history {
+  grid-column: 1 / -1;
+}
+
+.paper-audit-skipped {
+  color: var(--muted);
+  opacity: 0.78;
+}
+
+.paper-audit-skipped code {
+  color: var(--muted);
+}
+
 .paper-warning {
   margin-bottom: 12px;
   padding: 10px 12px;

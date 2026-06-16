@@ -1855,6 +1855,146 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["statusCommandRanTick"])
         self.assertEqual(before, after)
 
+    def test_paper_tick_audits_api_lists_active_candidate_audits_read_only(self):
+        self.write_active_paper_config()
+        candidate_key = "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca"
+        zgua_app.PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        processed = {
+            "generatedAt": "2026-06-15T20:22:17+00:00",
+            "command": "paper:tick-once",
+            "candidateIdentity": candidate_key,
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "expectedLatestClosedCandleAt": "2026-06-15T16:00:00+00:00",
+            "processedCandleAt": 1781539200,
+            "confirmationMatched": True,
+            "alreadyProcessed": False,
+            "skipped": False,
+            "paperTickRan": True,
+            "tickRan": True,
+            "paperStateChanged": True,
+            "previewSignal": "HOLD",
+            "previewProposedAction": "no action",
+            "openedTrade": False,
+            "closedTrade": False,
+            "openPositionsBefore": 0,
+            "openPositionsAfter": 0,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+            "realTradingEnabled": False,
+            "liveOrdersTouched": False,
+            "returnCode": 0,
+            "warnings": [],
+        }
+        skipped = {
+            "generatedAt": "2026-06-15T20:24:40+00:00",
+            "command": "paper:tick-once",
+            "candidateIdentity": candidate_key,
+            "symbol": "BTCUSDT",
+            "timeframe": "4h",
+            "expectedLatestClosedCandleAt": "2026-06-15T16:00:00+00:00",
+            "processedCandleAt": 1781539200,
+            "confirmationMatched": True,
+            "alreadyProcessed": True,
+            "skipped": True,
+            "paperTickRan": False,
+            "tickRan": False,
+            "paperStateChanged": False,
+            "openedTrade": False,
+            "closedTrade": False,
+            "openPositionsBefore": 0,
+            "openPositionsAfter": 0,
+            "equityBefore": 10000,
+            "equityAfter": 10000,
+            "realTradingEnabled": False,
+            "liveOrdersTouched": False,
+            "returnCode": 0,
+            "warnings": ["duplicate candle skipped"],
+        }
+        other = {"candidateIdentity": "other-candidate", "paperTickRan": True}
+        processed_path = zgua_app.PAPER_TICK_AUDIT_DIR / "processed.json"
+        skipped_path = zgua_app.PAPER_TICK_AUDIT_DIR / "skipped.json"
+        other_path = zgua_app.PAPER_TICK_AUDIT_DIR / "other.json"
+        malformed_path = zgua_app.PAPER_TICK_AUDIT_DIR / "malformed.json"
+        processed_path.write_text(json.dumps(processed, indent=2), encoding="utf-8")
+        skipped_path.write_text(json.dumps(skipped, indent=2), encoding="utf-8")
+        other_path.write_text(json.dumps(other, indent=2), encoding="utf-8")
+        malformed_path.write_text("{not-json", encoding="utf-8")
+        os.utime(processed_path, (1000, 1000))
+        os.utime(skipped_path, (2000, 2000))
+        before_hashes = zgua_app.preview_file_hashes()
+        before_audits = {path.name: path.read_text(encoding="utf-8") for path in zgua_app.PAPER_TICK_AUDIT_DIR.glob("*.json")}
+        with zgua_app.app.test_client() as client:
+            response = client.get("/api/research/paper-tick-audits?limit=20")
+            limited_response = client.get("/api/research/paper-tick-audits?limit=1")
+            capped_response = client.get("/api/research/paper-tick-audits?limit=500")
+            post_response = client.post("/api/research/paper-tick-audits")
+            put_response = client.put("/api/research/paper-tick-audits")
+            delete_response = client.delete("/api/research/paper-tick-audits")
+        after_hashes = zgua_app.preview_file_hashes()
+        after_audits = {path.name: path.read_text(encoding="utf-8") for path in zgua_app.PAPER_TICK_AUDIT_DIR.glob("*.json")}
+        payload = response.get_json()
+        rows = payload["audits"]
+        summary = payload["summary"]
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["candidateIdentity"], candidate_key)
+        self.assertEqual(summary["totalAuditsRead"], 4)
+        self.assertEqual(summary["returnedCount"], 2)
+        self.assertEqual(summary["processedCount"], 1)
+        self.assertEqual(summary["skippedCount"], 1)
+        self.assertEqual(summary["malformedAuditCount"], 1)
+        self.assertEqual(summary["latestProcessedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(summary["latestProcessedTickAt"], "2026-06-15T20:22:17+00:00")
+        self.assertEqual(summary["openedTradeCount"], 0)
+        self.assertEqual(summary["closedTradeCount"], 0)
+        self.assertEqual(summary["liveOrdersTouchedCount"], 0)
+        self.assertEqual(summary["realTradingEnabledCount"], 0)
+        self.assertEqual([row["auditPath"].endswith("skipped.json") for row in rows], [True, False])
+        self.assertTrue(rows[0]["skipped"])
+        self.assertTrue(rows[0]["alreadyProcessed"])
+        self.assertFalse(rows[0]["paperTickRan"])
+        self.assertEqual(rows[0]["warnings"], ["duplicate candle skipped"])
+        self.assertEqual(rows[1]["processedCandleAt"], "2026-06-15T16:00:00+00:00")
+        self.assertEqual(rows[1]["previewSignal"], "HOLD")
+        self.assertEqual(rows[1]["previewProposedAction"], "no action")
+        self.assertFalse(rows[1]["openedTrade"])
+        self.assertFalse(rows[1]["closedTrade"])
+        self.assertEqual(rows[1]["equityBefore"], 10000)
+        self.assertEqual(rows[1]["equityAfter"], 10000)
+        self.assertFalse(rows[1]["realTradingEnabled"])
+        self.assertFalse(rows[1]["liveOrdersTouched"])
+        self.assertEqual(limited_response.get_json()["summary"]["returnedCount"], 1)
+        self.assertEqual(capped_response.get_json()["limit"], 100)
+        self.assertEqual(post_response.status_code, 405)
+        self.assertEqual(put_response.status_code, 405)
+        self.assertEqual(delete_response.status_code, 405)
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertFalse(payload["safety"]["realTradingEnabled"])
+        self.assertEqual(before_hashes, after_hashes)
+        self.assertEqual(before_audits, after_audits)
+
+    def test_paper_tick_audits_surfaces_live_safety_flags(self):
+        self.write_active_paper_config()
+        candidate_key = "candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca"
+        zgua_app.PAPER_TICK_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+        audit = {
+            "candidateIdentity": candidate_key,
+            "paperTickRan": True,
+            "tickRan": True,
+            "processedCandleAt": 1781539200,
+            "realTradingEnabled": True,
+            "liveOrdersTouched": True,
+        }
+        (zgua_app.PAPER_TICK_AUDIT_DIR / "danger.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+        payload, status = zgua_app.build_research_paper_tick_audits({})
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["summary"]["realTradingEnabledCount"], 1)
+        self.assertEqual(payload["summary"]["liveOrdersTouchedCount"], 1)
+        self.assertTrue(payload["audits"][0]["realTradingEnabled"])
+        self.assertTrue(payload["audits"][0]["liveOrdersTouched"])
+
     def tick_due_freshness(self, latest_time=2000, status="FRESH", blocking=False):
         return {
             "ok": True,
@@ -2214,16 +2354,24 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("research-paper-operator-panel", template)
         self.assertIn("/research/paper-operator", template)
         self.assertIn('apiGet("/api/research/paper-operator-check")', script)
+        self.assertIn('apiGet("/api/research/paper-tick-audits")', script)
         self.assertIn("Read-only paper operator view. This page cannot run paper ticks or live orders.", script)
         self.assertIn("nextHumanAction", script)
         self.assertIn("Tick due", script)
         self.assertIn("lastProcessedCandleAt", script)
+        self.assertIn("Paper Tick Audit History", script)
+        self.assertIn("SKIPPED_DUPLICATE", script)
+        self.assertIn("PROCESSED", script)
+        self.assertIn("Audit path", script)
+        self.assertIn("paper-audit-skipped", script)
         self.assertIn("Paper tick OFF", script)
         self.assertIn("Live orders OFF", script)
         self.assertIn("Real trading OFF", script)
         self.assertIn("Auto tick OFF", script)
         self.assertIn("Scheduler OFF", script)
         self.assertIn(".paper-operator-panel", styles)
+        self.assertIn(".paper-audit-history", styles)
+        self.assertIn(".paper-audit-skipped", styles)
         operator_template = template.split('id="research-paper-operator-panel"', 1)[1].split("Candidate Evidence Ledger", 1)[0]
         operator_script = script.split("function renderResearchPaperOperator", 1)[1].split("function renderPaperCandidateList", 1)[0]
         self.assertNotIn("<button", operator_template.lower())
@@ -2231,6 +2379,9 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertNotIn('apiPost("/api/research/paper-operator-check"', script)
         self.assertNotIn('apiPut("/api/research/paper-operator-check"', script)
         self.assertNotIn('apiDelete("/api/research/paper-operator-check"', script)
+        self.assertNotIn('apiPost("/api/research/paper-tick-audits"', script)
+        self.assertNotIn('apiPut("/api/research/paper-tick-audits"', script)
+        self.assertNotIn('apiDelete("/api/research/paper-tick-audits"', script)
         self.assertNotIn("paper-operator-refresh", template)
         self.assertNotIn("paper-operator-enable", template)
         self.assertNotIn("paper-operator-run", template)
