@@ -11411,6 +11411,57 @@ def active_candidate_confirmation_phrase(candidate: dict, candle_at: str | None)
     return f"RUN ONE PAPER TICK {candidate.get('candidateKey') or ''} {candle_at or ''}"
 
 
+def active_candidate_catch_up_confirmation_phrase(candidate: dict, candle_at: str | None) -> str:
+    return f"RUN ONE PAPER CATCH-UP TICK {candidate.get('candidateKey') or ''} {candle_at or ''}"
+
+
+def active_paper_cache_times(candidate: dict) -> list[int]:
+    active = primary_active_market(candidate)
+    if (candidate.get("source") or "bybit") != "bybit":
+        return []
+    symbol = active.get("symbol") or candidate.get("symbol")
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    if not symbol or not timeframe:
+        return []
+    try:
+        return sorted({
+            int(row.get("time"))
+            for row in load_bybit_disk_cache(symbol, timeframe)
+            if row.get("time") is not None
+        })
+    except Exception:
+        return []
+
+
+def catch_up_target_cache_validation(candidate: dict, target_time: int | None) -> dict:
+    target_time = int(safe_float(target_time, 0))
+    active = primary_active_market(candidate)
+    timeframe = active.get("interval") or active.get("timeframe") or candidate.get("timeframe")
+    interval_seconds = paper_interval_seconds(timeframe)
+    cache_times = active_paper_cache_times(candidate)
+    fill_model = str((candidate.get("params") or {}).get("fillModel") or candidate.get("fillModel") or "next-open")
+    next_time = target_time + interval_seconds if target_time else None
+    target_present = bool(target_time and target_time in cache_times)
+    next_present = bool(next_time and next_time in cache_times)
+    next_required = fill_model == "next-open"
+    blockers = []
+    if not target_present:
+        blockers.append("Target catch-up candle is missing from cache.")
+    if next_required and not next_present:
+        blockers.append("Next-open fill candle is missing from cache.")
+    return {
+        "ok": not blockers,
+        "targetCandleTime": target_time or None,
+        "targetCandleAt": epoch_to_iso(target_time),
+        "targetCandlePresent": target_present,
+        "nextOpenCandleRequired": next_required,
+        "nextOpenCandleTime": next_time,
+        "nextOpenCandleAt": epoch_to_iso(next_time),
+        "nextOpenCandlePresent": next_present,
+        "blockers": blockers,
+    }
+
+
 def paper_state_market_snapshot(candidate: dict) -> dict:
     state = read_json_file(str(PAPER_STATE_PATH), {}) if PAPER_STATE_PATH.exists() else {}
     active = primary_active_market(candidate)
@@ -11718,6 +11769,183 @@ def build_research_paper_tick_due(args=None) -> tuple[dict, int]:
     return payload, 200 if payload.get("ok") else 500
 
 
+def build_research_paper_catch_up_plan(args=None) -> tuple[dict, int]:
+    args = args or {}
+    before = preview_file_hashes()
+    refresh_payload = None
+    refresh_requested = bool(args.get("refresh"))
+    if refresh_requested:
+        refresh_payload, _refresh_status = build_research_refresh_active_paper_data(args)
+    candidate = load_paper_candidate_config()
+    status_payload, _status_code = build_research_paper_status(args)
+    freshness = active_paper_market_freshness(args)
+    gap = active_paper_missed_closed_candles(candidate, freshness, status_payload)
+    target_at = gap.get("firstMissedCandleAt") if gap.get("catchUpRequired") else None
+    target_time = gap.get("firstMissedCandleTime") if gap.get("catchUpRequired") else None
+    required_confirmation = active_candidate_catch_up_confirmation_phrase(candidate, target_at) if target_at else None
+    validation = catch_up_target_cache_validation(candidate, target_time) if target_time else {}
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    real_enabled, _real_detail = paper_real_trading_enabled()
+    safety = paper_safety_snapshot(real_enabled)
+    safety.update({"autoTickEnabled": False, "schedulerEnabled": False})
+    payload = {
+        "ok": bool(state_unchanged and not real_enabled),
+        "catchUpPlanOnly": True,
+        "refreshAttempted": refresh_requested,
+        "refreshed": bool(refresh_payload.get("refreshed")) if isinstance(refresh_payload, dict) else False,
+        "catchUpRequired": bool(gap.get("catchUpRequired")),
+        "catchUpModeAvailable": bool(gap.get("catchUpRequired")),
+        "strategy": candidate.get("strategy"),
+        "symbol": gap.get("symbol"),
+        "timeframe": gap.get("timeframe"),
+        "lastProcessedCandleAt": gap.get("lastProcessedCandleAt"),
+        "lastProcessedCandleTime": gap.get("lastProcessedCandleTime"),
+        "latestClosedCandleAt": gap.get("latestClosedCandleAt"),
+        "latestClosedCandleTime": gap.get("latestClosedCandleTime"),
+        "missedClosedCandleCount": gap.get("missedClosedCandleCount"),
+        "missedClosedCandles": gap.get("missedClosedCandles"),
+        "firstMissedCandleAt": gap.get("firstMissedCandleAt"),
+        "firstMissedCandleTime": gap.get("firstMissedCandleTime"),
+        "latestMissedCandleAt": gap.get("latestMissedCandleAt"),
+        "latestMissedCandleTime": gap.get("latestMissedCandleTime"),
+        "targetCandleAt": target_at,
+        "targetCandleTime": target_time,
+        "nextExpectedCandleAt": gap.get("nextExpectedCandleAt"),
+        "nextExpectedCandleTime": gap.get("nextExpectedCandleTime"),
+        "requiredConfirmation": required_confirmation,
+        "nextSafeCommand": f'python scripts\\research_autopilot.py paper:catch-up-next --confirm "{required_confirmation}"' if required_confirmation else None,
+        "targetCacheValidation": validation,
+        "refresh": refresh_payload,
+        "freshness": freshness,
+        "status": status_payload,
+        "stateUnchanged": state_unchanged,
+        "fileHashesBefore": before,
+        "fileHashesAfter": after,
+        "safety": safety,
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+        payload["error"] = "Catch-up plan changed config/state/journal hashes."
+    if real_enabled:
+        payload["error"] = "realTradingEnabled must be false."
+    return payload, 200 if payload.get("ok") else 500
+
+
+def build_research_preview_paper_catch_up_next(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    before = preview_file_hashes()
+    plan, plan_status = build_research_paper_catch_up_plan({"refresh": False})
+    target_time = plan.get("targetCandleTime")
+    target_at = plan.get("targetCandleAt")
+    validation = plan.get("targetCacheValidation") or {}
+    real_enabled, real_detail = paper_real_trading_enabled()
+    base = {
+        "ok": False,
+        "catchUpPreviewOnly": True,
+        "targetCandleAt": target_at,
+        "targetCandleTime": target_time,
+        "requiredConfirmation": plan.get("requiredConfirmation"),
+        "paperTickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+        "catchUpRequired": plan.get("catchUpRequired"),
+        "catchUpModeAvailable": plan.get("catchUpModeAvailable"),
+        "missedClosedCandleCount": plan.get("missedClosedCandleCount"),
+        "blockers": [],
+        "warnings": [],
+    }
+    if real_enabled:
+        base["blockers"] = [real_detail]
+    elif plan_status >= 400 or not plan.get("ok"):
+        base["blockers"] = [plan.get("error") or "Catch-up plan is not safe."]
+    elif not plan.get("catchUpRequired"):
+        base["blockers"] = ["Catch-up is not required; use the normal paper tick path when one candle is due."]
+    elif not validation.get("ok"):
+        base["blockers"] = validation.get("blockers") or ["Target catch-up candle cache validation failed."]
+    if base["blockers"]:
+        after = preview_file_hashes()
+        base.update({
+            "stateHashBefore": before["state"],
+            "stateHashAfter": after["state"],
+            "configHashBefore": before["config"],
+            "configHashAfter": after["config"],
+            "journalHashBefore": before["journal"],
+            "journalHashAfter": after["journal"],
+            "journalCsvHashBefore": before["journalCsv"],
+            "journalCsvHashAfter": after["journalCsv"],
+            "stateUnchanged": before == after,
+            "paperTickAllowed": False,
+            "proposedAction": "blocked",
+            "proposedOrder": None,
+            "currentPaperPosition": None,
+            "signal": None,
+        })
+        return base, 200 if base["stateUnchanged"] else 400
+    timeout_seconds = int(safe_float(args.get("timeout_seconds", 120), 120))
+    diagnostics_command = package_node_script_args("paper:signal-diagnostics") + ["--limit", str(args.get("limit", 20)), "--target-candle-time", str(int(target_time))]
+    diagnostics, diagnostic_code = run_preview_node_json(diagnostics_command, timeout_seconds)
+    tick_command = package_node_script_args("paper:tick") + ["--dry-run", "--target-candle-time", str(int(target_time))]
+    tick_payload, tick_code = run_preview_node_json(tick_command, timeout_seconds)
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    diagnostics_payload = diagnostics.get("diagnostics") or {}
+    active_market = diagnostics.get("activeMarket") or primary_active_market(candidate)
+    latest_candle = diagnostics.get("latestCandle") or {}
+    position_state = diagnostics_payload.get("positionState") or {}
+    current_position = None
+    if position_state.get("hasOpenPosition"):
+        current_position = {"side": position_state.get("side"), "barsHeld": position_state.get("barsHeld")}
+    signal = diagnostics_payload.get("signal") or "UNKNOWN"
+    reason = diagnostics_payload.get("reason") or (diagnostics.get("nextAction") or {}).get("reason") or "No signal diagnostics reason returned."
+    proposed_action, proposed_order = preview_estimated_order(candidate, signal, latest_candle, current_position, reason)
+    warnings = dedupe_list((diagnostics.get("warnings") or []) + (tick_payload.get("warnings") or []))
+    payload = {
+        **base,
+        "ok": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0 and diagnostics.get("ok", True) is not False),
+        "paperTickAllowed": bool(state_unchanged and diagnostic_code == 0 and tick_code == 0),
+        "strategy": candidate.get("strategy"),
+        "symbol": active_market.get("symbol") or candidate.get("symbol"),
+        "timeframe": active_market.get("timeframe") or active_market.get("interval") or candidate.get("timeframe"),
+        "signal": signal,
+        "signalReason": reason,
+        "proposedAction": proposed_action,
+        "proposedOrder": proposed_order,
+        "currentPaperPosition": current_position,
+        "equityBefore": paper_state_market_snapshot(candidate).get("accountEquity"),
+        "openPositionsBefore": len(paper_state_market_snapshot(candidate).get("openPositions") or []),
+        "targetCacheValidation": validation,
+        "catchUpPlan": plan,
+        "tickDryRun": {
+            "status": tick_payload.get("status"),
+            "events": tick_payload.get("events"),
+            "openPositions": tick_payload.get("openPositions"),
+            "closedTrades": tick_payload.get("closedTrades"),
+            "returnCode": tick_code,
+        },
+        "blockers": [] if diagnostics.get("ok", True) is not False else [diagnostics.get("error") or "Signal diagnostics failed."],
+        "warnings": warnings,
+        "stateHashBefore": before["state"],
+        "stateHashAfter": after["state"],
+        "configHashBefore": before["config"],
+        "configHashAfter": after["config"],
+        "journalHashBefore": before["journal"],
+        "journalHashAfter": after["journal"],
+        "journalCsvHashBefore": before["journalCsv"],
+        "journalCsvHashAfter": after["journalCsv"],
+        "stateUnchanged": state_unchanged,
+    }
+    if not state_unchanged:
+        payload["ok"] = False
+        payload["paperTickAllowed"] = False
+        payload.setdefault("blockers", []).append("Catch-up preview changed config/state/journal hashes.")
+    if not payload["ok"] and not payload.get("blockers"):
+        payload["blockers"] = [diagnostics.get("error") or tick_payload.get("error") or "Catch-up preview helper failed."]
+    return payload, 200 if payload.get("ok") else 400
+
+
 def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
     args = args or {}
     refresh_requested = bool(args.get("refresh"))
@@ -11729,6 +11957,9 @@ def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
     freshness = active_paper_market_freshness(args)
     alignment, alignment_status = build_research_paper_candle_alignment(args)
     due, due_status = build_research_paper_tick_due(args)
+    catch_up_plan = None
+    if due.get("catchUpRequired"):
+        catch_up_plan, _catch_up_plan_status = build_research_paper_catch_up_plan({"refresh": False})
     preview = None
     if due.get("tickDue"):
         preview, _preview_status = build_research_preview_paper_tick(args)
@@ -11778,6 +12009,9 @@ def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
         "missedClosedCandles": due.get("missedClosedCandles"),
         "nextExpectedCandleAt": due.get("nextExpectedCandleAt"),
         "nextDueCandleAt": due.get("nextDueCandleAt"),
+        "targetCandleAt": (catch_up_plan or {}).get("targetCandleAt"),
+        "catchUpRequiredConfirmation": (catch_up_plan or {}).get("requiredConfirmation"),
+        "catchUpNextSafeCommand": (catch_up_plan or {}).get("nextSafeCommand"),
     }
     preview_summary = None
     if preview is not None:
@@ -11827,6 +12061,7 @@ def build_research_paper_operator_check(args=None) -> tuple[dict, int]:
         "freshness": freshness,
         "candleAlignment": alignment,
         "tickDue": due,
+        "catchUpPlan": catch_up_plan,
         "refresh": refresh_payload,
         "fileHashesBefore": before,
         "fileHashesAfter": after,
@@ -11973,6 +12208,135 @@ def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
     }
     if completed.returncode != 0:
         payload["error"] = completed.stderr.strip() or "paper:tick command failed."
+    audit_path = write_confirmed_tick_audit(payload)
+    payload["auditPath"] = autopilot_display_path(audit_path)
+    return payload, 200 if payload.get("ok") else 502
+
+
+def build_research_paper_catch_up_next(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    candidate_key = candidate.get("candidateKey")
+    plan, plan_status = build_research_paper_catch_up_plan({"refresh": False})
+    target_at = plan.get("targetCandleAt")
+    target_time = plan.get("targetCandleTime")
+    expected_confirm = plan.get("requiredConfirmation") or active_candidate_catch_up_confirmation_phrase(candidate, target_at)
+    confirm = str(args.get("confirm") or "")
+    real_enabled, real_detail = paper_real_trading_enabled()
+    base = {
+        "ok": False,
+        "command": "paper:catch-up-next",
+        "catchUpTick": True,
+        "candidateIdentity": candidate_key,
+        "targetCandleAt": target_at,
+        "targetCandleTime": target_time,
+        "confirmationMatched": confirm == expected_confirm,
+        "paperTickRan": False,
+        "tickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+        "openedTrade": False,
+        "closedTrade": False,
+        "equityBefore": None,
+        "equityAfter": None,
+        "openPositionsBefore": None,
+        "openPositionsAfter": None,
+        "processedCandleAt": None,
+        "auditPath": None,
+        "warnings": [],
+        "requiredConfirmation": expected_confirm if target_at else None,
+    }
+
+    def refused(message: str, status: int = 400, extra: dict | None = None):
+        payload = {**base, "error": message}
+        if extra:
+            payload.update(extra)
+        return payload, status
+
+    if confirm != expected_confirm:
+        return refused("Exact catch-up confirmation required; no paper catch-up tick was run.")
+    if real_enabled or candidate.get("realTradingEnabled"):
+        return refused(real_detail if real_enabled else "Candidate realTradingEnabled must be false.", extra={"realTradingEnabled": True})
+    if not canonical_paper_enabled(candidate):
+        return refused("paperEnabled must be true before running one paper catch-up tick.")
+    if candidate.get("mode") != "PAPER_ONLY" or candidate.get("exchangeOrders") or candidate.get("liveOrdersTouched"):
+        return refused("Active paper candidate must be PAPER_ONLY with exchangeOrders=false and liveOrdersTouched=false.")
+    if plan_status >= 400 or not plan.get("ok"):
+        return refused(plan.get("error") or "Catch-up plan is not safe.")
+    if not plan.get("catchUpRequired"):
+        return refused("Catch-up is not required; no paper catch-up tick was run.")
+    if not target_time:
+        return refused("No first missed candle is available for catch-up.")
+    provided_target = str(confirm).rsplit(" ", 1)[-1] if confirm else ""
+    if provided_target != target_at:
+        return refused("Catch-up target must be exactly the first missed candle.")
+    before_market = paper_state_market_snapshot(candidate)
+    if safe_float(before_market.get("lastProcessedCandleTime"), 0) >= safe_float(target_time, 0):
+        return refused("Target catch-up candle is already processed.", extra={"alreadyProcessed": True})
+    validation = plan.get("targetCacheValidation") or {}
+    if not validation.get("ok"):
+        return refused("; ".join(validation.get("blockers") or ["Catch-up target cache validation failed."]), extra={"targetCacheValidation": validation})
+    preview, preview_status = build_research_preview_paper_catch_up_next(args)
+    base["previewSignal"] = preview.get("signal")
+    base["previewProposedAction"] = preview.get("proposedAction")
+    if preview_status >= 400 or not preview.get("ok") or not preview.get("paperTickAllowed"):
+        return refused("Catch-up preview blocked paper catch-up tick; no paper tick was run.", extra={"preview": preview})
+    before_hashes = preview_file_hashes()
+    before_snapshot = paper_state_snapshot()
+    completed = subprocess.run(
+        package_node_script_args("paper:tick") + ["--target-candle-time", str(int(target_time))],
+        text=True,
+        capture_output=True,
+        cwd=app.root_path,
+        timeout=int(safe_float(args.get("timeout_seconds", 90), 90)),
+    )
+    stdout_payload = {}
+    if completed.stdout.strip():
+        try:
+            stdout_payload = json.loads(completed.stdout)
+        except Exception:
+            stdout_payload = {"raw": completed.stdout.strip()}
+    after_hashes = preview_file_hashes()
+    after_snapshot = paper_state_snapshot()
+    after_market = paper_state_market_snapshot(candidate)
+    after_status, _after_status_code = build_research_paper_status({})
+    after_freshness = active_paper_market_freshness({})
+    after_gap = active_paper_missed_closed_candles(candidate, after_freshness, after_status)
+    opened = len(after_snapshot.get("openPositions") or []) > len(before_snapshot.get("openPositions") or [])
+    closed = len(after_snapshot.get("closedTrades") or []) > len(before_snapshot.get("closedTrades") or [])
+    payload = {
+        **base,
+        "ok": completed.returncode == 0 and int(safe_float(after_market.get("lastProcessedCandleTime"), 0)) == int(safe_float(target_time, 0)),
+        "confirmationMatched": True,
+        "tickRan": completed.returncode == 0,
+        "paperTickRan": completed.returncode == 0,
+        "paperStateChanged": before_hashes.get("state") != after_hashes.get("state"),
+        "liveOrdersTouched": False,
+        "realTradingEnabled": False,
+        "openedTrade": opened,
+        "closedTrade": closed,
+        "equityBefore": before_market.get("accountEquity"),
+        "equityAfter": after_market.get("accountEquity"),
+        "openPositionsBefore": len(before_snapshot.get("openPositions") or []),
+        "openPositionsAfter": len(after_snapshot.get("openPositions") or []),
+        "processedCandleAt": after_market.get("lastProcessedCandleTime"),
+        "processedCandleTime": after_market.get("lastProcessedCandleTime"),
+        "missedClosedCandleCountBefore": plan.get("missedClosedCandleCount"),
+        "missedClosedCandleCountAfter": after_gap.get("missedClosedCandleCount"),
+        "remainingMissedClosedCandles": after_gap.get("missedClosedCandles"),
+        "signal": preview.get("signal"),
+        "proposedAction": preview.get("proposedAction"),
+        "tickResult": stdout_payload,
+        "returnCode": completed.returncode,
+        "warnings": dedupe_list((preview.get("warnings") or []) + (stdout_payload.get("warnings") or [])),
+        "fileHashesBefore": before_hashes,
+        "fileHashesAfter": after_hashes,
+    }
+    if completed.returncode != 0:
+        payload["error"] = completed.stderr.strip() or "paper catch-up tick command failed."
+    elif not payload["ok"]:
+        payload["error"] = "Paper catch-up tick did not advance exactly to the target candle."
     audit_path = write_confirmed_tick_audit(payload)
     payload["auditPath"] = autopilot_display_path(audit_path)
     return payload, 200 if payload.get("ok") else 502

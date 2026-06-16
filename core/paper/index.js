@@ -250,6 +250,8 @@ function activeSignalDiagnostics(options) {
     })
   ]).then(([payload, regimeCandles]) => {
     let candles = latestClosedCandles(payload.candles || [], active.interval);
+    const targetCandleTime = Number(options.targetCandleTime || 0);
+    if (targetCandleTime) candles = candles.filter((candle) => Number(candle.time || 0) <= targetCandleTime);
     const freshness = freshnessForMarket(active, candles, payload.metadata);
     const params = Object.assign({}, config.params || {}, {
       regimeMode: canonicalRegimeMode(config),
@@ -766,6 +768,17 @@ function processMarket(config, state, market, regimeCandles, options) {
     let candles = payload.candles;
     const warnings = [];
     if (!options.includeOpenCandle) candles = latestClosedCandles(candles, market.interval);
+    const targetCandleTime = Number(options.targetCandleTime || 0);
+    let processingCandleTime = null;
+    if (targetCandleTime) {
+      const targetIndex = candles.findIndex((candle) => Number(candle.time || 0) === targetCandleTime);
+      if (targetIndex < 0) return warningEvent(config, state, market, "Target catch-up candle is missing from cache.");
+      const fillModel = String((config.params && config.params.fillModel) || config.fillModel || "next-open");
+      let endIndex = targetIndex;
+      if (fillModel === "next-open" && targetIndex + 1 < candles.length) endIndex = targetIndex + 1;
+      candles = candles.slice(0, endIndex + 1);
+      processingCandleTime = targetCandleTime;
+    }
     const freshness = freshnessForMarket(market, candles, payload.metadata);
     state.freshness = state.freshness || {};
     state.freshness[marketKey(market)] = freshness;
@@ -782,7 +795,7 @@ function processMarket(config, state, market, regimeCandles, options) {
     if (!lastProcessed && !options.allowBootstrapImport) {
       return warningEvent(config, state, market, "Market not initialized. Run npm run paper:init first.");
     }
-    const newCandles = candles.filter((candle) => candle.time > lastProcessed);
+    const newCandles = candles.filter((candle) => candle.time > lastProcessed && (!processingCandleTime || candle.time <= processingCandleTime));
     if (!newCandles.length) {
       return warningEvents(config, state, market, warnings);
     }
@@ -812,7 +825,7 @@ function processMarket(config, state, market, regimeCandles, options) {
     } else {
       applyResultToState(config, state, market, result, lastProcessed, events);
     }
-    state.lastProcessedCandleTime[key] = candles[candles.length - 1].time;
+    state.lastProcessedCandleTime[key] = processingCandleTime || candles[candles.length - 1].time;
     state.processedCandles += newCandles.length;
     return events;
   });

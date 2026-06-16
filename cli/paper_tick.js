@@ -12,7 +12,8 @@ paper.runPaperTick({
   allowBootstrapImport: args["allow-bootstrap-import"] === true,
   dryRun: args["dry-run"] === true,
   refreshFirst: args["refresh-first"] === true,
-  allowStale: args["allow-stale"] === true
+  allowStale: args["allow-stale"] === true,
+  targetCandleTime: args["target-candle-time"]
 }).then((result) => {
   process.stdout.write(JSON.stringify(result, null, 2));
   runtime.finishCli({

@@ -9,7 +9,8 @@ paper.activeSignalDiagnostics({
   statePath: args.state || "data/paper-state.json",
   reportDir: args.output || "reports",
   limit: args.limit || 20,
-  refresh: args.refresh === true
+  refresh: args.refresh === true,
+  targetCandleTime: args["target-candle-time"]
 }).then((result) => {
   process.stdout.write(JSON.stringify(result, null, 2));
   runtime.finishCli({ debugHandles: args["debug-handles"] === true, forceExit: args["force-exit"] === true, exitCode: result.ok === false ? 1 : 0 });

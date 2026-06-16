@@ -5773,10 +5773,12 @@ function renderResearchPaperOperator(payload = {}, audits = {}) {
   const dueCard = `
     <section class="paper-operator-card">
       <h4 class="modal-section-title">Due / Next Action</h4>
-      ${due.catchUpRequired ? `<p class="paper-warning">Multiple closed candles are pending. Sequential catch-up is required before paper ticking can continue.</p>` : ""}
+      ${due.catchUpRequired ? `<p class="paper-warning">Multiple closed candles are pending. Sequential manual catch-up required. Process only the first missed candle.</p>` : ""}
       <div class="paper-review-identity paper-operator-grid">${dueRows.join("")}</div>
       ${due.requiredConfirmation && !due.catchUpRequired ? `<p class="modal-note"><strong>Required confirmation:</strong> <code>${escapeHtml(due.requiredConfirmation)}</code></p>` : ""}
       ${due.nextSafeCommand && !due.catchUpRequired ? `<p class="modal-note"><strong>Next safe CLI command:</strong> <code>${escapeHtml(due.nextSafeCommand)}</code></p>` : ""}
+      ${due.catchUpRequiredConfirmation ? `<p class="modal-note"><strong>Catch-up confirmation:</strong> <code>${escapeHtml(due.catchUpRequiredConfirmation)}</code></p>` : ""}
+      ${due.catchUpNextSafeCommand ? `<p class="modal-note"><strong>Catch-up CLI command:</strong> <code>${escapeHtml(due.catchUpNextSafeCommand)}</code></p>` : ""}
     </section>
   `;
   const previewCard = preview ? renderPaperOperatorCard("Preview", [
