@@ -2,12 +2,14 @@ import json
 import os
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 import app as zgua_app
+import scripts.research_autopilot as research_cli
 
 
 def patch_autopilot_paths(testcase):
@@ -2649,6 +2651,54 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["previewSummary"]["signal"], "HOLD")
         self.assertEqual(payload["previewSummary"]["proposedAction"], "no action")
         self.assertFalse(payload["safety"]["paperTickRan"])
+
+    def test_paper_next_action_prints_concise_safe_command(self):
+        payload = {
+            "nextHumanAction": "SAFE_TO_RUN_SINGLE_CONFIRMED_TICK",
+            "statusSummary": {
+                "strategy": "EmaBounceV2",
+                "symbol": "BTCUSDT",
+                "timeframe": "4h",
+                "lastProcessedCandleAt": "2026-06-28T12:00:00+00:00",
+                "lastProcessedTickSignal": "HOLD",
+                "lastProcessedTickAction": "no action",
+                "openPositions": 0,
+            },
+            "freshnessSummary": {
+                "freshnessStatus": "FRESH",
+                "latestClosedCandleAt": "2026-06-28T16:00:00+00:00",
+            },
+            "alignmentSummary": {"candleAlignmentStatus": "ALIGNED"},
+            "dueSummary": {
+                "nextExpectedCandleAt": "2026-06-28T20:00:00+00:00",
+                "missedClosedCandleCount": 0,
+                "reason": "New closed candle available.",
+                "nextSafeCommand": 'python scripts\\research_autopilot.py paper:tick-once --confirm "RUN ONE PAPER TICK candidate 2026-06-28T16:00:00+00:00"',
+            },
+            "previewSummary": {
+                "signal": "HOLD",
+                "proposedAction": "no action",
+                "blockers": [],
+                "warnings": [],
+            },
+            "safety": {
+                "realTradingEnabled": False,
+                "liveOrdersTouched": False,
+                "schedulerEnabled": False,
+                "autoTickEnabled": False,
+            },
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_paper_next_action(payload)
+        text = output.getvalue()
+        self.assertIn("Next action: SAFE_TO_RUN_SINGLE_CONFIRMED_TICK", text)
+        self.assertIn("Market: EmaBounceV2 BTCUSDT 4h", text)
+        self.assertIn("Preview: HOLD / no action", text)
+        self.assertIn("Reason: New closed candle available.", text)
+        self.assertIn("paper:tick-once", text)
+        self.assertIn("Blockers: -", text)
+        self.assertIn("realTradingEnabled=False", text)
 
     def test_paper_operator_check_due_order_requires_preview_review(self):
         self.write_active_paper_config()

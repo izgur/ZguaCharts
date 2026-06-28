@@ -78,6 +78,42 @@ def print_summary(payload: dict) -> None:
     print(f"Safety: researchOnly={safety.get('researchOnly')} paperEnabled={safety.get('paperEnabled')} realTradingEnabled={safety.get('realTradingEnabled')} configWritten={safety.get('configWritten')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')}")
 
 
+def print_paper_next_action(payload: dict) -> None:
+    status = payload.get("statusSummary") or {}
+    due = payload.get("dueSummary") or {}
+    freshness = payload.get("freshnessSummary") or {}
+    alignment = payload.get("alignmentSummary") or {}
+    preview = payload.get("previewSummary") or {}
+    safety = payload.get("safety") or {}
+    action = payload.get("nextHumanAction") or "UNKNOWN"
+    print(f"Next action: {action}")
+    print(f"Market: {status.get('strategy') or '-'} {status.get('symbol') or '-'} {status.get('timeframe') or '-'}")
+    print(f"Last processed candle: {status.get('lastProcessedCandleAt') or due.get('lastProcessedCandleAt') or '-'}")
+    print(f"Latest closed candle: {freshness.get('latestClosedCandleAt') or alignment.get('expectedLatestClosedCandleAt') or '-'}")
+    print(f"Next expected candle: {due.get('nextExpectedCandleAt') or '-'}")
+    print(f"Missed candles: {due.get('missedClosedCandleCount', 0)}")
+    print(f"Alignment: {alignment.get('candleAlignmentStatus') or '-'}")
+    print(f"Freshness: {freshness.get('freshnessStatus') or '-'}")
+    print(f"Reason: {due.get('reason') or '-'}")
+    print(f"Open positions: {status.get('openPositions', 0)}")
+    print(f"Last signal/action: {status.get('lastProcessedTickSignal') or '-'} / {status.get('lastProcessedTickAction') or '-'}")
+    if preview:
+        print(f"Preview: {preview.get('signal') or '-'} / {preview.get('proposedAction') or '-'}")
+    if due.get("nextSafeCommand"):
+        print("\nRun next:")
+        print(due.get("nextSafeCommand"))
+    elif due.get("catchUpNextSafeCommand"):
+        print("\nCatch-up required:")
+        print(due.get("catchUpNextSafeCommand"))
+    else:
+        print("\nRun next: -")
+    blockers = (preview.get("blockers") or []) + (payload.get("blockers") or [])
+    warnings = (preview.get("warnings") or []) + (payload.get("warnings") or [])
+    print("Blockers: " + ("; ".join(str(item) for item in blockers) if blockers else "-"))
+    print("Warnings: " + ("; ".join(str(item) for item in warnings) if warnings else "-"))
+    print(f"Safety: realTradingEnabled={safety.get('realTradingEnabled')} liveOrdersTouched={safety.get('liveOrdersTouched')} schedulerEnabled={safety.get('schedulerEnabled')} autoTickEnabled={safety.get('autoTickEnabled')}")
+
+
 def get_json(client, path: str) -> tuple[dict, int]:
     response = client.get(path)
     payload = response.get_json() or {"ok": False, "error": response.get_data(as_text=True)}
@@ -155,6 +191,9 @@ def main() -> int:
     catch_up_batch.add_argument("--confirm", required=True)
     operator_check = sub.add_parser("paper:operator-check")
     operator_check.add_argument("--refresh", action="store_true")
+    next_action = sub.add_parser("paper:next-action")
+    next_action.add_argument("--refresh", action="store_true")
+    next_action.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     with app.test_client() as client:
@@ -217,6 +256,8 @@ def main() -> int:
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
             payload, status = build_research_paper_operator_check({"refresh": args.refresh})
+        elif args.command == "paper:next-action":
+            payload, status = build_research_paper_operator_check({"refresh": args.refresh})
         elif args.command == "preview-paper-tick":
             payload, status = build_research_preview_paper_tick({})
         elif args.command == "preview-paper-catch-up-next":
@@ -245,6 +286,8 @@ def main() -> int:
         print_status(payload)
     elif args.command == "summarize" and not args.json:
         print_summary(payload)
+    elif args.command == "paper:next-action" and not args.json:
+        print_paper_next_action(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1
