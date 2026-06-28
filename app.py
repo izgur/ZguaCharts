@@ -19,6 +19,7 @@ from flask import Flask, jsonify, render_template, request
 from data_source import (
     BYBIT_MAX_CACHE_CANDLES,
     DATA_SOURCE_CONFIG,
+    bybit_disk_cache_path,
     bybit_symbol_validation_payload,
     fetch_candles,
     fetch_historical_candles,
@@ -11004,21 +11005,22 @@ def build_research_refresh_active_paper_data(args=None) -> tuple[dict, int]:
     before_cache = cache_snapshot_for_market(active, source) if active else {}
     fetch_error = None
     fetch_attempts = 0
+    fetch_payload = None
+    fetch_diagnostics = {}
     refresh_attempted = False
+    limit = int(safe_float(args.get("limit", 600), 600))
     if real_enabled:
         fetch_error = real_detail
     elif not symbol or not timeframe:
         fetch_error = "No active paper market is configured."
+    elif source != "bybit":
+        fetch_error = f"Active paper refresh currently supports Bybit only, not {source}."
     else:
         try:
-            limit = int(safe_float(args.get("limit", 600), 600))
-            fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)
+            fetch_payload = fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1, force_network=True)
+            fetch_diagnostics = fetch_payload.get("diagnostics") or {}
             fetch_attempts += 1
             refresh_attempted = True
-            interim_freshness = active_paper_market_freshness(args)
-            if interim_freshness.get("freshnessStatus") in {"STALE", "MISSING"}:
-                fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=1)
-                fetch_attempts += 1
         except Exception as exc:
             fetch_error = str(exc)
     after_freshness = active_paper_market_freshness(args)
@@ -11030,20 +11032,39 @@ def build_research_refresh_active_paper_data(args=None) -> tuple[dict, int]:
         or safe_float(after_cache.get("cachedCandles"), 0) > safe_float(before_cache.get("cachedCandles"), 0)
     )
     freshness_improved = before_freshness.get("freshnessStatus") != "FRESH" and after_freshness.get("freshnessStatus") == "FRESH"
-    refreshed = bool(refresh_attempted and (cache_improved or freshness_improved or before_freshness.get("freshnessStatus") == "FRESH"))
+    network_fetch_attempted = bool(fetch_diagnostics.get("network_fetch_attempted") or safe_float(fetch_diagnostics.get("bybit_requests"), 0) > 0)
+    stale_disk_cache_reused = bool(fetch_diagnostics.get("degraded_to_stale_cache") and safe_float(fetch_diagnostics.get("bybit_requests"), 0) <= 0)
+    refreshed = bool(refresh_attempted and not stale_disk_cache_reused and (cache_improved or freshness_improved or before_freshness.get("freshnessStatus") == "FRESH"))
+    fetch_warnings = fetch_diagnostics.get("warnings") or []
     payload = {
         "ok": bool(refreshed and state_unchanged and not real_enabled and not fetch_error),
         "refreshAttempted": refresh_attempted,
         "refreshed": refreshed,
+        "requested": {
+            "source": source,
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "limit": limit,
+            "forceNetwork": True,
+        },
         "symbol": symbol,
         "timeframe": timeframe,
+        "cacheFile": after_cache.get("cacheFile") or before_cache.get("cacheFile"),
+        "cachePath": after_cache.get("cachePath") or before_cache.get("cachePath"),
         "candlesBefore": before_cache.get("cachedCandles"),
         "candlesAfter": after_cache.get("cachedCandles"),
         "latestCandleTimeBefore": before_cache.get("latestCandleTime"),
         "latestCandleTimeAfter": after_cache.get("latestCandleTime"),
+        "latestCandleAtBefore": before_cache.get("latestCandleAt"),
+        "latestCandleAtAfter": after_cache.get("latestCandleAt"),
         "freshnessBefore": before_freshness,
         "freshnessAfter": after_freshness,
         "fetchAttempts": fetch_attempts,
+        "networkFetchAttempted": network_fetch_attempted,
+        "staleDiskCacheReused": stale_disk_cache_reused,
+        "fetchDiagnostics": fetch_diagnostics,
+        "fetchWarnings": fetch_warnings,
+        "warnings": dedupe_list((before_cache.get("warnings") or []) + (after_cache.get("warnings") or []) + fetch_warnings),
         "paperStateChanged": False,
         "paperTickRan": False,
         "liveOrdersTouched": False,
@@ -11054,6 +11075,8 @@ def build_research_refresh_active_paper_data(args=None) -> tuple[dict, int]:
     }
     if fetch_error:
         payload["error"] = fetch_error
+    elif refresh_attempted and not network_fetch_attempted:
+        payload["error"] = "Active paper data refresh did not attempt a Bybit network fetch."
     elif refresh_attempted and not refreshed:
         payload["error"] = "Active paper data refresh did not update stale or missing cache."
     if not state_unchanged:
@@ -17220,9 +17243,13 @@ def cache_snapshot_for_market(market: dict, source: str) -> dict:
     if source != "bybit" or not symbol or not timeframe:
         return {"cachedCandles": None, "latestCandleTime": None, "warnings": [f"Cache inspection is only supported for Bybit, not {source}."]}
     cache = inspect_bybit_cache(symbol, timeframe)
+    cache_path = bybit_disk_cache_path(symbol, timeframe)
     return {
         "cachedCandles": cache.get("cachedCandles"),
         "latestCandleTime": cache.get("lastCandleTime"),
+        "latestCandleAt": epoch_to_iso(cache.get("lastCandleTime")),
+        "cacheFile": cache.get("cacheFile") or cache_path.name,
+        "cachePath": str(cache_path),
         "warnings": cache.get("warnings") or [],
     }
 

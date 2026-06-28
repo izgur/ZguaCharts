@@ -156,7 +156,7 @@ DATA_SOURCE_CONFIG = {
 }
 
 
-def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, visible_charts: int | None = None) -> dict:
+def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, visible_charts: int | None = None, force_network: bool = False) -> dict:
     """Single public data entry point used by Flask.
 
     To add a broker later, implement a fetch function with this signature and
@@ -170,7 +170,7 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, vi
     diagnostics = {}
     if source == "bybit":
         normalized_limit = adaptive_bybit_limit(normalized_limit, visible_charts)
-        candles, diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, normalized_limit, visible_charts)
+        candles, diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, normalized_limit, visible_charts, force_network=force_network)
     else:
         normalized_limit = min(normalized_limit, 5000)
         candles = provider(symbol, timeframe, normalized_limit)
@@ -637,6 +637,7 @@ def fetch_bybit_candles_with_diagnostics(
     timeframe: str,
     limit: int,
     visible_charts: int | None = None,
+    force_network: bool = False,
 ) -> tuple[list[dict], dict]:
     symbol = symbol.upper()
     interval = bybit_interval(timeframe)
@@ -658,6 +659,8 @@ def fetch_bybit_candles_with_diagnostics(
         "max_candles_per_chart": bybit_visible_chart_cap(visible_charts),
         "disk_cache_hits": 0,
         "degraded_to_stale_cache": False,
+        "force_network": bool(force_network),
+        "network_fetch_attempted": False,
         "warnings": [],
     }
     cache_key = (symbol, timeframe)
@@ -672,7 +675,7 @@ def fetch_bybit_candles_with_diagnostics(
                 _bybit_cache[cache_key] = cached[-BYBIT_MAX_CACHE_CANDLES:]
 
     cache_fresh = not bybit_cache_is_stale(cached, timeframe, diagnostics)
-    if diagnostics["disk_cache_hits"] and len(cached) >= requested:
+    if not force_network and diagnostics["disk_cache_hits"] and len(cached) >= requested:
         diagnostics["cache_hits"] = 1
         diagnostics["degraded_to_stale_cache"] = not cache_fresh
         if not cache_fresh:
@@ -682,7 +685,7 @@ def fetch_bybit_candles_with_diagnostics(
         log_bybit_diagnostics(diagnostics)
         return candles, diagnostics
 
-    if len(cached) >= requested and cache_fresh:
+    if not force_network and len(cached) >= requested and cache_fresh:
         diagnostics["cache_hits"] = 1
         candles = cached[-requested:]
         diagnostics["returned_candles"] = len(candles)
@@ -695,8 +698,9 @@ def fetch_bybit_candles_with_diagnostics(
 
     # Always refresh the newest page when the cached tail is stale. Otherwise a
     # chart can end yesterday and then websocket updates appear to jump forward.
-    if not cache_fresh:
+    if force_network or not cache_fresh:
         try:
+            diagnostics["network_fetch_attempted"] = True
             latest_batch = request_bybit_kline_batch(symbol, interval)
             diagnostics["bybit_requests"] += 1
             rows.extend(latest_batch)

@@ -106,6 +106,29 @@ class BybitLoadingTests(unittest.TestCase):
         self.assertEqual(len(second), 500)
         self.assertEqual(len(calls), 1)
 
+    def test_force_network_bypasses_stale_disk_cache_shortcut(self):
+        old_time = int(time.time()) - 24 * 60 * 60
+        stale_candles = [
+            {"time": old_time - index * 4 * 60 * 60, "open": 100, "high": 101, "low": 99, "close": 100, "volume": 10}
+            for index in range(60, 0, -1)
+        ]
+        data_source.save_bybit_disk_cache("BTCUSDT", "4h", stale_candles)
+        data_source.clear_bybit_cache()
+        calls = []
+        fresh_time_ms = int(time.time() // (4 * 60 * 60)) * 4 * 60 * 60 * 1000
+
+        def fake_get(_url, params, timeout):
+            calls.append(dict(params))
+            return FakeResponse([row(fresh_time_ms, 200)])
+
+        with patch.object(data_source.requests, "get", side_effect=fake_get):
+            candles, diagnostics = data_source.fetch_bybit_candles_with_diagnostics("BTCUSDT", "4h", 50, force_network=True)
+
+        self.assertTrue(calls)
+        self.assertTrue(diagnostics["network_fetch_attempted"])
+        self.assertEqual(diagnostics["bybit_requests"], 1)
+        self.assertEqual(candles[-1]["time"], fresh_time_ms // 1000)
+
     def test_concurrency_limit_holds_multiple_chart_loads_to_two_requests(self):
         active = 0
         max_active = 0

@@ -107,6 +107,10 @@ def print_paper_next_action(payload: dict) -> None:
         print(due.get("catchUpNextSafeCommand"))
     else:
         print("\nRun next: -")
+    if str(freshness.get("freshnessStatus") or "").upper() == "STALE":
+        print("\nRefresh stale data:")
+        print("python scripts\\research_autopilot.py paper:refresh-active-data")
+        print("python scripts\\research_autopilot.py paper:freshness")
     blockers = (preview.get("blockers") or []) + (payload.get("blockers") or [])
     warnings = (preview.get("warnings") or []) + (payload.get("warnings") or [])
     print("Blockers: " + ("; ".join(str(item) for item in blockers) if blockers else "-"))

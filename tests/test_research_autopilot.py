@@ -1553,11 +1553,15 @@ class ResearchAutopilotTests(unittest.TestCase):
             self.fresh_cache_payload(candles=620),
             self.fresh_cache_payload(candles=620),
         ]
-        def fake_fetch(source, symbol, timeframe, limit=240, visible_charts=None):
+        def fake_fetch(source, symbol, timeframe, limit=240, visible_charts=None, force_network=False):
             self.assertEqual(source, "bybit")
             self.assertEqual(symbol, "BTCUSDT")
             self.assertEqual(timeframe, "4h")
-            return {"candles": [{"time": self.fresh_cache_payload()["lastCandleTime"], "close": 50000}]}
+            self.assertTrue(force_network)
+            return {
+                "diagnostics": {"network_fetch_attempted": True, "bybit_requests": 1, "degraded_to_stale_cache": False, "warnings": []},
+                "candles": [{"time": self.fresh_cache_payload()["lastCandleTime"], "close": 50000}],
+            }
         with patch.object(zgua_app, "PAPER_JOURNAL_PATH", journal_path), patch.object(zgua_app, "inspect_bybit_cache", side_effect=cache_payloads), patch.object(zgua_app, "fetch_candles", side_effect=fake_fetch):
             payload, status = zgua_app.build_research_refresh_active_paper_data({})
         self.assertEqual(status, 200)
@@ -1565,6 +1569,8 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertTrue(payload["refreshed"])
         self.assertEqual(payload["freshnessBefore"]["freshnessStatus"], "STALE")
         self.assertEqual(payload["freshnessAfter"]["freshnessStatus"], "FRESH")
+        self.assertTrue(payload["networkFetchAttempted"])
+        self.assertFalse(payload["staleDiskCacheReused"])
         self.assertFalse(payload["paperStateChanged"])
         self.assertFalse(payload["paperTickRan"])
         self.assertFalse(payload["liveOrdersTouched"])
@@ -1573,6 +1579,30 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"), state_before)
         self.assertEqual(zgua_app.PAPER_CANDIDATE_LOCAL_PATH.read_text(encoding="utf-8"), config_before)
         self.assertFalse(journal_path.exists())
+
+    def test_refresh_active_paper_data_does_not_treat_stale_disk_cache_as_success(self):
+        self.write_active_paper_config()
+        stale = self.stale_cache_payload(candles=600)
+        def fake_fetch(source, symbol, timeframe, limit=240, visible_charts=None, force_network=False):
+            self.assertTrue(force_network)
+            return {
+                "diagnostics": {
+                    "network_fetch_attempted": False,
+                    "bybit_requests": 0,
+                    "degraded_to_stale_cache": True,
+                    "warnings": ["Using stale disk cache because this is the first load after restart."],
+                },
+                "candles": [{"time": stale["lastCandleTime"], "close": 50000}],
+            }
+        with patch.object(zgua_app, "inspect_bybit_cache", return_value=stale), patch.object(zgua_app, "fetch_candles", side_effect=fake_fetch):
+            payload, status = zgua_app.build_research_refresh_active_paper_data({})
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["refreshed"])
+        self.assertFalse(payload["networkFetchAttempted"])
+        self.assertTrue(payload["staleDiskCacheReused"])
+        self.assertEqual(payload["freshnessAfter"]["freshnessStatus"], "STALE")
+        self.assertIn("did not attempt a Bybit network fetch", payload["error"])
 
     def test_init_active_paper_candidate_wrong_confirmation_fails_without_writes(self):
         self.write_active_paper_config()
@@ -2728,6 +2758,22 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertEqual(payload["freshnessSummary"]["freshnessStatus"], "STALE")
         self.assertFalse(payload["safety"]["paperTickRan"])
         self.assertFalse(payload["safety"]["liveOrdersTouched"])
+
+    def test_paper_next_action_prints_stale_refresh_commands(self):
+        payload = {
+            "nextHumanAction": "BLOCKED",
+            "statusSummary": {"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"},
+            "freshnessSummary": {"freshnessStatus": "STALE", "latestClosedCandleAt": "2026-06-28T12:00:00+00:00"},
+            "dueSummary": {"reason": "Paper tick blocked because freshness is not safe."},
+            "alignmentSummary": {},
+            "safety": {"realTradingEnabled": False, "liveOrdersTouched": False, "schedulerEnabled": False, "autoTickEnabled": False},
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_paper_next_action(payload)
+        text = output.getvalue()
+        self.assertIn("python scripts\\research_autopilot.py paper:refresh-active-data", text)
+        self.assertIn("python scripts\\research_autopilot.py paper:freshness", text)
 
     def test_paper_operator_check_candle_mismatch_is_blocked(self):
         self.write_active_paper_config()
