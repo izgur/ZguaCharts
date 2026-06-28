@@ -1240,6 +1240,9 @@ class ResearchAutopilotTests(unittest.TestCase):
     def catch_up_confirm_text(self, candle_at="2026-06-15T20:00:00+00:00"):
         return f"RUN ONE PAPER CATCH-UP TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca {candle_at}"
 
+    def catch_up_batch_confirm_text(self, candle_at="2026-06-15T20:00:00+00:00", limit=5):
+        return f"RUN PAPER CATCH-UP BATCH candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca {candle_at} {limit}"
+
     def tick_alignment_payload(self, status="ALIGNED", expected_at="2026-06-14T16:00:00+00:00", expected_time=2000):
         blocking = status == "MISMATCH"
         return {
@@ -2438,6 +2441,117 @@ class ResearchAutopilotTests(unittest.TestCase):
             payload, status = zgua_app.build_research_paper_catch_up_next({"confirm": self.catch_up_confirm_text("2026-06-15T20:00:00+00:00")})
         self.assertEqual(status, 400)
         self.assertFalse(payload["paperTickRan"])
+
+    def test_preview_paper_catch_up_batch_requires_exact_batch_confirmation(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        second_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(second_missed)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, second_missed, second_missed + 4 * 60 * 60)), patch.object(zgua_app.subprocess, "run", side_effect=self.preview_subprocess_payloads(first_missed)):
+            payload, status = zgua_app.build_research_preview_paper_catch_up_batch({"limit": 5})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["previewOnly"])
+        self.assertTrue(payload["cliOnly"])
+        self.assertFalse(payload["uiMutationAction"])
+        self.assertEqual(payload["requestedLimit"], 5)
+        self.assertEqual(payload["maxCandlesLimit"], 5)
+        self.assertEqual(payload["firstTargetCandleAt"], "2026-06-15T20:00:00+00:00")
+        self.assertEqual(payload["requiredConfirmation"], self.catch_up_batch_confirm_text("2026-06-15T20:00:00+00:00", 5))
+        self.assertIn("paper:catch-up-batch", payload["nextSafeCommand"])
+        self.assertEqual(payload["projectedCandles"], ["2026-06-15T20:00:00+00:00", "2026-06-16T00:00:00+00:00"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertFalse(payload["paperStateChanged"])
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["schedulerEnabled"])
+        self.assertFalse(payload["autoTickEnabled"])
+        self.assertEqual(before, after)
+
+    def test_paper_catch_up_batch_refuses_wrong_confirmation_without_tick(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        latest_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        before = zgua_app.preview_file_hashes()
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(latest_missed)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, latest_missed)), patch.object(zgua_app.subprocess, "run") as run_mock:
+            payload, status = zgua_app.build_research_paper_catch_up_batch({"limit": 5, "confirm": self.catch_up_batch_confirm_text("2026-06-16T00:00:00+00:00", 5)})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 400)
+        self.assertFalse(payload["ok"])
+        self.assertFalse(payload["confirmationMatched"])
+        self.assertFalse(payload["paperTickRan"])
+        self.assertEqual(payload["stopReason"], "REFUSED")
+        run_mock.assert_not_called()
+        self.assertEqual(before, after)
+
+    def test_paper_catch_up_batch_processes_sequential_candles_until_limit(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        second_missed = first_missed + 4 * 60 * 60
+        third_missed = second_missed + 4 * 60 * 60
+        next_open = third_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        preview = {"ok": True, "paperTickAllowed": True, "signal": "HOLD", "proposedAction": "no action", "warnings": []}
+
+        def fake_run(command, text, capture_output, cwd, timeout):
+            target = int(command[command.index("--target-candle-time") + 1])
+            state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            state["lastProcessedCandleTime"] = {"BTCUSDT:4h": target}
+            state["processedCandles"] = int(state.get("processedCandles") or 0) + 1
+            state["updatedAt"] = zgua_app.epoch_to_iso(target)
+            zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            payload = {"status": "processed", "events": 0, "openPositions": 0, "closedTrades": 0, "warnings": [], "freshness": {"BTCUSDT:4h": {"latestCandleTime": target}}}
+            return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
+
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(third_missed)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, second_missed, third_missed, next_open)), patch.object(zgua_app, "build_research_preview_paper_catch_up_next", return_value=(preview, 200)), patch.object(zgua_app, "package_node_script_args", return_value=["node", "cli/paper_tick.js"]), patch.object(zgua_app.subprocess, "run", side_effect=fake_run) as run_mock:
+            payload, status = zgua_app.build_research_paper_catch_up_batch({"limit": 2, "confirm": self.catch_up_batch_confirm_text("2026-06-15T20:00:00+00:00", 2)})
+        after_state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["paperTickRan"])
+        self.assertTrue(payload["paperStateChanged"])
+        self.assertEqual(payload["processedCount"], 2)
+        self.assertEqual(payload["stopReason"], "REQUESTED_LIMIT_REACHED")
+        self.assertEqual([row["targetCandleAt"] for row in payload["rows"]], ["2026-06-15T20:00:00+00:00", "2026-06-16T00:00:00+00:00"])
+        self.assertEqual(after_state["lastProcessedCandleTime"]["BTCUSDT:4h"], second_missed)
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertFalse(payload["liveOrdersTouched"])
+        self.assertFalse(payload["realTradingEnabled"])
+        self.assertFalse(payload["schedulerEnabled"])
+        self.assertFalse(payload["autoTickEnabled"])
+
+    def test_paper_catch_up_batch_stops_on_warning_after_current_candle(self):
+        self.write_active_paper_config()
+        last_processed = 1781539200
+        first_missed = last_processed + 4 * 60 * 60
+        second_missed = first_missed + 4 * 60 * 60
+        self.set_last_processed_candle(last_processed)
+        preview = {"ok": True, "paperTickAllowed": True, "signal": "HOLD", "proposedAction": "no action", "warnings": []}
+
+        def fake_run(command, text, capture_output, cwd, timeout):
+            target = int(command[command.index("--target-candle-time") + 1])
+            state = json.loads(zgua_app.PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            state["lastProcessedCandleTime"] = {"BTCUSDT:4h": target}
+            state["processedCandles"] = int(state.get("processedCandles") or 0) + 1
+            zgua_app.PAPER_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            payload = {"status": "processed", "events": 0, "openPositions": 0, "closedTrades": 0, "warnings": ["paper tick warning"], "freshness": {"BTCUSDT:4h": {"latestCandleTime": target}}}
+            return type("Completed", (), {"stdout": json.dumps(payload), "stderr": "", "returncode": 0})()
+
+        with patch.object(zgua_app, "active_paper_market_freshness", return_value=self.tick_due_freshness(second_missed)), patch.object(zgua_app, "load_bybit_disk_cache", return_value=self.candle_cache_rows(last_processed, first_missed, second_missed, second_missed + 4 * 60 * 60)), patch.object(zgua_app, "build_research_preview_paper_catch_up_next", return_value=(preview, 200)), patch.object(zgua_app, "package_node_script_args", return_value=["node", "cli/paper_tick.js"]), patch.object(zgua_app.subprocess, "run", side_effect=fake_run) as run_mock:
+            payload, status = zgua_app.build_research_paper_catch_up_batch({"limit": 5, "confirm": self.catch_up_batch_confirm_text("2026-06-15T20:00:00+00:00", 5)})
+        self.assertEqual(status, 409)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["processedCount"], 1)
+        self.assertEqual(payload["stopReason"], "WARNING_RETURNED")
+        self.assertTrue(payload["stoppedBySafety"])
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertEqual(payload["rows"][0]["warnings"], ["paper tick warning"])
 
     def test_paper_tick_due_false_when_freshness_is_stale(self):
         self.write_active_paper_config()

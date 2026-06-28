@@ -11551,6 +11551,91 @@ def active_candidate_catch_up_confirmation_phrase(candidate: dict, candle_at: st
     return f"RUN ONE PAPER CATCH-UP TICK {candidate.get('candidateKey') or ''} {candle_at or ''}"
 
 
+PAPER_CATCH_UP_BATCH_DEFAULT_LIMIT = 5
+PAPER_CATCH_UP_BATCH_MAX_LIMIT = 5
+
+
+def paper_catch_up_batch_limit(args=None) -> int:
+    args = args or {}
+    return int(max(1, min(PAPER_CATCH_UP_BATCH_MAX_LIMIT, safe_float(args.get("limit"), PAPER_CATCH_UP_BATCH_DEFAULT_LIMIT))))
+
+
+def active_candidate_batch_catch_up_confirmation_phrase(candidate: dict, first_target_at: str | None, limit: int) -> str:
+    return f"RUN PAPER CATCH-UP BATCH {candidate.get('candidateKey') or ''} {first_target_at or ''} {int(limit)}"
+
+
+def paper_candidate_identity_snapshot(candidate: dict) -> dict:
+    active = primary_active_market(candidate)
+    return {
+        "candidateKey": candidate.get("candidateKey"),
+        "strategy": candidate.get("strategy"),
+        "symbol": active.get("symbol") or candidate.get("symbol"),
+        "timeframe": active.get("interval") or active.get("timeframe") or candidate.get("timeframe"),
+        "paramsHash": candidate.get("paramsHash"),
+        "selectionHash": candidate.get("selectionHash"),
+    }
+
+
+def paper_candidate_identity_changed(before: dict, after: dict) -> bool:
+    keys = ["candidateKey", "strategy", "symbol", "timeframe", "paramsHash", "selectionHash"]
+    return any(before.get(key) != after.get(key) for key in keys)
+
+
+def paper_catch_up_batch_row(payload: dict, status: int) -> dict:
+    return {
+        "statusCode": status,
+        "ok": payload.get("ok"),
+        "targetCandleAt": payload.get("targetCandleAt"),
+        "targetCandleTime": payload.get("targetCandleTime"),
+        "processedCandleAt": payload.get("processedCandleAt"),
+        "processedCandleTime": payload.get("processedCandleTime"),
+        "paperTickRan": payload.get("paperTickRan"),
+        "paperStateChanged": payload.get("paperStateChanged"),
+        "openedTrade": payload.get("openedTrade"),
+        "closedTrade": payload.get("closedTrade"),
+        "openPositionsBefore": payload.get("openPositionsBefore"),
+        "openPositionsAfter": payload.get("openPositionsAfter"),
+        "equityBefore": payload.get("equityBefore"),
+        "equityAfter": payload.get("equityAfter"),
+        "realTradingEnabled": payload.get("realTradingEnabled"),
+        "liveOrdersTouched": payload.get("liveOrdersTouched"),
+        "warnings": payload.get("warnings") or [],
+        "blockers": payload.get("blockers") or [],
+        "error": payload.get("error"),
+        "auditPath": payload.get("auditPath"),
+    }
+
+
+def paper_catch_up_batch_stop_reason(payload: dict, status: int, before_identity: dict, after_identity: dict) -> str | None:
+    hashes_before = payload.get("fileHashesBefore") or {}
+    hashes_after = payload.get("fileHashesAfter") or {}
+    if status >= 400 or not payload.get("ok"):
+        return "FAILED_VALIDATION_OR_TICK"
+    if payload.get("realTradingEnabled"):
+        return "REAL_TRADING_ENABLED"
+    if payload.get("liveOrdersTouched"):
+        return "LIVE_ORDERS_TOUCHED"
+    if payload.get("openedTrade"):
+        return "OPENED_TRADE"
+    if payload.get("closedTrade"):
+        return "CLOSED_TRADE"
+    if payload.get("warnings"):
+        return "WARNING_RETURNED"
+    if payload.get("blockers"):
+        return "BLOCKER_RETURNED"
+    if not payload.get("paperTickRan"):
+        return "PAPER_TICK_NOT_RUN"
+    if not payload.get("paperStateChanged"):
+        return "PAPER_STATE_NOT_CHANGED"
+    if not payload.get("confirmationMatched"):
+        return "CONFIRMATION_MISMATCH"
+    if hashes_before.get("config") != hashes_after.get("config"):
+        return "CONFIG_HASH_CHANGED"
+    if paper_candidate_identity_changed(before_identity, after_identity):
+        return "CANDIDATE_IDENTITY_CHANGED"
+    return None
+
+
 def active_paper_cache_times(candidate: dict) -> list[int]:
     active = primary_active_market(candidate)
     if (candidate.get("source") or "bybit") != "bybit":
@@ -12587,6 +12672,244 @@ def build_research_paper_catch_up_next(args=None) -> tuple[dict, int]:
     audit_path = write_confirmed_tick_audit(payload)
     payload["auditPath"] = autopilot_display_path(audit_path)
     return payload, 200 if payload.get("ok") else 502
+
+
+def build_research_preview_paper_catch_up_batch(args=None) -> tuple[dict, int]:
+    args = args or {}
+    limit = paper_catch_up_batch_limit(args)
+    candidate = load_paper_candidate_config()
+    identity = paper_candidate_identity_snapshot(candidate)
+    before = preview_file_hashes()
+    plan, plan_status = build_research_paper_catch_up_plan({"refresh": False})
+    first_target_at = plan.get("targetCandleAt")
+    required_confirmation = active_candidate_batch_catch_up_confirmation_phrase(candidate, first_target_at, limit) if first_target_at else None
+    preview, preview_status = build_research_preview_paper_catch_up_next(args)
+    after = preview_file_hashes()
+    state_unchanged = before == after
+    real_enabled, real_detail = paper_real_trading_enabled()
+    safety = paper_safety_snapshot(real_enabled)
+    safety.update({
+        "schedulerEnabled": False,
+        "autoTickEnabled": False,
+        "exchangeOrders": False,
+        "cliOnly": True,
+        "uiMutationAction": False,
+    })
+    missed = list(plan.get("missedClosedCandles") or [])
+    payload = {
+        "ok": bool(state_unchanged and not real_enabled and plan_status < 400 and plan.get("ok") and preview_status < 400 and preview.get("ok") and preview.get("paperTickAllowed")),
+        "command": "preview-paper-catch-up-batch",
+        "previewOnly": True,
+        "batchCatchUp": True,
+        "cliOnly": True,
+        "uiMutationAction": False,
+        "requestedLimit": limit,
+        "maxCandlesLimit": PAPER_CATCH_UP_BATCH_MAX_LIMIT,
+        "candidateIdentity": identity.get("candidateKey"),
+        "candidateIdentitySnapshot": identity,
+        "firstTargetCandleAt": first_target_at,
+        "firstTargetCandleTime": plan.get("targetCandleTime"),
+        "projectedCandles": missed[:limit],
+        "projectedCandleCount": min(limit, len(missed)),
+        "missedClosedCandleCount": plan.get("missedClosedCandleCount"),
+        "catchUpRequired": plan.get("catchUpRequired"),
+        "paperTickAllowed": bool(preview.get("paperTickAllowed")),
+        "requiredConfirmation": required_confirmation,
+        "nextSafeCommand": f'python scripts\\research_autopilot.py paper:catch-up-batch --limit {limit} --confirm "{required_confirmation}"' if required_confirmation else None,
+        "singleCandlePreview": preview,
+        "catchUpPlan": plan,
+        "stateUnchanged": state_unchanged,
+        "fileHashesBefore": before,
+        "fileHashesAfter": after,
+        "paperTickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+        "schedulerEnabled": False,
+        "autoTickEnabled": False,
+        "safety": safety,
+        "warnings": [],
+        "blockers": [],
+    }
+    if real_enabled:
+        payload["blockers"].append(real_detail)
+    if plan_status >= 400 or not plan.get("ok"):
+        payload["blockers"].append(plan.get("error") or "Catch-up plan is not safe.")
+    if preview_status >= 400 or not preview.get("ok") or not preview.get("paperTickAllowed"):
+        payload["blockers"].append("First catch-up candle preview is blocked.")
+    if not state_unchanged:
+        payload["blockers"].append("Batch preview changed config/state/journal hashes.")
+    if not plan.get("catchUpRequired"):
+        payload["blockers"].append("Catch-up is not required.")
+    if payload["blockers"]:
+        payload["ok"] = False
+    return payload, 200 if state_unchanged and not real_enabled else 400
+
+
+def build_research_paper_catch_up_batch(args=None) -> tuple[dict, int]:
+    args = args or {}
+    limit = paper_catch_up_batch_limit(args)
+    candidate = load_paper_candidate_config()
+    initial_identity = paper_candidate_identity_snapshot(candidate)
+    initial_hashes = preview_file_hashes()
+    plan, plan_status = build_research_paper_catch_up_plan({"refresh": False})
+    first_target_at = plan.get("targetCandleAt")
+    expected_confirm = active_candidate_batch_catch_up_confirmation_phrase(candidate, first_target_at, limit) if first_target_at else None
+    confirm = str(args.get("confirm") or "")
+    real_enabled, real_detail = paper_real_trading_enabled()
+    base = {
+        "ok": False,
+        "command": "paper:catch-up-batch",
+        "batchCatchUp": True,
+        "cliOnly": True,
+        "uiMutationAction": False,
+        "requestedLimit": limit,
+        "maxCandlesLimit": PAPER_CATCH_UP_BATCH_MAX_LIMIT,
+        "candidateIdentity": initial_identity.get("candidateKey"),
+        "candidateIdentitySnapshot": initial_identity,
+        "firstTargetCandleAt": first_target_at,
+        "firstTargetCandleTime": plan.get("targetCandleTime"),
+        "requiredConfirmation": expected_confirm,
+        "confirmationMatched": confirm == expected_confirm,
+        "paperTickRan": False,
+        "paperStateChanged": False,
+        "liveOrdersTouched": False,
+        "realTradingEnabled": bool(real_enabled),
+        "schedulerEnabled": False,
+        "autoTickEnabled": False,
+        "rows": [],
+        "processedCount": 0,
+        "stopReason": None,
+        "stoppedBySafety": False,
+        "fileHashesBefore": initial_hashes,
+    }
+
+    def refused(message: str, status: int = 400, extra: dict | None = None):
+        payload = {**base, "error": message, "stopReason": "REFUSED"}
+        if extra:
+            payload.update(extra)
+        return payload, status
+
+    if confirm != expected_confirm:
+        return refused("Exact batch catch-up confirmation required; no paper catch-up ticks were run.")
+    if real_enabled or candidate.get("realTradingEnabled"):
+        return refused(real_detail if real_enabled else "Candidate realTradingEnabled must be false.", extra={"realTradingEnabled": True})
+    if not canonical_paper_enabled(candidate):
+        return refused("paperEnabled must be true before running paper catch-up batch.")
+    if candidate.get("mode") != "PAPER_ONLY" or candidate.get("exchangeOrders") or candidate.get("liveOrdersTouched"):
+        return refused("Active paper candidate must be PAPER_ONLY with exchangeOrders=false and liveOrdersTouched=false.")
+    if plan_status >= 400 or not plan.get("ok"):
+        return refused(plan.get("error") or "Catch-up plan is not safe.")
+    if not plan.get("catchUpRequired") or not first_target_at:
+        return refused("Catch-up is not required; no paper catch-up ticks were run.")
+
+    rows = []
+    stop_reason = None
+    stopped_by_safety = False
+    for _index in range(limit):
+        real_enabled, real_detail = paper_real_trading_enabled()
+        current_candidate = load_paper_candidate_config()
+        current_identity = paper_candidate_identity_snapshot(current_candidate)
+        if real_enabled or current_candidate.get("realTradingEnabled"):
+            stop_reason = "REAL_TRADING_ENABLED"
+            stopped_by_safety = True
+            break
+        if current_candidate.get("liveOrdersTouched"):
+            stop_reason = "LIVE_ORDERS_TOUCHED"
+            stopped_by_safety = True
+            break
+        if paper_candidate_identity_changed(initial_identity, current_identity):
+            stop_reason = "CANDIDATE_IDENTITY_CHANGED"
+            stopped_by_safety = True
+            break
+        next_plan, next_plan_status = build_research_paper_catch_up_plan({"refresh": False})
+        if next_plan_status >= 400 or not next_plan.get("ok"):
+            stop_reason = "FAILED_VALIDATION_OR_TICK"
+            stopped_by_safety = True
+            break
+        if not next_plan.get("catchUpRequired") or not next_plan.get("targetCandleAt"):
+            stop_reason = "NO_MORE_CATCH_UP_REQUIRED"
+            break
+        single_confirm = active_candidate_catch_up_confirmation_phrase(current_candidate, next_plan.get("targetCandleAt"))
+        payload, status = build_research_paper_catch_up_next({
+            "confirm": single_confirm,
+            "timeout_seconds": args.get("timeout_seconds", 90),
+        })
+        after_identity = paper_candidate_identity_snapshot(load_paper_candidate_config())
+        row = paper_catch_up_batch_row(payload, status)
+        row["batchIndex"] = len(rows) + 1
+        rows.append(row)
+        reason = paper_catch_up_batch_stop_reason(payload, status, initial_identity, after_identity)
+        if reason:
+            stop_reason = reason
+            stopped_by_safety = True
+            break
+    if stop_reason is None:
+        stop_reason = "REQUESTED_LIMIT_REACHED"
+
+    final_candidate = load_paper_candidate_config()
+    final_identity = paper_candidate_identity_snapshot(final_candidate)
+    final_hashes = preview_file_hashes()
+    final_status, _final_status_code = build_research_paper_status({})
+    final_freshness = active_paper_market_freshness({})
+    final_gap = active_paper_missed_closed_candles(final_candidate, final_freshness, final_status)
+    processed = [row for row in rows if row.get("ok") and row.get("paperTickRan")]
+    failure_reasons = {
+        "FAILED_VALIDATION_OR_TICK",
+        "REAL_TRADING_ENABLED",
+        "LIVE_ORDERS_TOUCHED",
+        "WARNING_RETURNED",
+        "BLOCKER_RETURNED",
+        "PAPER_TICK_NOT_RUN",
+        "PAPER_STATE_NOT_CHANGED",
+        "CONFIRMATION_MISMATCH",
+        "CONFIG_HASH_CHANGED",
+        "CANDIDATE_IDENTITY_CHANGED",
+    }
+    payload = {
+        **base,
+        "ok": stop_reason not in failure_reasons,
+        "confirmationMatched": True,
+        "paperTickRan": bool(processed),
+        "paperStateChanged": initial_hashes.get("state") != final_hashes.get("state"),
+        "rows": rows,
+        "processedCount": len(processed),
+        "stopReason": stop_reason,
+        "stoppedBySafety": stopped_by_safety,
+        "completedRequestedLimit": stop_reason == "REQUESTED_LIMIT_REACHED" and len(processed) == limit,
+        "finalCandidateIdentitySnapshot": final_identity,
+        "candidateIdentityChanged": paper_candidate_identity_changed(initial_identity, final_identity),
+        "fileHashesAfter": final_hashes,
+        "configHashChanged": initial_hashes.get("config") != final_hashes.get("config"),
+        "initialCatchUpPlan": plan,
+        "finalGap": final_gap,
+        "finalStatus": {
+            "lastProcessedCandleAt": final_gap.get("lastProcessedCandleAt"),
+            "latestClosedCandleAt": final_gap.get("latestClosedCandleAt"),
+            "missedClosedCandleCount": final_gap.get("missedClosedCandleCount"),
+            "firstMissedCandleAt": final_gap.get("firstMissedCandleAt"),
+            "catchUpRequired": final_gap.get("catchUpRequired"),
+        },
+        "safety": {
+            **paper_safety_snapshot(False),
+            "schedulerEnabled": False,
+            "autoTickEnabled": False,
+            "exchangeOrders": False,
+            "cliOnly": True,
+            "uiMutationAction": False,
+        },
+        "summary": {
+            "processedCount": len(processed),
+            "requestedLimit": limit,
+            "stopReason": stop_reason,
+            "stoppedBySafety": stopped_by_safety,
+            "remainingMissedClosedCandleCount": final_gap.get("missedClosedCandleCount"),
+            "nextFirstMissedCandleAt": final_gap.get("firstMissedCandleAt"),
+        },
+    }
+    if stop_reason in failure_reasons:
+        payload["error"] = f"Batch catch-up stopped: {stop_reason}."
+    return payload, 200 if payload.get("ok") else 409
 
 
 def build_research_paper_candidates() -> dict:
