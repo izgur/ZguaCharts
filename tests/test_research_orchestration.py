@@ -1,4 +1,8 @@
+import json
+import tempfile
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import app as zgua_app
@@ -233,6 +237,108 @@ class GuidedPaperRunnerTests(unittest.TestCase):
         client = FakeClient(readiness_status=None, useful_now=False)
         payload = paper_run_once.guided_run_once(client)
         self.assertFalse(payload["postAttempted"])
+
+
+class OperationalFreshnessTests(unittest.TestCase):
+    def test_runtime_status_recomputes_active_data_freshness_from_candle_time(self):
+        now = datetime.now(timezone.utc)
+        old_candle = int(now.timestamp()) - 12 * 3600
+        candidate = {
+            "enabled": True,
+            "paperEnabled": True,
+            "source": "bybit",
+            "strategy": "EmaBounceV2",
+            "symbols": [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}],
+        }
+        state = {
+            "updatedAt": now.isoformat(),
+            "lastProcessedCandleTime": {"BTCUSDT:4h": old_candle},
+            "freshness": {
+                "BTCUSDT:4h": {
+                    "latestCandleTime": old_candle,
+                    "latestClosedCandleAgeSeconds": 60,
+                    "staleThresholdSeconds": 36000,
+                    "isStale": False,
+                }
+            },
+        }
+
+        def fake_read_json(path, fallback):
+            if str(path).endswith("paper-state.json"):
+                return state
+            return fallback
+
+        with patch.object(zgua_app, "load_paper_candidate_config", return_value=candidate), \
+             patch.object(zgua_app, "read_json_file", side_effect=fake_read_json), \
+             patch.object(zgua_app, "read_jsonl_tail", return_value=[]), \
+             patch.object(zgua_app, "paper_real_trading_enabled", return_value=(False, "")):
+            payload = zgua_app.build_paper_runtime_status({})
+
+        freshness = payload["operationalFreshness"]["activeMarketData"]
+        self.assertEqual(freshness["status"], "STALE")
+        self.assertGreater(freshness["latestClosedCandleAgeSeconds"], freshness["staleThresholdSeconds"])
+        self.assertEqual(payload["nextAction"]["action"], "REFRESH_ACTIVE_MARKET_DATA")
+
+    def test_system_health_exposes_operational_freshness_checks(self):
+        payload = zgua_app.build_system_health(quick=True)
+        self.assertIn("freshness", payload)
+        check_ids = {check["id"] for check in payload["checks"]}
+        self.assertIn("paper_state_freshness", check_ids)
+        self.assertIn("research_memory_freshness", check_ids)
+
+    def test_candidate_evidence_status_reports_missing_baseline_package_and_dossier(self):
+        candidate = {
+            "enabled": True,
+            "source": "bybit",
+            "strategy": "EmaBounceV2",
+            "symbols": [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}],
+            "paramsHash": "abc123",
+        }
+        evidence = zgua_app.candidate_evidence_status(candidate)
+        self.assertEqual(evidence["status"], "INCOMPLETE")
+        self.assertIn("expected baseline metrics", evidence["missing"])
+        self.assertIn("disabled review package", evidence["missing"])
+        self.assertIn("candidate dossier", evidence["missing"])
+
+    def test_candidate_evidence_status_links_matching_package_and_dossier(self):
+        candidate = {
+            "enabled": True,
+            "source": "bybit",
+            "strategy": "EmaBounceV2",
+            "symbols": [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}],
+            "paramsHash": "abc123",
+            "candidateKey": "candidate-key",
+            "promotedFromOptimization": {
+                "test": {"trades": 42, "profitFactor": 1.4, "totalReturn": 3.2, "maxDrawdown": 2.1, "winRate": 40}
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            review_dir = root / "review"
+            deploy_dir = root / "deploy"
+            dossier = root / "dossier.md"
+            review_dir.mkdir()
+            deploy_dir.mkdir()
+            dossier.write_text("# dossier\n", encoding="utf-8")
+            package_path = review_dir / zgua_app.autopilot_review_candidate_filename("EmaBounceV2", "BTCUSDT", "4h")
+            package_path.write_text(json.dumps({
+                "status": "DISABLED_REVIEW_ONLY",
+                "candidateIdentity": {
+                    "strategy": "EmaBounceV2",
+                    "symbol": "BTCUSDT",
+                    "timeframe": "4h",
+                    "paramsHash": "abc123",
+                    "candidateKey": "candidate-key",
+                },
+                "dossierPath": str(dossier),
+            }), encoding="utf-8")
+            with patch.object(zgua_app, "PAPER_CANDIDATE_REVIEW_DIR", review_dir), \
+                 patch.object(zgua_app, "DEPLOY_REVIEW_CANDIDATE_DIR", deploy_dir):
+                evidence = zgua_app.candidate_evidence_status(candidate)
+        self.assertEqual(evidence["status"], "READY")
+        self.assertTrue(evidence["baselineReady"])
+        self.assertTrue(evidence["reviewPackageReady"])
+        self.assertTrue(evidence["dossierReady"])
 
 
 if __name__ == "__main__":

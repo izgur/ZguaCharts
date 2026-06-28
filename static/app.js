@@ -405,9 +405,9 @@ function renderWorkflowPage(page) {
 
 function statusBadgeClass(status) {
   const value = String(status || "").toUpperCase();
-  if (["PASS", "READY", "GOOD", "OK", "HIGH"].includes(value)) return "badge-pass";
-  if (["WATCH", "TOO_EARLY", "MEDIUM", "RESEARCH_MORE", "READY_FOR_LONGER_PAPER"].includes(value)) return "badge-watch";
-  if (["FAIL", "BLOCKED", "DEGRADED", "INVALID", "LOW", "KEEP_BASELINE"].includes(value)) return "badge-fail";
+  if (["PASS", "READY", "GOOD", "OK", "HIGH", "CURRENT"].includes(value)) return "badge-pass";
+  if (["WATCH", "TOO_EARLY", "MEDIUM", "RESEARCH_MORE", "READY_FOR_LONGER_PAPER", "AGING", "INCOMPLETE"].includes(value)) return "badge-watch";
+  if (["FAIL", "BLOCKED", "DEGRADED", "INVALID", "LOW", "KEEP_BASELINE", "STALE", "MISSING"].includes(value)) return "badge-fail";
   if (["RUNNING", "PAPER_ENABLED", "ENABLED"].includes(value)) return "badge-running";
   return "badge-raw";
 }
@@ -415,6 +415,20 @@ function statusBadgeClass(status) {
 function statusBadge(status) {
   const label = status || "NOT_CHECKED";
   return `<span class="status-badge ${statusBadgeClass(label)}">${escapeHtml(label)}</span>`;
+}
+
+function freshnessLabel(item) {
+  if (!item) return "-";
+  const status = item.status || "-";
+  const age = item.ageHours ?? item.latestClosedCandleAgeHours;
+  if (age === null || age === undefined || age === "") return status;
+  return `${status} · ${formatMaybeNumber(age)}h`;
+}
+
+function freshnessWarningList(items) {
+  return (items || [])
+    .filter((item) => item && ["AGING", "STALE", "MISSING"].includes(String(item.status || "").toUpperCase()))
+    .map((item) => item.message || `${item.label || "Freshness"} is ${freshnessLabel(item)}.`);
 }
 
 function workflowCard(title, status, summary, metrics = [], action = "") {
@@ -493,6 +507,7 @@ async function loadWorkflowDashboard(force = false) {
   };
   const candidatePayload = results.candidate.payload || {};
   const candidate = candidatePayload.candidate || candidatePayload.current || candidatePayload;
+  const evidence = candidate.evidenceStatus || {};
   const market = primaryCandidateMarket(candidate);
   const paperStatus = results.paperStatus.payload || {};
   const runtime = results.runtime.payload || {};
@@ -501,13 +516,20 @@ async function loadWorkflowDashboard(force = false) {
   const review = results.review.payload || {};
   const signal = results.signal.payload || {};
   const signalDiag = signal.diagnostics || signal;
+  const freshness = runtime.operationalFreshness || {};
+  const freshnessWarnings = freshnessWarningList([
+    { label: "Paper state", ...(freshness.paperState || {}) },
+    { label: "Last tick", ...(freshness.lastTick || {}) },
+    { label: "Active market data", ...(freshness.activeMarketData || {}) },
+  ]);
   const next = dashboardNextAction(results);
   const failures = Object.entries(results).filter(([, result]) => !result.ok).map(([key, result]) => `${key}: ${result.error}`);
   host.dataset.loaded = "true";
   host.innerHTML = `
-    ${workflowCard("Current Candidate", review.verdict?.action || candidatePayload.status || "ACTIVE", `${candidate.strategy || "-"} ${market.symbol} ${market.timeframe}`, [
+    ${workflowCard("Current Candidate", evidence.status || review.verdict?.action || candidatePayload.status || "ACTIVE", `${candidate.strategy || "-"} ${market.symbol} ${market.timeframe}`, [
       { label: "Strategy", value: candidate.strategy || "-" },
       { label: "Market", value: `${market.symbol} ${market.timeframe}` },
+      { label: "Evidence", value: evidence.status || "-" },
       { label: "Config warnings", value: (candidate.configWarnings || []).length || 0 },
     ], `<a class="small-action-button" href="/candidate" data-route="candidate">Open Candidate</a>`)}
     ${workflowCard("Paper Status", paperStatus.paperEnabled ? "PAPER_ENABLED" : "DISABLED", runtime.initialized ? "Runtime initialized for active market." : "Runtime may need review before paper actions.", [
@@ -515,6 +537,11 @@ async function loadWorkflowDashboard(force = false) {
       { label: "Initialized", value: runtime.initialized ? "yes" : "no" },
       { label: "Last tick", value: runtime.lastTick?.updatedAt || "-" },
     ], `<a class="small-action-button" href="/paper" data-route="paper">Open Paper</a>`)}
+    ${workflowCard("Freshness", freshness.activeMarketData?.status || freshness.paperState?.status || "NOT_CHECKED", freshnessWarnings[0] || "Paper state, active data, and tick timing are current enough for review.", [
+      { label: "Paper state", value: freshnessLabel(freshness.paperState) },
+      { label: "Last tick", value: freshnessLabel(freshness.lastTick) },
+      { label: "Active data", value: freshnessLabel(freshness.activeMarketData) },
+    ], `<a class="small-action-button" href="/ops" data-route="ops">Open Ops</a>`)}
     ${workflowCard("Real Trading Safety", paperStatus.realTradingEnabled ? "BLOCKED" : "DISABLED", paperStatus.realTradingEnabled ? "Real trading flag is not false." : "Real trading is disabled.", [
       { label: "realTradingEnabled", value: String(Boolean(paperStatus.realTradingEnabled)) },
       { label: "Paper clone", value: "separate" },
@@ -559,6 +586,7 @@ async function loadCandidateWorkflowSummary() {
   ]);
   const candidatePayload = current.payload || {};
   const candidate = candidatePayload.candidate || candidatePayload.current || candidatePayload;
+  const evidence = candidate.evidenceStatus || {};
   const market = primaryCandidateMarket(candidate);
   const verdict = review.payload?.verdict || review.payload?.recommendation || {};
   document.querySelector("#candidate-next-action").innerHTML = `Next action: <strong>${escapeHtml(verdict.action || "KEEP_BASELINE")}</strong>`;
@@ -567,6 +595,12 @@ async function loadCandidateWorkflowSummary() {
       { label: "Strategy", value: candidate.strategy || "-" },
       { label: "Symbol", value: market.symbol },
       { label: "Timeframe", value: market.timeframe },
+    ])}
+    ${workflowCard("Evidence Trail", evidence.status || "NOT_CHECKED", evidence.recommendation?.reason || "Baseline, review package, and dossier status are backend checked.", [
+      { label: "Baseline", value: evidence.baselineReady ? "ready" : "missing" },
+      { label: "Review pkg", value: evidence.reviewPackageReady ? "ready" : "missing" },
+      { label: "Dossier", value: evidence.dossierReady ? "ready" : "missing" },
+      { label: "Missing", value: (evidence.missing || []).join(", ") || "-" },
     ])}
     ${workflowCard("Replacement Status", review.payload?.replacementEligibility?.eligible ? "READY" : "WATCH", verdict.reason || "No replacement is currently eligible.", [
       { label: "Eligible", value: String(Boolean(review.payload?.replacementEligibility?.eligible)) },
@@ -589,16 +623,24 @@ async function loadPaperWorkflowSummary() {
     safeDashboardGet("/api/paper/run-quality-report"),
   ]);
   const paper = status.payload || {};
+  const runtimePayload = runtime.payload || {};
+  const freshness = runtimePayload.operationalFreshness || {};
   const runQuality = quality.payload?.quality || {};
-  document.querySelector("#paper-next-action").innerHTML = `Real trading disabled. Next action: <strong>${escapeHtml(runQuality.recommendation?.action || (paper.paperEnabled ? "MONITOR_PAPER" : "REVIEW_STATUS"))}</strong>`;
+  const nextAction = runtimePayload.nextAction?.action || runQuality.recommendation?.action || (paper.paperEnabled ? "MONITOR_PAPER" : "REVIEW_STATUS");
+  document.querySelector("#paper-next-action").innerHTML = `Real trading disabled. Next action: <strong>${escapeHtml(nextAction)}</strong>`;
   host.innerHTML = `
     ${workflowCard("Simulation", paper.paperEnabled ? "PAPER_ENABLED" : "DISABLED", paper.paperEnabled ? "Paper is enabled in this runtime." : "Paper is disabled in this working repo.", [
       { label: "paperEnabled", value: String(Boolean(paper.paperEnabled)) },
       { label: "realTradingEnabled", value: String(Boolean(paper.realTradingEnabled)) },
     ])}
-    ${workflowCard("Runtime", runtime.payload?.health?.status || runtime.payload?.initializationStatus || "NOT_CHECKED", runtime.payload?.health?.reasons?.[0] || "Runtime status is read-only.", [
-      { label: "Initialized", value: runtime.payload?.initialized ? "yes" : "no" },
-      { label: "Active market", value: runtime.payload?.lastTick?.activeMarket || "-" },
+    ${workflowCard("Runtime", runtimePayload.health?.status || runtimePayload.initializationStatus || "NOT_CHECKED", runtimePayload.health?.reasons?.[0] || "Runtime status is read-only.", [
+      { label: "Initialized", value: runtimePayload.initialized ? "yes" : "no" },
+      { label: "Active market", value: runtimePayload.lastTick?.activeMarket || "-" },
+    ])}
+    ${workflowCard("Freshness", freshness.activeMarketData?.status || freshness.paperState?.status || "NOT_CHECKED", runtimePayload.nextAction?.reason || "Freshness is read from backend runtime diagnostics.", [
+      { label: "Paper state", value: freshnessLabel(freshness.paperState) },
+      { label: "Last tick", value: freshnessLabel(freshness.lastTick) },
+      { label: "Active data", value: freshnessLabel(freshness.activeMarketData) },
     ])}
     ${workflowCard("Run Quality", runQuality.status || "NOT_CHECKED", runQuality.recommendation?.reason || "Refresh after a paper runner session.", [
       { label: "Trust", value: runQuality.evidenceTrust || "-" },
@@ -3819,6 +3861,14 @@ function renderOpsDetails(checks) {
   const learning = findHealthCheck(checks, "learning_runner_config").details || {};
   const candidate = findHealthCheck(checks, "paper_candidate_summary").details || {};
   const auto = findHealthCheck(checks, "auto_promotion").details || {};
+  const freshnessRows = [
+    ["Paper state", findHealthCheck(checks, "paper_state_freshness").details || {}],
+    ["Research memory", findHealthCheck(checks, "research_memory_freshness").details || {}],
+    ["Learning reports", findHealthCheck(checks, "learning_report_freshness").details || {}],
+    ["Learning decisions", findHealthCheck(checks, "decision_log_freshness").details || {}],
+  ].map(([label, item]) => `
+    <tr><th>${escapeHtml(label)}</th><td>${escapeHtml(item.status || "-")}</td><td>${escapeHtml(String(item.ageHours ?? "-"))}</td><td>${escapeHtml(item.updatedAt || item.latestAt || "-")}</td></tr>
+  `).join("");
   const firstActive = (candidate.activeSymbols || [])[0] || {};
   const fileRows = Object.entries(generated).map(([name, info]) => `
     <tr><th>${escapeHtml(name)}</th><td>${info.exists ? `${formatNumber(info.sizeKb)} KB` : "missing"}</td><td>${escapeHtml(info.updatedAt || "-")}</td></tr>
@@ -3830,6 +3880,11 @@ function renderOpsDetails(checks) {
       <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(firstActive.symbol || "")} ${escapeHtml(firstActive.interval || "")}` : "-"}</strong></div>
       <div class="metric"><span>Auto-promote</span><strong>${escapeHtml(String(auto.autoPromote ?? false))}</strong></div>
     </div>
+    <h3 class="modal-section-title">Operational Freshness</h3>
+    <table class="trade-table">
+      <thead><tr><th>Item</th><th>Status</th><th>Age h</th><th>Timestamp</th></tr></thead>
+      <tbody>${freshnessRows}</tbody>
+    </table>
     <h3 class="modal-section-title">Generated Data Sizes</h3>
     <table class="trade-table">
       <thead><tr><th>File</th><th>Size</th><th>Updated</th></tr></thead>
@@ -7300,6 +7355,7 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
   const journal = runtime.journal || {};
   const lastTick = runtime.lastTick || {};
   const lastSignal = runtime.lastSignal || {};
+  const freshness = runtime.operationalFreshness || {};
   const next = runtime.nextAction || {};
   const stopNext = stopRules.nextAction || {};
   const healthTone = health.status === "BLOCKED" ? "negative" : health.status === "WATCH" ? "neutral" : "positive";
@@ -7325,6 +7381,9 @@ function renderPaperRuntimeMonitor(runtime, stopRules) {
       <div class="metric"><span>Real trading</span><strong>${runtime.realTradingEnabled ? "enabled" : "disabled"}</strong></div>
       <div class="metric"><span>Candidate</span><strong>${candidate.strategy ? `${escapeHtml(candidate.strategy)} ${escapeHtml(active.symbol || "")} ${escapeHtml(active.interval || "")}` : "-"}</strong></div>
       <div class="metric"><span>Last tick</span><strong>${escapeHtml(lastTick.updatedAt || "-")}</strong></div>
+      <div class="metric"><span>Tick freshness</span><strong>${escapeHtml(freshnessLabel(freshness.lastTick))}</strong></div>
+      <div class="metric"><span>State freshness</span><strong>${escapeHtml(freshnessLabel(freshness.paperState))}</strong></div>
+      <div class="metric"><span>Active data</span><strong>${escapeHtml(freshnessLabel(freshness.activeMarketData))}</strong></div>
       <div class="metric"><span>Last signal</span><strong>${escapeHtml(lastSignal.processedAt || "-")}</strong></div>
       <div class="metric"><span>Stop rules</span><strong class="${stopTone}">${escapeHtml(stopRules.status || "-")}</strong></div>
       <div class="metric"><span>Active warnings</span><strong>${journal.activeWarningCount ?? (journal.activeWarnings || []).length}</strong></div>

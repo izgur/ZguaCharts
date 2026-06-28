@@ -32,6 +32,13 @@ from data_source import (
 )
 from indicators import available_indicators, build_indicator_payload
 from signals import build_signal_payload
+from services.operational_freshness import (
+    freshness_check_message,
+    freshness_check_status,
+    freshness_verdict,
+    generated_file_freshness,
+    record_age_freshness,
+)
 from strategy import DEFAULT_PRESET_ID, preset_options
 
 
@@ -1246,8 +1253,27 @@ def build_system_health(quick: bool = False, include_optimizer: bool = False) ->
         health_check_item(checks, check_id, label, status, message, details)
 
     health_check_item(checks, "generated_data_sizes", "Generated data file sizes", "PASS", "Generated runtime data sizes collected.", generated_files)
-    health_check_item(checks, "learning_report_age", "Latest learning report age", "PASS" if load_learning_reports() else "WARN", "Latest learning report age calculated." if load_learning_reports() else "No learning reports yet.", latest_record_age(load_learning_reports()))
-    health_check_item(checks, "decision_age", "Latest decision age", "PASS" if load_learning_decisions() else "WARN", "Latest decision age calculated." if load_learning_decisions() else "No learning decisions yet.", latest_record_age(load_learning_decisions()))
+    learning_reports = load_learning_reports()
+    learning_decisions = load_learning_decisions()
+    research_runs = read_json_file(str(RESEARCH_RUNS_PATH), [])
+    if not isinstance(research_runs, list):
+        research_runs = []
+    freshness = {
+        "paperState": generated_file_freshness(PAPER_STATE_PATH, warn_after_hours=6, stale_after_hours=24),
+        "researchRuns": generated_file_freshness(RESEARCH_RUNS_PATH, warn_after_hours=168, stale_after_hours=336),
+        "learningReports": record_age_freshness(learning_reports, warn_after_hours=168, stale_after_hours=336),
+        "learningDecisions": record_age_freshness(learning_decisions, warn_after_hours=168, stale_after_hours=336),
+        "researchMemory": record_age_freshness(research_runs, warn_after_hours=168, stale_after_hours=336),
+    }
+    for check_id, label, item in (
+        ("paper_state_freshness", "Paper state freshness", freshness["paperState"]),
+        ("research_memory_freshness", "Research memory freshness", freshness["researchMemory"]),
+        ("learning_report_freshness", "Learning report freshness", freshness["learningReports"]),
+        ("decision_log_freshness", "Learning decision freshness", freshness["learningDecisions"]),
+    ):
+        health_check_item(checks, check_id, label, freshness_check_status(item), freshness_check_message(label, item), item)
+    health_check_item(checks, "learning_report_age", "Latest learning report age", "PASS" if learning_reports else "WARN", "Latest learning report age calculated." if learning_reports else "No learning reports yet.", latest_record_age(learning_reports))
+    health_check_item(checks, "decision_age", "Latest decision age", "PASS" if learning_decisions else "WARN", "Latest decision age calculated." if learning_decisions else "No learning decisions yet.", latest_record_age(learning_decisions))
 
     if not quick:
         try:
@@ -1284,6 +1310,7 @@ def build_system_health(quick: bool = False, include_optimizer: bool = False) ->
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "checks": checks,
         "summary": summary,
+        "freshness": freshness,
     }
 
 
@@ -5154,6 +5181,106 @@ def candidate_config_warnings(candidate: dict) -> list[str]:
     if safe_float(expected.get("profitFactor")) <= 0:
         warnings.append("Expected baseline profitFactor is missing.")
     return dedupe_list(warnings)
+
+
+def candidate_identity_summary(candidate: dict) -> dict:
+    identity = candidate.get("candidateIdentity") if isinstance(candidate.get("candidateIdentity"), dict) else {}
+    active = candidate_symbols_by_mode(candidate, "active")
+    primary = active[0] if active else {}
+    return {
+        "strategy": identity.get("strategy") or candidate.get("strategy"),
+        "symbol": identity.get("symbol") or candidate.get("symbol") or primary.get("symbol"),
+        "timeframe": identity.get("timeframe") or candidate.get("timeframe") or candidate.get("interval") or primary.get("interval") or primary.get("timeframe"),
+        "paramsHash": identity.get("paramsHash") or candidate.get("paramsHash"),
+        "candidateKey": identity.get("candidateKey") or candidate.get("candidateKey"),
+        "label": identity.get("label"),
+    }
+
+
+def active_candidate_review_package_status(candidate: dict) -> dict:
+    identity = candidate_identity_summary(candidate)
+    strategy = identity.get("strategy")
+    symbol = identity.get("symbol")
+    timeframe = identity.get("timeframe")
+    if not strategy or not symbol or not timeframe:
+        return {"exists": False, "status": "MISSING", "reason": "Candidate identity is incomplete.", "paths": []}
+    filename = autopilot_review_candidate_filename(strategy, symbol, timeframe)
+    paths = [PAPER_CANDIDATE_REVIEW_DIR / filename, DEPLOY_REVIEW_CANDIDATE_DIR / filename]
+    matches = []
+    mismatches = []
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            mismatches.append({"path": autopilot_display_path(path), "reason": f"Could not read package: {exc}"})
+            continue
+        package_identity = payload.get("candidateIdentity") or {}
+        package_hash = package_identity.get("paramsHash") or payload.get("paramsHash")
+        package_key = package_identity.get("candidateKey") or payload.get("candidateKey")
+        hash_matches = not identity.get("paramsHash") or not package_hash or package_hash == identity.get("paramsHash")
+        key_matches = not identity.get("candidateKey") or not package_key or package_key == identity.get("candidateKey")
+        if hash_matches and key_matches:
+            matches.append({
+                "path": autopilot_display_path(path),
+                "status": payload.get("status"),
+                "dossierPath": payload.get("dossierPath"),
+                "paramsHash": package_hash,
+                "candidateKey": package_key,
+            })
+        else:
+            mismatches.append({
+                "path": autopilot_display_path(path),
+                "reason": "Package identity does not match active candidate.",
+                "paramsHash": package_hash,
+                "candidateKey": package_key,
+            })
+    if matches:
+        return {"exists": True, "status": "FOUND", "matches": matches, "mismatches": mismatches, "paths": [autopilot_display_path(path) for path in paths]}
+    return {"exists": False, "status": "MISSING", "reason": "No matching disabled review package found.", "mismatches": mismatches, "paths": [autopilot_display_path(path) for path in paths]}
+
+
+def candidate_evidence_status(candidate: dict) -> dict:
+    expected = expected_metrics_from_candidate(candidate)
+    package = active_candidate_review_package_status(candidate)
+    review_match = (package.get("matches") or [{}])[0]
+    dossier_path = (
+        candidate.get("dossierPath")
+        or candidate.get("researchDossierPath")
+        or review_match.get("dossierPath")
+    )
+    dossier_exists = False
+    if dossier_path:
+        resolved = Path(app.root_path) / dossier_path if not Path(str(dossier_path)).is_absolute() else Path(str(dossier_path))
+        try:
+            dossier_exists = resolved.exists() and resolved.is_file()
+        except Exception:
+            dossier_exists = False
+    baseline_ok = bool(expected.get("source") and safe_float(expected.get("trades")) > 0 and safe_float(expected.get("profitFactor")) > 0)
+    package_ok = bool(package.get("exists"))
+    status = "READY" if baseline_ok and package_ok and dossier_exists else "INCOMPLETE"
+    missing = []
+    if not baseline_ok:
+        missing.append("expected baseline metrics")
+    if not package_ok:
+        missing.append("disabled review package")
+    if not dossier_exists:
+        missing.append("candidate dossier")
+    return {
+        "status": status,
+        "baselineReady": baseline_ok,
+        "reviewPackageReady": package_ok,
+        "dossierReady": dossier_exists,
+        "expected": expected,
+        "reviewPackage": package,
+        "dossierPath": dossier_path,
+        "missing": missing,
+        "recommendation": {
+            "action": "REVIEW_EVIDENCE_BEFORE_JUDGING_PAPER" if missing else "EVIDENCE_READY_FOR_PAPER_REVIEW",
+            "reason": "Missing " + ", ".join(missing) + "." if missing else "Baseline metrics, review package, and dossier are linked.",
+        },
+    }
 
 
 def paper_readiness_check(checks: list[dict], name: str, passed: bool, severity: str, detail: str) -> None:
@@ -17172,6 +17299,44 @@ def build_paper_runtime_status(args) -> dict:
     max_tick_age = int(safe_float(args.get("max_tick_age_seconds", 21600), 21600))
     last_tick_age = seconds_since(last_tick_at)
     tick_stale = bool(paper_enabled and (last_tick_age is None or last_tick_age > max_tick_age))
+    paper_state_freshness = generated_file_freshness(state_path, warn_after_hours=6, stale_after_hours=24)
+    journal_freshness = generated_file_freshness(journal_path, warn_after_hours=24, stale_after_hours=72)
+    primary_latest_epoch = safe_float(primary_latest_candle, 0)
+    stored_latest_closed_age_seconds = safe_float(primary_freshness.get("latestClosedCandleAgeSeconds"), None)
+    latest_closed_age_seconds = round(datetime.now(timezone.utc).timestamp() - primary_latest_epoch) if primary_latest_epoch else stored_latest_closed_age_seconds
+    stale_threshold_seconds = safe_float(primary_freshness.get("staleThresholdSeconds"), None)
+    latest_closed_age_hours = round(latest_closed_age_seconds / 3600, 2) if latest_closed_age_seconds is not None else None
+    active_data_status = "MISSING"
+    if primary_freshness:
+        active_data_status = "STALE" if primary_freshness.get("isStale") else "CURRENT"
+        if stale_threshold_seconds and latest_closed_age_seconds:
+            if latest_closed_age_seconds > stale_threshold_seconds:
+                active_data_status = "STALE"
+            elif latest_closed_age_seconds > stale_threshold_seconds * 0.75:
+                active_data_status = "AGING"
+    operational_freshness = {
+        "paperState": paper_state_freshness,
+        "journal": journal_freshness,
+        "lastTick": {
+            "status": freshness_verdict(round(last_tick_age / 3600, 2) if last_tick_age is not None else None, max_tick_age / 7200, max_tick_age / 3600),
+            "ageSeconds": last_tick_age,
+            "ageHours": round(last_tick_age / 3600, 2) if last_tick_age is not None else None,
+            "staleThresholdSeconds": max_tick_age,
+        },
+        "activeMarketData": {
+            "status": active_data_status,
+            "marketKey": primary_market_key,
+            "latestClosedCandleAgeSeconds": latest_closed_age_seconds,
+            "storedLatestClosedCandleAgeSeconds": stored_latest_closed_age_seconds,
+            "latestClosedCandleAgeHours": latest_closed_age_hours,
+            "staleThresholdSeconds": stale_threshold_seconds,
+            "latestClosedCandleAt": epoch_to_iso(primary_latest_candle),
+            "lastProcessedCandleAt": epoch_to_iso(primary_last_processed),
+            "cacheHit": bool(primary_freshness.get("cacheHit")),
+            "cacheMiss": bool(primary_freshness.get("cacheMiss")),
+            "fetchedFromBybit": bool(primary_freshness.get("fetchedFromBybit")),
+        },
+    }
     health_reasons = []
     if paper_enabled and not initialized:
         health_status = "BLOCKED"
@@ -17187,6 +17352,12 @@ def build_paper_runtime_status(args) -> dict:
         if tick_stale:
             health_status = "WATCH" if health_status == "OK" else health_status
             health_reasons.append(f"Paper simulation is enabled but the last tick is stale ({last_tick_age} seconds old; watch threshold {max_tick_age}).")
+        if paper_enabled and paper_state_freshness.get("status") in {"AGING", "STALE"}:
+            health_status = "WATCH" if health_status == "OK" else health_status
+            health_reasons.append(f"Paper state file is {paper_state_freshness.get('status').lower()} ({paper_state_freshness.get('ageHours')} hours old).")
+        if active_data_status in {"AGING", "STALE", "MISSING"}:
+            health_status = "WATCH" if health_status == "OK" else health_status
+            health_reasons.append(f"Active market data freshness is {active_data_status}.")
         if warning_buckets["blockingWarnings"]:
             health_status = "WATCH" if health_status == "OK" else health_status
             health_reasons.append(f"{len(warning_buckets['blockingWarnings'])} active or unclassified runtime warning(s) are present.")
@@ -17203,6 +17374,16 @@ def build_paper_runtime_status(args) -> dict:
         next_action = {
             "action": "RUN_PAPER_INIT_BEFORE_ENABLE",
             "reason": "Initialize paper runtime state before manually reviewing paper enablement.",
+        }
+    elif paper_enabled and active_data_status in {"STALE", "MISSING"}:
+        next_action = {
+            "action": "REFRESH_ACTIVE_MARKET_DATA",
+            "reason": "Paper simulation is enabled, but active-market data is not fresh enough to trust. Refresh before judging signals or running a tick.",
+        }
+    elif paper_enabled and tick_stale:
+        next_action = {
+            "action": "REVIEW_STALE_PAPER_TICK",
+            "reason": "Paper simulation is enabled, but the last tick is stale. Refresh active-market data and review tick readiness.",
         }
     elif paper_enabled:
         next_action = {
@@ -17245,6 +17426,7 @@ def build_paper_runtime_status(args) -> dict:
             "stale": tick_stale,
             "staleThresholdSeconds": max_tick_age,
         },
+        "operationalFreshness": operational_freshness,
         "lastSignal": last_signal,
         "journal": {
             "available": journal_available,
@@ -17812,6 +17994,8 @@ def candidate_summary(candidate: dict) -> dict:
         "riskPct": candidate.get("riskPct"),
         "maxOpenTrades": candidate.get("maxOpenTrades"),
         "maxNotionalPerTrade": candidate.get("maxNotionalPerTrade"),
+        "candidateIdentity": candidate_identity_summary(candidate),
+        "evidenceStatus": candidate_evidence_status(candidate),
         "configWarnings": candidate_config_warnings(candidate),
         "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
     }
