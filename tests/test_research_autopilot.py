@@ -2704,6 +2704,50 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("BTCUSDT 15m", text)
         self.assertIn("paperTickRan=False", text)
 
+    def test_focused_optimizer_printer_is_compact(self):
+        payload = {
+            "ok": True,
+            "search": {
+                "symbols": ["BTCUSDT", "SOLUSDT"],
+                "timeframes": ["15m", "1h"],
+                "strategies": ["SimpleAtrTrendV2"],
+                "period": "365d",
+                "maxCombosPerStrategy": 80,
+            },
+            "summary": {
+                "replacementEligibleCount": 0,
+                "reproducibleCandidateCount": 1,
+                "rejectedByQualityGateCount": 2,
+                "recommendation": {"action": "KEEP_BASELINE", "reason": "No replacement candidate cleared gates."},
+            },
+            "savedPath": "reports/research-batches/example.json",
+            "rows": [
+                {
+                    "rank": 1,
+                    "strategy": "SimpleAtrTrendV2",
+                    "symbol": "SOLUSDT",
+                    "timeframe": "15m",
+                    "status": "PASS",
+                    "finalCandidateTier": "REJECTED",
+                    "trades": 42,
+                    "totalReturnPct": 1.2,
+                    "profitFactor": 1.4,
+                    "maxDrawdownPct": 2.5,
+                    "replacementRejectionReasons": ["quality_gate_rejected"],
+                }
+            ],
+            "warnings": [],
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_focused_optimizer(payload)
+        text = output.getvalue()
+        self.assertIn("Focused optimizer: OK", text)
+        self.assertIn("Recommendation: KEEP_BASELINE - No replacement candidate cleared gates.", text)
+        self.assertIn("Saved report: reports/research-batches/example.json", text)
+        self.assertIn("SimpleAtrTrendV2 SOLUSDT 15m", text)
+        self.assertIn("readOnly=True", text)
+
     def test_paper_operator_check_refresh_does_not_mutate_paper_files(self):
         self.write_active_paper_config()
         before = zgua_app.preview_file_hashes()
@@ -2833,11 +2877,12 @@ class ResearchAutopilotTests(unittest.TestCase):
             research_cli.print_paper_next_action(payload)
         text = output.getvalue()
         self.assertIn("Next action: WAIT_FOR_NEXT_CLOSED_CANDLE", text)
-        self.assertIn("Next expected candle (UTC): 2026-06-28T20:00:00+00:00", text)
-        self.assertIn("Approx local time:", text)
-        self.assertIn("Check again after: 2026-06-28T20:00:00+00:00", text)
+        self.assertIn("Next expected candle start (UTC): 2026-06-28T20:00:00+00:00", text)
+        self.assertIn("Expected candle close (UTC): 2026-06-29T00:00:00+00:00", text)
+        self.assertIn("Approx local close time:", text)
+        self.assertIn("Check again after candle close: 2026-06-29T00:00:00+00:00", text)
         self.assertIn("Normal 4h UTC close schedule: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC", text)
-        self.assertIn("Latest cached candle is open (2026-06-28T20:00:00+00:00); paper tick ignores it until it closes.", text)
+        self.assertIn("Latest cached candle is open (2026-06-28T20:00:00+00:00) and should close at 2026-06-29T00:00:00+00:00; paper tick ignores it until it closes.", text)
         self.assertIn("Run next: -", text)
 
     def test_paper_operator_check_due_order_requires_preview_review(self):

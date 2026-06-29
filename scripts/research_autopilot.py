@@ -3,14 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_catch_up_batch, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_paper_watch_diagnostics, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_batch, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
+from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_multi_strategy_optimizer_batch, build_research_paper_candle_alignment, build_research_paper_catch_up_batch, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_paper_watch_diagnostics, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_batch, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -101,18 +101,44 @@ def local_time_label(value: str | None) -> str:
     return f"{local.isoformat()}{suffix}"
 
 
+def timeframe_delta(timeframe: str | None) -> timedelta | None:
+    raw = str(timeframe or "").strip().lower()
+    try:
+        if raw.endswith("m"):
+            return timedelta(minutes=int(raw[:-1]))
+        if raw.endswith("h"):
+            return timedelta(hours=int(raw[:-1]))
+        if raw.endswith("d"):
+            return timedelta(days=int(raw[:-1]))
+    except ValueError:
+        return None
+    return None
+
+
+def iso_after_interval(value: str | None, timeframe: str | None) -> str | None:
+    start = parse_utc_iso(value)
+    delta = timeframe_delta(timeframe)
+    if start is None or delta is None:
+        return None
+    return (start + delta).isoformat()
+
+
 def print_wait_for_next_closed_candle(status: dict, due: dict, freshness: dict) -> None:
     next_expected = due.get("nextExpectedCandleAt")
     timeframe = str(status.get("timeframe") or "").strip().lower()
+    expected_close = iso_after_interval(next_expected, timeframe)
     print("\nWaiting for next closed candle:")
-    print(f"Next expected candle (UTC): {next_expected or '-'}")
-    print(f"Approx local time: {local_time_label(next_expected)}")
-    print(f"Check again after: {next_expected or '-'}")
+    print(f"Next expected candle start (UTC): {next_expected or '-'}")
+    print(f"Expected candle close (UTC): {expected_close or '-'}")
+    print(f"Approx local close time: {local_time_label(expected_close)}")
+    print(f"Check again after candle close: {expected_close or '-'}")
     if timeframe == "4h":
         print("Normal 4h UTC close schedule: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC")
     if freshness.get("latestCachedCandleIsOpen"):
         cached = freshness.get("latestCachedCandleAt") or freshness.get("latestOpenCandleAt") or "-"
-        print(f"Latest cached candle is open ({cached}); paper tick ignores it until it closes.")
+        cached_close = iso_after_interval(cached, timeframe)
+        close_suffix = f" and should close at {cached_close}" if cached_close else ""
+        print(f"Latest cached candle is open ({cached}){close_suffix}; paper tick ignores it until it closes.")
 
 
 def print_paper_next_action(payload: dict) -> None:
@@ -173,6 +199,39 @@ def print_paper_watch_diagnostics(payload: dict) -> None:
     if not payload.get("rows"):
         print("- No diagnostic watch markets configured.")
     print(f"Safety: paperTickRan={safety.get('paperTickRan')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')} realTradingEnabled={safety.get('realTradingEnabled')}")
+
+
+def print_focused_optimizer(payload: dict) -> None:
+    search = payload.get("search") or {}
+    summary = payload.get("summary") or {}
+    rec = summary.get("recommendation") or {}
+    print("Focused optimizer: " + ("OK" if payload.get("ok") else "CHECK"))
+    print(f"Markets: {','.join(str(item) for item in (search.get('symbols') or [])) or search.get('symbols') or '-'}")
+    print(f"Timeframes: {','.join(str(item) for item in (search.get('timeframes') or [])) or search.get('timeframes') or '-'}")
+    print(f"Strategies: {','.join(str(item) for item in (search.get('strategies') or [])) or search.get('strategies') or '-'}")
+    print(f"Period: {search.get('period') or '-'} maxCombosPerStrategy={search.get('maxCombosPerStrategy') or '-'}")
+    print(f"Recommendation: {rec.get('action') or '-'} - {rec.get('reason') or '-'}")
+    print(f"Replacement eligible: {summary.get('replacementEligibleCount', 0)}")
+    print(f"Reproducible candidates: {summary.get('reproducibleCandidateCount', 0)}")
+    print(f"Quality rejected: {summary.get('rejectedByQualityGateCount', 0)}")
+    if payload.get("savedPath"):
+        print(f"Saved report: {payload.get('savedPath')}")
+    print("Top rows:")
+    rows = payload.get("rows") or []
+    for row in rows[:8]:
+        tier = row.get("finalCandidateTier") or row.get("qualityGateStatus") or row.get("status") or "-"
+        reasons = row.get("replacementRejectionReasons") or row.get("qualityGateReasons") or []
+        reason = "; ".join(str(item) for item in reasons[:3]) if reasons else row.get("mainFailureReason") or "-"
+        print(
+            f"- #{row.get('rank') or '-'} {row.get('strategy') or '-'} {row.get('symbol') or '-'} {row.get('timeframe') or row.get('interval') or '-'} "
+            f"{row.get('status') or '-'} tier={tier} trades={row.get('trades')} return={row.get('totalReturnPct')}% "
+            f"PF={row.get('profitFactor')} DD={row.get('maxDrawdownPct')} reason={reason}"
+        )
+    if not rows:
+        print("- No rows returned.")
+    if payload.get("warnings"):
+        print("Warnings: " + "; ".join(str(item) for item in payload.get("warnings") or []))
+    print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
 
 
 def get_json(client, path: str) -> tuple[dict, int]:
@@ -246,6 +305,23 @@ def main() -> int:
     watch_diagnostics.add_argument("--limit", default="auto")
     watch_diagnostics.add_argument("--refresh", action="store_true")
     watch_diagnostics.add_argument("--json", action="store_true")
+    focused_optimizer = sub.add_parser("research:focused-optimizer")
+    focused_optimizer.add_argument("--symbols", default="BTCUSDT,SOLUSDT,BNBUSDT,ETHUSDT,XRPUSDT")
+    focused_optimizer.add_argument("--timeframes", default="15m,1h")
+    focused_optimizer.add_argument("--strategies", default="SimpleAtrTrendV2,EmaBounceV2,PullbackReclaimV2,BreakoutRetestV2,RangeExpansionV2,RelativeStrengthV2")
+    focused_optimizer.add_argument("--period", default="365d")
+    focused_optimizer.add_argument("--max-candidates", default="40")
+    focused_optimizer.add_argument("--max-combos-per-strategy", default="80")
+    focused_optimizer.add_argument("--top-n", default="20")
+    focused_optimizer.add_argument("--repro-top-n", default="6")
+    focused_optimizer.add_argument("--repro-reruns", default="2")
+    focused_optimizer.add_argument("--timeout-seconds", default="900")
+    focused_optimizer.add_argument("--limit", default="auto")
+    focused_optimizer.add_argument("--no-walk-forward", action="store_true")
+    focused_optimizer.add_argument("--no-stress", action="store_true")
+    focused_optimizer.add_argument("--no-repro", action="store_true")
+    focused_optimizer.add_argument("--no-save", action="store_true")
+    focused_optimizer.add_argument("--json", action="store_true")
     observation_summary = sub.add_parser("paper:observation-summary")
     observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
@@ -324,6 +400,24 @@ def main() -> int:
                 "limit": args.limit,
                 "refresh": args.refresh,
             })
+        elif args.command == "research:focused-optimizer":
+            payload, status = build_research_multi_strategy_optimizer_batch({
+                "symbols": args.symbols,
+                "timeframes": args.timeframes,
+                "strategies": args.strategies,
+                "period": args.period,
+                "maxCandidates": args.max_candidates,
+                "maxCombosPerStrategy": args.max_combos_per_strategy,
+                "topN": args.top_n,
+                "includeWalkForward": "false" if args.no_walk_forward else "true",
+                "includeStress": "false" if args.no_stress else "true",
+                "includeReproAudit": "false" if args.no_repro else "true",
+                "reproTopN": args.repro_top_n,
+                "reproReruns": args.repro_reruns,
+                "save": "false" if args.no_save else "true",
+                "limit": args.limit,
+                "timeout_seconds": args.timeout_seconds,
+            })
         elif args.command == "paper:observation-summary":
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
@@ -362,6 +456,8 @@ def main() -> int:
         print_paper_next_action(payload)
     elif args.command == "paper:watch-diagnostics" and not args.json:
         print_paper_watch_diagnostics(payload)
+    elif args.command == "research:focused-optimizer" and not args.json:
+        print_focused_optimizer(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1
