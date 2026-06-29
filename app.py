@@ -5159,6 +5159,31 @@ def candidate_symbols_by_mode(candidate: dict, mode: str) -> list[dict]:
     ]
 
 
+def diagnostic_watch_symbols(candidate: dict) -> list[dict]:
+    configured = candidate.get("diagnosticWatchSymbols")
+    if not isinstance(configured, list):
+        configured = candidate.get("watchDiagnostics") if isinstance(candidate.get("watchDiagnostics"), list) else []
+    active_keys = {
+        (str(item.get("symbol") or "").upper(), str(item.get("interval") or item.get("timeframe") or ""))
+        for item in candidate_symbols_by_mode(candidate, "active")
+    }
+    rows = []
+    seen = set()
+    for item in configured:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").strip().upper()
+        interval = str(item.get("interval") or item.get("timeframe") or "").strip()
+        if not symbol or not interval:
+            continue
+        key = (symbol, interval)
+        if key in seen or key in active_keys:
+            continue
+        rows.append({"symbol": symbol, "interval": interval, "mode": "diagnostic-watch"})
+        seen.add(key)
+    return rows
+
+
 def candidate_config_warnings(candidate: dict) -> list[str]:
     warnings = []
     params = candidate.get("params") if isinstance(candidate.get("params"), dict) else {}
@@ -15782,6 +15807,9 @@ def build_research_blocker_analytics(args) -> tuple[dict, int]:
         "--includeRecentCandles", "true" if include_recent else "false",
         "--recentLimit", str(recent_limit),
     ])
+    refresh_requested = str(args.get("refresh", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    if refresh_requested:
+        command.append("--refresh")
     try:
         completed = subprocess.run(
             command,
@@ -15831,6 +15859,108 @@ def build_research_blocker_analytics(args) -> tuple[dict, int]:
         response["returnCode"] = completed.returncode
         response["stderr"] = completed.stderr.strip()
     return response, 200 if response["ok"] else 502
+
+
+def compact_watch_diagnostic_row(market: dict, payload: dict, status: int) -> dict:
+    active_market = payload.get("activeMarket") or {}
+    freshness = active_market.get("freshness") or {}
+    summary = payload.get("summary") or {}
+    recommendation = summary.get("recommendation") or {}
+    blockers = payload.get("blockers") or []
+    main_blocker = summary.get("mainBlocker")
+    if not main_blocker and blockers:
+        main_blocker = (blockers[0] or {}).get("name")
+    return {
+        "symbol": market.get("symbol"),
+        "timeframe": market.get("interval") or market.get("timeframe"),
+        "mode": "diagnostic-watch",
+        "ok": bool(payload.get("ok")) and status < 400,
+        "statusCode": status,
+        "freshnessStale": bool(freshness.get("isStale")),
+        "latestCandleTime": freshness.get("latestCandleTime"),
+        "latestCandleAt": epoch_to_iso(freshness.get("latestCandleTime")),
+        "candlesAnalyzed": summary.get("candlesAnalyzed"),
+        "tradeCount": summary.get("tradeCount"),
+        "signalRatePct": summary.get("signalRatePct"),
+        "approximateSignalsPerMonth": summary.get("approximateSignalsPerMonth"),
+        "mainBlocker": main_blocker,
+        "recommendation": recommendation,
+        "warnings": payload.get("warnings") or [],
+        "command": payload.get("command"),
+    }
+
+
+def build_research_paper_watch_diagnostics(args=None) -> tuple[dict, int]:
+    args = args or {}
+    candidate = load_paper_candidate_config()
+    real_enabled, real_detail = paper_real_trading_enabled()
+    markets = diagnostic_watch_symbols(candidate)
+    before_hashes = preview_file_hashes()
+    period = args.get("period", "90d")
+    limit_raw = args.get("limit", "auto")
+    include_recent = str(args.get("includeRecentCandles", args.get("include_recent", "false"))).strip().lower() not in {"0", "false", "no", "off"}
+    recent_limit = max(1, min(int(safe_float(args.get("recentLimit", args.get("recent_limit", 20)), 20)), 100))
+    refresh_requested = str(args.get("refresh", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    rows = []
+    raw = []
+    for market in markets:
+        payload, status = build_research_blocker_analytics({
+            "symbol": market.get("symbol"),
+            "timeframe": market.get("interval") or market.get("timeframe"),
+            "strategy": candidate.get("strategy"),
+            "period": period,
+            "limit": limit_raw,
+            "includeRecentCandles": "true" if include_recent else "false",
+            "recentLimit": recent_limit,
+            "refresh": refresh_requested,
+            "timeout_seconds": args.get("timeout_seconds", 240),
+        })
+        rows.append(compact_watch_diagnostic_row(market, payload, status))
+        raw.append(payload)
+    after_hashes = preview_file_hashes()
+    state_unchanged = before_hashes == after_hashes
+    warnings = dedupe_list(
+        ([real_detail] if real_enabled else [])
+        + [warning for row in rows for warning in (row.get("warnings") or [])]
+    )
+    ok = bool(state_unchanged and not real_enabled and rows and all(row.get("ok") for row in rows))
+    payload = {
+        "ok": ok,
+        "paperEnabled": canonical_paper_enabled(candidate),
+        "realTradingEnabled": real_enabled,
+        "candidate": candidate_summary(candidate),
+        "activeSymbols": candidate_symbols_by_mode(candidate, "active"),
+        "diagnosticWatchSymbols": markets,
+        "search": {
+            "period": period,
+            "limit": limit_raw,
+            "includeRecentCandles": include_recent,
+            "recentLimit": recent_limit,
+            "refresh": refresh_requested,
+        },
+        "rows": rows,
+        "raw": raw if args.get("includeRaw") else None,
+        "safety": {
+            "paperStateChanged": False,
+            "paperTickRan": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": real_enabled,
+            "activePaperStateUnchanged": state_unchanged,
+        },
+        "fileHashesBefore": before_hashes,
+        "fileHashesAfter": after_hashes,
+        "stateUnchanged": state_unchanged,
+        "warnings": warnings,
+    }
+    if not markets:
+        payload["error"] = "No diagnosticWatchSymbols are configured."
+    elif real_enabled:
+        payload["error"] = real_detail
+    elif not state_unchanged:
+        payload["error"] = "Watch diagnostics changed paper config/state/journal hashes."
+    elif not ok:
+        payload["error"] = "One or more watch diagnostics failed."
+    return payload, 200 if payload.get("ok") else 502
 
 
 def build_research_strategy_variant_lab(args) -> tuple[dict, int]:
@@ -18332,6 +18462,7 @@ def candidate_summary(candidate: dict) -> dict:
         "regimeMode": candidate.get("regimeMode"),
         "activeSymbols": candidate_symbols_by_mode(candidate, "active"),
         "watchSymbols": candidate_symbols_by_mode(candidate, "watch"),
+        "diagnosticWatchSymbols": diagnostic_watch_symbols(candidate),
         "params": candidate.get("params", {}),
         "promotedAt": candidate.get("promotedAt"),
         "promotedFromRanking": candidate.get("promotedFromRanking"),

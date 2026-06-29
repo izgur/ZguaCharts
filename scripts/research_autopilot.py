@@ -3,13 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_catch_up_batch, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_batch, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
+from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_paper_candle_alignment, build_research_paper_catch_up_batch, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_paper_watch_diagnostics, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_batch, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
 
 
 def print_json(payload: dict) -> None:
@@ -78,6 +79,42 @@ def print_summary(payload: dict) -> None:
     print(f"Safety: researchOnly={safety.get('researchOnly')} paperEnabled={safety.get('paperEnabled')} realTradingEnabled={safety.get('realTradingEnabled')} configWritten={safety.get('configWritten')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')}")
 
 
+def parse_utc_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def local_time_label(value: str | None) -> str:
+    parsed = parse_utc_iso(value)
+    if parsed is None:
+        return "-"
+    local = parsed.astimezone()
+    zone = local.tzname()
+    suffix = f" {zone}" if zone else ""
+    return f"{local.isoformat()}{suffix}"
+
+
+def print_wait_for_next_closed_candle(status: dict, due: dict, freshness: dict) -> None:
+    next_expected = due.get("nextExpectedCandleAt")
+    timeframe = str(status.get("timeframe") or "").strip().lower()
+    print("\nWaiting for next closed candle:")
+    print(f"Next expected candle (UTC): {next_expected or '-'}")
+    print(f"Approx local time: {local_time_label(next_expected)}")
+    print(f"Check again after: {next_expected or '-'}")
+    if timeframe == "4h":
+        print("Normal 4h UTC close schedule: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC")
+    if freshness.get("latestCachedCandleIsOpen"):
+        cached = freshness.get("latestCachedCandleAt") or freshness.get("latestOpenCandleAt") or "-"
+        print(f"Latest cached candle is open ({cached}); paper tick ignores it until it closes.")
+
+
 def print_paper_next_action(payload: dict) -> None:
     status = payload.get("statusSummary") or {}
     due = payload.get("dueSummary") or {}
@@ -99,6 +136,8 @@ def print_paper_next_action(payload: dict) -> None:
     print(f"Last signal/action: {status.get('lastProcessedTickSignal') or '-'} / {status.get('lastProcessedTickAction') or '-'}")
     if preview:
         print(f"Preview: {preview.get('signal') or '-'} / {preview.get('proposedAction') or '-'}")
+    if action == "WAIT_FOR_NEXT_CLOSED_CANDLE":
+        print_wait_for_next_closed_candle(status, due, freshness)
     if due.get("nextSafeCommand"):
         print("\nRun next:")
         print(due.get("nextSafeCommand"))
@@ -116,6 +155,24 @@ def print_paper_next_action(payload: dict) -> None:
     print("Blockers: " + ("; ".join(str(item) for item in blockers) if blockers else "-"))
     print("Warnings: " + ("; ".join(str(item) for item in warnings) if warnings else "-"))
     print(f"Safety: realTradingEnabled={safety.get('realTradingEnabled')} liveOrdersTouched={safety.get('liveOrdersTouched')} schedulerEnabled={safety.get('schedulerEnabled')} autoTickEnabled={safety.get('autoTickEnabled')}")
+
+
+def print_paper_watch_diagnostics(payload: dict) -> None:
+    search = payload.get("search") or {}
+    safety = payload.get("safety") or {}
+    print("Watch diagnostics: " + ("OK" if payload.get("ok") else "CHECK"))
+    print(f"Period: {search.get('period') or '-'} limit={search.get('limit') or '-'} refresh={search.get('refresh')}")
+    for row in payload.get("rows") or []:
+        rec = row.get("recommendation") or {}
+        stale = "STALE" if row.get("freshnessStale") else "FRESH"
+        print(f"- {row.get('symbol')} {row.get('timeframe')}: {stale}, trades={row.get('tradeCount')}, signalRate={row.get('signalRatePct')}%, mainBlocker={row.get('mainBlocker') or '-'}")
+        if rec.get("action") or rec.get("reason"):
+            print(f"  Recommendation: {rec.get('action') or '-'} - {rec.get('reason') or '-'}")
+        if row.get("warnings"):
+            print("  Warnings: " + "; ".join(str(item) for item in row.get("warnings") or []))
+    if not payload.get("rows"):
+        print("- No diagnostic watch markets configured.")
+    print(f"Safety: paperTickRan={safety.get('paperTickRan')} paperStateChanged={safety.get('paperStateChanged')} liveOrdersTouched={safety.get('liveOrdersTouched')} realTradingEnabled={safety.get('realTradingEnabled')}")
 
 
 def get_json(client, path: str) -> tuple[dict, int]:
@@ -184,6 +241,11 @@ def main() -> int:
     tick_once.add_argument("--confirm", required=True)
     sub.add_parser("paper:status")
     sub.add_parser("paper:tick-due")
+    watch_diagnostics = sub.add_parser("paper:watch-diagnostics")
+    watch_diagnostics.add_argument("--period", default="90d")
+    watch_diagnostics.add_argument("--limit", default="auto")
+    watch_diagnostics.add_argument("--refresh", action="store_true")
+    watch_diagnostics.add_argument("--json", action="store_true")
     observation_summary = sub.add_parser("paper:observation-summary")
     observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
@@ -256,6 +318,12 @@ def main() -> int:
             payload, status = build_research_paper_status({})
         elif args.command == "paper:tick-due":
             payload, status = build_research_paper_tick_due({})
+        elif args.command == "paper:watch-diagnostics":
+            payload, status = build_research_paper_watch_diagnostics({
+                "period": args.period,
+                "limit": args.limit,
+                "refresh": args.refresh,
+            })
         elif args.command == "paper:observation-summary":
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
@@ -292,6 +360,8 @@ def main() -> int:
         print_summary(payload)
     elif args.command == "paper:next-action" and not args.json:
         print_paper_next_action(payload)
+    elif args.command == "paper:watch-diagnostics" and not args.json:
+        print_paper_watch_diagnostics(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1

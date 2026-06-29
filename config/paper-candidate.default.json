@@ -50,6 +50,18 @@
       "mode": "watch"
     }
   ],
+  "diagnosticWatchSymbols": [
+    {
+      "symbol": "BTCUSDT",
+      "interval": "15m",
+      "mode": "diagnostic-watch"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "interval": "1h",
+      "mode": "diagnostic-watch"
+    }
+  ],
   "source": "bybit",
   "fillModel": "next-open",
   "makerFeePct": 0.02,

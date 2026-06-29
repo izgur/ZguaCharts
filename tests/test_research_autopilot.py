@@ -2637,6 +2637,73 @@ class ResearchAutopilotTests(unittest.TestCase):
         preview_mock.assert_not_called()
         self.assertEqual(before, after)
 
+    def test_paper_watch_diagnostics_uses_separate_read_only_markets(self):
+        config = self.write_active_paper_config()
+        config["diagnosticWatchSymbols"] = [
+            {"symbol": "BTCUSDT", "interval": "15m", "mode": "diagnostic-watch"},
+            {"symbol": "BTCUSDT", "interval": "1h", "mode": "diagnostic-watch"},
+        ]
+        zgua_app.PAPER_CANDIDATE_LOCAL_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+        before = zgua_app.preview_file_hashes()
+        calls = []
+        def fake_blocker(args):
+            calls.append(dict(args))
+            timeframe = args["timeframe"]
+            return {
+                "ok": True,
+                "command": f"npm run research:blocker-analytics -- --timeframe {timeframe}",
+                "activeMarket": {"freshness": {"latestCandleTime": 2000, "isStale": False}},
+                "summary": {
+                    "candlesAnalyzed": 100,
+                    "tradeCount": 2 if timeframe == "1h" else 0,
+                    "signalRatePct": 1.5,
+                    "approximateSignalsPerMonth": 4,
+                    "mainBlocker": "noSetup",
+                    "recommendation": {"action": "WATCH", "reason": "Read-only diagnostic row."},
+                },
+                "warnings": ["Selected market differs from the active promoted paper market; this report is read-only research only."],
+            }, 200
+        with patch.object(zgua_app, "build_research_blocker_analytics", side_effect=fake_blocker):
+            payload, status = zgua_app.build_research_paper_watch_diagnostics({})
+        after = zgua_app.preview_file_hashes()
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual([(call["symbol"], call["timeframe"]) for call in calls], [("BTCUSDT", "15m"), ("BTCUSDT", "1h")])
+        self.assertEqual(payload["activeSymbols"], [{"symbol": "BTCUSDT", "interval": "4h", "mode": "active"}])
+        self.assertEqual([row["interval"] for row in payload["diagnosticWatchSymbols"]], ["15m", "1h"])
+        self.assertEqual([row["timeframe"] for row in payload["rows"]], ["15m", "1h"])
+        self.assertFalse(payload["safety"]["paperTickRan"])
+        self.assertFalse(payload["safety"]["paperStateChanged"])
+        self.assertFalse(payload["safety"]["liveOrdersTouched"])
+        self.assertTrue(payload["stateUnchanged"])
+        self.assertEqual(before, after)
+
+    def test_paper_watch_diagnostics_printer_is_compact(self):
+        payload = {
+            "ok": True,
+            "search": {"period": "90d", "limit": "auto", "refresh": False},
+            "rows": [
+                {
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "freshnessStale": False,
+                    "tradeCount": 0,
+                    "signalRatePct": 0,
+                    "mainBlocker": "noSetup",
+                    "recommendation": {"action": "WATCH", "reason": "Read-only diagnostic row."},
+                    "warnings": [],
+                }
+            ],
+            "safety": {"paperTickRan": False, "paperStateChanged": False, "liveOrdersTouched": False, "realTradingEnabled": False},
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_paper_watch_diagnostics(payload)
+        text = output.getvalue()
+        self.assertIn("Watch diagnostics: OK", text)
+        self.assertIn("BTCUSDT 15m", text)
+        self.assertIn("paperTickRan=False", text)
+
     def test_paper_operator_check_refresh_does_not_mutate_paper_files(self):
         self.write_active_paper_config()
         before = zgua_app.preview_file_hashes()
@@ -2729,6 +2796,49 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("paper:tick-once", text)
         self.assertIn("Blockers: -", text)
         self.assertIn("realTradingEnabled=False", text)
+
+    def test_paper_next_action_wait_prints_next_close_context(self):
+        payload = {
+            "nextHumanAction": "WAIT_FOR_NEXT_CLOSED_CANDLE",
+            "statusSummary": {
+                "strategy": "EmaBounceV2",
+                "symbol": "BTCUSDT",
+                "timeframe": "4h",
+                "lastProcessedCandleAt": "2026-06-28T16:00:00+00:00",
+                "lastProcessedTickSignal": "HOLD",
+                "lastProcessedTickAction": "no action",
+                "openPositions": 0,
+            },
+            "freshnessSummary": {
+                "freshnessStatus": "FRESH",
+                "latestCachedCandleAt": "2026-06-28T20:00:00+00:00",
+                "latestCachedCandleIsOpen": True,
+                "latestClosedCandleAt": "2026-06-28T16:00:00+00:00",
+            },
+            "alignmentSummary": {"candleAlignmentStatus": "ALIGNED"},
+            "dueSummary": {
+                "nextExpectedCandleAt": "2026-06-28T20:00:00+00:00",
+                "missedClosedCandleCount": 0,
+                "reason": "Active market already processed the latest closed candle.",
+            },
+            "safety": {
+                "realTradingEnabled": False,
+                "liveOrdersTouched": False,
+                "schedulerEnabled": False,
+                "autoTickEnabled": False,
+            },
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_paper_next_action(payload)
+        text = output.getvalue()
+        self.assertIn("Next action: WAIT_FOR_NEXT_CLOSED_CANDLE", text)
+        self.assertIn("Next expected candle (UTC): 2026-06-28T20:00:00+00:00", text)
+        self.assertIn("Approx local time:", text)
+        self.assertIn("Check again after: 2026-06-28T20:00:00+00:00", text)
+        self.assertIn("Normal 4h UTC close schedule: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC", text)
+        self.assertIn("Latest cached candle is open (2026-06-28T20:00:00+00:00); paper tick ignores it until it closes.", text)
+        self.assertIn("Run next: -", text)
 
     def test_paper_operator_check_due_order_requires_preview_review(self):
         self.write_active_paper_config()
