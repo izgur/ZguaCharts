@@ -14,6 +14,7 @@ from app import (  # noqa: E402
     app,
     build_research_confirmed_paper_tick_once,
     build_research_enable_paper_candidate,
+    build_research_history_coverage,
     build_research_init_active_paper_candidate,
     build_research_multi_strategy_matrix,
     build_research_multi_strategy_optimizer_batch,
@@ -232,7 +233,10 @@ def print_focused_optimizer(payload: dict) -> None:
     print(f"Markets: {','.join(str(item) for item in (search.get('symbols') or [])) or search.get('symbols') or '-'}")
     print(f"Timeframes: {','.join(str(item) for item in (search.get('timeframes') or [])) or search.get('timeframes') or '-'}")
     print(f"Strategies: {','.join(str(item) for item in (search.get('strategies') or [])) or search.get('strategies') or '-'}")
-    print(f"Period: {search.get('period') or '-'} maxCombosPerStrategy={search.get('maxCombosPerStrategy') or '-'}")
+    limit_note = search.get("limit") or "auto"
+    cap_note = search.get("optimizerAutoLimitCap")
+    cap_suffix = f" autoCap={cap_note}" if cap_note else ""
+    print(f"Period: {search.get('period') or '-'} limit={limit_note}{cap_suffix} maxCombosPerStrategy={search.get('maxCombosPerStrategy') or '-'}")
     print(f"Recommendation: {rec.get('action') or '-'} - {rec.get('reason') or '-'}")
     print(f"Replacement eligible: {summary.get('replacementEligibleCount', 0)}")
     print(f"Reproducible candidates: {summary.get('reproducibleCandidateCount', 0)}")
@@ -311,6 +315,49 @@ def print_watch_matrix(payload: dict) -> None:
         print(f"\nRanking: {summary.get('rankingExplanation')}")
     if summary.get("recommendationExplanation"):
         print(f"Decision rule: {summary.get('recommendationExplanation')}")
+    if payload.get("warnings"):
+        print("Warnings: " + "; ".join(str(item) for item in payload.get("warnings") or []))
+    print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
+
+
+def print_history_coverage(payload: dict) -> None:
+    search = payload.get("search") or {}
+    rows = payload.get("rows") or []
+    print("History coverage: " + ("OK" if payload.get("ok") else "CHECK"))
+    print(f"Markets: {','.join(str(item) for item in (search.get('symbols') or [])) or search.get('symbols') or '-'}")
+    print(f"Timeframes: {','.join(str(item) for item in (search.get('timeframes') or [])) or search.get('timeframes') or '-'}")
+    print(f"Period: {search.get('period') or '-'} limit={search.get('limit') or '-'} refresh={search.get('refresh')}")
+    print("")
+    print("Symbol     TF    Need candles  Requested  Returned  Coverage days  First candle              Last candle               Source")
+    print("---------  ----  ------------  ---------  --------  -------------  ------------------------  ------------------------  ----------------")
+    for row in rows:
+        source_bits = []
+        source_bits.append("cache" if row.get("cacheHit") else "fetch")
+        if row.get("fetchedFromBybit"):
+            source_bits.append(f"bybitRequests={row.get('bybitRequests')}")
+        warnings = row.get("warnings") or []
+        source = ",".join(source_bits)
+        print(
+            f"{str(row.get('symbol') or '-')[:9]:<9}  "
+            f"{str(row.get('timeframe') or '-')[:4]:<4}  "
+            f"{str(row.get('expectedPeriodCandles') if row.get('expectedPeriodCandles') is not None else '-'):>12}  "
+            f"{str(row.get('requestedCandles') if row.get('requestedCandles') is not None else '-'):>9}  "
+            f"{str(row.get('returnedCandles') if row.get('returnedCandles') is not None else '-'):>8}  "
+            f"{str(row.get('approxCoverageDays') if row.get('approxCoverageDays') is not None else '-'):>13}  "
+            f"{str(row.get('firstCandleAt') or '-')[:24]:<24}  "
+            f"{str(row.get('lastCandleAt') or '-')[:24]:<24}  "
+            f"{source}"
+        )
+        if warnings:
+            print("  Warnings: " + "; ".join(str(item) for item in warnings))
+        if row.get("error"):
+            print(f"  Error: {row.get('error')}")
+        expected = row.get("expectedPeriodCandles")
+        requested = row.get("requestedCandles")
+        if expected and requested and requested < expected:
+            print(f"  To use full requested period in optimizer, rerun with --limit {expected} or --limit period.")
+    if not rows:
+        print("- No coverage rows returned.")
     if payload.get("warnings"):
         print("Warnings: " + "; ".join(str(item) for item in payload.get("warnings") or []))
     print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
@@ -415,6 +462,14 @@ def main() -> int:
     watch_matrix.add_argument("--include-stress", action="store_true")
     watch_matrix.add_argument("--include-walk-forward", action="store_true")
     watch_matrix.add_argument("--json", action="store_true")
+    history_coverage = sub.add_parser("research:history-coverage")
+    history_coverage.add_argument("--symbols", default="SOLUSDT")
+    history_coverage.add_argument("--timeframes", default="15m")
+    history_coverage.add_argument("--period", default="730d")
+    history_coverage.add_argument("--limit", default="auto")
+    history_coverage.add_argument("--timeout-seconds", default="420")
+    history_coverage.add_argument("--refresh", action="store_true")
+    history_coverage.add_argument("--json", action="store_true")
     observation_summary = sub.add_parser("paper:observation-summary")
     observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
@@ -523,6 +578,15 @@ def main() -> int:
                 "includeWalkForward": "true" if args.include_walk_forward else "false",
                 "timeout_seconds": args.timeout_seconds,
             })
+        elif args.command == "research:history-coverage":
+            payload, status = build_research_history_coverage({
+                "symbols": args.symbols,
+                "timeframes": args.timeframes,
+                "period": args.period,
+                "limit": args.limit,
+                "refresh": args.refresh,
+                "timeout_seconds": args.timeout_seconds,
+            })
         elif args.command == "paper:observation-summary":
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
@@ -565,6 +629,8 @@ def main() -> int:
         print_focused_optimizer(payload)
     elif args.command == "research:watch-matrix" and not args.json:
         print_watch_matrix(payload)
+    elif args.command == "research:history-coverage" and not args.json:
+        print_history_coverage(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1

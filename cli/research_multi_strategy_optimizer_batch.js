@@ -652,6 +652,11 @@ const save = String(args.save || "false").toLowerCase() === "true";
 const from = args.from || argsUtil.daysToFrom(days);
 const to = args.to || new Date().toISOString();
 const limit = args.limit && args.limit !== "auto" ? Number(args.limit) : null;
+function requestedLimitFor(timeframe) {
+  if (!args.limit || args.limit === "auto") return autoLimitFor(timeframe, days, 1000);
+  if (String(args.limit).toLowerCase() === "period") return Math.ceil(days * 24 / timeframeHours(timeframe));
+  return Number.isFinite(limit) && limit > 0 ? limit : autoLimitFor(timeframe, days, 1000);
+}
 const catalog = optimizer.optimizerGridCatalog();
 const discoveredStrategies = strategiesRegistry.listStrategies().map((strategy) => strategy.name).filter((name) => name !== "AlwaysLongTest");
 const selectedStrategies = requestedStrategies.filter((strategy) => strategy !== "AlwaysLongTest");
@@ -685,14 +690,14 @@ cappedCombos.concat([{ symbol: active.symbol, timeframe: active.timeframe, strat
       interval: combo.timeframe,
       from,
       to,
-      limit: limit || autoLimitFor(combo.timeframe, days, 1000)
+      limit: requestedLimitFor(combo.timeframe)
     }).then((candles) => data.normalizeCandles(candles || []));
   }
 });
 
 Promise.all([
   Promise.all(Object.keys(candleJobs).map((key) => candleJobs[key].then((candles) => [key, candles]))),
-  data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: limit || autoLimitFor("4h", days, 1000) }).then((candles) => data.normalizeCandles(candles || []))
+  data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor("4h") }).then((candles) => data.normalizeCandles(candles || []))
 ]).then(async ([entries, regimeCandles]) => {
   const candlesByKey = {};
   entries.forEach(([key, candles]) => { candlesByKey[key] = candles; });
@@ -783,7 +788,7 @@ Promise.all([
           interval: row.timeframe,
           from,
           to,
-          limit: limit || autoLimitFor(row.timeframe, days, 5000)
+          limit: args.limit && args.limit !== "auto" ? requestedLimitFor(row.timeframe) : autoLimitFor(row.timeframe, days, 5000)
         }).then((raw) => data.normalizeCandles(raw || []));
       } catch (error) {
         warnings.push(`Reproducibility audit used optimizer-window candles for ${row.strategy} ${row.symbol} ${row.timeframe} because full-window refresh failed: ${error.message}`);
@@ -816,6 +821,8 @@ Promise.all([
       timeframes,
       strategies: selectedStrategies,
       period: args.period || "365d",
+      limit: args.limit || "auto",
+      optimizerAutoLimitCap: 1000,
       maxCandidates,
       maxCombosPerStrategy,
       evaluatedCombos: cappedCombos.length,

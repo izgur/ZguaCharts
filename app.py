@@ -14684,6 +14684,67 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
     return response, 200 if response["ok"] else 502
 
 
+def build_research_history_coverage(args) -> tuple[dict, int]:
+    candidate = load_paper_candidate_config()
+    paper_enabled = canonical_paper_enabled(candidate)
+    real_enabled, real_detail = paper_real_trading_enabled()
+    symbols = args.get("symbols", "SOLUSDT")
+    timeframes = args.get("timeframes", "15m")
+    period = args.get("period", "730d")
+    limit = args.get("limit", "auto")
+    refresh = str(args.get("refresh", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    command = package_node_script_args("research:history-coverage")
+    command.extend([
+        "--symbols", str(symbols),
+        "--timeframes", str(timeframes),
+        "--period", str(period),
+        "--limit", str(limit),
+        "--refresh", "true" if refresh else "false",
+    ])
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=app.root_path,
+            timeout=int(safe_float(args.get("timeout_seconds", 420), 420)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "error": "Research history coverage timed out.",
+            "paperEnabled": paper_enabled,
+            "realTradingEnabled": real_enabled,
+            "stdout": exc.stdout,
+            "stderr": exc.stderr,
+            "warnings": ["Research history coverage timed out before returning rows."],
+        }, 504
+    payload = None
+    if completed.stdout.strip():
+        try:
+            payload = json.loads(completed.stdout)
+        except Exception:
+            payload = {"ok": False, "error": "Research history coverage returned non-JSON output.", "stdout": completed.stdout.strip()}
+    if payload is None:
+        payload = {"ok": False, "error": completed.stderr.strip() or "Research history coverage returned no output."}
+    warnings = dedupe_list((payload.get("warnings") or []) + ([real_detail] if real_enabled else []))
+    if completed.returncode != 0:
+        warnings.append(completed.stderr.strip() or "Research history coverage command failed.")
+    response = {
+        "ok": completed.returncode == 0 and payload.get("ok", True) is not False,
+        "paperEnabled": paper_enabled,
+        "realTradingEnabled": real_enabled,
+        "search": payload.get("search") or {"symbols": symbols, "timeframes": timeframes, "period": period, "limit": limit, "refresh": refresh},
+        "rows": payload.get("rows") or [],
+        "warnings": warnings,
+        "command": " ".join(command),
+    }
+    if completed.returncode != 0:
+        response["returnCode"] = completed.returncode
+        response["stderr"] = completed.stderr.strip()
+    return response, 200 if response["ok"] else 502
+
+
 def _optimizer_audit_candidates_from_batch(batch_payload: dict, top_n: int) -> list[dict]:
     rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict) and not row.get("isActiveBaseline")]
     rows = sorted(rows, key=lambda row: int(safe_float(row.get("rank"), 999999)))

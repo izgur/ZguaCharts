@@ -2812,6 +2812,45 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("TOO_FEW_TRADES", text)
         self.assertIn("Safety: readOnly=True", text)
 
+    def test_history_coverage_printer_shows_candle_limits(self):
+        payload = {
+            "ok": True,
+            "search": {
+                "symbols": ["SOLUSDT"],
+                "timeframes": ["15m"],
+                "period": "730d",
+                "limit": "auto",
+                "refresh": False,
+            },
+            "rows": [
+                {
+                    "symbol": "SOLUSDT",
+                    "timeframe": "15m",
+                    "expectedPeriodCandles": 70080,
+                    "requestedCandles": 1000,
+                    "returnedCandles": 1000,
+                    "approxCoverageDays": 10.41,
+                    "firstCandleAt": "2026-06-19T12:00:00.000Z",
+                    "lastCandleAt": "2026-06-29T22:00:00.000Z",
+                    "cacheHit": True,
+                    "fetchedFromBybit": False,
+                    "bybitRequests": 0,
+                    "warnings": ["limit_below_period_need_70080", "optimizer_auto_limit_1000_candles"],
+                }
+            ],
+            "warnings": [],
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_history_coverage(payload)
+        text = output.getvalue()
+        self.assertIn("History coverage: OK", text)
+        self.assertIn("Need candles", text)
+        self.assertIn("SOLUSDT", text)
+        self.assertIn("limit_below_period_need_70080", text)
+        self.assertIn("rerun with --limit 70080 or --limit period", text)
+        self.assertIn("Safety: readOnly=True", text)
+
     def test_paper_operator_check_refresh_does_not_mutate_paper_files(self):
         self.write_active_paper_config()
         before = zgua_app.preview_file_hashes()
