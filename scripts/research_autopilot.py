@@ -10,7 +10,30 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import app, build_research_confirmed_paper_tick_once, build_research_enable_paper_candidate, build_research_init_active_paper_candidate, build_research_multi_strategy_optimizer_batch, build_research_paper_candle_alignment, build_research_paper_catch_up_batch, build_research_paper_catch_up_next, build_research_paper_catch_up_plan, build_research_paper_freshness, build_research_paper_observation_summary, build_research_paper_operator_check, build_research_paper_status, build_research_paper_tick_due, build_research_paper_watch_diagnostics, build_research_plan_paper_enable_candidate, build_research_preview_paper_catch_up_batch, build_research_preview_paper_catch_up_next, build_research_preview_paper_tick, build_research_publish_review_candidate, build_research_refresh_active_paper_data  # noqa: E402
+from app import (  # noqa: E402
+    app,
+    build_research_confirmed_paper_tick_once,
+    build_research_enable_paper_candidate,
+    build_research_init_active_paper_candidate,
+    build_research_multi_strategy_matrix,
+    build_research_multi_strategy_optimizer_batch,
+    build_research_paper_candle_alignment,
+    build_research_paper_catch_up_batch,
+    build_research_paper_catch_up_next,
+    build_research_paper_catch_up_plan,
+    build_research_paper_freshness,
+    build_research_paper_observation_summary,
+    build_research_paper_operator_check,
+    build_research_paper_status,
+    build_research_paper_tick_due,
+    build_research_paper_watch_diagnostics,
+    build_research_plan_paper_enable_candidate,
+    build_research_preview_paper_catch_up_batch,
+    build_research_preview_paper_catch_up_next,
+    build_research_preview_paper_tick,
+    build_research_publish_review_candidate,
+    build_research_refresh_active_paper_data,
+)
 
 
 def print_json(payload: dict) -> None:
@@ -234,6 +257,65 @@ def print_focused_optimizer(payload: dict) -> None:
     print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
 
 
+def compact_reasons(row: dict, limit: int = 3) -> str:
+    reasons = row.get("replacementRejectionReasons") or []
+    if reasons:
+        return "; ".join(str(item) for item in reasons[:limit])
+    if row.get("mainFailureReason"):
+        return str(row.get("mainFailureReason"))
+    warnings = row.get("warnings") or []
+    if warnings:
+        return "; ".join(str(item) for item in warnings[:limit])
+    if row.get("replacementEligible"):
+        return "replacement_eligible"
+    return "-"
+
+
+def print_watch_matrix(payload: dict) -> None:
+    search = payload.get("search") or {}
+    summary = payload.get("summary") or {}
+    rec = summary.get("recommendation") or {}
+    rows = payload.get("rows") or []
+    print("Watch matrix: " + ("OK" if payload.get("ok") else "CHECK"))
+    print(f"Markets: {','.join(str(item) for item in (search.get('symbols') or [])) or search.get('symbols') or '-'}")
+    print(f"Timeframes: {','.join(str(item) for item in (search.get('timeframes') or [])) or search.get('timeframes') or '-'}")
+    print(f"Strategies: {','.join(str(item) for item in (search.get('strategies') or [])) or search.get('strategies') or '-'}")
+    print(f"Period: {search.get('period') or '-'} rows={len(rows)}")
+    print(f"Pass/Warn: {summary.get('passCount', 0)}  Fail: {summary.get('failCount', 0)}  Unsupported: {summary.get('unsupportedCount', 0)}")
+    print(f"Replacement eligible: {summary.get('replacementEligibleCount', 0)}")
+    print(f"Recommendation: {rec.get('action') or '-'} - {rec.get('reason') or '-'}")
+    print("")
+    print("Rank  Symbol     TF    Strategy                  Params            Status     Trades  Ret%    PF     DD%    Win%   Tier          Why")
+    print("----  ---------  ----  ------------------------  ----------------  ---------  ------  ------  -----  ------  -----  ------------  ------------------------------")
+    for row in rows:
+        tier = row.get("evidenceTier") or row.get("qualityStatus") or "-"
+        why = compact_reasons(row)
+        print(
+            f"{str(row.get('rank') or '-'):>4}  "
+            f"{str(row.get('symbol') or '-')[:9]:<9}  "
+            f"{str(row.get('timeframe') or '-')[:4]:<4}  "
+            f"{str(row.get('strategy') or '-')[:24]:<24}  "
+            f"{str(row.get('paramsSource') or '-')[:16]:<16}  "
+            f"{str(row.get('status') or '-')[:9]:<9}  "
+            f"{str(row.get('trades') if row.get('trades') is not None else '-'):>6}  "
+            f"{str(row.get('totalReturnPct') if row.get('totalReturnPct') is not None else '-'):>6}  "
+            f"{str(row.get('profitFactor') if row.get('profitFactor') is not None else '-'):>5}  "
+            f"{str(row.get('maxDrawdownPct') if row.get('maxDrawdownPct') is not None else '-'):>6}  "
+            f"{str(row.get('winRate') if row.get('winRate') is not None else '-'):>5}  "
+            f"{str(tier)[:12]:<12}  "
+            f"{why[:120]}"
+        )
+    if not rows:
+        print("- No matrix rows returned.")
+    if summary.get("rankingExplanation"):
+        print(f"\nRanking: {summary.get('rankingExplanation')}")
+    if summary.get("recommendationExplanation"):
+        print(f"Decision rule: {summary.get('recommendationExplanation')}")
+    if payload.get("warnings"):
+        print("Warnings: " + "; ".join(str(item) for item in payload.get("warnings") or []))
+    print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
+
+
 def get_json(client, path: str) -> tuple[dict, int]:
     response = client.get(path)
     payload = response.get_json() or {"ok": False, "error": response.get_data(as_text=True)}
@@ -322,6 +404,17 @@ def main() -> int:
     focused_optimizer.add_argument("--no-repro", action="store_true")
     focused_optimizer.add_argument("--no-save", action="store_true")
     focused_optimizer.add_argument("--json", action="store_true")
+    watch_matrix = sub.add_parser("research:watch-matrix")
+    watch_matrix.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT")
+    watch_matrix.add_argument("--timeframes", default="15m,1h,4h")
+    watch_matrix.add_argument("--strategies", default="SimpleAtrTrendV2,EmaBounceV2,PullbackReclaimV2,BreakoutRetestV2,RangeExpansionV2,RelativeStrengthV2")
+    watch_matrix.add_argument("--period", default="365d")
+    watch_matrix.add_argument("--limit", default="auto")
+    watch_matrix.add_argument("--max-rows", default="100")
+    watch_matrix.add_argument("--timeout-seconds", default="600")
+    watch_matrix.add_argument("--include-stress", action="store_true")
+    watch_matrix.add_argument("--include-walk-forward", action="store_true")
+    watch_matrix.add_argument("--json", action="store_true")
     observation_summary = sub.add_parser("paper:observation-summary")
     observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
@@ -418,6 +511,18 @@ def main() -> int:
                 "limit": args.limit,
                 "timeout_seconds": args.timeout_seconds,
             })
+        elif args.command == "research:watch-matrix":
+            payload, status = build_research_multi_strategy_matrix({
+                "symbols": args.symbols,
+                "timeframes": args.timeframes,
+                "strategies": args.strategies,
+                "period": args.period,
+                "limit": args.limit,
+                "maxRows": args.max_rows,
+                "includeStress": "true" if args.include_stress else "false",
+                "includeWalkForward": "true" if args.include_walk_forward else "false",
+                "timeout_seconds": args.timeout_seconds,
+            })
         elif args.command == "paper:observation-summary":
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
@@ -458,6 +563,8 @@ def main() -> int:
         print_paper_watch_diagnostics(payload)
     elif args.command == "research:focused-optimizer" and not args.json:
         print_focused_optimizer(payload)
+    elif args.command == "research:watch-matrix" and not args.json:
+        print_watch_matrix(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1

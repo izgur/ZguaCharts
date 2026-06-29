@@ -2748,6 +2748,70 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("SimpleAtrTrendV2 SOLUSDT 15m", text)
         self.assertIn("readOnly=True", text)
 
+    def test_watch_matrix_printer_shows_results_table_and_reasons(self):
+        payload = {
+            "ok": True,
+            "search": {
+                "symbols": ["BTCUSDT", "ETHUSDT"],
+                "timeframes": ["15m", "1h"],
+                "strategies": ["SimpleAtrTrendV2", "EmaBounceV2"],
+                "period": "365d",
+            },
+            "summary": {
+                "passCount": 1,
+                "failCount": 1,
+                "unsupportedCount": 0,
+                "replacementEligibleCount": 0,
+                "rankingExplanation": "rawRank is the ordinary matrix ranking.",
+                "recommendationExplanation": "KEEP_BASELINE means no replacement-eligible candidate beat the active baseline.",
+                "recommendation": {
+                    "action": "KEEP_BASELINE",
+                    "reason": "Best raw row is not replacement eligible.",
+                },
+            },
+            "rows": [
+                {
+                    "rank": 1,
+                    "symbol": "ETHUSDT",
+                    "timeframe": "1h",
+                    "strategy": "SimpleAtrTrendV2",
+                    "status": "PASS",
+                    "trades": 63,
+                    "totalReturnPct": 8.4,
+                    "profitFactor": 1.42,
+                    "maxDrawdownPct": 11.2,
+                    "winRate": 0.51,
+                    "evidenceTier": "MEDIUM",
+                    "replacementRejectionReasons": ["weak_return_vs_baseline"],
+                },
+                {
+                    "rank": 2,
+                    "symbol": "BTCUSDT",
+                    "timeframe": "15m",
+                    "strategy": "EmaBounceV2",
+                    "status": "FAIL",
+                    "trades": 8,
+                    "totalReturnPct": -1.1,
+                    "profitFactor": 0.88,
+                    "maxDrawdownPct": 4.0,
+                    "winRate": 0.42,
+                    "evidenceTier": "INSUFFICIENT",
+                    "mainFailureReason": "TOO_FEW_TRADES",
+                },
+            ],
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            research_cli.print_watch_matrix(payload)
+        text = output.getvalue()
+        self.assertIn("Watch matrix: OK", text)
+        self.assertIn("Rank  Symbol", text)
+        self.assertIn("ETHUSDT", text)
+        self.assertIn("SimpleAtrTrendV2", text)
+        self.assertIn("weak_return_vs_baseline", text)
+        self.assertIn("TOO_FEW_TRADES", text)
+        self.assertIn("Safety: readOnly=True", text)
+
     def test_paper_operator_check_refresh_does_not_mutate_paper_files(self):
         self.write_active_paper_config()
         before = zgua_app.preview_file_hashes()

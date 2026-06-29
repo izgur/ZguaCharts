@@ -287,9 +287,12 @@ function buildSummary(rows, activeEvidence, rules) {
     recommendation = { action: "RESEARCH_MORE", reason: "No viable matrix row beat the baseline gates." };
   }
   const rankingExplanation = "rawRank is the ordinary matrix ranking by status, score, PF, and return. practicalRank only includes the active baseline plus rows that pass conservative replacement eligibility gates.";
-  const recommendationExplanation = recommendation.action === "KEEP_BASELINE"
-    ? "KEEP_BASELINE means no replacement-eligible candidate beat the active baseline. A high raw rank alone is not enough when trades, return, drawdown, or baseline comparison are weak."
-    : "REVIEW_NEW_STRATEGY is research-only and requires replacement eligibility plus a meaningful practical-score edge over the baseline.";
+  let recommendationExplanation = "RESEARCH_MORE means no matrix row cleared the basic evidence gates yet. Use broader data, different strategies, or a focused optimizer pass before considering promotion.";
+  if (recommendation.action === "KEEP_BASELINE") {
+    recommendationExplanation = "KEEP_BASELINE means no replacement-eligible candidate beat the active baseline. A high raw rank alone is not enough when trades, return, drawdown, or baseline comparison are weak.";
+  } else if (recommendation.action === "REVIEW_NEW_STRATEGY") {
+    recommendationExplanation = "REVIEW_NEW_STRATEGY is research-only and requires replacement eligibility plus a meaningful practical-score edge over the baseline.";
+  }
   return {
     activeBaselineRank: active ? active.rank : null,
     activeBaselineRawRank: active ? active.rawRank : null,
