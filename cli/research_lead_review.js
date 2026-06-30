@@ -38,6 +38,13 @@ function autoLimitFor(timeframe, days, cap) {
   return Math.max(100, Math.min(Number(cap || 5000), bars));
 }
 
+function requestedLimitFor(timeframe, days, rawLimit, cap) {
+  if (!rawLimit || rawLimit === "auto") return autoLimitFor(timeframe, days, cap);
+  if (String(rawLimit).toLowerCase() === "period") return Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  const parsed = Number(rawLimit);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : autoLimitFor(timeframe, days, cap);
+}
+
 function classify(row) {
   if (row.status === "ERROR") return "ERROR";
   if (row.trades <= 0) return "NO_TRADES";
@@ -360,7 +367,7 @@ async function main() {
   const costs = { feePct: Number(args.feePct || 0.055), slippagePct: Number(args.slippagePct || 0.02) };
   const from = args.from || argsUtil.daysToFrom(days);
   const to = args.to || new Date().toISOString();
-  const limit = args.limit && args.limit !== "auto" ? Number(args.limit) : null;
+  const rawLimit = args.limit || "auto";
   const baseline = {
     source,
     strategy: args.baselineStrategy || "SimpleAtrTrendV2",
@@ -382,9 +389,9 @@ async function main() {
   const includeDeepCompare = String(args.includeDeepCompare || "true").toLowerCase() !== "false";
   const warnings = ["No promotion, paper tick, config write, or real trading action was performed."];
   const [baselineFetch, leadFetch, regimeFetch] = await Promise.all([
-    fetchSet(source, baseline.symbol, baseline.timeframe, from, to, limit || autoLimitFor(baseline.timeframe, days, 5000)),
-    fetchSet(source, lead.symbol, lead.timeframe, from, to, limit || autoLimitFor(lead.timeframe, days, 5000)),
-    fetchSet(source, "BTCUSDT", "4h", from, to, limit || autoLimitFor("4h", days, 3000))
+    fetchSet(source, baseline.symbol, baseline.timeframe, from, to, requestedLimitFor(baseline.timeframe, days, rawLimit, 5000)),
+    fetchSet(source, lead.symbol, lead.timeframe, from, to, requestedLimitFor(lead.timeframe, days, rawLimit, 5000)),
+    fetchSet(source, "BTCUSDT", "4h", from, to, requestedLimitFor("4h", days, rawLimit, 3000))
   ]);
   if (baselineFetch.error) warnings.push(`Baseline candles unavailable: ${baselineFetch.error}`);
   if (leadFetch.error) warnings.push(`Lead candles unavailable: ${leadFetch.error}`);

@@ -16,6 +16,7 @@ from app import (  # noqa: E402
     build_research_enable_paper_candidate,
     build_research_history_coverage,
     build_research_init_active_paper_candidate,
+    build_research_lead_review,
     build_research_multi_strategy_matrix,
     build_research_multi_strategy_optimizer_batch,
     build_research_paper_candle_alignment,
@@ -373,6 +374,43 @@ def print_history_coverage(payload: dict) -> None:
     print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
 
 
+def print_lead_review(payload: dict) -> None:
+    search = payload.get("search") or {}
+    lead = payload.get("lead") or {}
+    baseline = payload.get("baseline") or {}
+    evidence = payload.get("evidence") or {}
+    activity = evidence.get("activity") or {}
+    comparison = payload.get("comparison") or {}
+    eligibility = payload.get("replacementEligibility") or {}
+    verdict = payload.get("verdict") or {}
+    print("Lead review: " + ("OK" if payload.get("ok") else "CHECK"))
+    print(f"Lead: {lead.get('strategy') or search.get('leadStrategy') or '-'} {lead.get('symbol') or search.get('leadSymbol') or '-'} {lead.get('timeframe') or search.get('leadTimeframe') or '-'} params={lead.get('paramsSource') or '-'}")
+    print(f"Baseline: {baseline.get('strategy') or search.get('baselineStrategy') or '-'} {baseline.get('symbol') or search.get('baselineSymbol') or '-'} {baseline.get('timeframe') or search.get('baselineTimeframe') or '-'}")
+    print(f"Period: {search.get('period') or '-'}")
+    lead_activity = activity.get("lead") or {}
+    base_activity = activity.get("baseline") or {}
+    print(f"Lead activity: {lead_activity.get('status') or '-'} trades={lead_activity.get('trades')} return={lead_activity.get('totalReturnPct')}% PF={lead_activity.get('profitFactor')} DD={lead_activity.get('maxDrawdownPct')}")
+    print(f"Baseline activity: {base_activity.get('status') or '-'} trades={base_activity.get('trades')} return={base_activity.get('totalReturnPct')}% PF={base_activity.get('profitFactor')} DD={base_activity.get('maxDrawdownPct')}")
+    print(f"Comparison: winner={comparison.get('winner') or '-'} {comparison.get('tradeoffSummary') or ''}".strip())
+    print(f"Replacement eligible: {eligibility.get('eligible')} reasons=" + ("; ".join(str(item) for item in (eligibility.get("reasons") or [])) if eligibility.get("reasons") else "-"))
+    print(f"Verdict: {verdict.get('action') or '-'} - {verdict.get('reason') or '-'}")
+    checks = [
+        ("Robustness", (evidence.get("robustness") or {}).get("status")),
+        ("Stress", (evidence.get("feeSlippageStress") or {}).get("status")),
+        ("Walk-forward", (evidence.get("walkForward") or {}).get("status")),
+        ("Regime", (evidence.get("regimeBreakdown") or {}).get("status")),
+        ("Deep compare", (evidence.get("deepCompare") or {}).get("status")),
+    ]
+    print("Checks: " + "; ".join(f"{name}={status or '-'}" for name, status in checks))
+    if payload.get("savedPath"):
+        print(f"Saved report: {payload.get('savedPath')}")
+    if payload.get("error"):
+        print(f"Error: {payload.get('error')}")
+    if payload.get("warnings"):
+        print("Warnings: " + "; ".join(str(item) for item in payload.get("warnings") or []))
+    print("Safety: readOnly=True paperTickRan=False paperStateChanged=False liveOrdersTouched=False realTradingEnabled=False")
+
+
 def get_json(client, path: str) -> tuple[dict, int]:
     response = client.get(path)
     payload = response.get_json() or {"ok": False, "error": response.get_data(as_text=True)}
@@ -481,6 +519,24 @@ def main() -> int:
     history_coverage.add_argument("--timeout-seconds", default="420")
     history_coverage.add_argument("--refresh", action="store_true")
     history_coverage.add_argument("--json", action="store_true")
+    lead_review = sub.add_parser("research:lead-review")
+    lead_review.add_argument("--strategy", default="SimpleAtrTrendV2")
+    lead_review.add_argument("--symbol", default="ETHUSDT")
+    lead_review.add_argument("--timeframe", default="1h")
+    lead_review.add_argument("--period", default="365d")
+    lead_review.add_argument("--limit", default="period")
+    lead_review.add_argument("--batch-file")
+    lead_review.add_argument("--max-combos-per-strategy", default="80")
+    lead_review.add_argument("--top-n", default="10")
+    lead_review.add_argument("--timeout-seconds", default="900")
+    lead_review.add_argument("--review-timeout-seconds", default="900")
+    lead_review.add_argument("--no-robustness", action="store_true")
+    lead_review.add_argument("--no-stress", action="store_true")
+    lead_review.add_argument("--no-walk-forward", action="store_true")
+    lead_review.add_argument("--no-regime", action="store_true")
+    lead_review.add_argument("--no-deep-compare", action="store_true")
+    lead_review.add_argument("--save", action="store_true")
+    lead_review.add_argument("--json", action="store_true")
     observation_summary = sub.add_parser("paper:observation-summary")
     observation_summary.add_argument("--limit", type=int, default=20)
     catch_up_plan = sub.add_parser("paper:catch-up-plan")
@@ -599,6 +655,27 @@ def main() -> int:
                 "refresh": args.refresh,
                 "timeout_seconds": args.timeout_seconds,
             })
+        elif args.command == "research:lead-review":
+            request = {
+                "leadStrategy": args.strategy,
+                "leadSymbol": args.symbol,
+                "leadTimeframe": args.timeframe,
+                "period": args.period,
+                "limit": args.limit,
+                "maxCombosPerStrategy": args.max_combos_per_strategy,
+                "topN": args.top_n,
+                "includeRobustness": "false" if args.no_robustness else "true",
+                "includeStress": "false" if args.no_stress else "true",
+                "includeWalkForward": "false" if args.no_walk_forward else "true",
+                "includeRegime": "false" if args.no_regime else "true",
+                "includeDeepCompare": "false" if args.no_deep_compare else "true",
+                "save": "true" if args.save else "false",
+                "timeout_seconds": args.timeout_seconds,
+                "review_timeout_seconds": args.review_timeout_seconds,
+            }
+            if args.batch_file:
+                request["batchFile"] = args.batch_file
+            payload, status = build_research_lead_review(request)
         elif args.command == "paper:observation-summary":
             payload, status = build_research_paper_observation_summary({"limit": args.limit})
         elif args.command == "paper:operator-check":
@@ -643,6 +720,8 @@ def main() -> int:
         print_watch_matrix(payload)
     elif args.command == "research:history-coverage" and not args.json:
         print_history_coverage(payload)
+    elif args.command == "research:lead-review" and not args.json:
+        print_lead_review(payload)
     else:
         print_json(payload)
     return 0 if status < 400 and payload.get("ok", True) is not False else 1
