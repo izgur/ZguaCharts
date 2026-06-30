@@ -241,6 +241,16 @@ def print_focused_optimizer(payload: dict) -> None:
     print(f"Replacement eligible: {summary.get('replacementEligibleCount', 0)}")
     print(f"Reproducible candidates: {summary.get('reproducibleCandidateCount', 0)}")
     print(f"Quality rejected: {summary.get('rejectedByQualityGateCount', 0)}")
+    timings = payload.get("timings") or {}
+    if timings:
+        elapsed = timings.get("elapsedMs")
+        elapsed_text = f"{round(float(elapsed) / 1000, 2)}s" if elapsed is not None else "-"
+        print(f"Runtime: elapsed={elapsed_text} evaluatedBacktests={timings.get('evaluatedCandidateBacktests', '-')} plannedBacktests={timings.get('plannedCandidateBacktests', '-')} budgetHit={timings.get('runtimeBudgetHit')}")
+        strategy_timings = timings.get("strategyTimings") or []
+        if strategy_timings:
+            print("Strategy timing:")
+            for item in strategy_timings[:8]:
+                print(f"- {item.get('strategy')} {item.get('symbol')} {item.get('timeframe')}: {item.get('evaluatedCombinations')}/{item.get('plannedCombinations')} combos in {round(float(item.get('elapsedMs') or 0) / 1000, 2)}s")
     if payload.get("savedPath"):
         print(f"Saved report: {payload.get('savedPath')}")
     print("Top rows:")
@@ -445,6 +455,7 @@ def main() -> int:
     focused_optimizer.add_argument("--repro-top-n", default="6")
     focused_optimizer.add_argument("--repro-reruns", default="2")
     focused_optimizer.add_argument("--timeout-seconds", default="900")
+    focused_optimizer.add_argument("--runtime-budget-seconds", default="auto")
     focused_optimizer.add_argument("--limit", default="auto")
     focused_optimizer.add_argument("--no-walk-forward", action="store_true")
     focused_optimizer.add_argument("--no-stress", action="store_true")
@@ -562,6 +573,7 @@ def main() -> int:
                 "includeReproAudit": "false" if args.no_repro else "true",
                 "reproTopN": args.repro_top_n,
                 "reproReruns": args.repro_reruns,
+                "runtimeBudgetSeconds": args.runtime_budget_seconds,
                 "save": "false" if args.no_save else "true",
                 "limit": args.limit,
                 "timeout_seconds": args.timeout_seconds,

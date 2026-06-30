@@ -649,6 +649,8 @@ const reproTopN = Math.max(1, Math.min(Number(args.reproTopN || args.repro_top_n
 const reproReruns = Math.max(1, Math.min(Number(args.reproReruns || args.repro_reruns || 1), 5));
 const requireReproducible = String(args.requireReproducible || args.require_reproducible || "false").toLowerCase() === "true";
 const save = String(args.save || "false").toLowerCase() === "true";
+const startedAt = Date.now();
+const runtimeBudgetSeconds = Math.max(0, Number(args.runtimeBudgetSeconds || args.runtime_budget_seconds || 0));
 const from = args.from || argsUtil.daysToFrom(days);
 const to = args.to || new Date().toISOString();
 const limit = args.limit && args.limit !== "auto" ? Number(args.limit) : null;
@@ -656,6 +658,9 @@ function requestedLimitFor(timeframe) {
   if (!args.limit || args.limit === "auto") return autoLimitFor(timeframe, days, 1000);
   if (String(args.limit).toLowerCase() === "period") return Math.ceil(days * 24 / timeframeHours(timeframe));
   return Number.isFinite(limit) && limit > 0 ? limit : autoLimitFor(timeframe, days, 1000);
+}
+function runtimeBudgetExceeded() {
+  return runtimeBudgetSeconds > 0 && (Date.now() - startedAt) / 1000 >= runtimeBudgetSeconds;
 }
 const catalog = optimizer.optimizerGridCatalog();
 const discoveredStrategies = strategiesRegistry.listStrategies().map((strategy) => strategy.name).filter((name) => name !== "AlwaysLongTest");
@@ -702,6 +707,15 @@ Promise.all([
   const candlesByKey = {};
   entries.forEach(([key, candles]) => { candlesByKey[key] = candles; });
   const warnings = [];
+  const timings = {
+    startedAt: new Date(startedAt).toISOString(),
+    fetchAndSetupMs: Date.now() - startedAt,
+    runtimeBudgetSeconds,
+    evaluatedCandidateBacktests: 0,
+    plannedCandidateBacktests: 0,
+    strategyTimings: []
+  };
+  let runtimeBudgetHit = false;
   if (combos.length > cappedCombos.length) warnings.push(`Optimizer batch capped ${combos.length} requested strategy/market combination(s) to ${cappedCombos.length}.`);
   if (skippedStrategies.length) warnings.push(`${skippedStrategies.length} strategy family/families skipped because no safe bounded grid was available.`);
 
@@ -735,7 +749,14 @@ Promise.all([
     const candles = candlesByKey[combo.symbol + ":" + combo.timeframe] || [];
     try {
       const grid = boundedGridCombos(combo.strategy, maxCombosPerStrategy);
-      const candidates = grid.combos.map((params) => {
+      timings.plannedCandidateBacktests += grid.combos.length;
+      const strategyStartedAt = Date.now();
+      const candidates = [];
+      for (const params of grid.combos) {
+        if (runtimeBudgetExceeded()) {
+          runtimeBudgetHit = true;
+          break;
+        }
         const withCosts = Object.assign({}, params, costs);
         const result = backtest.runBacktestOnCandles({
           source,
@@ -748,6 +769,7 @@ Promise.all([
           feePct: costs.feePct,
           slippagePct: costs.slippagePct
         });
+        timings.evaluatedCandidateBacktests += 1;
         const row = compactResult(result, {
           strategy: combo.strategy,
           symbol: combo.symbol,
@@ -763,7 +785,15 @@ Promise.all([
           sampledCombinations: grid.metadata ? grid.metadata.sampledCombinations : 0,
           sampled: grid.metadata ? grid.metadata.sampled : false
         };
-        return row;
+        candidates.push(row);
+      }
+      timings.strategyTimings.push({
+        strategy: combo.strategy,
+        symbol: combo.symbol,
+        timeframe: combo.timeframe,
+        evaluatedCombinations: candidates.length,
+        plannedCombinations: grid.combos.length,
+        elapsedMs: Date.now() - strategyStartedAt
       });
       const best = candidates.sort(sortRows)[0] || errorRow(combo, "No optimizer candidates were evaluated.");
       rows.push(best);
@@ -771,13 +801,14 @@ Promise.all([
       rows.push(errorRow(combo, error.message));
     }
   });
+  if (runtimeBudgetHit) warnings.push(`Optimizer runtime budget hit after ${runtimeBudgetSeconds}s; returning partial rows.`);
 
   rows.sort(sortRows);
   rows.forEach((row, index) => {
     row.rank = index + 1;
     row.rawRank = row.isActiveBaseline ? null : index + 1;
   });
-  if (includeReproAudit) {
+  if (includeReproAudit && !runtimeBudgetHit) {
     for (const row of rows.filter((item) => !item.isActiveBaseline).slice(0, reproTopN)) {
       const fallbackCandles = candlesByKey[row.symbol + ":" + row.timeframe] || [];
       let candles = fallbackCandles;
@@ -795,6 +826,8 @@ Promise.all([
       }
       auditRowReproducibility(row, candles, regimeCandles, { source, costs }, reproReruns);
     }
+  } else if (includeReproAudit && runtimeBudgetHit) {
+    warnings.push("Reproducibility audit skipped because optimizer runtime budget was hit.");
   }
   rows.forEach((row) => applyQualityGate(row, includeReproAudit, requireReproducible));
   annotateReplacementSemantics(rows, activeEvidence, REPLACEMENT_RULES);
@@ -802,12 +835,13 @@ Promise.all([
   const activeRow = rows.find((row) => row.isActiveBaseline);
   if (activeRow) enriched.add(activeRow.rank);
   rows.forEach((row) => {
-    if (enriched.has(row.rank)) {
+    if (enriched.has(row.rank) && !runtimeBudgetHit) {
       const candles = candlesByKey[row.symbol + ":" + row.timeframe] || [];
       if (includeStress) row.stress = stressSummary(row, candles, regimeCandles, { source, days, costs });
       if (includeWalkForward) row.walkForward = walkForwardSummary(row, candles, regimeCandles, { source, days, costs });
     }
   });
+  if (runtimeBudgetHit && (includeStress || includeWalkForward)) warnings.push("Stress and walk-forward summaries skipped because optimizer runtime budget was hit.");
   const outputRows = rows.slice(0, topN);
   if (activeRow && !outputRows.some((row) => row.isActiveBaseline)) outputRows.push(activeRow);
   const summary = buildSummary(rows, skippedStrategies, activeEvidence, REPLACEMENT_RULES, { includeReproAudit, reproTopN, reproReruns, requireReproducible });
@@ -834,12 +868,19 @@ Promise.all([
       reproReruns,
       requireReproducible,
       reproducibilityTolerances: REPRO_TOLERANCES,
+      runtimeBudgetSeconds,
+      runtimeBudgetHit,
       save
     },
     discoveredStrategies,
     skippedStrategies,
     rows: outputRows,
     summary,
+    timings: Object.assign({}, timings, {
+      elapsedMs: Date.now() - startedAt,
+      finishedAt: new Date().toISOString(),
+      runtimeBudgetHit
+    }),
     warnings
   };
   if (save) payload.savedPath = saveResult(payload);

@@ -14599,6 +14599,12 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
     repro_reruns = max(1, min(int(safe_float(args.get("reproReruns", args.get("repro_reruns", 1)), 1)), 5))
     require_repro = str(args.get("requireReproducible", args.get("require_reproducible", "false"))).strip().lower() in {"1", "true", "yes", "on"}
     save = str(args.get("save", "false")).strip().lower() in {"1", "true", "yes", "on"}
+    timeout_seconds = int(safe_float(args.get("timeout_seconds", 900), 900))
+    runtime_budget_arg = args.get("runtimeBudgetSeconds", args.get("runtime_budget_seconds"))
+    if runtime_budget_arg in (None, "", "auto"):
+        runtime_budget_seconds = max(0, timeout_seconds - 30)
+    else:
+        runtime_budget_seconds = max(0, int(safe_float(runtime_budget_arg, 0)))
     params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
     fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
     slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
@@ -14620,6 +14626,7 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
         "--reproTopN", str(repro_top_n),
         "--reproReruns", str(repro_reruns),
         "--requireReproducible", "true" if require_repro else "false",
+        "--runtimeBudgetSeconds", str(runtime_budget_seconds),
         "--save", "true" if save else "false",
         "--activeSymbol", active_symbol,
         "--activeTimeframe", active_timeframe,
@@ -14640,7 +14647,7 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
             text=True,
             capture_output=True,
             cwd=app.root_path,
-            timeout=int(safe_float(args.get("timeout_seconds", 900), 900)),
+            timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -14649,6 +14656,7 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
             "paperEnabled": paper_enabled,
             "realTradingEnabled": real_enabled,
             "activeBaseline": candidate_summary(candidate),
+            "search": {"symbols": symbols, "timeframes": timeframes, "strategies": strategies, "period": period, "maxCandidates": max_candidates, "maxCombosPerStrategy": max_combos, "topN": top_n, "includeReproAudit": include_repro, "reproTopN": repro_top_n, "reproReruns": repro_reruns, "requireReproducible": require_repro, "limit": args.get("limit", "auto"), "runtimeBudgetSeconds": runtime_budget_seconds},
             "stdout": exc.stdout,
             "stderr": exc.stderr,
             "warnings": ["Multi-strategy optimizer batch timed out before returning rows."],
@@ -14674,6 +14682,7 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
         "skippedStrategies": payload.get("skippedStrategies") or [],
         "rows": payload.get("rows") or [],
         "summary": payload.get("summary") or {},
+        "timings": payload.get("timings") or {},
         "warnings": warnings,
         "savedPath": payload.get("savedPath"),
         "command": " ".join(command),
