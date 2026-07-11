@@ -15214,6 +15214,34 @@ def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, le
         if not isinstance(params, dict):
             return None, "inline", {"ok": False, "error": "leadParams must decode to a JSON object."}, [], 400
         return params, "inline", None, [], 200
+    if args.get("batchFile"):
+        batch_payload, batch_error = _load_candidate_deep_compare_batch_file(str(args.get("batchFile")))
+        if batch_error:
+            return None, "batchFile", {"ok": False, "error": batch_error}, [], 400
+        rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict)]
+        matching_rows = []
+        for row in rows:
+            if row.get("isActiveBaseline"):
+                continue
+            if str(row.get("strategy") or "") != lead_strategy:
+                continue
+            if str(row.get("symbol") or "") != lead_symbol:
+                continue
+            if str(row.get("timeframe") or row.get("interval") or "") != lead_timeframe:
+                continue
+            if isinstance(row.get("params"), dict) and row.get("params"):
+                matching_rows.append(row)
+        if matching_rows:
+            matching_rows = sorted(matching_rows, key=lambda row: int(safe_float(row.get("rank"), 999999)))
+            return dict(matching_rows[0].get("params")), "optimizerBatch", {
+                "ok": True,
+                "source": {
+                    "batchFile": batch_payload.get("_resolvedBatchFile"),
+                    "matchedRows": len(matching_rows),
+                    "selectedRank": matching_rows[0].get("rank"),
+                },
+                "summary": batch_payload.get("summary") or {},
+            }, [], 200
     drilldown_args = {
         "symbols": lead_symbol,
         "timeframes": lead_timeframe,
