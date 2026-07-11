@@ -1,6 +1,7 @@
 const STORAGE_KEY = "tvk-dashboard-state";
 const UI_PREF_KEY = "zgua-ui-preferences";
 const MANUAL_BACKTEST_COMPARISON_KEY = "zgua-manual-backtest-comparisons";
+const GOOD_PEOPLE_PRESETS_KEY = "zgua-good-people-presets";
 // Frontend boundary:
 // This file owns UI state, chart rendering, marker rendering, websocket candle
 // display, and API calls only. Indicator formulas, signal scoring, strategy
@@ -55,6 +56,7 @@ let panes = [];
 let chartsInitialized = false;
 let chartsToolbarInitialized = false;
 let backtestInitialized = false;
+let goodPeopleInitialized = false;
 let analysisInitialized = false;
 let learningInitialized = false;
 let opsInitialized = false;
@@ -66,6 +68,11 @@ let lastManualBacktestPayload = null;
 let manualBacktestComparisons = loadManualBacktestComparisons();
 let lastSensitivityResults = [];
 let sensitivityRunActive = false;
+let goodPeopleParams = {};
+let goodPeopleSort = { key: "createdAt", direction: "desc" };
+let goodPeopleHistoryRows = [];
+let goodPeoplePresets = loadGoodPeoplePresets();
+let goodPeopleSelectedIndicators = [];
 let lastStrategyRankingPayload = null;
 let lastOptimizationPayload = null;
 let lastResearchSuggestion = null;
@@ -241,6 +248,7 @@ function setupNavigation() {
 function pathToPage(pathname) {
   if (pathname === "/" || pathname === "/dashboard") return "dashboard";
   if (pathname === "/backtest") return "backtest";
+  if (pathname === "/good-people") return "good-people";
   if (pathname === "/analysis" || pathname === "/research") return "research";
   if (pathname === "/research/paper-review" || pathname === "/research/paper-operator") return "research";
   if (pathname === "/candidate") return "candidate";
@@ -261,6 +269,7 @@ function showPage(page) {
   if (page === "dashboard") renderDashboardPage();
   if (page === "charts") initChartsPage();
   if (page === "backtest") initBacktestPage();
+  if (page === "good-people") initGoodPeoplePage();
   if (page === "analysis") renderAnalysisPage();
   if (page === "research" || page === "candidate" || page === "paper") renderWorkflowPage(page);
   if (page === "learning") renderLearningPage();
@@ -1992,6 +2001,1038 @@ function initBacktestPage() {
   renderManualBacktestComparisons();
 }
 
+function initGoodPeoplePage() {
+  if (goodPeopleInitialized) {
+    loadGoodPeopleHistory();
+    return;
+  }
+  goodPeopleInitialized = true;
+  document.querySelector("#good-symbol-select")?.addEventListener("change", onGoodPeopleSymbolChange);
+  document.querySelector("#good-mode-select")?.addEventListener("change", onGoodPeopleModeChange);
+  document.querySelector("#good-strategy-select")?.addEventListener("change", onGoodPeopleStrategyChange);
+  document.querySelector("#good-preset-select")?.addEventListener("change", onGoodPeoplePresetChange);
+  document.querySelector("#good-run-button")?.addEventListener("click", runGoodPeople);
+  document.querySelector("#good-open-optimizer")?.addEventListener("click", openGoodPeopleOptimizerPlan);
+  document.querySelector("#good-save-preset")?.addEventListener("click", saveGoodPeoplePreset);
+  document.querySelector("#good-refresh-history")?.addEventListener("click", loadGoodPeopleHistory);
+  document.querySelectorAll("#good-filter-symbol, #good-filter-timeframe, #good-filter-strategy, #good-filter-params").forEach((input) => {
+    input.addEventListener("input", renderGoodPeopleHistory);
+    input.addEventListener("input", () => showGoodPeopleFilterSuggestions(input));
+    input.addEventListener("focus", () => showGoodPeopleFilterSuggestions(input));
+    input.addEventListener("click", () => showGoodPeopleFilterSuggestions(input));
+  });
+  document.querySelector("#good-filter-suggestions")?.addEventListener("mousedown", onGoodPeopleSuggestionPick);
+  document.querySelector("#good-history-body")?.addEventListener("click", onGoodPeopleHistoryClick);
+  backtestContent?.addEventListener("change", onGoodPeopleOptimizerModalChange);
+  backtestContent?.addEventListener("click", onGoodPeopleOptimizerModalClick);
+  document.addEventListener("click", (event) => {
+    if (!event.target?.closest?.(".good-history-toolbar")) hideGoodPeopleFilterSuggestions();
+  });
+  document.querySelector("#good-history-body")?.closest("table")?.querySelectorAll("[data-good-sort]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const key = button.dataset.goodSort;
+      if (goodPeopleSort.key === key) {
+        goodPeopleSort.direction = goodPeopleSort.direction === "asc" ? "desc" : "asc";
+      } else {
+        goodPeopleSort = { key, direction: key === "totalReturnPct" ? "desc" : "asc" };
+      }
+      renderGoodPeopleHistory();
+    });
+  });
+  populateGoodPeopleControls();
+  onGoodPeopleModeChange();
+  loadGoodPeopleHistory();
+}
+
+async function populateGoodPeopleControls() {
+  const strategySelect = document.querySelector("#good-strategy-select");
+  if (!strategySelect) return;
+  try {
+    if (!backtestStrategyMetadata) {
+      backtestStrategyMetadata = await apiGet("/api/backtest/strategy-metadata");
+    }
+    const strategies = (backtestStrategyMetadata.strategies || []).filter((strategy) => strategy.supported);
+    strategySelect.innerHTML = strategies
+      .map((strategy) => `<option value="${escapeHtml(strategy.name)}">${escapeHtml(goodPeopleStrategyOptionLabel(strategy))}</option>`)
+      .join("");
+    strategySelect.value = strategies.some((strategy) => strategy.name === "SimpleAtrTrendV2") ? "SimpleAtrTrendV2" : (strategies[0]?.name || "");
+    onGoodPeopleStrategyChange();
+    renderGoodPeopleHistory();
+  } catch (error) {
+    document.querySelector("#good-strategy-summary").innerHTML = `<span class="danger-note">${escapeHtml(error.message)}</span>`;
+  }
+}
+
+function goodPeopleStrategyMetadata() {
+  const name = document.querySelector("#good-strategy-select")?.value;
+  return (backtestStrategyMetadata?.strategies || []).find((strategy) => strategy.name === name) || null;
+}
+
+function goodPeopleStrategyOptionLabel(strategy) {
+  const hasOptimizerGrid = (strategy.presets || []).some((preset) => preset.name === "gridSeed");
+  const source = hasOptimizerGrid ? "[O]" : "[S]";
+  return `${source} ${strategy.label || strategy.name}`;
+}
+
+function onGoodPeopleSymbolChange() {
+  const selected = Boolean(document.querySelector("#good-symbol-select")?.value);
+  const panel = document.querySelector("#good-params-panel");
+  if (panel) panel.hidden = !selected;
+  populateGoodPeoplePresetSelect();
+  renderGoodPeopleHistory();
+}
+
+function onGoodPeopleModeChange() {
+  const mode = document.querySelector("#good-mode-select")?.value || "manual";
+  const combo = document.querySelector("#good-max-combos-input")?.closest("label");
+  const preset = document.querySelector("#good-preset-select")?.closest("label");
+  const save = document.querySelector("#good-save-preset");
+  if (combo) combo.hidden = mode !== "optimizer";
+  if (preset) preset.hidden = mode !== "manual";
+  if (save) save.disabled = mode !== "manual";
+  const note = document.querySelector("#good-mode-note");
+  if (note) {
+    note.textContent = mode === "optimizer"
+      ? "Showing optimizer history and optimizer run controls."
+      : "Showing manual history and manual run controls.";
+  }
+  renderGoodPeopleHistory();
+}
+
+function onGoodPeopleStrategyChange() {
+  const strategy = goodPeopleStrategyMetadata();
+  if (!strategy) return;
+  const preset = (strategy.presets || []).find((item) => item.name === "gridSeed")
+    || (strategy.presets || []).find((item) => item.name === "default")
+    || { name: "default", params: strategy.defaultParams || {} };
+  goodPeopleParams = structuredCloneSafe(preset.params || strategy.defaultParams || {});
+  goodPeopleSelectedIndicators = goodPeopleIndicatorGroups(strategy).map((group) => group.id);
+  renderGoodPeopleStrategySummary(strategy, preset);
+  renderGoodPeopleParamEditor(strategy);
+  populateGoodPeoplePresetSelect();
+}
+
+function onGoodPeoplePresetChange() {
+  const select = document.querySelector("#good-preset-select");
+  const strategy = goodPeopleStrategyMetadata();
+  if (!select || !strategy) return;
+  const value = select.value;
+  const builtIn = (strategy.presets || []).find((preset) => `builtin:${preset.name}` === value);
+  const saved = goodPeopleSavedPresetOptions().find((preset) => preset.value === value);
+  const params = builtIn?.params || saved?.params;
+  if (!params) return;
+  goodPeopleParams = structuredCloneSafe(params);
+  goodPeopleSelectedIndicators = goodPeopleIndicatorGroups(strategy).map((group) => group.id);
+  renderGoodPeopleStrategySummary(strategy, builtIn || saved);
+  renderGoodPeopleParamEditor(strategy);
+}
+
+function renderGoodPeopleStrategySummary(strategy, preset = {}) {
+  const host = document.querySelector("#good-strategy-summary");
+  if (!host) return;
+  host.innerHTML = `
+    <strong>${escapeHtml(strategy.label || strategy.name)}</strong>
+    <span>${escapeHtml(strategy.description || "Backend strategy metadata.")}</span>
+    <span>Preset: ${escapeHtml(preset.label || preset.name || "custom")}. Starting equity for display: $10,000.</span>
+  `;
+}
+
+function renderGoodPeopleParamEditor(strategy) {
+  const host = document.querySelector("#good-param-editor");
+  if (!host) return;
+  const schema = strategy.paramSchema || {};
+  const groups = goodPeopleIndicatorGroups(strategy);
+  if (!goodPeopleSelectedIndicators.length) {
+    goodPeopleSelectedIndicators = groups.map((group) => group.id);
+  }
+  const selected = new Set(goodPeopleSelectedIndicators);
+  const visibleGroups = groups.filter((group) => selected.has(group.id));
+  const hiddenGroups = groups.filter((group) => !selected.has(group.id));
+  const visibleKeys = visibleGroups.flatMap((group) => group.params || []).filter((key) => schema[key]);
+  host.innerHTML = `
+    <div class="good-param-editor-heading">
+      <h3>Strategy Params</h3>
+      <span>${visibleKeys.length}/${Object.keys(schema).length} visible</span>
+    </div>
+    <div class="good-indicator-picker">
+      <div class="good-indicator-tags">
+        ${visibleGroups.map((group) => `
+          <button type="button" class="good-indicator-tag" data-good-remove-indicator="${escapeHtml(group.id)}" title="Hide this parameter family">
+            <span>${escapeHtml(group.label)}</span><strong>x</strong>
+          </button>
+        `).join("") || `<span class="muted">No parameter families selected.</span>`}
+      </div>
+      ${hiddenGroups.length ? `<label><span>Add family</span><select id="good-indicator-add-select">
+        <option value="">Choose...</option>
+        ${hiddenGroups.map((group) => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.label)}</option>`).join("")}
+      </select></label>` : `<div class="good-no-hidden-families">All families visible</div>`}
+    </div>
+    <div class="good-indicator-groups">
+      ${visibleGroups.map((group) => renderGoodPeopleParamGroup(group, schema)).join("")}
+    </div>
+  `;
+  host.querySelectorAll("[data-good-param-key]").forEach((input) => {
+    input.addEventListener("input", onGoodPeopleParamEdit);
+    input.addEventListener("change", onGoodPeopleParamEdit);
+  });
+  host.querySelectorAll("[data-good-remove-indicator]").forEach((button) => {
+    button.addEventListener("click", () => {
+      goodPeopleSelectedIndicators = goodPeopleSelectedIndicators.filter((id) => id !== button.dataset.goodRemoveIndicator);
+      renderGoodPeopleParamEditor(strategy);
+    });
+  });
+  host.querySelector("#good-indicator-add-select")?.addEventListener("change", (event) => {
+    const id = event.target.value;
+    if (!id) return;
+    if (!goodPeopleSelectedIndicators.includes(id)) goodPeopleSelectedIndicators.push(id);
+    renderGoodPeopleParamEditor(strategy);
+  });
+}
+
+function goodPeopleIndicatorGroups(strategy) {
+  const schema = strategy?.paramSchema || {};
+  const fromMetadata = Array.isArray(strategy?.indicatorGroups) ? strategy.indicatorGroups : [];
+  const groups = fromMetadata.length ? fromMetadata : Object.entries(schema).reduce((items, [key, entry]) => {
+    const id = entry.group || entry.indicator || "other";
+    let group = items.find((item) => item.id === id);
+    if (!group) {
+      group = { id, label: entry.groupLabel || entry.indicatorLabel || id, params: [] };
+      items.push(group);
+    }
+    group.params.push(key);
+    return items;
+  }, []);
+  return groups
+    .map((group) => ({
+      id: group.id,
+      label: group.label || group.id,
+      params: (group.params || []).filter((key) => schema[key]),
+    }))
+    .filter((group) => group.params.length);
+}
+
+function renderGoodPeopleParamGroup(group, schema) {
+  return `
+    <section class="good-indicator-group" data-good-indicator-group="${escapeHtml(group.id)}">
+      <div class="good-indicator-group-title">
+        <strong>${escapeHtml(group.label)}</strong>
+        <span>${group.params.length} param${group.params.length === 1 ? "" : "s"}</span>
+        <button type="button" class="good-indicator-remove-link" data-good-remove-indicator="${escapeHtml(group.id)}" title="Hide this parameter family">hide</button>
+      </div>
+      <div class="good-param-fields">
+        ${group.params.map((key) => renderGoodPeopleParamField(key, schema[key], goodPeopleParams[key])).join("")}
+      </div>
+    </section>
+  `;
+}
+
+function renderGoodPeopleParamField(key, schema, value) {
+  const label = schema.label || key;
+  const resolvedValue = value !== undefined ? value : schema.defaultValue;
+  const title = `${schema.description || `${label} strategy parameter.`}${schema.optional ? " Optional for this selected strategy; only affects runs if the backend strategy reads this parameter." : ""}`;
+  const common = `data-good-param-key="${escapeHtml(key)}"`;
+  const labelHtml = `<span class="good-param-label" data-tip="${escapeHtml(title)}">${escapeHtml(label)}${schema.optional ? " *" : ""}</span>`;
+  if (schema.type === "boolean") {
+    return `<label class="param-field param-boolean"><input ${common} type="checkbox" ${resolvedValue ? "checked" : ""}>${labelHtml}</label>`;
+  }
+  if (schema.type === "select") {
+    const options = schema.options || [];
+    return `<label class="param-field">${labelHtml}<select ${common}>${options.map((option) => `<option value="${escapeHtml(String(option))}" ${String(option) === String(resolvedValue) ? "selected" : ""}>${escapeHtml(String(option))}</option>`).join("")}</select></label>`;
+  }
+  if (schema.type === "number") {
+    const min = schema.min !== undefined ? ` min="${escapeHtml(String(schema.min))}"` : "";
+    const max = schema.max !== undefined ? ` max="${escapeHtml(String(schema.max))}"` : "";
+    const step = schema.step !== undefined ? ` step="${escapeHtml(String(schema.step))}"` : ` step="0.01"`;
+    return `<label class="param-field">${labelHtml}<input ${common} type="number"${min}${max}${step} value="${escapeHtml(String(resolvedValue ?? ""))}"></label>`;
+  }
+  return `<label class="param-field">${labelHtml}<input ${common} type="text" value="${escapeHtml(String(resolvedValue ?? ""))}"></label>`;
+}
+
+function onGoodPeopleParamEdit(event) {
+  const input = event.target;
+  const key = input.dataset.goodParamKey;
+  const strategy = goodPeopleStrategyMetadata();
+  if (!key || !strategy) return;
+  const schema = strategy.paramSchema?.[key] || {};
+  if (schema.type === "boolean") {
+    goodPeopleParams[key] = input.checked;
+  } else if (schema.type === "number") {
+    goodPeopleParams[key] = Number(input.value);
+  } else {
+    goodPeopleParams[key] = input.value;
+  }
+}
+
+function loadGoodPeoplePresets() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(GOOD_PEOPLE_PRESETS_KEY) || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveGoodPeoplePresets() {
+  localStorage.setItem(GOOD_PEOPLE_PRESETS_KEY, JSON.stringify(goodPeoplePresets.slice(-200)));
+}
+
+function goodPeopleSavedPresetOptions() {
+  const symbol = document.querySelector("#good-symbol-select")?.value || "";
+  const strategy = document.querySelector("#good-strategy-select")?.value || "";
+  return goodPeoplePresets
+    .filter((preset) => preset.strategy === strategy && (preset.scope === "all" || preset.symbol === symbol))
+    .map((preset) => ({ ...preset, value: `saved:${preset.id}` }));
+}
+
+function populateGoodPeoplePresetSelect() {
+  const select = document.querySelector("#good-preset-select");
+  const strategy = goodPeopleStrategyMetadata();
+  if (!select || !strategy) return;
+  const builtIns = (strategy.presets || []).map((preset) => ({
+    value: `builtin:${preset.name}`,
+    label: `${goodPeoplePresetSourceIcon(preset.name)} ${preset.label || preset.name}`,
+  }));
+  const saved = goodPeopleSavedPresetOptions().map((preset) => ({
+    value: preset.value,
+    label: `[M] ${preset.name} (${preset.scope === "all" ? "all" : preset.symbol})`,
+  }));
+  select.innerHTML = [...builtIns, ...saved]
+    .map((preset) => `<option value="${escapeHtml(preset.value)}">${escapeHtml(preset.label)}</option>`)
+    .join("");
+}
+
+function goodPeoplePresetSourceIcon(name) {
+  if (name === "gridSeed") return "[O]";
+  if (name === "activeCandidate") return "[A]";
+  return "[S]";
+}
+
+function saveGoodPeoplePreset() {
+  const name = (document.querySelector("#good-preset-name")?.value || "").trim();
+  const symbol = document.querySelector("#good-symbol-select")?.value || "";
+  const strategy = document.querySelector("#good-strategy-select")?.value || "";
+  const scope = document.querySelector("#good-preset-scope")?.value || "symbol";
+  const status = document.querySelector("#good-run-status");
+  if (!name || !strategy || !symbol) {
+    if (status) status.textContent = "Preset needs a name, symbol, and strategy.";
+    return;
+  }
+  goodPeoplePresets.push({
+    id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    name,
+    symbol,
+    strategy,
+    scope,
+    params: structuredCloneSafe(goodPeopleParams),
+    createdAt: new Date().toISOString(),
+  });
+  saveGoodPeoplePresets();
+  populateGoodPeoplePresetSelect();
+  if (status) status.textContent = `Saved preset "${name}" for ${scope === "all" ? "all symbols" : symbol}.`;
+}
+
+function goodPeopleBaseRequest() {
+  return {
+    source: "bybit",
+    symbol: document.querySelector("#good-symbol-select")?.value || "BTCUSDT",
+    timeframe: document.querySelector("#good-timeframe-select")?.value || "1h",
+    period: document.querySelector("#good-period-select")?.value || "365d",
+    strategy: document.querySelector("#good-strategy-select")?.value || "SimpleAtrTrendV2",
+    limit: document.querySelector("#good-limit-select")?.value || "period",
+    feePct: Number(document.querySelector("#good-fee-input")?.value || 0),
+    slippagePct: Number(document.querySelector("#good-slippage-input")?.value || 0),
+  };
+}
+
+async function runGoodPeople() {
+  const button = document.querySelector("#good-run-button");
+  const status = document.querySelector("#good-run-status");
+  const request = goodPeopleBaseRequest();
+  if (!request.symbol) return;
+  button.disabled = true;
+  if (status) status.textContent = "Running manual backtest...";
+  try {
+    const payload = await apiPost("/api/backtest/run-custom", {
+      ...request,
+      params: structuredCloneSafe(goodPeopleParams),
+      paramsSource: document.querySelector("#good-preset-select")?.selectedOptions?.[0]?.textContent || "custom",
+    });
+    const result = payload.result || {};
+    if (status) status.textContent = `Backtest finished: ${formatSigned(result.totalReturnPct)}%, ${result.trades ?? 0} trades.`;
+    await loadGoodPeopleHistory();
+  } catch (error) {
+    if (status) status.textContent = `Run failed: ${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openGoodPeopleOptimizerPlan() {
+  const request = goodPeopleBaseRequest();
+  const strategy = goodPeopleStrategyMetadata();
+  const grid = strategy?.optimizerGrid;
+  if (!request.symbol || !strategy) {
+    const status = document.querySelector("#good-run-status");
+    if (status) status.textContent = "Choose a symbol and strategy before opening optimizer plan.";
+    return;
+  }
+  if (!grid?.params || !Object.keys(grid.params).length) {
+    openBacktestModal(`<p class="pane-status">No optimizer grid metadata is available for ${escapeHtml(strategy?.name || "-")}.</p>`, "Optimizer Plan");
+    return;
+  }
+  openBacktestModal(renderGoodPeopleOptimizerPlan(strategy, grid, request), "Optimizer Plan");
+  updateGoodPeopleOptimizerPlanCounts();
+}
+
+function renderGoodPeopleOptimizerPlan(strategy, grid, request) {
+  const rows = Object.entries(grid.params || {}).map(([key, values]) => {
+    const valueList = Array.isArray(values) ? values : [values];
+    const current = goodPeopleParams[key];
+    const description = strategy.paramSchema?.[key]?.description || `${key} optimizer parameter.`;
+    return `
+      <tr>
+        <td><label class="allow-short-toggle"><input type="checkbox" data-good-opt-param="${escapeHtml(key)}" checked><span>${escapeHtml(key)}</span></label></td>
+        <td>${escapeHtml(current === undefined ? "default" : String(current))}</td>
+        <td>${valueList.length}</td>
+        <td class="good-optimizer-values"><input data-good-opt-values="${escapeHtml(key)}" value="${escapeHtml(valueList.map((value) => String(value)).join(", "))}"></td>
+        <td>${escapeHtml(description)}</td>
+      </tr>
+    `;
+  }).join("");
+  return `
+    <div class="good-optimizer-modal">
+      <p class="modal-note">This is research-only. It runs bounded backtests over selected parameter values, saves an optimizer report, and does not touch paper/live trading.</p>
+      <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Symbol</span><strong>${escapeHtml(request.symbol)}</strong></div>
+        <div class="metric"><span>Timeframe</span><strong>${escapeHtml(request.timeframe)}</strong></div>
+        <div class="metric"><span>Strategy</span><strong>${escapeHtml(strategy.name)}</strong></div>
+        <div class="metric"><span>Period</span><strong>${escapeHtml(request.period)}</strong></div>
+        <div class="metric"><span>Grid</span><strong>${escapeHtml(grid.humanName || grid.gridName || "-")}</strong></div>
+        <div class="metric"><span>Risk</span><strong>${escapeHtml(grid.riskLevel || "-")}</strong></div>
+      </div>
+      <div class="mini-lab-controls">
+        <label><span>Max tests to run</span><input id="good-optimizer-max-combos" type="number" min="1" max="250" value="${escapeHtml(document.querySelector("#good-max-combos-input")?.value || "80")}"></label>
+        <label><span>Saved top rows</span><input id="good-optimizer-top-n" type="number" min="1" max="100" value="5"></label>
+      </div>
+      <div id="good-optimizer-counts" class="pane-status">Calculating optimizer matrix...</div>
+      <table class="trade-table compact-table">
+        <thead><tr><th>Vary</th><th>Current</th><th>Values</th><th>Matrix values</th><th>Explanation</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      <div class="button-row">
+        <button id="good-optimizer-select-all" type="button">Select All</button>
+        <button id="good-optimizer-select-none" type="button">Select None</button>
+        <button id="good-optimizer-run" type="button">Run Optimizer</button>
+      </div>
+      <div id="good-optimizer-result" class="paper-validation-result"><p class="pane-status">Review the matrix, choose which params may vary, then run optimizer.</p></div>
+    </div>
+  `;
+}
+
+function selectedGoodOptimizerParams() {
+  return Array.from(document.querySelectorAll("[data-good-opt-param]:checked")).map((input) => input.dataset.goodOptParam);
+}
+
+function parseGoodOptimizerValue(raw) {
+  const text = String(raw || "").trim();
+  if (text === "") return null;
+  if (text === "true") return true;
+  if (text === "false") return false;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : text;
+}
+
+function goodOptimizerValueOverrides() {
+  const overrides = {};
+  document.querySelectorAll("[data-good-opt-values]").forEach((input) => {
+    const key = input.dataset.goodOptValues;
+    const values = String(input.value || "")
+      .split(",")
+      .map((part) => parseGoodOptimizerValue(part))
+      .filter((value) => value !== null);
+    if (key && values.length) overrides[key] = Array.from(new Set(values.map((value) => JSON.stringify(value)))).map((value) => JSON.parse(value));
+  });
+  return overrides;
+}
+
+function updateGoodPeopleOptimizerPlanCounts() {
+  const selected = selectedGoodOptimizerParams();
+  const selectedKeys = selected;
+  const overrides = goodOptimizerValueOverrides();
+  const planned = selectedKeys.reduce((product, key) => {
+    const values = overrides[key] || [];
+    return product * Math.max(1, Array.isArray(values) ? values.length : 1);
+  }, 1);
+  const maxCombos = Number(document.querySelector("#good-optimizer-max-combos")?.value || 80);
+  const willRun = Math.max(1, Math.min(planned || 1, maxCombos || planned || 1));
+  const host = document.querySelector("#good-optimizer-counts");
+  if (host) {
+    host.textContent = `${selectedKeys.length} varying param(s), ${planned} possible combination(s), ${willRun} planned test(s) after caps.`;
+  }
+}
+
+function onGoodPeopleOptimizerModalChange(event) {
+  if (event.target?.matches?.("[data-good-opt-param], [data-good-opt-values], #good-optimizer-max-combos")) {
+    updateGoodPeopleOptimizerPlanCounts();
+  }
+}
+
+function onGoodPeopleOptimizerModalClick(event) {
+  if (event.target?.id === "good-optimizer-select-all") {
+    document.querySelectorAll("[data-good-opt-param]").forEach((input) => { input.checked = true; });
+    updateGoodPeopleOptimizerPlanCounts();
+  }
+  if (event.target?.id === "good-optimizer-select-none") {
+    document.querySelectorAll("[data-good-opt-param]").forEach((input) => { input.checked = false; });
+    updateGoodPeopleOptimizerPlanCounts();
+  }
+  if (event.target?.id === "good-optimizer-run") {
+    runGoodPeopleOptimizerFromModal(event.target);
+  }
+}
+
+async function runGoodPeopleOptimizerFromModal(button) {
+  const request = goodPeopleBaseRequest();
+  const selected = selectedGoodOptimizerParams();
+  const resultHost = document.querySelector("#good-optimizer-result");
+  button.disabled = true;
+  if (resultHost) resultHost.innerHTML = `<p class="pane-status">Running optimizer batch...</p>`;
+  try {
+    const params = new URLSearchParams({
+      symbols: request.symbol,
+      timeframes: request.timeframe,
+      strategies: request.strategy,
+      period: request.period,
+      limit: request.limit,
+      maxCandidates: "1",
+      maxCombosPerStrategy: String(document.querySelector("#good-optimizer-max-combos")?.value || "80"),
+      topN: String(document.querySelector("#good-optimizer-top-n")?.value || "5"),
+      includeWalkForward: "false",
+      includeStress: "false",
+      includeReproAudit: "false",
+      feePct: String(request.feePct),
+      slippagePct: String(request.slippagePct),
+      optimizerParams: selected.length ? selected.join(",") : "__none__",
+      optimizerGridOverrides: JSON.stringify(goodOptimizerValueOverrides()),
+      optimizerBaseParams: JSON.stringify(goodPeopleParams || {}),
+      save: "true",
+      timeout_seconds: "900",
+    });
+    const payload = await apiGet(`/api/research/multi-strategy-optimizer-batch?${params.toString()}`);
+    const rows = (payload.rows || []).filter((row) => !row.isActiveBaseline);
+    if (resultHost) resultHost.innerHTML = renderGoodPeopleOptimizerResult(payload, rows);
+    const status = document.querySelector("#good-run-status");
+    if (status) status.textContent = `Optimizer finished: ${rows.length} candidate row(s).`;
+    await loadGoodPeopleHistory();
+  } catch (error) {
+    if (resultHost) resultHost.innerHTML = `<p class="pane-status">Optimizer failed: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderGoodPeopleOptimizerResult(payload, rows) {
+  const body = rows.slice(0, 15).map((row) => `
+    <tr>
+      <td>${escapeHtml(row.strategy || "-")} ${escapeHtml(row.symbol || "")} ${escapeHtml(row.timeframe || "")}</td>
+      <td class="${Number(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</td>
+      <td>${row.trades ?? 0}</td>
+      <td>${formatNumber(row.winRate, 1)}%</td>
+      <td>${escapeHtml(row.finalCandidateTier || row.status || "-")}</td>
+      <td>${escapeHtml(compactParamsText(row.params || {}))}</td>
+    </tr>
+  `).join("");
+  return `
+    <p class="modal-note"><strong>Saved:</strong> ${escapeHtml(payload.savedPath || "-")}</p>
+    <table class="trade-table compact-table">
+      <thead><tr><th>Market</th><th>Return</th><th>Trades</th><th>Win</th><th>Tier</th><th>Params</th></tr></thead>
+      <tbody>${body || `<tr><td colspan="6">No optimizer rows returned.</td></tr>`}</tbody>
+    </table>
+  `;
+}
+
+async function loadGoodPeopleHistory() {
+  const body = document.querySelector("#good-history-body");
+  if (body) body.innerHTML = `<tr><td colspan="11">Loading history...</td></tr>`;
+  try {
+    const payload = await apiGet("/api/good-people/history?limit=400");
+    goodPeopleHistoryRows = payload.rows || [];
+    updateGoodPeopleFilterOptions();
+    renderGoodPeopleHistory();
+  } catch (error) {
+    if (body) body.innerHTML = `<tr><td colspan="11">History failed: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+function updateGoodPeopleFilterOptions() {
+  const setOptions = (selector, values) => {
+    const datalist = document.querySelector(selector);
+    if (!datalist) return;
+    datalist.innerHTML = Array.from(new Set(values.filter(Boolean).map((value) => String(value))))
+      .sort((a, b) => a.localeCompare(b))
+      .slice(0, 160)
+      .map((value) => `<option value="${escapeHtml(value)}"></option>`)
+      .join("");
+  };
+  const rows = goodPeopleHistoryRows || [];
+  setOptions("#good-symbol-options", rows.map((row) => row.symbol));
+  setOptions("#good-timeframe-options", rows.map((row) => row.timeframe));
+  setOptions("#good-strategy-options", rows.map((row) => row.strategy));
+  const paramOptions = [];
+  rows.forEach((row) => {
+    Object.entries(row.params || {}).forEach(([key, value]) => {
+      paramOptions.push(key);
+      paramOptions.push(`${key}=${String(value)}`);
+    });
+  });
+  setOptions("#good-param-options", paramOptions);
+}
+
+function goodPeopleSuggestionValues(input) {
+  const rows = goodPeopleHistoryRows || [];
+  const id = input?.id || "";
+  if (id === "good-filter-symbol") return rows.map((row) => row.symbol);
+  if (id === "good-filter-timeframe") return rows.map((row) => row.timeframe);
+  if (id === "good-filter-strategy") return rows.map((row) => row.strategy);
+  if (id === "good-filter-params") {
+    const values = [];
+    rows.forEach((row) => {
+      Object.entries(row.params || {}).forEach(([key, value]) => {
+        values.push(key);
+        values.push(`${key}=${String(value)}`);
+      });
+    });
+    return values;
+  }
+  return [];
+}
+
+function showGoodPeopleFilterSuggestions(input) {
+  updateGoodPeopleFilterOptions();
+  const panel = document.querySelector("#good-filter-suggestions");
+  if (!panel || !input) return;
+  const needle = String(input.value || "").trim().toLowerCase();
+  const values = Array.from(new Set(goodPeopleSuggestionValues(input).filter(Boolean).map((value) => String(value))))
+    .filter((value) => !needle || value.toLowerCase().includes(needle))
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, 24);
+  if (!values.length) {
+    panel.hidden = true;
+    return;
+  }
+  panel.dataset.targetInput = input.id;
+  panel.innerHTML = values.map((value) => `<button type="button" data-good-suggestion="${escapeHtml(value)}">${escapeHtml(value)}</button>`).join("");
+  const toolbar = input.closest(".good-history-toolbar");
+  const inputRect = input.getBoundingClientRect();
+  const toolbarRect = toolbar.getBoundingClientRect();
+  panel.style.left = `${Math.max(0, inputRect.left - toolbarRect.left)}px`;
+  panel.style.top = `${inputRect.bottom - toolbarRect.top + 4}px`;
+  panel.style.width = `${Math.max(160, inputRect.width)}px`;
+  panel.hidden = false;
+}
+
+function hideGoodPeopleFilterSuggestions() {
+  const panel = document.querySelector("#good-filter-suggestions");
+  if (panel) panel.hidden = true;
+}
+
+function onGoodPeopleSuggestionPick(event) {
+  const button = event.target?.closest?.("[data-good-suggestion]");
+  if (!button) return;
+  event.preventDefault();
+  const panel = document.querySelector("#good-filter-suggestions");
+  const input = document.querySelector(`#${panel?.dataset?.targetInput || ""}`);
+  if (input) {
+    input.value = button.dataset.goodSuggestion || "";
+    renderGoodPeopleHistory();
+  }
+  hideGoodPeopleFilterSuggestions();
+}
+
+function goodPeopleFilters() {
+  const symbol = (document.querySelector("#good-filter-symbol")?.value || document.querySelector("#good-symbol-select")?.value || "").trim().toLowerCase();
+  return {
+    mode: (document.querySelector("#good-mode-select")?.value || "").trim().toLowerCase(),
+    symbol,
+    timeframe: (document.querySelector("#good-filter-timeframe")?.value || "").trim().toLowerCase(),
+    strategy: (document.querySelector("#good-filter-strategy")?.value || "").trim().toLowerCase(),
+    params: (document.querySelector("#good-filter-params")?.value || "").trim().toLowerCase(),
+  };
+}
+
+function renderGoodPeopleHistory() {
+  const body = document.querySelector("#good-history-body");
+  if (!body) return;
+  const filters = goodPeopleFilters();
+  const filtered = goodPeopleHistoryRows.filter((row) => {
+    const paramsText = JSON.stringify(row.params || {}).toLowerCase();
+    return (!filters.mode || String(row.mode || "").toLowerCase() === filters.mode)
+      && (!filters.symbol || String(row.symbol || "").toLowerCase().includes(filters.symbol))
+      && (!filters.timeframe || String(row.timeframe || "").toLowerCase().includes(filters.timeframe))
+      && (!filters.strategy || String(row.strategy || "").toLowerCase().includes(filters.strategy))
+      && (!filters.params || paramsText.includes(filters.params));
+  });
+  const sorted = filtered.sort((a, b) => {
+    const av = a[goodPeopleSort.key];
+    const bv = b[goodPeopleSort.key];
+    const an = Number(av);
+    const bn = Number(bv);
+    const result = Number.isFinite(an) && Number.isFinite(bn)
+      ? an - bn
+      : String(av || "").localeCompare(String(bv || ""));
+    return goodPeopleSort.direction === "asc" ? result : -result;
+  });
+  body.innerHTML = sorted.slice(0, 250).map(renderGoodPeopleHistoryRow).join("")
+    || `<tr><td colspan="10">No history rows match the current filters.</td></tr>`;
+}
+
+function renderGoodPeopleHistoryRow(row) {
+  const returnPct = Number(row.totalReturnPct || 0);
+  const paramsHtml = renderGoodPeopleHistoryParams(row);
+  const outcome = `
+    <strong class="${returnPct >= 0 ? "positive" : "negative"}">${formatSigned(returnPct)}%</strong>
+    <span>$${formatNumber(row.endEquity || 10000 * (1 + returnPct / 100), 2)}</span>
+    <small>${row.trades ?? 0} trades / win ${formatNumber(row.winRate, 1)}%</small>
+  `;
+  return `
+    <tr>
+      <td>
+        <code>${escapeHtml(String(row.id || "-").slice(0, 18))}</code><br>
+        <span class="muted">${escapeHtml(row.mode || "manual")}</span>
+      </td>
+      <td class="good-time-cell">${formatGoodPeopleTime(row.createdAt)}</td>
+      <td>${escapeHtml(row.symbol || "-")}</td>
+      <td>${escapeHtml(row.timeframe || "-")}</td>
+      <td>${escapeHtml(row.strategy || "-")}</td>
+      <td>${escapeHtml(row.period || "-")}</td>
+      <td class="good-param-cell" title="${escapeHtml(JSON.stringify(row.params || {}))}">${paramsHtml}</td>
+      <td class="good-trades-cell">${row.trades ?? 0}</td>
+      <td class="good-outcome-cell"><button type="button" class="good-outcome-button" data-good-detail-id="${escapeHtml(row.id || "")}">${outcome}</button></td>
+      <td class="good-actions-cell">
+        <span class="good-action-link disabled" title="Paper start/stop is disabled in this research-only iteration">paper</span>
+        <span class="good-action-link disabled" title="Real trading is disabled">trade</span>
+        <button type="button" class="good-action-link good-copy-button" data-good-copy-id="${escapeHtml(row.id || "")}" title="Copy this row to the setup panel">copy</button>
+      </td>
+    </tr>
+  `;
+}
+
+function onGoodPeopleHistoryClick(event) {
+  const copyButton = event.target?.closest?.("[data-good-copy-id]");
+  if (copyButton) {
+    const row = goodPeopleHistoryRows.find((item) => String(item.id || "") === String(copyButton.dataset.goodCopyId || ""));
+    if (row) copyGoodPeopleRowToSetup(row);
+    return;
+  }
+  const button = event.target?.closest?.("[data-good-detail-id]");
+  if (!button) return;
+  const row = goodPeopleHistoryRows.find((item) => String(item.id || "") === String(button.dataset.goodDetailId || ""));
+  if (row) openGoodPeopleResultDetail(row);
+}
+
+function copyGoodPeopleRowToSetup(row) {
+  const symbolSelect = document.querySelector("#good-symbol-select");
+  const modeSelect = document.querySelector("#good-mode-select");
+  const timeframeSelect = document.querySelector("#good-timeframe-select");
+  const periodSelect = document.querySelector("#good-period-select");
+  const strategySelect = document.querySelector("#good-strategy-select");
+  const feeInput = document.querySelector("#good-fee-input");
+  const slippageInput = document.querySelector("#good-slippage-input");
+  const status = document.querySelector("#good-run-status");
+  if (symbolSelect) symbolSelect.value = row.symbol || "";
+  if (modeSelect) modeSelect.value = ["manual", "optimizer"].includes(row.mode) ? row.mode : "manual";
+  onGoodPeopleSymbolChange();
+  if (timeframeSelect && row.timeframe) timeframeSelect.value = row.timeframe;
+  if (periodSelect && row.period) periodSelect.value = row.period;
+  if (strategySelect && row.strategy) strategySelect.value = row.strategy;
+  const strategy = goodPeopleStrategyMetadata();
+  goodPeopleParams = structuredCloneSafe(row.params || {});
+  if (!Object.keys(goodPeopleParams).length && strategy?.defaultParams) {
+    goodPeopleParams = structuredCloneSafe(strategy.defaultParams);
+  }
+  if (feeInput && goodPeopleParams.feePct !== undefined) feeInput.value = goodPeopleParams.feePct;
+  if (slippageInput && goodPeopleParams.slippagePct !== undefined) slippageInput.value = goodPeopleParams.slippagePct;
+  goodPeopleSelectedIndicators = goodPeopleIndicatorGroups(strategy).map((group) => group.id);
+  renderGoodPeopleStrategySummary(strategy || { name: row.strategy, label: row.strategy }, { label: `Copied ${row.mode || "history"} row`, name: row.id || "history" });
+  renderGoodPeopleParamEditor(strategy || { paramSchema: {}, indicatorGroups: [] });
+  populateGoodPeoplePresetSelect();
+  onGoodPeopleModeChange();
+  const panel = document.querySelector("#good-params-panel");
+  if (panel) panel.hidden = false;
+  if (status) status.textContent = `Copied ${row.symbol || "-"} ${row.timeframe || "-"} ${row.strategy || "-"} into setup. Adjust params, then run manually or open optimizer plan.`;
+  document.querySelector("#good-params-panel")?.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function renderGoodPeopleHistoryParams(row) {
+  const params = row.params || {};
+  const entries = Object.entries(params);
+  if (!entries.length) {
+    return `<span class="muted">${row.mode === "manual" ? "params not stored for this older manual row" : "no params"}</span>`;
+  }
+  const defaults = goodPeopleDefaultParams(row.strategy);
+  return `
+    <div class="good-param-mini-grid">
+      ${entries.map(([key, value]) => {
+        const tone = goodPeopleParamTone(value, defaults[key]);
+        const delta = goodPeopleParamDelta(value, defaults[key]);
+        return `
+          <span class="good-param-chip">
+            <span class="good-param-name" title="${escapeHtml(key)}">${escapeHtml(shortGoodParamName(key))}</span>
+            <span class="good-param-value ${tone}" title="${escapeHtml(delta)}">${escapeHtml(String(value))}</span>
+          </span>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function compactParamsText(params) {
+  return Object.entries(params || {})
+    .slice(0, 8)
+    .map(([key, value]) => `${key}=${String(value)}`)
+    .join(", ");
+}
+
+function shortGoodParamName(key) {
+  const map = {
+    regimeMode: "regime",
+    useRsiFilter: "rsi?",
+    atrMultiplier: "atr",
+    emaFast: "emaF",
+    emaSlow: "emaS",
+    emaTrend: "emaT",
+    emaTrendLength: "emaTL",
+    emaMomentumSlow: "momS",
+    emaTrendFast: "trF",
+    rsiMin: "rsiMin",
+    rsiMax: "rsiMax",
+    rsiPullbackLevel: "rsiPb",
+    rsiReclaimLevel: "rsiRc",
+    stopAtr: "stop",
+    takeProfitAtr: "tp",
+    trailingAtr: "trail",
+    cooldownBars: "cool",
+    minHoldBars: "hold",
+    volumeFilter: "vol",
+    requireVolume: "vol?",
+    requireBreakout: "brk?",
+    donchianEntry: "donIn",
+    donchianExit: "donOut",
+    adxThreshold: "adx",
+    retestLookback: "rtBars",
+    retestAtr: "rtAtr",
+    squeezeLookback: "sqz",
+    squeezePercentile: "sqzPct",
+    rangeLookback: "rng",
+    rangeSma: "rngSma",
+    closeHighPct: "hiPct",
+    rsLookback: "rs",
+    rsThreshold: "rsThr",
+    shortMode: "short",
+    fillModel: "fill",
+    feePct: "fee",
+    slippagePct: "slip",
+  };
+  return map[key] || String(key).replace(/[a-z]+/g, (part) => part.slice(0, 4));
+}
+
+function goodPeopleDefaultParams(strategyName) {
+  const strategy = (backtestStrategyMetadata?.strategies || []).find((item) => item.name === strategyName);
+  return strategy?.defaultParams || {};
+}
+
+function goodPeopleParamTone(value, defaultValue) {
+  const current = Number(value);
+  const base = Number(defaultValue);
+  if (!Number.isFinite(current) || !Number.isFinite(base)) return "muted";
+  if (current > base) return "positive";
+  if (current < base) return "negative";
+  return "muted";
+}
+
+function goodPeopleParamDelta(value, defaultValue) {
+  const current = Number(value);
+  const base = Number(defaultValue);
+  if (!Number.isFinite(current) || !Number.isFinite(base)) return "No numeric default comparison";
+  if (current > base) return `Higher than default ${defaultValue}`;
+  if (current < base) return `Lower than default ${defaultValue}`;
+  return `Same as default ${defaultValue}`;
+}
+
+function formatGoodPeopleTime(value) {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return escapeHtml(String(value));
+  const dateText = date.toISOString().slice(0, 10);
+  const timeText = date.toTimeString().slice(0, 5);
+  return `<small>${escapeHtml(dateText)}</small><small>${escapeHtml(timeText)}</small>`;
+}
+
+async function openGoodPeopleResultDetail(row) {
+  openBacktestModal(renderGoodPeopleStoredDetail(row, true), `Test ${row.symbol || ""} ${row.timeframe || ""}`);
+  const params = row.params && Object.keys(row.params).length ? row.params : null;
+  if (!params) {
+    backtestContent.innerHTML = renderGoodPeopleStoredDetail(row, false, "Exact replay is unavailable because this history row has no stored params.");
+    return;
+  }
+  try {
+    const replay = await apiPost("/api/backtest/run-custom", {
+      source: row.source || "bybit",
+      symbol: row.symbol,
+      timeframe: row.timeframe,
+      period: row.period || "365d",
+      strategy: row.strategy,
+      limit: "period",
+      params,
+      paramsSource: row.paramsSource || `${row.mode || "history"} replay`,
+      saveHistory: false,
+      includeFullTrades: true,
+      includeChartCandles: true,
+    });
+    backtestContent.innerHTML = renderGoodPeopleReplayDetail(row, replay);
+    await renderGoodPeopleReplayChart(row, replay);
+  } catch (error) {
+    backtestContent.innerHTML = renderGoodPeopleStoredDetail(row, false, `Replay failed: ${error.message}`);
+  }
+}
+
+function renderGoodPeopleStoredDetail(row, loading = false, note = "") {
+  return `
+    <div class="good-result-detail">
+      <p class="modal-note">${escapeHtml(note || (loading ? "Replaying saved params to load trades and chart..." : "Stored summary only."))}</p>
+      <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Mode</span><strong>${escapeHtml(row.mode || "-")}</strong></div>
+        <div class="metric"><span>Market</span><strong>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "")}</strong></div>
+        <div class="metric"><span>Strategy</span><strong>${escapeHtml(row.strategy || "-")}</strong></div>
+        <div class="metric"><span>Period</span><strong>${escapeHtml(row.period || "-")}</strong></div>
+        <div class="metric"><span>Return</span><strong class="${Number(row.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(row.totalReturnPct)}%</strong></div>
+        <div class="metric"><span>End $</span><strong>$${formatNumber(row.endEquity || 10000 * (1 + Number(row.totalReturnPct || 0) / 100), 2)}</strong></div>
+        <div class="metric"><span>Trades</span><strong>${row.trades ?? 0}</strong></div>
+        <div class="metric"><span>Win</span><strong>${formatNumber(row.winRate, 1)}%</strong></div>
+      </div>
+      <h3 class="modal-section-title">Params</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(row.params || {}, null, 2))}</pre>
+    </div>
+  `;
+}
+
+function renderGoodPeopleReplayDetail(row, payload) {
+  const result = payload.result || {};
+  const trades = payload.trades || [];
+  const chartCandles = payload.chartCandles || [];
+  const expectedTrades = payload.tradeCount ?? result.trades ?? row.trades ?? trades.length;
+  const tradeRows = trades.slice(0, 80).map((trade) => `
+    <tr>
+      <td>${formatDateTime(trade.entry_time || trade.entryTime)}</td>
+      <td>${formatDateTime(trade.exit_time || trade.exitTime)}</td>
+      <td>${formatPrice(trade.entry_price || trade.entryPrice)}</td>
+      <td>${formatPrice(trade.exit_price || trade.exitPrice)}</td>
+      <td class="${Number(trade.return_pct ?? trade.returnPct ?? 0) >= 0 ? "positive" : "negative"}">${formatSigned(trade.return_pct ?? trade.returnPct)}%</td>
+      <td>${escapeHtml(trade.exit_reason || trade.exitReason || "-")}</td>
+    </tr>
+  `).join("");
+  return `
+    <div class="good-result-detail">
+      <p class="modal-note">Read-only replay of this history row. No paper tick, config write, live trading, or exchange order.</p>
+      <div class="metric-grid diagnostics-grid">
+        <div class="metric"><span>Market</span><strong>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "")}</strong></div>
+        <div class="metric"><span>Strategy</span><strong>${escapeHtml(row.strategy || "-")}</strong></div>
+        <div class="metric"><span>Period</span><strong>${escapeHtml(row.period || "-")}</strong></div>
+        <div class="metric"><span>Status</span><strong>${escapeHtml(result.status || "-")}</strong></div>
+        <div class="metric"><span>Return</span><strong class="${Number(result.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(result.totalReturnPct)}%</strong></div>
+        <div class="metric"><span>End $</span><strong>$${formatNumber(10000 * (1 + Number(result.totalReturnPct || 0) / 100), 2)}</strong></div>
+        <div class="metric"><span>Trades</span><strong>${expectedTrades}</strong></div>
+        <div class="metric"><span>Win</span><strong>${formatNumber(result.winRate, 1)}%</strong></div>
+      </div>
+      <div id="good-detail-chart" class="good-detail-chart"><p class="pane-status">Loading ${chartCandles.length || "test"} candles...</p></div>
+      <p id="good-detail-chart-note" class="modal-note">Chart uses the same ${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")} candles as this replay. Exit marker color shows win/loss.</p>
+      <h3 class="modal-section-title">Params</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(payload.paramsUsed || row.params || {}, null, 2))}</pre>
+      <h3 class="modal-section-title">Trades</h3>
+      <table class="trade-table compact-table">
+        <thead><tr><th>Entry</th><th>Exit</th><th>Entry Price</th><th>Exit Price</th><th>Return</th><th>Reason</th></tr></thead>
+        <tbody>${tradeRows || `<tr><td colspan="6">No closed trades returned.</td></tr>`}</tbody>
+      </table>
+      ${trades.length > 80 ? `<p class="modal-note">Showing first 80 trade rows; chart markers include all ${escapeHtml(String(trades.length))} returned trades.</p>` : ""}
+    </div>
+  `;
+}
+
+async function renderGoodPeopleReplayChart(row, payload) {
+  const host = document.querySelector("#good-detail-chart");
+  if (!host) return;
+  try {
+    await loadChartLibrary();
+    let sourceLabel = "replay";
+    let rawCandles = payload.chartCandles || [];
+    if (!rawCandles.length) {
+      const limit = goodPeopleChartLimit(row.timeframe, row.period);
+      const candlesPayload = await apiGet(`/api/candles?${new URLSearchParams({
+        source: row.source || "bybit",
+        symbol: row.symbol || "BTCUSDT",
+        timeframe: row.timeframe || "1h",
+        limit: String(limit),
+        visible_charts: "1",
+      }).toString()}`);
+      rawCandles = candlesPayload.candles || [];
+      sourceLabel = "chart API fallback";
+    }
+    const candles = rawCandles.map((candle) => ({
+      time: normalizeMarkerTime(candle.time),
+      open: Number(candle.open),
+      high: Number(candle.high),
+      low: Number(candle.low),
+      close: Number(candle.close),
+    })).filter((candle) => candle.time && Number.isFinite(candle.close));
+    host.innerHTML = "";
+    if (!candles.length) {
+      host.innerHTML = `<p class="pane-status">No candles returned for chart.</p>`;
+      return;
+    }
+    const chart = createChart(host);
+    const series = addSeries(chart, "candlestick", {});
+    series.setData(candles);
+    const markerPayload = goodPeopleTradeMarkers(payload, candles[0].time, candles[candles.length - 1].time);
+    setSeriesMarkers(series, markerPayload.markers);
+    chart.timeScale().fitContent();
+    const note = document.querySelector("#good-detail-chart-note");
+    if (note) {
+      note.textContent = `${row.symbol || "-"} ${row.timeframe || "-"} chart loaded from ${sourceLabel}: ${candles.length} candles, ${markerPayload.visibleTrades}/${markerPayload.totalTrades} trades plotted. Exit marker color shows win/loss.`;
+    }
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Chart failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function goodPeopleChartLimit(timeframe, period) {
+  const days = parsePeriodDays(period) || 365;
+  const minutes = timeframe === "15m" ? 15 : timeframe === "4h" ? 240 : 60;
+  return Math.max(300, Math.min(9000, Math.ceil(days * 1440 / minutes)));
+}
+
+function goodPeopleTradeMarkers(payload, firstTime, lastTime) {
+  const markers = [];
+  let visibleTrades = 0;
+  const trades = normalizedTrades(payload);
+  trades.forEach((trade, index) => {
+    const entryTime = normalizeMarkerTime(trade.entry_time ?? trade.entryTime);
+    const exitTime = normalizeMarkerTime(trade.exit_time ?? trade.exitTime);
+    const returnPct = Number(trade.return_pct ?? trade.returnPct ?? 0);
+    const resultText = Number.isFinite(returnPct) ? `${returnPct >= 0 ? "+" : ""}${returnPct.toFixed(2)}%` : "";
+    const exitIsVisible = exitTime && exitTime >= firstTime && exitTime <= lastTime;
+    const entryIsVisible = entryTime && entryTime >= firstTime && entryTime <= lastTime;
+    if (entryIsVisible || exitIsVisible) visibleTrades += 1;
+    if (entryTime && entryTime >= firstTime && entryTime <= lastTime) {
+      markers.push({ time: entryTime, position: "belowBar", color: "#12b886", shape: "arrowUp", text: `BUY #${index + 1}` });
+    }
+    if (exitTime && exitTime >= firstTime && exitTime <= lastTime) {
+      markers.push({ time: exitTime, position: "aboveBar", color: returnPct >= 0 ? "#0ca678" : "#ff5c7a", shape: "arrowDown", text: `SELL ${resultText}` });
+    }
+  });
+  markers.sort((a, b) => a.time - b.time);
+  return { markers, totalTrades: trades.length, visibleTrades };
+}
+
 async function populateLabControls() {
   const sourceSelect = document.querySelector("#lab-source-select");
   const strategySelect = document.querySelector("#lab-strategy-select");
@@ -2650,6 +3691,7 @@ function markersFromBacktestPayload(payload) {
 }
 
 function normalizedTrades(payload) {
+  if (Array.isArray(payload.trades)) return payload.trades;
   if (Array.isArray(payload.trade_list)) return payload.trade_list;
   if (Array.isArray(payload.tradeList)) {
     return payload.tradeList.map((trade) => ({
@@ -2667,8 +3709,12 @@ function normalizedTrades(payload) {
 
 function normalizeMarkerTime(value) {
   const number = Number(value);
-  if (!Number.isFinite(number)) return null;
-  return number > 1_000_000_000_000 ? Math.floor(number / 1000) : Math.floor(number);
+  if (Number.isFinite(number)) {
+    return number > 1_000_000_000_000 ? Math.floor(number / 1000) : Math.floor(number);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return Math.floor(parsed / 1000);
 }
 
 async function testPresets(pane) {
@@ -9088,7 +10134,12 @@ function formatNumber(value, digits = 2) {
 
 function formatDateTime(timestamp) {
   if (!timestamp) return "-";
-  return new Date(timestamp * 1000).toLocaleString();
+  const numeric = Number(timestamp);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 1_000_000_000_000 ? numeric : numeric * 1000)
+    : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return escapeHtml(String(timestamp));
+  return date.toLocaleString();
 }
 
 function escapeHtml(value) {

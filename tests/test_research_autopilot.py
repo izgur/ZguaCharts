@@ -3178,6 +3178,84 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertIn("Manual Paper Review Candidates", html)
         self.assertIn("Review disabled paper candidates", html)
 
+    def test_good_people_route_renders_research_only_backtest_lab(self):
+        with zgua_app.app.test_client() as client:
+            response = client.get("/good-people")
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn("Only for good people", html)
+        self.assertIn("good-history-body", html)
+        self.assertIn("good-param-options", html)
+        self.assertIn("good-filter-suggestions", html)
+        self.assertIn("good-mode-note", html)
+        self.assertIn("Trades", html)
+        self.assertIn("Start Trading", html)
+        self.assertIn("disabled", html)
+        script = (Path(zgua_app.app.root_path) / "static" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("goodPeopleStrategyOptionLabel", script)
+        self.assertIn("renderGoodPeopleHistoryParams", script)
+        self.assertIn("updateGoodPeopleFilterOptions", script)
+        self.assertIn("showGoodPeopleFilterSuggestions", script)
+        self.assertIn("goodPeopleSuggestionValues", script)
+        self.assertIn("openGoodPeopleResultDetail", script)
+        self.assertIn("goodPeopleTradeMarkers", script)
+        self.assertIn("saveHistory: false", script)
+        self.assertIn("[O]", script)
+        self.assertIn("[M]", script)
+        styles = (Path(zgua_app.app.root_path) / "static" / "styles.css").read_text(encoding="utf-8")
+        self.assertIn(".good-param-label::after", styles)
+        self.assertIn("grid-template-columns: repeat(4, minmax(0, 1fr))", styles)
+
+    def test_good_people_history_combines_manual_and_optimizer_rows(self):
+        root = patch_autopilot_paths(self)
+        history_path = root / "backtest-history.json"
+        batch_dir = Path(zgua_app.app.root_path) / "reports" / "research-batches"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        manual = [{
+            "id": "manual-1",
+            "createdAt": "2026-06-30T10:00:00+00:00",
+            "mode": "manual",
+            "source": "bybit",
+            "symbol": "ETHUSDT",
+            "timeframe": "1h",
+            "period": "365d",
+            "strategy": "SimpleAtrTrendV2",
+            "params": {"emaFast": 20},
+            "totalReturnPct": 12.5,
+            "trades": 100,
+            "winRate": 48,
+        }]
+        batch_path = batch_dir / "multi-strategy-optimizer-batch-20990101-000000.json"
+        batch_payload = {
+            "generatedAt": "2026-06-30T11:00:00+00:00",
+            "search": {"period": "365d", "source": "bybit"},
+            "rows": [{
+                "strategy": "BreakoutRetestV2",
+                "symbol": "BNBUSDT",
+                "timeframe": "1h",
+                "params": {"atrMultiplier": 2},
+                "totalReturnPct": 9.25,
+                "trades": 80,
+                "winRate": 44,
+                "isActiveBaseline": False,
+            }],
+        }
+        try:
+            with patch.object(zgua_app, "BACKTEST_HISTORY_PATH", history_path):
+                zgua_app.save_backtest_history(manual)
+                batch_path.write_text(json.dumps(batch_payload), encoding="utf-8")
+                with zgua_app.app.test_client() as client:
+                    response = client.get("/api/good-people/history")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            modes = {row["mode"] for row in payload["rows"]}
+            self.assertIn("manual", modes)
+            self.assertIn("optimizer", modes)
+            self.assertTrue(all(row["startTradingEnabled"] is False for row in payload["rows"]))
+        finally:
+            if batch_path.exists():
+                batch_path.unlink()
+
     def test_research_paper_candidates_ui_is_display_only_and_fetches_read_only_api(self):
         template = (Path(zgua_app.app.root_path) / "templates" / "index.html").read_text(encoding="utf-8")
         script = (Path(zgua_app.app.root_path) / "static" / "app.js").read_text(encoding="utf-8")

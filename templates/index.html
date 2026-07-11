@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260524-research-history">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260701-good-people-v6">
   </head>
   <body>
     <header class="topbar">
@@ -19,6 +19,7 @@
         <a href="/candidate" data-route="candidate">Candidate</a>
         <a href="/paper" data-route="paper">Paper</a>
         <a href="/backtest" data-route="backtest">Backtest</a>
+        <a href="/good-people" data-route="good-people">Only for good people</a>
         <a href="/ops" data-route="ops">Ops</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
@@ -217,6 +218,107 @@
             </section>
           </section>
         </div>
+      </section>
+
+      <section id="good-people-page" class="route-page good-people-page" data-page="good-people" hidden>
+        <div class="page-heading">
+          <div>
+            <h2>Only for good people</h2>
+            <p>Compact read-only backtest lab for manual tests, optimizer scans, saved presets, and result history.</p>
+          </div>
+          <span class="status-badge badge-raw">RESEARCH_ONLY</span>
+        </div>
+        <div class="good-people-topbar">
+          <label><span>Symbol</span><select id="good-symbol-select">
+            <option value="">Choose symbol</option>
+            <option value="BTCUSDT">BTCUSDT</option>
+            <option value="ETHUSDT">ETHUSDT</option>
+            <option value="SOLUSDT">SOLUSDT</option>
+            <option value="XRPUSDT">XRPUSDT</option>
+            <option value="BNBUSDT">BNBUSDT</option>
+          </select></label>
+          <label><span>Run type</span><select id="good-mode-select">
+            <option value="manual">Manual</option>
+            <option value="optimizer">Optimizer</option>
+          </select></label>
+          <button id="good-refresh-history" type="button">Refresh History</button>
+          <div id="good-mode-note" class="good-mode-note">Showing manual history and manual run controls.</div>
+        </div>
+        <section id="good-params-panel" class="good-params-panel" hidden>
+          <div class="good-param-grid">
+            <label><span>Timeframe</span><select id="good-timeframe-select">
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+            </select></label>
+            <label><span>Period</span><select id="good-period-select">
+              <option value="90d">90d</option>
+              <option value="180d">180d</option>
+              <option value="365d" selected>365d</option>
+              <option value="730d">730d</option>
+            </select></label>
+            <label><span>Strategy</span><select id="good-strategy-select"></select></label>
+            <label><span>Saved preset</span><select id="good-preset-select"></select></label>
+            <label><span>Fee % / side</span><input id="good-fee-input" type="number" min="0" step="0.001" value="0.055"></label>
+            <label><span>Slippage % / side</span><input id="good-slippage-input" type="number" min="0" step="0.001" value="0.02"></label>
+            <label><span>Candle limit</span><select id="good-limit-select">
+              <option value="auto">Auto</option>
+              <option value="period" selected>Full period</option>
+              <option value="1000">1000</option>
+              <option value="5000">5000</option>
+              <option value="20000">20000</option>
+              <option value="50000">50000</option>
+            </select></label>
+            <label><span>Optimizer combos</span><input id="good-max-combos-input" type="number" min="1" max="250" value="80"></label>
+          </div>
+          <div id="good-strategy-summary" class="builder-summary">Choose a symbol to load strategies.</div>
+          <div id="good-param-editor" class="param-editor"></div>
+          <div class="good-actions">
+            <input id="good-preset-name" placeholder="Preset name">
+            <select id="good-preset-scope">
+              <option value="symbol">Save for this symbol</option>
+              <option value="all">Save for all symbols</option>
+            </select>
+            <button id="good-save-preset" type="button">Save Preset</button>
+            <button id="good-run-button" type="button">Run Manual Backtest</button>
+            <button id="good-open-optimizer" type="button">Optimizer Plan</button>
+          </div>
+          <p id="good-run-status" class="modal-note">Manual and optimizer runs are research-only. Start Trading is intentionally disabled.</p>
+        </section>
+        <section class="good-history-panel">
+          <div class="good-history-toolbar">
+            <label><span>Pair</span><input id="good-filter-symbol" list="good-symbol-options" placeholder="Any"></label>
+            <label><span>TF</span><input id="good-filter-timeframe" list="good-timeframe-options" placeholder="Any"></label>
+            <label><span>Strategy</span><input id="good-filter-strategy" list="good-strategy-options" placeholder="Any"></label>
+            <label><span>Param text</span><input id="good-filter-params" list="good-param-options" placeholder="Contains..."></label>
+            <div id="good-filter-suggestions" class="good-filter-suggestions" hidden></div>
+            <datalist id="good-symbol-options"></datalist>
+            <datalist id="good-timeframe-options"></datalist>
+            <datalist id="good-strategy-options"></datalist>
+            <datalist id="good-param-options"></datalist>
+          </div>
+          <div class="good-history-table-wrap">
+            <table class="trade-table good-history-table">
+              <thead>
+                <tr>
+                  <th><button type="button" data-good-sort="id">Test ID</button></th>
+                  <th><button type="button" data-good-sort="createdAt">Time</button></th>
+                  <th><button type="button" data-good-sort="symbol">Pair</button></th>
+                  <th><button type="button" data-good-sort="timeframe">TF</button></th>
+                  <th><button type="button" data-good-sort="strategy">Strategy</button></th>
+                  <th><button type="button" data-good-sort="period">Period</button></th>
+                  <th>Params</th>
+                  <th>Trades</th>
+                  <th><button type="button" data-good-sort="totalReturnPct">Outcome</button></th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="good-history-body">
+                <tr><td colspan="10">Loading history...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
       </section>
 
       <section id="analysis-page" class="route-page analysis-page" data-page="analysis" hidden>
@@ -1188,6 +1290,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260601-paper-tick" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260701-good-people-v6" defer></script>
   </body>
 </html>

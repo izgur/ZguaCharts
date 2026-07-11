@@ -16,12 +16,86 @@ const MANUAL_STRATEGIES = [
   "PullbackTrend",
   "BreakoutRetestV2",
   "RangeExpansionV2",
-  "RegimeFilteredTrendStrategy"
+  "RegimeFilteredTrendStrategy",
+  "RobustTrendFollowerV1"
 ];
 
 const SELECT_OPTIONS = {
   regimeMode: ["symbolFastTrend", "symbolTrend", "noRegime", "looseBtcBull"],
   fillModel: ["next-open", "close", "conservative"]
+};
+
+const PARAM_LIBRARY = {
+  accountEquity: 10000,
+  riskPct: 0.005,
+  maxOpenTrades: 1,
+  maxNotional: 100000,
+  maxNotionalPerTrade: 100000,
+  makerFeePct: 0,
+  takerFeePct: 0,
+  feePct: 0,
+  slippagePct: 0,
+  slippageBps: 0,
+  fillModel: "next-open",
+  regimeMode: "looseBtcBull",
+  btcTrendFilter: false,
+  emaFast: 20,
+  emaMid: 100,
+  emaSlow: 50,
+  emaTrend: 200,
+  emaTrendLength: 200,
+  emaBounceAtr: 0.8,
+  emaMomentumSlow: 21,
+  emaTrendFast: 50,
+  rsiMin: 45,
+  rsiMax: 70,
+  rsiLimit: 32,
+  rsiOversold: 35,
+  rsiPullbackLevel: 45,
+  rsiReclaimLevel: 50,
+  useRsiFilter: true,
+  atrMultiplier: 2.5,
+  stopAtr: 2,
+  takeProfitAtr: 3,
+  trailingActivationAtr: 1.5,
+  trailingAtr: 2,
+  useDonchianTrail: true,
+  cooldownBars: 0,
+  minHoldBars: 1,
+  volumeFilter: false,
+  requireVolume: false,
+  volumeMultiplier: 1,
+  volumeMa: 20,
+  useFundingFilter: false,
+  maxFundingRate: 0.0005,
+  useOpenInterestFilter: false,
+  minOpenInterestChangePct: 0,
+  requireBreakout: false,
+  breakoutLookback: 20,
+  donchianEntry: 20,
+  donchianConfirmAlt: 55,
+  donchianExit: 10,
+  retestBars: 8,
+  retestLookback: 8,
+  retestAtr: 0.8,
+  squeezeLookback: 80,
+  squeezePercentile: 0.35,
+  rangeLookback: 20,
+  rangeSma: 20,
+  closeHighPct: 0.7,
+  adxMin: 14,
+  adxThreshold: 14,
+  useAdx: false,
+  relativeStrengthLookback: 24,
+  rsLookback: 24,
+  rsThreshold: 0,
+  scoreThreshold: 55,
+  minBodyPct: 0.35,
+  shortMode: false,
+  swingLeft: 3,
+  swingRight: 2,
+  goldenPocketTolerancePct: 0.35,
+  requireAnchoredVwap: true
 };
 
 function titleize(name) {
@@ -35,6 +109,7 @@ function labelForParam(key) {
   const labels = {
     atrMultiplier: "ATR Multiplier",
     emaFast: "EMA Fast",
+    emaMid: "EMA Mid",
     emaSlow: "EMA Slow",
     emaTrend: "EMA Trend",
     emaTrendLength: "EMA Trend Length",
@@ -43,6 +118,13 @@ function labelForParam(key) {
     useRsiFilter: "Use RSI Filter",
     regimeMode: "Regime Mode",
     volumeFilter: "Volume Filter",
+    volumeMultiplier: "Volume Multiplier",
+    volumeMa: "Volume MA",
+    useFundingFilter: "Use Funding Filter",
+    maxFundingRate: "Max Funding Rate",
+    useOpenInterestFilter: "Use OI Filter",
+    minOpenInterestChangePct: "Min OI Change %",
+    useDonchianTrail: "Use Donchian Trail",
     cooldownBars: "Cooldown Bars",
     minHoldBars: "Min Hold Bars",
     riskPct: "Risk %",
@@ -55,6 +137,145 @@ function labelForParam(key) {
     fillModel: "Fill Model"
   };
   return labels[key] || titleize(key);
+}
+
+function descriptionForParam(key) {
+  const descriptions = {
+    accountEquity: "Starting paper account size used by the strategy engine for position sizing.",
+    atrMultiplier: "Multiplier applied to ATR for trend distance, stop distance, or breakout filtering depending on the strategy.",
+    emaFast: "Fast exponential moving average length. Lower values react faster to price.",
+    emaMid: "Mid-length EMA used by strategies that require a coin trend filter, commonly EMA100 on 1h.",
+    emaSlow: "Slow exponential moving average length. Higher values make the trend filter slower.",
+    emaTrend: "Trend EMA length used to decide whether price is in a larger trend.",
+    emaTrendLength: "Trend EMA lookback length. Higher values require a longer trend to agree.",
+    emaBounceAtr: "Allowed distance from EMA measured in ATR for bounce-style entries.",
+    rsiMin: "Minimum RSI accepted for entry. Higher values require stronger momentum.",
+    rsiMax: "Maximum RSI accepted for entry. Lower values avoid more overbought entries.",
+    rsiPullbackLevel: "RSI level used to detect the pullback part of a bounce or reclaim setup.",
+    rsiReclaimLevel: "RSI level that must be reclaimed before entry is allowed.",
+    useRsiFilter: "Whether RSI rules are active for this strategy.",
+    regimeMode: "Market regime filter mode. It controls whether BTC or symbol trend context is required.",
+    volumeFilter: "Whether volume must pass the strategy filter before entry.",
+    requireVolume: "Whether volume confirmation must pass before entry.",
+    volumeMultiplier: "Multiplier above volume moving average required for volume confirmation.",
+    volumeMa: "Volume moving-average length used by volume filters where supported.",
+    useFundingFilter: "Whether entries are blocked when the latest known Bybit funding rate is above the configured maximum.",
+    maxFundingRate: "Maximum allowed funding rate as a decimal. Example: 0.0005 means 0.05%.",
+    useOpenInterestFilter: "Whether entries require open interest to be rising by at least the configured percentage.",
+    minOpenInterestChangePct: "Minimum open-interest change percentage between Bybit open-interest points. Zero means flat or rising.",
+    cooldownBars: "Minimum candles to wait after a trade before another entry can trigger.",
+    minHoldBars: "Minimum candles a trade should remain open before normal exit checks.",
+    riskPct: "Percent of account equity risked per trade in the sizing model.",
+    maxOpenTrades: "Maximum simultaneous open trades allowed by the strategy runner.",
+    maxNotional: "Maximum notional exposure allowed.",
+    maxNotionalPerTrade: "Maximum position notional allowed for one trade.",
+    makerFeePct: "Maker fee percentage used in cost modeling.",
+    takerFeePct: "Taker fee percentage used in cost modeling.",
+    slippageBps: "Slippage cost in basis points used in cost modeling.",
+    stopAtr: "Stop-loss distance measured in ATR. Higher values give trades more room.",
+    takeProfitAtr: "Take-profit distance measured in ATR. Higher values target larger moves.",
+    trailingAtr: "Trailing stop distance measured in ATR after a trade moves favorably.",
+    useDonchianTrail: "Whether the trailing stop should also respect the opposite-side Donchian channel.",
+    fillModel: "Price fill assumption used by the backtest engine.",
+    breakoutLookback: "Lookback window used to detect breakouts.",
+    requireBreakout: "Whether a breakout confirmation is required before entry.",
+    donchianEntry: "Donchian channel length used for breakout entries.",
+    donchianConfirmAlt: "Alternate Donchian length used by close-confirm breakout logic.",
+    donchianExit: "Donchian channel length used for exit signals.",
+    retestBars: "Number of candles allowed for a breakout retest.",
+    retestLookback: "How far back to search for the breakout before a retest.",
+    retestAtr: "How close price must retest the breakout level, measured in ATR.",
+    squeezeLookback: "Lookback window used to measure volatility squeeze.",
+    squeezePercentile: "Percentile threshold for squeeze detection. Lower is stricter.",
+    rangeLookback: "Lookback window used for range breakout checks.",
+    rangeSma: "Average range length used by range-expansion checks.",
+    closeHighPct: "How high in the candle range the close must be for expansion entries.",
+    rangeLookback: "Lookback window used to measure range expansion.",
+    adxMin: "Minimum ADX trend strength required for entry.",
+    adxThreshold: "ADX threshold used by trend and breakout filters.",
+    useAdx: "Whether ADX filtering is active where the strategy supports it.",
+    relativeStrengthLookback: "Lookback window used to compare relative strength.",
+    rsLookback: "Relative-strength lookback window.",
+    rsThreshold: "Required return edge versus BTC over the relative-strength lookback.",
+    scoreThreshold: "Composite indicator score required by momentum strategies.",
+    minBodyPct: "Minimum candle body as a fraction of full candle range.",
+    rsiLimit: "RSI threshold used by mean-reversion entries.",
+    rsiOversold: "RSI oversold threshold used before reclaim entries.",
+    shortMode: "Whether the strategy may consider short-side entries where supported.",
+    swingLeft: "Left-side candle count for swing point detection.",
+    swingRight: "Right-side candle count for swing point confirmation.",
+    goldenPocketTolerancePct: "Allowed tolerance around Fibonacci golden-pocket pullbacks.",
+    requireAnchoredVwap: "Whether anchored VWAP confirmation is required.",
+    btcTrendFilter: "Whether BTC trend context must agree before entries are accepted."
+  };
+  return descriptions[key] || `${labelForParam(key)} strategy parameter. Adjust only when you want this strategy rule to change.`;
+}
+
+function groupForParam(key) {
+  const groups = {
+    accountEquity: ["execution", "Execution / Costs"],
+    riskPct: ["execution", "Execution / Costs"],
+    maxOpenTrades: ["execution", "Execution / Costs"],
+    maxNotional: ["execution", "Execution / Costs"],
+    maxNotionalPerTrade: ["execution", "Execution / Costs"],
+    makerFeePct: ["execution", "Execution / Costs"],
+    takerFeePct: ["execution", "Execution / Costs"],
+    feePct: ["execution", "Execution / Costs"],
+    slippagePct: ["execution", "Execution / Costs"],
+    slippageBps: ["execution", "Execution / Costs"],
+    fillModel: ["execution", "Execution / Costs"],
+    regimeMode: ["regime", "Regime Filter"],
+    btcTrendFilter: ["regime", "Regime Filter"],
+    emaFast: ["ema", "EMA"],
+    emaMid: ["ema", "EMA"],
+    emaSlow: ["ema", "EMA"],
+    emaTrend: ["ema", "EMA"],
+    emaTrendLength: ["ema", "EMA"],
+    emaBounceAtr: ["ema", "EMA"],
+    emaMomentumSlow: ["ema", "EMA"],
+    emaTrendFast: ["ema", "EMA"],
+    rsiMin: ["rsi", "RSI"],
+    rsiMax: ["rsi", "RSI"],
+    rsiLimit: ["rsi", "RSI"],
+    rsiOversold: ["rsi", "RSI"],
+    rsiPullbackLevel: ["rsi", "RSI"],
+    rsiReclaimLevel: ["rsi", "RSI"],
+    useRsiFilter: ["rsi", "RSI"],
+    atrMultiplier: ["atr", "ATR / Volatility"],
+    stopAtr: ["risk", "Stops / Exits"],
+    takeProfitAtr: ["risk", "Stops / Exits"],
+    trailingAtr: ["risk", "Stops / Exits"],
+    useDonchianTrail: ["risk", "Stops / Exits"],
+    cooldownBars: ["timing", "Timing"],
+    minHoldBars: ["timing", "Timing"],
+    volumeFilter: ["volume", "Volume"],
+    requireVolume: ["volume", "Volume"],
+    volumeMultiplier: ["volume", "Volume"],
+    volumeMa: ["volume", "Volume"],
+    useFundingFilter: ["derivatives", "Funding / OI"],
+    maxFundingRate: ["derivatives", "Funding / OI"],
+    useOpenInterestFilter: ["derivatives", "Funding / OI"],
+    minOpenInterestChangePct: ["derivatives", "Funding / OI"],
+    breakoutLookback: ["breakout", "Breakout"],
+    requireBreakout: ["breakout", "Breakout"],
+    donchianEntry: ["donchian", "Donchian"],
+    donchianExit: ["donchian", "Donchian"],
+    retestBars: ["retest", "Retest"],
+    retestLookback: ["retest", "Retest"],
+    retestAtr: ["retest", "Retest"],
+    rangeLookback: ["range", "Range Expansion"],
+    rangeSma: ["range", "Range Expansion"],
+    closeHighPct: ["range", "Range Expansion"],
+    squeezeLookback: ["squeeze", "Squeeze"],
+    squeezePercentile: ["squeeze", "Squeeze"],
+    adxMin: ["adx", "ADX"],
+    adxThreshold: ["adx", "ADX"],
+    relativeStrengthLookback: ["relativeStrength", "Relative Strength"],
+    rsLookback: ["relativeStrength", "Relative Strength"],
+    rsThreshold: ["relativeStrength", "Relative Strength"],
+    shortMode: ["direction", "Direction"]
+  };
+  return groups[key] || ["other", "Other Rules"];
 }
 
 function isRegimeRunner(name) {
@@ -73,7 +294,8 @@ function isRegimeRunner(name) {
     "BreakoutRetestV2",
     "RangeExpansionV2",
     "RelativeStrengthV2",
-    "SimpleAtrTrendV2"
+    "SimpleAtrTrendV2",
+    "RobustTrendFollowerV1"
   ].includes(name);
 }
 
@@ -98,36 +320,57 @@ function firstGridParams(grid) {
   return params;
 }
 
-function schemaEntry(key, value, gridValues) {
+function schemaEntry(key, value, gridValues, optional) {
+  const group = groupForParam(key);
+  function withGroup(entry) {
+    return Object.assign(entry, { group: group[0], groupLabel: group[1], indicator: group[0], indicatorLabel: group[1], optional: !!optional, defaultValue: PARAM_LIBRARY[key] });
+  }
   if (SELECT_OPTIONS[key]) {
-    return { type: "select", options: SELECT_OPTIONS[key], label: labelForParam(key) };
+    return withGroup({ type: "select", options: SELECT_OPTIONS[key], label: labelForParam(key), description: descriptionForParam(key) });
   }
   if (Array.isArray(gridValues) && gridValues.some(function (item) { return typeof item === "string"; })) {
-    return { type: "select", options: gridValues, label: labelForParam(key) };
+    return withGroup({ type: "select", options: gridValues, label: labelForParam(key), description: descriptionForParam(key) });
   }
   if (typeof value === "boolean" || (Array.isArray(gridValues) && gridValues.every(function (item) { return typeof item === "boolean"; }))) {
-    return { type: "boolean", label: labelForParam(key) };
+    return withGroup({ type: "boolean", label: labelForParam(key), description: descriptionForParam(key) });
   }
   if (typeof value === "number" || (Array.isArray(gridValues) && gridValues.every(function (item) { return typeof item === "number"; }))) {
     const numeric = (Array.isArray(gridValues) ? gridValues : [value]).filter(function (item) { return typeof item === "number" && Number.isFinite(item); });
     const min = numeric.length ? Math.min.apply(null, numeric) : undefined;
     const max = numeric.length ? Math.max.apply(null, numeric) : undefined;
     const step = numeric.some(function (item) { return Math.abs(item - Math.round(item)) > 0.000001; }) ? 0.01 : 1;
-    const entry = { type: "number", step: step, label: labelForParam(key) };
+    const entry = withGroup({ type: "number", step: step, label: labelForParam(key), description: descriptionForParam(key) });
     if (min !== undefined) entry.min = Math.min(0, min);
     if (max !== undefined) entry.max = Math.max(max, Number(value || 0), 1);
     return entry;
   }
-  return { type: "text", label: labelForParam(key) };
+  return withGroup({ type: "text", label: labelForParam(key), description: descriptionForParam(key) });
 }
 
 function buildParamSchema(defaultParams, gridParams) {
   const schema = {};
-  const keys = Array.from(new Set(Object.keys(defaultParams).concat(Object.keys(gridParams || {})))).sort();
+  const strategyKeys = new Set(Object.keys(defaultParams).concat(Object.keys(gridParams || {})));
+  const keys = Array.from(new Set(Object.keys(PARAM_LIBRARY).concat(Object.keys(defaultParams)).concat(Object.keys(gridParams || {})))).sort();
   keys.forEach(function (key) {
-    schema[key] = schemaEntry(key, defaultParams[key], gridParams ? gridParams[key] : undefined);
+    var value = defaultParams[key] !== undefined ? defaultParams[key] : PARAM_LIBRARY[key];
+    schema[key] = schemaEntry(key, value, gridParams ? gridParams[key] : undefined, !strategyKeys.has(key));
   });
   return schema;
+}
+
+function indicatorGroupsFromSchema(schema) {
+  const groups = {};
+  Object.entries(schema || {}).forEach(function ([key, entry]) {
+    const id = entry.group || entry.indicator || "other";
+    groups[id] = groups[id] || { id: id, label: entry.groupLabel || entry.indicatorLabel || titleize(id), params: [] };
+    groups[id].params.push(key);
+  });
+  return Object.values(groups).sort(function (a, b) {
+    const order = ["execution", "regime", "ema", "rsi", "atr", "risk", "timing", "volume", "derivatives", "breakout", "donchian", "retest", "range", "squeeze", "adx", "relativeStrength", "direction", "other"];
+    const ai = order.indexOf(a.id);
+    const bi = order.indexOf(b.id);
+    return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+  });
 }
 
 function strategyInfo(name, activeCandidate) {
@@ -148,6 +391,7 @@ function strategyInfo(name, activeCandidate) {
   ];
   if (activeParams) presets.push({ name: "activeCandidate", label: "Active Candidate", params: activeParams });
   if (grid) presets.push({ name: "gridSeed", label: grid.humanName || grid.gridName || "Grid Seed", params: gridSeedParams });
+  const paramSchema = buildParamSchema(activeParams ? Object.assign({}, gridSeedParams, activeParams) : gridSeedParams, grid ? grid.params : {});
   return {
     name: name,
     label: titleize(name),
@@ -155,7 +399,16 @@ function strategyInfo(name, activeCandidate) {
     supported: true,
     defaultParams: defaultParams,
     presets: presets,
-    paramSchema: buildParamSchema(activeParams ? Object.assign({}, gridSeedParams, activeParams) : gridSeedParams, grid ? grid.params : {}),
+    paramSchema: paramSchema,
+    indicatorGroups: indicatorGroupsFromSchema(paramSchema),
+    optimizerGrid: grid ? {
+      gridName: grid.gridName || grid.humanName || name,
+      humanName: grid.humanName || grid.gridName || name,
+      params: grid.params || {},
+      maxCombinations: grid.maxCombinations || 0,
+      notes: grid.notes || [],
+      riskLevel: grid.riskLevel || "unknown"
+    } : null,
     warnings: grid ? [] : ["No optimizer grid metadata is available; showing engine defaults only."]
   };
 }

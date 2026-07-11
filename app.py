@@ -116,6 +116,7 @@ LEARNING_OPTIMIZER_STRATEGY_OPTIONS = [
 @app.get("/candidate")
 @app.get("/paper")
 @app.get("/backtest")
+@app.get("/good-people")
 @app.get("/analysis")
 @app.get("/learning")
 @app.get("/ops")
@@ -377,11 +378,17 @@ def backtest_run_custom():
             debug=False,
             allow_shorts=allow_shorts,
             strategy_params=params,
+            include_candles=bool(payload.get("includeChartCandles")),
         )
         stage = "custom response normalization"
         result_payload = normalize_backtest_response(result_payload, source, symbol, timeframe, period, strategy, fee_pct, slippage_pct)
         params_used = (result_payload.get("diagnostics") or {}).get("params") or params
         params_used = {**(params_used or {}), "feePct": fee_pct, "slippagePct": slippage_pct}
+        result_payload["mode"] = "manual"
+        result_payload["params"] = params_used
+        result_payload["paramsSource"] = str(payload.get("paramsSource") or payload.get("presetName") or payload.get("preset") or "custom")
+        result_payload.setdefault("diagnostics", {})["params"] = params_used
+        result_payload["diagnostics"]["paramsSource"] = result_payload["paramsSource"]
         active_candidate = load_paper_candidate_config()
         active_comparison = compare_manual_backtest_to_active_candidate(
             strategy,
@@ -408,7 +415,17 @@ def backtest_run_custom():
         )
         comparability = manual_backtest_comparability(run_context, active_comparison, context_warnings)
         metrics = manual_backtest_result_summary(result_payload, period)
+        result_payload["totalReturnPct"] = metrics["totalReturnPct"]
+        result_payload["trades"] = metrics["trades"]
+        result_payload["winRate"] = metrics["winRate"]
+        result_payload["maxDrawdown"] = metrics["maxDrawdownPct"]
+        result_payload["profitFactor"] = metrics["profitFactor"]
+        result_payload["averageBarsHeld"] = metrics["avgBarsHeld"]
+        if payload.get("saveHistory", True) is not False:
+            record_backtest_history(result_payload)
         trades = result_payload.get("trade_list") or result_payload.get("tradeList") or []
+        trade_limit = None if payload.get("includeFullTrades") else 75
+        returned_trades = trades if trade_limit is None else trades[:trade_limit]
         warnings = dedupe_list(list(result_payload.get("warnings") or []) + list((result_payload.get("diagnostics") or {}).get("warnings") or []))
         warnings = dedupe_list(warnings + context_warnings + active_comparison.get("warnings", []))
         return jsonify({
@@ -429,7 +446,11 @@ def backtest_run_custom():
                 "warnings": warnings,
             },
             "diagnostics": result_payload.get("diagnostics") or {},
-            "trades": trades[:75],
+            "chartCandles": result_payload.get("chartCandles") if payload.get("includeChartCandles") else None,
+            "trades": returned_trades,
+            "tradeCount": len(trades),
+            "tradesReturned": len(returned_trades),
+            "tradesTruncated": trade_limit is not None and len(trades) > len(returned_trades),
             "warnings": warnings,
         })
     except ValueError as exc:
@@ -1323,6 +1344,27 @@ def backtest_history():
         "runs": records[-limit:][::-1],
         "strategySummary": summarize_backtest_history(records),
         "totalRuns": len(records),
+    })
+
+
+@app.get("/api/good-people/history")
+def good_people_history():
+    limit = int(request.args.get("limit", "250"))
+    manual_rows = [backtest_lab_history_row(record) for record in load_backtest_history()]
+    optimizer_rows = load_optimizer_batch_history_rows()
+    rows = sorted(
+        [row for row in manual_rows + optimizer_rows if row],
+        key=lambda row: row.get("createdAt") or "",
+        reverse=True,
+    )
+    return jsonify({
+        "ok": True,
+        "rows": rows[:limit],
+        "totalRows": len(rows),
+        "manualRows": len(manual_rows),
+        "optimizerRows": len(optimizer_rows),
+        "readOnly": True,
+        "realTradingEnabled": False,
     })
 
 
@@ -7748,6 +7790,12 @@ def build_research_fee_slippage_stress(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams") or args.get("optimizer_params"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams", args.get("optimizer_params")))])
+    if args.get("optimizerBaseParams") or args.get("optimizer_base_params"):
+        command.extend(["--optimizerBaseParams", str(args.get("optimizerBaseParams", args.get("optimizer_base_params")))])
+    if args.get("optimizerGridOverrides") or args.get("optimizer_grid_overrides"):
+        command.extend(["--optimizerGridOverrides", str(args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides")))])
     try:
         completed = subprocess.run(
             command,
@@ -7845,6 +7893,12 @@ def build_research_walk_forward_review(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams") or args.get("optimizer_params"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams", args.get("optimizer_params")))])
+    if args.get("optimizerBaseParams") or args.get("optimizer_base_params"):
+        command.extend(["--optimizerBaseParams", str(args.get("optimizerBaseParams", args.get("optimizer_base_params")))])
+    if args.get("optimizerGridOverrides") or args.get("optimizer_grid_overrides"):
+        command.extend(["--optimizerGridOverrides", str(args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides")))])
     try:
         completed = subprocess.run(
             command,
@@ -14149,8 +14203,8 @@ def build_research_timeframe_preset_search(args) -> tuple[dict, int]:
     presets = args.get("presets", "default")
     max_rows = max(1, min(int(safe_float(args.get("maxRows", args.get("max_rows", 100)), 100)), 100))
     params = dict(candidate.get("params") if isinstance(candidate.get("params"), dict) else {})
-    fee_pct = safe_float(candidate.get("feePct"), safe_float(candidate.get("takerFeePct"), 0.055))
-    slippage_pct = safe_float(candidate.get("slippagePct"), safe_float(candidate.get("slippageBps"), 2) / 100)
+    fee_pct = safe_float(args.get("feePct", args.get("fee_pct", candidate.get("feePct"))), safe_float(candidate.get("takerFeePct"), 0.055))
+    slippage_pct = safe_float(args.get("slippagePct", args.get("slippage_pct", candidate.get("slippagePct"))), safe_float(candidate.get("slippageBps"), 2) / 100)
     command = package_node_script_args("research:timeframe-preset-search")
     command.extend([
         "--symbol", symbol,
@@ -14527,6 +14581,12 @@ def build_research_multi_strategy_matrix(args) -> tuple[dict, int]:
         "--feePct", str(fee_pct),
         "--slippagePct", str(slippage_pct),
     ])
+    if args.get("optimizerParams") or args.get("optimizer_params"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams", args.get("optimizer_params")))])
+    if args.get("optimizerBaseParams") or args.get("optimizer_base_params"):
+        command.extend(["--optimizerBaseParams", str(args.get("optimizerBaseParams", args.get("optimizer_base_params")))])
+    if args.get("optimizerGridOverrides") or args.get("optimizer_grid_overrides"):
+        command.extend(["--optimizerGridOverrides", str(args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides")))])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
     try:
@@ -19011,7 +19071,7 @@ def node_executable() -> str:
     return fallback or "node"
 
 
-def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None) -> dict:
+def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None, include_candles: bool = False) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
     Python keeps responsibility for broker adapters that already work here
@@ -19071,6 +19131,8 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["diagnostics"]["period_capped"] = historical_diag.get("period_capped", False)
     payload["diagnostics"].setdefault("warnings", [])
     payload["diagnostics"]["warnings"].extend(historical_diag.get("warnings", []))
+    if include_candles:
+        payload["chartCandles"] = candles_payload["candles"]
     return payload
 
 
@@ -19760,17 +19822,22 @@ def save_backtest_history(records: list[dict]) -> None:
 
 
 def record_backtest_history(payload: dict) -> None:
+    diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    params = diagnostics.get("params") if isinstance(diagnostics.get("params"), dict) else payload.get("params")
     record = {
         "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"),
         "createdAt": datetime.now(timezone.utc).isoformat(),
+        "mode": payload.get("mode") or payload.get("runMode") or "manual",
         "source": payload.get("source"),
         "symbol": payload.get("symbol"),
         "timeframe": payload.get("timeframe"),
         "period": payload.get("period"),
         "strategy": payload.get("preset") or payload.get("strategy") or "unknown",
-        "totalReturnPct": safe_float(payload.get("total_return_pct", payload.get("totalReturn", 0))),
-        "trades": int(safe_float(payload.get("number_of_trades", payload.get("trades", 0)))),
-        "winRate": safe_float(payload.get("win_rate", payload.get("winRate", 0))),
+        "params": params if isinstance(params, dict) else {},
+        "paramsSource": payload.get("paramsSource") or diagnostics.get("paramsSource") or payload.get("preset_id"),
+        "totalReturnPct": safe_float(payload.get("totalReturnPct", payload.get("total_return_pct", payload.get("totalReturn", 0)))),
+        "trades": int(safe_float(payload.get("trades", payload.get("number_of_trades", 0)))),
+        "winRate": safe_float(payload.get("winRate", payload.get("win_rate", 0))),
         "maxDrawdown": safe_float(payload.get("max_drawdown", payload.get("maxDrawdown", 0))),
         "profitFactor": safe_float(payload.get("profit_factor", payload.get("profitFactor", 0))),
         "averageBarsHeld": safe_float(payload.get("average_bars_held", payload.get("avgBarsHeld", 0))),
@@ -19778,6 +19845,73 @@ def record_backtest_history(payload: dict) -> None:
     records = load_backtest_history()
     records.append(record)
     save_backtest_history(records)
+
+
+def backtest_lab_history_row(record: dict) -> dict:
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "id": record.get("id") or record.get("testId") or "",
+        "createdAt": record.get("createdAt") or record.get("generatedAt") or "",
+        "mode": record.get("mode") or "manual",
+        "source": record.get("source") or "bybit",
+        "symbol": record.get("symbol") or "",
+        "timeframe": record.get("timeframe") or record.get("interval") or "",
+        "period": record.get("period") or "",
+        "strategy": record.get("strategy") or record.get("preset") or "unknown",
+        "params": record.get("params") if isinstance(record.get("params"), dict) else {},
+        "paramsSource": record.get("paramsSource") or "",
+        "totalReturnPct": safe_float(record.get("totalReturnPct", record.get("totalReturn", 0))),
+        "trades": int(safe_float(record.get("trades", record.get("number_of_trades", 0)))),
+        "winRate": safe_float(record.get("winRate", record.get("win_rate", 0))),
+        "endEquity": round(10000 * (1 + safe_float(record.get("totalReturnPct", record.get("totalReturn", 0))) / 100), 2),
+        "status": record.get("status") or "OK",
+        "paperStatus": record.get("paperStatus") or "not started",
+        "startTradingEnabled": False,
+        "reportPath": record.get("reportPath") or "",
+    }
+
+
+def load_optimizer_batch_history_rows() -> list[dict]:
+    report_dir = Path(app.root_path) / "reports" / "research-batches"
+    if not report_dir.exists():
+        return []
+    rows = []
+    for path in sorted(report_dir.glob("multi-strategy-optimizer-batch-*.json"))[-50:]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        created_at = payload.get("generatedAt") or payload.get("createdAt") or datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        search = payload.get("search") if isinstance(payload.get("search"), dict) else {}
+        period = search.get("period") or payload.get("period") or ""
+        report_path = str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+        for index, row in enumerate(payload.get("rows") or []):
+            if not isinstance(row, dict) or row.get("isActiveBaseline"):
+                continue
+            return_pct = safe_float(row.get("totalReturnPct", row.get("totalReturn", 0)))
+            rows.append({
+                "id": f"{path.stem}-{index + 1}",
+                "createdAt": created_at,
+                "mode": "optimizer",
+                "source": search.get("source") or "bybit",
+                "symbol": row.get("symbol") or "",
+                "timeframe": row.get("timeframe") or row.get("interval") or "",
+                "period": period,
+                "strategy": row.get("strategy") or "unknown",
+                "params": row.get("params") if isinstance(row.get("params"), dict) else {},
+                "paramsSource": row.get("paramsSource") or "optimized",
+                "totalReturnPct": return_pct,
+                "trades": int(safe_float(row.get("trades", 0))),
+                "winRate": safe_float(row.get("winRate", 0)),
+                "endEquity": round(10000 * (1 + return_pct / 100), 2),
+                "status": row.get("finalCandidateTier") or row.get("status") or row.get("qualityGateStatus") or "RAW",
+                "paperStatus": "not started",
+                "startTradingEnabled": False,
+                "reportPath": report_path,
+            })
+    return rows
 
 
 def summarize_backtest_history(records: list[dict]) -> list[dict]:

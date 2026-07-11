@@ -14,7 +14,10 @@ function runBacktest(options) {
     limit: options.limit,
     candles: options.candles
   }).then(function (candles) {
-    return runBacktestOnCandles(Object.assign({}, options, { candles: candles }));
+    var enrich = (options.source || "bybit") === "bybit" && options.strategy === "RobustTrendFollowerV1";
+    return (enrich ? data.enrichCandlesWithDerivatives(options, candles) : Promise.resolve(candles)).then(function (loadedCandles) {
+      return runBacktestOnCandles(Object.assign({}, options, { candles: loadedCandles }));
+    });
   });
 }
 
@@ -105,7 +108,8 @@ function usesRegimeRunner(name) {
     "RangeExpansionV2",
     "RelativeStrengthV2",
     "SimpleAtrTrendV2",
-    "FibPullbackContinuationV1"
+    "FibPullbackContinuationV1",
+    "RobustTrendFollowerV1"
   ].includes(name);
 }
 

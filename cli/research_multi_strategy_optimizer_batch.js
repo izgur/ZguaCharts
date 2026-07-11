@@ -423,21 +423,28 @@ function sortRows(a, b) {
   return bp - ap || b.score - a.score || b.profitFactor - a.profitFactor || b.totalReturnPct - a.totalReturnPct;
 }
 
-function boundedGridCombos(strategy, maxCombos) {
+function boundedGridCombos(strategy, maxCombos, selectedParams, baseParams, gridOverrides) {
   const grid = optimizer.optimizerGridCatalog()[strategy];
   if (!grid || !grid.params) return { combos: [], metadata: null };
-  const keys = Object.keys(grid.params);
-  const lengths = keys.map((key) => Math.max(1, (grid.params[key] || []).length));
+  const paramsGrid = Object.assign({}, grid.params || {});
+  Object.entries(gridOverrides || {}).forEach(([key, values]) => {
+    if (Array.isArray(values) && values.length && paramsGrid[key]) paramsGrid[key] = values;
+  });
+  const selectedSet = new Set((selectedParams || []).filter((key) => paramsGrid[key]));
+  const varyNone = (selectedParams || []).includes("__none__");
+  const keys = varyNone ? [] : (selectedSet.size ? Object.keys(paramsGrid).filter((key) => selectedSet.has(key)) : Object.keys(paramsGrid));
+  const lengths = keys.map((key) => Math.max(1, (paramsGrid[key] || []).length));
   const total = lengths.reduce((product, length) => product * length, 1);
   const wanted = Math.max(1, Math.min(Number(maxCombos || 50), Number(grid.maxCombinations || maxCombos || 50), total));
   const seen = new Set();
   const combos = [];
+  const base = Object.assign({}, baseParams || {});
   const attempts = Math.max(wanted * 8, wanted + 20);
   for (let i = 0; i < attempts && combos.length < wanted; i += 1) {
     let cursor = Math.min(total - 1, Math.floor(i * total / attempts));
-    const combo = {};
+    const combo = Object.assign({}, base);
     keys.forEach((key, keyIndex) => {
-      const values = grid.params[key] || [];
+      const values = paramsGrid[key] || [];
       const length = lengths[keyIndex];
       const valueIndex = cursor % length;
       cursor = Math.floor(cursor / length);
@@ -451,9 +458,9 @@ function boundedGridCombos(strategy, maxCombos) {
   }
   for (let i = 0; i < total && combos.length < wanted && i < wanted * 50; i += 1) {
     let cursor = i;
-    const combo = {};
+    const combo = Object.assign({}, base);
     keys.forEach((key, keyIndex) => {
-      const values = grid.params[key] || [];
+      const values = paramsGrid[key] || [];
       const length = lengths[keyIndex];
       const valueIndex = cursor % length;
       cursor = Math.floor(cursor / length);
@@ -469,6 +476,8 @@ function boundedGridCombos(strategy, maxCombos) {
     combos,
     metadata: {
       gridName: grid.gridName,
+      selectedParams: keys,
+      gridOverrides: gridOverrides || {},
       plannedCombinations: total,
       sampledCombinations: combos.length,
       sampled: combos.length < total
@@ -627,6 +636,11 @@ const maxCombosPerStrategy = Math.max(1, Math.min(Number(args.maxCombosPerStrate
 const topN = Math.max(1, Math.min(Number(args.topN || args.top_n || 20), 100));
 const source = args.source || "bybit";
 const activeParams = args.activeParams ? JSON.parse(args.activeParams) : {};
+const optimizerBaseParams = args.optimizerBaseParams ? JSON.parse(args.optimizerBaseParams) : {};
+const optimizerGridOverrides = args.optimizerGridOverrides ? JSON.parse(args.optimizerGridOverrides) : {};
+const optimizerParams = args.optimizerParams
+  ? parseCsv(args.optimizerParams, [])
+  : [];
 const active = {
   symbol: args.activeSymbol || "ETHUSDT",
   timeframe: args.activeTimeframe || "1h",
@@ -677,6 +691,7 @@ const optimizableStrategies = selectedStrategies.filter((strategy) => {
   }
   return true;
 });
+const shouldEnrichDerivatives = optimizableStrategies.includes("RobustTrendFollowerV1");
 
 const combos = [];
 symbols.forEach((symbol) => {
@@ -696,7 +711,10 @@ cappedCombos.concat([{ symbol: active.symbol, timeframe: active.timeframe, strat
       from,
       to,
       limit: requestedLimitFor(combo.timeframe)
-    }).then((candles) => data.normalizeCandles(candles || []));
+    }).then((candles) => shouldEnrichDerivatives
+      ? data.enrichCandlesWithDerivatives({ source, symbol: combo.symbol, interval: combo.timeframe, from, to }, candles || [])
+      : candles
+    ).then((candles) => data.normalizeCandles(candles || []));
   }
 });
 
@@ -748,7 +766,7 @@ Promise.all([
   cappedCombos.forEach((combo) => {
     const candles = candlesByKey[combo.symbol + ":" + combo.timeframe] || [];
     try {
-      const grid = boundedGridCombos(combo.strategy, maxCombosPerStrategy);
+      const grid = boundedGridCombos(combo.strategy, maxCombosPerStrategy, optimizerParams, optimizerBaseParams, optimizerGridOverrides);
       timings.plannedCandidateBacktests += grid.combos.length;
       const strategyStartedAt = Date.now();
       const candidates = [];

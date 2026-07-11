@@ -98,6 +98,83 @@ assert(tradeAudit.auditTrades(result, tradingSample).ok);
   assert(variant.diagnostics.breakoutSummary, `${strategy} should return breakout diagnostics`);
 });
 
+const robust = backtest.runBacktestOnCandles({
+  symbol: "ETHUSDT",
+  interval: "1h",
+  strategy: "RobustTrendFollowerV1",
+  candles: tradingSample.map((row, index) => ({ ...row, volume: 1000 + index * 25 })),
+  regimeCandles,
+  params: {
+    donchianEntry: 20,
+    donchianExit: 20,
+    adxThreshold: 5,
+    atrMultiplier: 2,
+    volumeMultiplier: 1,
+    volumeFilter: true,
+    maxNotional: 1000000,
+  },
+});
+assert(robust.equityCurve.length > 0, "RobustTrendFollowerV1 should return an equity curve");
+assert(robust.trades > 0, "RobustTrendFollowerV1 should produce synthetic long-only trades");
+assert.strictEqual(robust.params.shortMode, false);
+assert(robust.diagnostics.breakoutSummary, "RobustTrendFollowerV1 should return breakout diagnostics");
+
+const robustFundingBlocked = backtest.runBacktestOnCandles({
+  symbol: "ETHUSDT",
+  interval: "1h",
+  strategy: "RobustTrendFollowerV1",
+  candles: tradingSample.map((row, index) => ({
+    ...row,
+    volume: 1000 + index * 25,
+    fundingRate: 0.001,
+    openInterest: 100000 + index * 1000,
+    openInterestChangePct: 1,
+  })),
+  regimeCandles,
+  params: {
+    donchianEntry: 20,
+    donchianExit: 20,
+    adxThreshold: 5,
+    atrMultiplier: 2,
+    volumeMultiplier: 1,
+    volumeFilter: true,
+    useFundingFilter: true,
+    maxFundingRate: 0.0001,
+    useOpenInterestFilter: false,
+    maxNotional: 1000000,
+  },
+});
+assert.strictEqual(robustFundingBlocked.trades, 0, "funding filter should be able to block RobustTrendFollowerV1 entries");
+assert(robustFundingBlocked.diagnostics.blockerCounts.fundingTooHigh > 0, "funding blocker should be diagnosed");
+
+const robustOiBlocked = backtest.runBacktestOnCandles({
+  symbol: "ETHUSDT",
+  interval: "1h",
+  strategy: "RobustTrendFollowerV1",
+  candles: tradingSample.map((row, index) => ({
+    ...row,
+    volume: 1000 + index * 25,
+    fundingRate: 0,
+    openInterest: 100000 - index * 1000,
+    openInterestChangePct: -1,
+  })),
+  regimeCandles,
+  params: {
+    donchianEntry: 20,
+    donchianExit: 20,
+    adxThreshold: 5,
+    atrMultiplier: 2,
+    volumeMultiplier: 1,
+    volumeFilter: true,
+    useFundingFilter: false,
+    useOpenInterestFilter: true,
+    minOpenInterestChangePct: 0,
+    maxNotional: 1000000,
+  },
+});
+assert.strictEqual(robustOiBlocked.trades, 0, "open-interest filter should be able to block RobustTrendFollowerV1 entries");
+assert(robustOiBlocked.diagnostics.blockerCounts.openInterestNotRising > 0, "open-interest blocker should be diagnosed");
+
 optimizer.optimizeRegimeStaged({
   symbol: "BTCUSDT",
   interval: "1h",

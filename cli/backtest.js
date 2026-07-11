@@ -7,6 +7,32 @@ const runtime = require("./runtime");
 
 var cliArgs = argsUtil.parseArgs(process.argv.slice(2));
 
+function usesRegimeRunner(strategy) {
+  return [
+    "RegimeFilteredTrendStrategy",
+    "RegimeDonchian20",
+    "RegimeDonchianCloseConfirm",
+    "RegimePullbackTrend",
+    "EmaPullbackContinuation",
+    "TrendBreakoutRetest",
+    "VolatilitySqueezeBreakout",
+    "MeanReversionInBullRegime",
+    "MomentumContinuation",
+    "PullbackReclaimV2",
+    "EmaBounceV2",
+    "BreakoutRetestV2",
+    "RangeExpansionV2",
+    "RelativeStrengthV2",
+    "SimpleAtrTrendV2",
+    "FibPullbackContinuationV1",
+    "RobustTrendFollowerV1"
+  ].includes(strategy);
+}
+
+function needsDerivativeEnrichment(options) {
+  return options.source === "bybit" && options.strategy === "RobustTrendFollowerV1";
+}
+
 runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(function (raw) {
   var args = cliArgs;
   var input = raw.trim() ? JSON.parse(raw) : {};
@@ -24,7 +50,14 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     debug: args.debug === true || input.debug === true
   };
   return data.fetchCandles(options).then(function (candles) {
-    if (String(options.strategy).indexOf("Regime") === 0 && !input.regimeCandles) {
+    var enriched = needsDerivativeEnrichment(options)
+      ? data.enrichCandlesWithDerivatives(options, candles)
+      : Promise.resolve(candles);
+    return enriched.then(function (loadedCandles) {
+      return loadedCandles;
+    });
+  }).then(function (candles) {
+    if (usesRegimeRunner(options.strategy) && !input.regimeCandles) {
       return data.fetchCandles({
         source: options.source,
         symbol: "BTCUSDT",

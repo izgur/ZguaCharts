@@ -825,6 +825,42 @@ function optimizerGridCatalog() {
       liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     }
   };
+  var robustTrendFollowerGrid = {
+    strategyKey: "robust_trend_follower_v1",
+    gridName: "Robust trend follower V1",
+    humanName: "Robust Trend Follower V1",
+    params: {
+      regimeMode: ["looseBtcBull"],
+      emaMid: [80, 100, 120],
+      emaSlow: [200],
+      donchianEntry: [20, 55, 100],
+      donchianExit: [20, 55],
+      adxThreshold: [14, 18, 20, 24, 28],
+      volumeFilter: [true],
+      volumeMultiplier: [1, 1.1, 1.2, 1.4],
+      volumeMa: [20],
+      useFundingFilter: [false, true],
+      maxFundingRate: [0.0003, 0.0005, 0.001],
+      useOpenInterestFilter: [false, true],
+      minOpenInterestChangePct: [-2, 0, 1],
+      atrMultiplier: [2, 2.5, 3],
+      useDonchianTrail: [true, false],
+      riskPct: [0.0025, 0.005, 0.0075],
+      cooldownBars: [0, 2, 4],
+      minHoldBars: [1, 3],
+      shortMode: [false],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 500,
+    notes: [
+      "Long-only research strategy: BTC 4h close above EMA200, coin 1h close above EMA100, Donchian breakout, ADX, volume confirmation.",
+      "Stops and trailing are ATR-based with optional Donchian opposite-side trail.",
+      "Optional funding and open-interest gates are research-only and disabled unless their filter flags are selected.",
+      "Shorts and portfolio exposure caps are intentionally not included yet."
+    ],
+    riskLevel: "medium-research-only",
+    timeframeHint: "1h"
+  };
   var fallbackGrid = {
     strategyKey: "default_fallback",
     gridName: "Default fallback",
@@ -909,6 +945,7 @@ function optimizerGridCatalog() {
       }
     }),
     FibPullbackContinuationV1: fibPullback15mGrid,
+    RobustTrendFollowerV1: robustTrendFollowerGrid,
     SimpleAtrTrendV2: v2TrendGrid
   };
 }

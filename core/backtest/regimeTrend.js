@@ -10,6 +10,8 @@ const BLOCKERS = [
   "donchianBreakoutFailed",
   "adxTooLow",
   "volumeTooLow",
+  "fundingTooHigh",
+  "openInterestNotRising",
   "atrMissing",
   "stopTooClose",
   "maxOpenTradesReached",
@@ -291,6 +293,28 @@ function defaultParams(strategyName) {
     base.minHoldBars = 2;
     base.donchianExit = 20;
   }
+  if (strategyName === "RobustTrendFollowerV1") {
+    base.regimeMode = "looseBtcBull";
+    base.emaMid = 100;
+    base.emaSlow = 200;
+    base.donchianEntry = 55;
+    base.donchianExit = 20;
+    base.adxThreshold = 20;
+    base.volumeFilter = true;
+    base.volumeMultiplier = 1.2;
+    base.volumeMa = 20;
+    base.useFundingFilter = false;
+    base.maxFundingRate = 0.0005;
+    base.useOpenInterestFilter = false;
+    base.minOpenInterestChangePct = 0;
+    base.atrMultiplier = 2.5;
+    base.useDonchianTrail = true;
+    base.riskPct = 0.005;
+    base.cooldownBars = 0;
+    base.minHoldBars = 1;
+    base.shortMode = false;
+    base.fillModel = "next-open";
+  }
   return base;
 }
 
@@ -326,6 +350,7 @@ function entrySignal(frame, index, state, params) {
   if (params.strategyName === "RelativeStrengthV2") return relativeStrengthV2Entry(frame, index, state, params);
   if (params.strategyName === "SimpleAtrTrendV2") return simpleAtrTrendV2Entry(frame, index, state, params);
   if (params.strategyName === "FibPullbackContinuationV1") return fibPullbackContinuationEntry(frame, index, state, params);
+  if (params.strategyName === "RobustTrendFollowerV1") return robustTrendFollowerV1Entry(frame, index, state, params);
   var row = frame[index];
   var previous = index > 0 ? frame[index - 1] : row;
   var blockers = [];
@@ -575,6 +600,26 @@ function fibPullbackContinuationEntry(frame, index, state, params) {
   return signalFromBlockers(blockers);
 }
 
+function robustTrendFollowerV1Entry(frame, index, state, params) {
+  var row = frame[index];
+  var previous = index > 0 ? frame[index - 1] : row;
+  var blockers = [];
+  if (state.position) blockers.push("alreadyInPosition");
+  if (state.cooldown > 0) blockers.push("cooldownBlocked");
+  if (state.position && params.maxOpenTrades <= 1) blockers.push("maxOpenTradesReached");
+  if (!row.atr14 || row.atr14 <= 0) blockers.push("atrMissing");
+  if (row.atr14 && row.atr14 * params.atrMultiplier <= 0) blockers.push("stopTooClose");
+  if (!(row.btcClose4h && row.btcEma200_4h && row.btcClose4h > row.btcEma200_4h)) blockers.push("regimeNotBullish");
+  if (!(row.close > row.ema100)) blockers.push("emaTrendFailed");
+  if (!breaksAboveDonchian(row, previous, params.donchianEntry || 55)) blockers.push("donchianBreakoutFailed");
+  if (!(row.adx14 > params.adxThreshold)) blockers.push("adxTooLow");
+  if (params.volumeFilter && !(row.volumeMa20 && row.volume > row.volumeMa20 * Number(params.volumeMultiplier || 1))) blockers.push("volumeTooLow");
+  if (params.useFundingFilter && !(row.fundingRate !== null && row.fundingRate !== undefined && Number(row.fundingRate) <= Number(params.maxFundingRate))) blockers.push("fundingTooHigh");
+  if (params.useOpenInterestFilter && !(row.openInterestChangePct !== null && row.openInterestChangePct !== undefined && Number(row.openInterestChangePct) >= Number(params.minOpenInterestChangePct || 0))) blockers.push("openInterestNotRising");
+  if (!validPositionSize(row, params)) blockers.push("stopTooClose");
+  return signalFromBlockers(blockers);
+}
+
 function averageRange(frame, index, period) {
   if (index < period) return Infinity;
   var sum = 0;
@@ -775,7 +820,11 @@ function updateTrailing(position, row, params) {
   var distance = row.atr14 * params.atrMultiplier;
   if (position.side === "long") {
     position.bestClose = Math.max(position.bestClose, row.close);
-    position.trailingStop = Math.max(position.trailingStop, position.bestClose - distance);
+    var longStop = position.bestClose - distance;
+    if (params.strategyName === "RobustTrendFollowerV1" && params.useDonchianTrail && row.donchianLow20 !== null && row.donchianLow20 !== undefined) {
+      longStop = Math.max(longStop, row.donchianLow20);
+    }
+    position.trailingStop = Math.max(position.trailingStop, longStop);
   } else {
     position.bestClose = Math.min(position.bestClose, row.close);
     position.trailingStop = Math.min(position.trailingStop, position.bestClose + distance);
@@ -843,6 +892,11 @@ function preview(row, blockers) {
     adx14: row.adx14,
     volume: row.volume,
     volumeMa20: row.volumeMa20,
+    fundingRate: row.fundingRate,
+    fundingRateTime: row.fundingRateTime,
+    openInterest: row.openInterest,
+    openInterestTime: row.openInterestTime,
+    openInterestChangePct: row.openInterestChangePct,
     previousDonchianHigh20: row.previousDonchianHigh20,
     previousDonchianHigh55: row.previousDonchianHigh55,
     previousDonchianHigh100: row.previousDonchianHigh100,

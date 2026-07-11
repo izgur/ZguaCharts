@@ -495,6 +495,9 @@ def main() -> int:
     focused_optimizer.add_argument("--timeout-seconds", default="900")
     focused_optimizer.add_argument("--runtime-budget-seconds", default="auto")
     focused_optimizer.add_argument("--limit", default="auto")
+    focused_optimizer.add_argument("--optimizer-params", default="")
+    focused_optimizer.add_argument("--optimizer-base-params", default="")
+    focused_optimizer.add_argument("--optimizer-grid-overrides", default="")
     focused_optimizer.add_argument("--no-walk-forward", action="store_true")
     focused_optimizer.add_argument("--no-stress", action="store_true")
     focused_optimizer.add_argument("--no-repro", action="store_true")
@@ -632,6 +635,9 @@ def main() -> int:
                 "runtimeBudgetSeconds": args.runtime_budget_seconds,
                 "save": "false" if args.no_save else "true",
                 "limit": args.limit,
+                "optimizerParams": args.optimizer_params,
+                "optimizerBaseParams": args.optimizer_base_params,
+                "optimizerGridOverrides": args.optimizer_grid_overrides,
                 "timeout_seconds": args.timeout_seconds,
             })
         elif args.command == "research:watch-matrix":

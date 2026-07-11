@@ -5,9 +5,15 @@ const logger = require("../utils/logger");
 
 const CACHE_DIR = path.join(process.cwd(), ".research-cache");
 const BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline";
+const BYBIT_FUNDING_URL = "https://api.bybit.com/v5/market/funding/history";
+const BYBIT_OPEN_INTEREST_URL = "https://api.bybit.com/v5/market/open-interest";
 const BYBIT_REQUEST_LIMIT = 1000;
+const BYBIT_FUNDING_LIMIT = 200;
+const BYBIT_OPEN_INTEREST_LIMIT = 200;
 const memoryCache = {};
+const seriesMemoryCache = {};
 const pendingFetches = {};
+const pendingSeriesFetches = {};
 var activeHttpRequests = 0;
 const httpQueue = [];
 
@@ -22,6 +28,15 @@ function cacheKey(source, symbol, interval) {
 function cachePath(source, symbol, interval) {
   ensureCacheDir();
   return path.join(CACHE_DIR, cacheKey(source, symbol, interval) + ".json");
+}
+
+function seriesCacheKey(kind, source, symbol, interval) {
+  return [kind, source || "bybit", symbol, interval || "all"].join("_").replace(/[^a-zA-Z0-9_.-]/g, "_");
+}
+
+function seriesCachePath(kind, source, symbol, interval) {
+  ensureCacheDir();
+  return path.join(CACHE_DIR, seriesCacheKey(kind, source, symbol, interval) + ".json");
 }
 
 function loadCachedCandles(source, symbol, interval) {
@@ -46,11 +61,33 @@ function saveCachedCandles(source, symbol, interval, candles) {
   fs.writeFileSync(cachePath(source, symbol, interval), JSON.stringify(normalized));
 }
 
+function loadCachedSeries(kind, source, symbol, interval) {
+  var key = seriesCacheKey(kind, source, symbol, interval);
+  if (seriesMemoryCache[key]) return seriesMemoryCache[key].slice();
+  var file = seriesCachePath(kind, source, symbol, interval);
+  if (!fs.existsSync(file)) return [];
+  try {
+    var rows = normalizeSeries(JSON.parse(fs.readFileSync(file, "utf8")));
+    seriesMemoryCache[key] = rows;
+    return rows.slice();
+  } catch (error) {
+    logger.warn("Ignoring unreadable derivative cache", { file: file, error: error.message });
+    return [];
+  }
+}
+
+function saveCachedSeries(kind, source, symbol, interval, rows) {
+  var normalized = normalizeSeries(rows);
+  var key = seriesCacheKey(kind, source, symbol, interval);
+  seriesMemoryCache[key] = normalized;
+  fs.writeFileSync(seriesCachePath(kind, source, symbol, interval), JSON.stringify(normalized));
+}
+
 function normalizeCandles(candles) {
   var byTime = {};
   (candles || []).forEach(function (candle) {
     if (!candle || candle.time === undefined) return;
-    byTime[Number(candle.time)] = {
+    var row = {
       time: Number(candle.time),
       open: Number(candle.open),
       high: Number(candle.high),
@@ -58,6 +95,31 @@ function normalizeCandles(candles) {
       close: Number(candle.close),
       volume: Number(candle.volume || 0)
     };
+    ["fundingRate", "fundingRateTime", "openInterest", "openInterestTime", "openInterestChangePct"].forEach(function (key) {
+      if (candle[key] === null || candle[key] === undefined || candle[key] === "") return;
+      var numeric = Number(candle[key]);
+      row[key] = Number.isFinite(numeric) ? numeric : candle[key];
+    });
+    byTime[Number(candle.time)] = row;
+  });
+  return Object.keys(byTime).map(Number).sort(function (a, b) { return a - b; }).map(function (time) {
+    return byTime[time];
+  });
+}
+
+function normalizeSeries(rows) {
+  var byTime = {};
+  (rows || []).forEach(function (row) {
+    if (!row || row.time === undefined) return;
+    var time = Number(row.time);
+    if (!Number.isFinite(time)) return;
+    var normalized = Object.assign({}, row, { time: time });
+    ["fundingRate", "openInterest", "openInterestChangePct"].forEach(function (key) {
+      if (normalized[key] === null || normalized[key] === undefined || normalized[key] === "") return;
+      var numeric = Number(normalized[key]);
+      normalized[key] = Number.isFinite(numeric) ? numeric : normalized[key];
+    });
+    byTime[time] = normalized;
   });
   return Object.keys(byTime).map(Number).sort(function (a, b) { return a - b; }).map(function (time) {
     return byTime[time];
@@ -102,6 +164,17 @@ function intervalToMs(interval) {
   return 60 * 1000;
 }
 
+function intervalToOpenInterestInterval(interval) {
+  var value = String(interval || "").toLowerCase();
+  if (/^\d+m$/.test(value)) return value.replace("m", "min");
+  if (/^\d+h$/.test(value)) return value;
+  if (/^\d+d$/.test(value)) return value;
+  if (/^\d+$/.test(value)) return value + "min";
+  if (value === "240") return "4h";
+  if (value.toUpperCase && value.toUpperCase() === "D") return "1d";
+  return value || "1h";
+}
+
 function fetchCandles(options) {
   options = options || {};
   var source = options.source || "bybit";
@@ -110,6 +183,26 @@ function fetchCandles(options) {
     throw new Error("Node research data currently supports bybit directly. Flask may pass candles for other sources.");
   }
   return Promise.resolve(fetchBybitCandles(options));
+}
+
+function enrichCandlesWithDerivatives(options, candles) {
+  options = options || {};
+  var normalized = normalizeCandles(candles || []);
+  if (!normalized.length || (options.source || "bybit") !== "bybit" || !options.symbol) {
+    return Promise.resolve(normalized);
+  }
+  return Promise.all([
+    fetchBybitFundingHistory(options, normalized).catch(function (error) {
+      logger.warn("Bybit funding enrichment failed", { symbol: options.symbol, error: error.message });
+      return [];
+    }),
+    fetchBybitOpenInterest(options, normalized).catch(function (error) {
+      logger.warn("Bybit open-interest enrichment failed", { symbol: options.symbol, interval: options.interval, error: error.message });
+      return [];
+    })
+  ]).then(function (series) {
+    return mergeDerivativeSeries(normalized, series[0], series[1]);
+  });
 }
 
 function fetchBybitCandles(options) {
@@ -198,6 +291,159 @@ function withMetadata(candles, metadata, options) {
   return normalizeCandles(candles);
 }
 
+function candleTimeRangeMs(candles, options) {
+  var normalized = normalizeCandles(candles || []);
+  var from = parseDateToSeconds(options.from);
+  var to = parseDateToSeconds(options.to);
+  var first = normalized.length ? normalized[0].time : null;
+  var last = normalized.length ? normalized[normalized.length - 1].time : null;
+  return {
+    start: (from !== null ? from : first || Math.floor(Date.now() / 1000) - 86400 * 365) * 1000,
+    end: (to !== null ? to : last || Math.floor(Date.now() / 1000)) * 1000
+  };
+}
+
+function fetchBybitFundingHistory(options, candles) {
+  var symbol = options.symbol;
+  var range = candleTimeRangeMs(candles, options);
+  var interval = "funding";
+  var pendingKey = JSON.stringify({ kind: "funding", symbol: symbol, start: range.start, end: range.end });
+  if (pendingSeriesFetches[pendingKey]) return pendingSeriesFetches[pendingKey];
+  var cached = loadCachedSeries("funding", "bybit", symbol, interval);
+  var filtered = filterSeries(cached, range.start / 1000, range.end / 1000);
+  if (!options.forceRefresh && seriesCoversRange(filtered, range.start / 1000, range.end / 1000, 12 * 60 * 60)) {
+    return Promise.resolve(filtered);
+  }
+  var rows = cached.slice();
+  var endTime = range.end;
+  var maxRequests = Math.max(1, Math.ceil((range.end - range.start) / (8 * 60 * 60 * 1000 * BYBIT_FUNDING_LIMIT)) + 3);
+  var requestCount = 0;
+
+  function loop() {
+    if (requestCount >= maxRequests || endTime < range.start) {
+      var normalized = normalizeSeries(rows);
+      saveCachedSeries("funding", "bybit", symbol, interval, normalized);
+      return filterSeries(normalized, range.start / 1000, range.end / 1000);
+    }
+    requestCount += 1;
+    return requestBybitFunding(symbol, range.start, endTime).then(function (batch) {
+      if (!batch.length) {
+        var normalized = normalizeSeries(rows);
+        saveCachedSeries("funding", "bybit", symbol, interval, normalized);
+        return filterSeries(normalized, range.start / 1000, range.end / 1000);
+      }
+      rows = rows.concat(batch.map(bybitFundingRowToSeries));
+      var oldest = Math.min.apply(null, batch.map(function (row) { return Number(row.fundingRateTimestamp || row.time || 0); }));
+      if (!Number.isFinite(oldest) || oldest <= 0) return filterSeries(normalizeSeries(rows), range.start / 1000, range.end / 1000);
+      endTime = oldest - 1;
+      return delay(180).then(loop);
+    });
+  }
+
+  pendingSeriesFetches[pendingKey] = Promise.resolve(loop()).then(function (result) {
+    delete pendingSeriesFetches[pendingKey];
+    return result;
+  }).catch(function (error) {
+    delete pendingSeriesFetches[pendingKey];
+    throw error;
+  });
+  return pendingSeriesFetches[pendingKey];
+}
+
+function fetchBybitOpenInterest(options, candles) {
+  var symbol = options.symbol;
+  var interval = intervalToOpenInterestInterval(options.interval);
+  var range = candleTimeRangeMs(candles, options);
+  var pendingKey = JSON.stringify({ kind: "openInterest", symbol: symbol, interval: interval, start: range.start, end: range.end });
+  if (pendingSeriesFetches[pendingKey]) return pendingSeriesFetches[pendingKey];
+  var cached = loadCachedSeries("openInterest", "bybit", symbol, interval);
+  var filtered = filterSeries(cached, range.start / 1000, range.end / 1000);
+  if (!options.forceRefresh && seriesCoversRange(filtered, range.start / 1000, range.end / 1000, intervalToMs(options.interval) / 1000 * 3)) {
+    return Promise.resolve(filtered);
+  }
+  var rows = cached.slice();
+  var cursor = null;
+  var requestCount = 0;
+  var maxRequests = Math.max(1, Math.ceil((range.end - range.start) / (intervalToMs(options.interval) * BYBIT_OPEN_INTEREST_LIMIT)) + 3);
+
+  function loop() {
+    if (requestCount >= maxRequests) {
+      var normalized = normalizeOpenInterestSeries(rows);
+      saveCachedSeries("openInterest", "bybit", symbol, interval, normalized);
+      return filterSeries(normalized, range.start / 1000, range.end / 1000);
+    }
+    requestCount += 1;
+    return requestBybitOpenInterest(symbol, interval, range.start, range.end, cursor).then(function (payload) {
+      var batch = payload.list || [];
+      rows = rows.concat(batch.map(bybitOpenInterestRowToSeries));
+      cursor = payload.nextPageCursor || null;
+      if (!cursor || !batch.length) {
+        var normalized = normalizeOpenInterestSeries(rows);
+        saveCachedSeries("openInterest", "bybit", symbol, interval, normalized);
+        return filterSeries(normalized, range.start / 1000, range.end / 1000);
+      }
+      return delay(180).then(loop);
+    });
+  }
+
+  pendingSeriesFetches[pendingKey] = Promise.resolve(loop()).then(function (result) {
+    delete pendingSeriesFetches[pendingKey];
+    return result;
+  }).catch(function (error) {
+    delete pendingSeriesFetches[pendingKey];
+    throw error;
+  });
+  return pendingSeriesFetches[pendingKey];
+}
+
+function filterSeries(rows, fromSec, toSec) {
+  return normalizeSeries(rows).filter(function (row) {
+    if (fromSec !== null && row.time < fromSec) return false;
+    if (toSec !== null && row.time > toSec) return false;
+    return true;
+  });
+}
+
+function seriesCoversRange(rows, fromSec, toSec, toleranceSeconds) {
+  if (!rows.length) return false;
+  var first = rows[0].time;
+  var last = rows[rows.length - 1].time;
+  return first <= fromSec + toleranceSeconds && last >= toSec - toleranceSeconds;
+}
+
+function mergeDerivativeSeries(candles, fundingRows, openInterestRows) {
+  var funding = normalizeSeries(fundingRows || []);
+  var oi = normalizeOpenInterestSeries(openInterestRows || []);
+  var fundingIndex = -1;
+  var oiIndex = -1;
+  return normalizeCandles(candles).map(function (candle) {
+    while (fundingIndex + 1 < funding.length && funding[fundingIndex + 1].time <= candle.time) fundingIndex += 1;
+    while (oiIndex + 1 < oi.length && oi[oiIndex + 1].time <= candle.time) oiIndex += 1;
+    var fundingRow = fundingIndex >= 0 ? funding[fundingIndex] : null;
+    var oiRow = oiIndex >= 0 ? oi[oiIndex] : null;
+    return Object.assign({}, candle, {
+      fundingRate: fundingRow ? fundingRow.fundingRate : null,
+      fundingRateTime: fundingRow ? fundingRow.time : null,
+      openInterest: oiRow ? oiRow.openInterest : null,
+      openInterestTime: oiRow ? oiRow.time : null,
+      openInterestChangePct: oiRow && oiRow.openInterestChangePct !== undefined ? oiRow.openInterestChangePct : null
+    });
+  });
+}
+
+function normalizeOpenInterestSeries(rows) {
+  var normalized = normalizeSeries(rows);
+  var previous = null;
+  return normalized.map(function (row) {
+    var current = Number(row.openInterest);
+    var change = previous && Number.isFinite(current) && Number.isFinite(previous) && previous !== 0
+      ? (current - previous) / previous * 100
+      : null;
+    previous = Number.isFinite(current) ? current : previous;
+    return Object.assign({}, row, { openInterestChangePct: change });
+  });
+}
+
 function candlesForRange(from, to, interval) {
   var fromMs = parseDateToSeconds(from);
   var toMs = parseDateToSeconds(to);
@@ -231,6 +477,70 @@ function requestBybitKline(symbol, interval, endTime, attempt) {
     }
     if (response.body.retCode !== 0) throw new Error(response.body.retMsg || "Bybit error");
     return response.body.result && response.body.result.list ? response.body.result.list : [];
+  });
+}
+
+function requestBybitFunding(symbol, startTime, endTime, attempt) {
+  attempt = attempt || 0;
+  var params = {
+    category: "linear",
+    symbol: symbol.toUpperCase(),
+    startTime: Math.floor(Number(startTime)),
+    endTime: Math.floor(Number(endTime)),
+    limit: BYBIT_FUNDING_LIMIT
+  };
+
+  return httpGetJson(BYBIT_FUNDING_URL, params).then(function (response) {
+    if (response.statusCode === 429 || response.statusCode >= 500) {
+      if (attempt >= 4) throw new Error("Bybit funding request failed after retries");
+      return retryDelay(response.headers, attempt).then(function () {
+        return requestBybitFunding(symbol, startTime, endTime, attempt + 1);
+      });
+    }
+    if (response.statusCode >= 400) throw new Error("Bybit funding HTTP " + response.statusCode);
+    if (response.body.retCode === 10006) {
+      if (attempt >= 4) throw new Error("Bybit funding rate limit after retries");
+      return retryDelay(response.headers, attempt).then(function () {
+        return requestBybitFunding(symbol, startTime, endTime, attempt + 1);
+      });
+    }
+    if (response.body.retCode !== 0) throw new Error(response.body.retMsg || "Bybit funding error");
+    return response.body.result && response.body.result.list ? response.body.result.list : [];
+  });
+}
+
+function requestBybitOpenInterest(symbol, intervalTime, startTime, endTime, cursor, attempt) {
+  attempt = attempt || 0;
+  var params = {
+    category: "linear",
+    symbol: symbol.toUpperCase(),
+    intervalTime: intervalTime,
+    startTime: Math.floor(Number(startTime)),
+    endTime: Math.floor(Number(endTime)),
+    limit: BYBIT_OPEN_INTEREST_LIMIT
+  };
+  if (cursor) params.cursor = cursor;
+
+  return httpGetJson(BYBIT_OPEN_INTEREST_URL, params).then(function (response) {
+    if (response.statusCode === 429 || response.statusCode >= 500) {
+      if (attempt >= 4) throw new Error("Bybit open-interest request failed after retries");
+      return retryDelay(response.headers, attempt).then(function () {
+        return requestBybitOpenInterest(symbol, intervalTime, startTime, endTime, cursor, attempt + 1);
+      });
+    }
+    if (response.statusCode >= 400) throw new Error("Bybit open-interest HTTP " + response.statusCode);
+    if (response.body.retCode === 10006) {
+      if (attempt >= 4) throw new Error("Bybit open-interest rate limit after retries");
+      return retryDelay(response.headers, attempt).then(function () {
+        return requestBybitOpenInterest(symbol, intervalTime, startTime, endTime, cursor, attempt + 1);
+      });
+    }
+    if (response.body.retCode !== 0) throw new Error(response.body.retMsg || "Bybit open-interest error");
+    var result = response.body.result || {};
+    return {
+      list: result.list || [],
+      nextPageCursor: result.nextPageCursor || ""
+    };
   });
 }
 
@@ -307,12 +617,28 @@ function candleToBybitRow(candle) {
   return [Number(candle.time) * 1000, candle.open, candle.high, candle.low, candle.close, candle.volume || 0];
 }
 
+function bybitFundingRowToSeries(row) {
+  return {
+    time: Math.floor(Number(row.fundingRateTimestamp || row.time || 0) / 1000),
+    fundingRate: Number(row.fundingRate)
+  };
+}
+
+function bybitOpenInterestRowToSeries(row) {
+  return {
+    time: Math.floor(Number(row.timestamp || row.time || 0) / 1000),
+    openInterest: Number(row.openInterest)
+  };
+}
+
 module.exports = {
   BYBIT_REQUEST_LIMIT: BYBIT_REQUEST_LIMIT,
   fetchCandles: fetchCandles,
+  enrichCandlesWithDerivatives: enrichCandlesWithDerivatives,
   normalizeCandles: normalizeCandles,
   filterCandles: filterCandles,
   loadCachedCandles: loadCachedCandles,
   saveCachedCandles: saveCachedCandles,
-  intervalToMs: intervalToMs
+  intervalToMs: intervalToMs,
+  intervalToOpenInterestInterval: intervalToOpenInterestInterval
 };
