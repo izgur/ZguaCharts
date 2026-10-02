@@ -11,6 +11,7 @@ const DEFAULT_STATE_PATH = path.join(process.cwd(), "data", "paper-state.json");
 const DEFAULT_REPORT_DIR = path.join(process.cwd(), "reports");
 const DEFAULT_CONFIG_PATH = path.join(process.cwd(), "config", "paper-candidate.default.json");
 const LOCAL_CONFIG_PATH = path.join(process.cwd(), "config", "local", "paper-candidate.json");
+const activeStateLocks = new Set();
 
 function resolveConfigPath(configPath) {
   return configPath || LOCAL_CONFIG_PATH;
@@ -52,8 +53,17 @@ function runPaperTick(options) {
   const reportDir = options.reportDir || DEFAULT_REPORT_DIR;
   ensureDir(path.dirname(statePath));
   ensureDir(reportDir);
-  const state = loadState(statePath, config);
+  const lockPath = statePath + ".lock";
+  acquireStateLock(statePath, lockPath);
+  let state;
+  try {
+    state = loadState(statePath, config);
+  } catch (error) {
+    releaseStateLock(statePath, lockPath);
+    throw error;
+  }
   state.warnings = [];
+  state.lastTickProcessedSignalCandles = 0;
 
   const markets = normalizeMarkets(config);
   const refreshPromise = options.refreshFirst
@@ -63,7 +73,8 @@ function runPaperTick(options) {
     source: config.source || "bybit",
     symbol: "BTCUSDT",
     interval: "4h",
-    limit: 3000
+    limit: 3000,
+    forceRefresh: options.forceRefresh === true || options.refreshFirst === true
   })).then((regimeCandles) => {
     const jobs = markets.map((market) => () => processMarket(config, state, market, regimeCandles, options));
     return jobs.reduce((p, job) => p.then((events) => job().then((next) => events.concat(next))), Promise.resolve([]));
@@ -88,10 +99,27 @@ function runPaperTick(options) {
     state.accountEquity = round(Number(config.accountEquity || 10000) + state.realizedPnl + state.unrealizedPnl, 4);
     state.equityCurve.push({ time: Math.floor(Date.now() / 1000), equity: state.accountEquity });
     if (state.equityCurve.length > 5000) state.equityCurve = state.equityCurve.slice(-5000);
+    const handbrake = evaluateHandbrake(state, config);
+    state.handbrake = handbrake;
+    if (handbrake.action === "ENGAGE" || handbrake.state === "PAPER_RECOVERY") {
+      if (config.realTradingEnabled) {
+        config.realTradingEnabled = false;
+        config.exchangeOrders = false;
+        config.mode = "HAND_BRAKE_PAPER_ONLY";
+        config.handbrakeEngagedAt = handbrake.engagedAt;
+        config.handbrakeReason = handbrake.reason;
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+      }
+      state.warnings.push("Handbrake active: real trading is blocked; paper recovery continues.");
+      if (handbrake.action === "ENGAGE") addSafetyEvent(events, config, "HANDBRAKE", handbrake.reason, handbrake);
+    } else if (handbrake.state === "READY_FOR_MANUAL_RESUME") {
+      state.warnings.push("Handbrake recovery passed paper checks. Manual approval is still required before real trading.");
+      addSafetyEvent(events, config, "HANDBRAKE_READY", handbrake.reason, handbrake);
+    }
     writeState(statePath, state);
     writeStatusReports(reportDir, state, config, events);
     return summary(state, config, events, "processed");
-  });
+  }).finally(() => releaseStateLock(statePath, lockPath));
 }
 
 function initializePaper(options) {
@@ -107,6 +135,7 @@ function initializePaper(options) {
   state.startedAt = state.startedAt || new Date().toISOString();
   state.warnings = ["Initialized paper baselines. Historical trades were not imported."];
   state.openPositions = [];
+  state.engineCheckpoints = {};
   state.closedTrades = [];
   state.pendingSignals = [];
   state.skippedSignals = 0;
@@ -270,6 +299,8 @@ function activeSignalDiagnostics(options) {
       accountEquity: Number(config.accountEquity || 10000),
       riskPct: Number(config.riskPct || 0.005),
       maxOpenTrades: Number(config.maxOpenTrades || 1),
+      maxPositionPct: Number(config.maxPositionPct || 0),
+      maxDailyLossPct: Number(config.maxDailyLossPct || 0),
       maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000)
     });
     const result = backtest.runBacktestOnCandles({
@@ -388,7 +419,9 @@ function blockerAnalytics(options) {
       accountEquity: Number(config.accountEquity || 10000),
       riskPct: Number(config.riskPct || 0.005),
       maxOpenTrades: Number(config.maxOpenTrades || 1),
-      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000)
+      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000),
+      maxPositionPct: Number(config.maxPositionPct || 0),
+      maxDailyLossPct: Number(config.maxDailyLossPct || 0)
     });
     const result = backtest.runBacktestOnCandles({
       symbol,
@@ -606,13 +639,13 @@ function compactCandle(row) {
 
 function signalTradeForTime(trades, time) {
   return (trades || []).find((trade) => Number(trade.entrySignalTime || trade.entryTime) === Number(time))
-    || (trades || []).find((trade) => Number(trade.exitSignalTime || trade.exitTime) === Number(time))
+    || (trades || []).find((trade) => trade.exitReason !== "End of data" && Number(trade.exitSignalTime || trade.exitTime) === Number(time))
     || null;
 }
 
 function signalForRow(preview, trade, rowTime) {
   const time = Number(rowTime || (preview && preview.time) || 0);
-  if (trade && Number(trade.exitSignalTime || trade.exitTime) === time) return "EXIT";
+  if (trade && trade.exitReason !== "End of data" && Number(trade.exitSignalTime || trade.exitTime) === time) return "EXIT";
   if (trade && Number(trade.entrySignalTime || trade.entryTime) === time) return trade.side === "short" ? "SHORT" : "BUY";
   if (preview && preview.entry) return "BUY";
   return preview ? "HOLD" : "NONE";
@@ -772,10 +805,29 @@ function uniqueList(items) {
 }
 
 function processMarket(config, state, market, regimeCandles, options) {
-  return fetchMarketCandles(config, market, { forceRefresh: options.forceRefresh === true }).then((payload) => {
+  const savedCheckpoint = (state.engineCheckpoints || {})[marketKey(market)];
+  const tracked = state.openPositions.find((position) => position.key === marketKey(market));
+  const intervalSeconds = data.intervalToMs(market.interval) / 1000;
+  const continuityTime = tracked && tracked.entrySignalTime || state.lastProcessedCandleTime[marketKey(market)];
+  const continuityLimit = continuityTime
+    ? Math.ceil((Math.floor(Date.now() / 1000) - Number(continuityTime)) / intervalSeconds) + 300
+    : 0;
+  const contextMarket = Object.assign({}, market, {
+    limit: Math.min(50000, Math.max(Number(market.limit || 600), continuityLimit))
+  });
+  return fetchMarketCandles(config, market, {
+    forceRefresh: options.forceRefresh === true,
+    limit: contextMarket.limit
+  }).then((payload) => {
     let candles = payload.candles;
     const warnings = [];
     if (!options.includeOpenCandle) candles = latestClosedCandles(candles, market.interval);
+    if (savedCheckpoint && savedCheckpoint.contextCandles) {
+      const previous = savedCheckpoint.contextCandles;
+      const last = previous[previous.length - 1].time;
+      candles = previous.concat(candles.filter((row) => row.time > last));
+      if (candles.length > 50000) throw new Error("Paper indicator context reached 50000 candles; explicit rebase required.");
+    }
     const targetCandleTime = Number(options.targetCandleTime || 0);
     let processingCandleTime = null;
     if (targetCandleTime) {
@@ -812,7 +864,9 @@ function processMarket(config, state, market, regimeCandles, options) {
       return warningEvent(config, state, market, "Market not initialized. Run npm run paper:init first.");
     }
     const newCandles = candles.filter((candle) => candle.time > lastProcessed && (!processingCandleTime || candle.time <= processingCandleTime));
-    if (!newCandles.length) {
+    const hasTrackedOpenPosition = state.openPositions.some((position) => position.key === key);
+    const hasPendingEntry = savedCheckpoint && savedCheckpoint.state.pendingEntry;
+    if (!newCandles.length && !hasTrackedOpenPosition && !hasPendingEntry) {
       return warningEvents(config, state, market, warnings);
     }
 
@@ -825,25 +879,145 @@ function processMarket(config, state, market, regimeCandles, options) {
       accountEquity: Number(config.accountEquity || 10000),
       riskPct: Number(config.riskPct || 0.005),
       maxOpenTrades: Number(config.maxOpenTrades || 1),
-      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000)
+      maxNotional: Number(config.maxNotionalPerTrade || config.maxNotional || 100000),
+      maxPositionPct: Number(config.maxPositionPct || 0),
+      maxDailyLossPct: Number(config.maxDailyLossPct || 0)
     });
-    const result = backtest.runBacktestOnCandles({
-      symbol: market.symbol,
-      interval: market.interval,
-      strategy: config.strategy,
-      candles,
-      regimeCandles,
-      params
+    return Promise.all([
+      loadPaperBenchmarkCandles(config, contextMarket, params, options),
+      loadPaperExecutionCandles(config, contextMarket, options)
+    ]).then(([benchmarkCandles, execution]) => {
+      if (execution.timeframe !== market.interval && (!execution.candles || !execution.candles.length)) {
+        return warningEvent(config, state, market, "Execution candles missing; protective checks cannot run.");
+      }
+      if (execution.candles && execution.candles.length && !targetReplayMode && !options.allowStale) {
+        const latestExecutionTime = execution.candles[execution.candles.length - 1].time;
+        if (Math.floor(Date.now() / 1000) - latestExecutionTime > data.intervalToMs(execution.timeframe) / 1000 * 3) {
+          return warningEvent(config, state, market, "Execution candles are stale; skipping paper processing.");
+        }
+      }
+      const useIncremental = config.enabled && market.mode !== "watch" && (config.strategy === "RelativeStrengthV2" || config.strategy === "SimpleAtrTrendV2");
+      state.engineCheckpoints = state.engineCheckpoints || {};
+      const resumeState = useIncremental && (state.engineCheckpoints[key] || migratePaperCheckpoint(config, state, market, candles, params, { regimeCandles, benchmarkCandles, execution }));
+      const result = backtest.runBacktestOnCandles({
+        symbol: market.symbol,
+        interval: market.interval,
+        executionInterval: execution.timeframe,
+        executionTimeframe: execution.timeframe,
+        executionCandles: execution.candles,
+        strategy: config.strategy,
+        candles,
+        regimeCandles,
+        benchmarkCandles,
+        params,
+        incremental: useIncremental,
+        resumeState: resumeState || undefined,
+        frameCache: options.frameCache
+      });
+      const events = warningEvents(config, state, market, warnings);
+      if (!config.enabled) {
+        addDisabledSignalEvents(config, state, market, result, lastProcessed, events);
+      } else {
+        applyResultToState(config, state, market, result, lastProcessed, events);
+      }
+      if (result.checkpoint && config.enabled && market.mode !== "watch") {
+        result.checkpoint.contextCandles = candles;
+        state.engineCheckpoints[key] = result.checkpoint;
+      }
+      state.lastTickProcessedSignalCandles += Number(result.processedSignalCandles ?? newCandles.length);
+      state.lastProcessedCandleTime[key] = processingCandleTime || candles[candles.length - 1].time;
+      state.processedCandles += newCandles.length;
+      return events;
     });
-    const events = warningEvents(config, state, market, warnings);
-    if (!config.enabled) {
-      addDisabledSignalEvents(config, state, market, result, lastProcessed, events);
-    } else {
-      applyResultToState(config, state, market, result, lastProcessed, events);
+  });
+}
+
+function migratePaperCheckpoint(config, state, market, candles, params, context) {
+  const key = marketKey(market);
+  const lastSignalTime = Number(state.lastProcessedCandleTime[key] || 0);
+  const lastSignalIndex = candles.findIndex((row) => Number(row.time) === lastSignalTime);
+  if (lastSignalIndex < 0) throw new Error("Cannot migrate paper state: baseline candle missing from history.");
+  const tracked = state.openPositions.find((position) => position.key === key);
+  let position = null;
+  let entryFee = 0;
+  let entrySlippage = 0;
+  if (tracked) {
+    const entrySignalIndex = candles.findIndex((row) => Number(row.time) === Number(tracked.entrySignalTime));
+    const entryIndex = candles.findIndex((row) => Number(row.time) === Number(tracked.entryFillTime));
+    if (entrySignalIndex < 0 || entryIndex < 0 || !Number.isFinite(tracked.initialStopDistance)) {
+      throw new Error("Cannot migrate open paper position: entry context or stop state missing.");
     }
-    state.lastProcessedCandleTime[key] = processingCandleTime || candles[candles.length - 1].time;
-    state.processedCandles += newCandles.length;
-    return events;
+    entryFee = Number(tracked.notional) * params.takerFeePct / 100;
+    const side = tracked.side || "long";
+    const entryBasePrice = Number(tracked.entryFillPrice) / (1 + (side === "long" ? 1 : -1) * params.slippageBps / 10000);
+    entrySlippage = Math.abs(Number(tracked.entryFillPrice) - entryBasePrice) * Number(tracked.size);
+    position = Object.assign({}, tracked, {
+      entryIndex, entrySignalIndex, entryTime: tracked.entryFillTime,
+      entryPrice: tracked.entryFillPrice, entrySignalPrice: candles[entrySignalIndex].close,
+      entryBasePrice, entryFee, entrySlippage,
+      stopDistance: tracked.initialStopDistance, takeProfit: null,
+      lastExecutionCheckTime: lastSignalTime, executionCursor: 0, softExecutionExitCount: 0
+    });
+  }
+  const dailyRealizedPnl = {};
+  state.closedTrades.forEach((trade) => {
+    const day = new Date(Number(trade.exitFillTime || trade.exitTime) * 1000).toISOString().slice(0, 10);
+    dailyRealizedPnl[day] = Number(dailyRealizedPnl[day] || 0) + Number(trade.netPnl ?? trade.pnl ?? 0);
+  });
+  const checkpoint = {
+    schemaVersion: 1, lastSignalTime, lastSignalIndex,
+    state: {
+      cash: Number(config.accountEquity || 10000) + Number(state.realizedPnl || 0) - entryFee,
+      peak: Number(state.accountEquity || config.accountEquity || 10000),
+      position, pendingEntry: null, pendingExit: null, cooldown: 0, exposureBars: 0,
+      grossPnl: 0, totalFees: Number(state.cumulativeFees || 0) + entryFee,
+      totalSlippage: Number(state.cumulativeSlippage || 0) + entrySlippage,
+      dailyRealizedPnl
+    }
+  };
+  if (!tracked && lastSignalIndex > 0) {
+    // Recover a pending final-bar signal without importing historical positions.
+    checkpoint.lastSignalTime = candles[lastSignalIndex - 1].time;
+    checkpoint.lastSignalIndex = lastSignalIndex - 1;
+    const latestExit = state.closedTrades.filter((trade) => trade.key === key)
+      .reduce((latest, trade) => Math.max(latest, Number(trade.exitFillTime || trade.exitTime || 0)), 0);
+    const barsSinceExit = (lastSignalTime - latestExit) / (data.intervalToMs(market.interval) / 1000);
+    checkpoint.state.cooldown = Math.max(0, Number(params.cooldownBars || 0) - barsSinceExit);
+    return backtest.runBacktestOnCandles({
+      symbol: market.symbol, interval: market.interval, strategy: config.strategy,
+      candles: candles.slice(0, lastSignalIndex + 1), regimeCandles: context.regimeCandles,
+      benchmarkCandles: context.benchmarkCandles, params, incremental: true, resumeState: checkpoint,
+      executionInterval: context.execution.timeframe,
+      executionCandles: (context.execution.candles || []).filter((row) => row.time <= lastSignalTime)
+    }).checkpoint;
+  }
+  return checkpoint;
+}
+
+function paperExecutionTimeframe(config, market) {
+  const configured = config.executionTimeframe || config.executionInterval || (config.params && (config.params.executionTimeframe || config.params.executionInterval));
+  if (configured) return String(configured).trim().toLowerCase();
+  return data.intervalToMs(market.interval) > data.intervalToMs("5m") ? "5m" : market.interval;
+}
+
+function loadPaperExecutionCandles(config, market, options) {
+  const timeframe = paperExecutionTimeframe(config, market);
+  if (!timeframe || timeframe === market.interval) return Promise.resolve({ timeframe: market.interval, candles: null });
+  const signalLimit = Number(market.limit || 600);
+  const ratio = Math.max(1, Math.ceil(data.intervalToMs(market.interval) / data.intervalToMs(timeframe)));
+  const limit = Math.min(50000, Math.max(signalLimit, signalLimit * ratio));
+  return data.fetchCandles({
+    source: config.source || "bybit",
+    symbol: market.symbol,
+    interval: timeframe,
+    limit,
+    forceRefresh: options && (options.forceRefresh === true || options.refreshFirst === true)
+  }).then((payload) => {
+    const rows = data.normalizeCandles(Array.isArray(payload) ? payload : payload.candles);
+    return {
+      timeframe,
+      candles: options && options.includeOpenCandle ? rows : latestClosedCandles(rows, timeframe)
+    };
   });
 }
 
@@ -875,32 +1049,41 @@ function applyResultToState(config, state, market, result, lastProcessed, events
     if (state.pendingSignals.length > 500) state.pendingSignals = state.pendingSignals.slice(-500);
     return;
   }
+  const existingOpenPosition = state.openPositions.find((position) => position.key === key);
   state.openPositions = state.openPositions.filter((position) => position.key !== key);
   trades.forEach((trade) => {
     if (trade.exitReason === "End of data") {
+      const lifecycleId = tradeLifecycleId(market, trade);
+      if (state.closedTrades.some((item) => tradeLifecycleId(market, item) === lifecycleId || item.lifecycleId === lifecycleId)) return;
       state.openPositions.push(openPositionFromTrade(key, market, trade));
       addEvent(events, config, market, "SIGNAL", "Open virtual position carried forward", trade);
       return;
     }
     const id = tradeId(market, trade);
+    const lifecycleId = tradeLifecycleId(market, trade);
     if (state.closedTrades.some((item) => item.id === id)) return;
+    if (state.closedTrades.some((item) => tradeLifecycleId(market, item) === lifecycleId || item.lifecycleId === lifecycleId)) return;
     if (Number(trade.exitFillTime || trade.exitTime) <= lastProcessed) return;
-    if (state.openPositions.some((position) => position.key === key)) {
+    const closesExistingPosition = existingOpenPosition && (
+      existingOpenPosition.lifecycleId === lifecycleId
+      || Number(existingOpenPosition.entrySignalTime || 0) === Number(trade.entrySignalTime || trade.entryTime || 0)
+    );
+    if (!closesExistingPosition && state.openPositions.some((position) => position.key === key)) {
       addEvent(events, config, market, "SKIP", "open position already exists for market", trade);
       state.skippedSignals = Number(state.skippedSignals || 0) + 1;
       return;
     }
-    if (state.openPositions.length >= Number(config.maxOpenTrades || 1)) {
+    if (!closesExistingPosition && state.openPositions.length >= Number(config.maxOpenTrades || 1)) {
       addEvent(events, config, market, "SKIP", "maxOpenTrades reached", trade);
       state.skippedSignals = Number(state.skippedSignals || 0) + 1;
       return;
     }
-    const closed = Object.assign({ id, key, symbol: market.symbol, interval: market.interval }, trade);
+    const closed = Object.assign({ id, lifecycleId, key, symbol: market.symbol, interval: market.interval }, trade);
     state.closedTrades.push(closed);
     state.realizedPnl = round(state.realizedPnl + Number(trade.pnl || trade.netPnl || 0), 4);
     state.cumulativeFees = round(state.cumulativeFees + Number(trade.feePaid || 0), 4);
     state.cumulativeSlippage = round(state.cumulativeSlippage + Number(trade.slippagePaid || 0), 4);
-    addEvent(events, config, market, "ENTRY", "Virtual entry from audited strategy", trade);
+    if (!closesExistingPosition) addEvent(events, config, market, "ENTRY", "Virtual entry from audited strategy", trade);
     addEvent(events, config, market, "EXIT", trade.exitReason || "Virtual exit", trade);
   });
   state.unrealizedPnl = round(state.openPositions.reduce((sum, position) => sum + Number(position.unrealizedPnl || 0), 0), 4);
@@ -909,6 +1092,7 @@ function applyResultToState(config, state, market, result, lastProcessed, events
 function openPositionFromTrade(key, market, trade) {
   return {
     id: tradeId(market, trade),
+    lifecycleId: tradeLifecycleId(market, trade),
     key,
     symbol: market.symbol,
     interval: market.interval,
@@ -920,7 +1104,13 @@ function openPositionFromTrade(key, market, trade) {
     unrealizedPnl: trade.pnl || 0,
     fillModel: trade.fillModel,
     size: trade.size,
-    notional: trade.notional
+    notional: trade.notional,
+    initialStop: trade.initialStop,
+    initialStopDistance: trade.initialStopDistance,
+    bestClose: trade.bestClose,
+    trailingStop: trade.trailingStop,
+    trailingActive: !!trade.trailingActive,
+    breakEvenActive: !!trade.breakEvenActive
   };
 }
 
@@ -953,6 +1143,158 @@ function addEvent(events, config, market, eventType, reason, trade) {
   };
   if (events.some((item) => item.eventId === event.eventId)) return;
   events.push(event);
+}
+
+function addSafetyEvent(events, config, eventType, reason, details) {
+  const event = {
+    eventId: crypto.createHash("sha1").update([eventType, reason, JSON.stringify(details || {}), Date.now()].join("|")).digest("hex").slice(0, 16),
+    tradeId: "",
+    marketKey: "SAFETY",
+    candleTime: "",
+    processedAt: new Date().toISOString(),
+    mode: "safety",
+    timestamp: new Date().toISOString(),
+    symbol: "",
+    interval: "",
+    eventType,
+    reason,
+    signalPrice: "",
+    fillPrice: "",
+    size: "",
+    feePaid: 0,
+    slippagePaid: 0,
+    netPnl: "",
+    accountEquity: config.accountEquity,
+    strategy: config.strategy,
+    paramsHash: paramsHash(config),
+    details
+  };
+  events.push(event);
+}
+
+function tradePnl(trade) {
+  return Number(trade.pnl ?? trade.netPnl ?? 0);
+}
+
+function currentLossStreak(trades) {
+  let streak = 0;
+  for (let index = trades.length - 1; index >= 0; index -= 1) {
+    if (tradePnl(trades[index]) < 0) streak += 1;
+    else break;
+  }
+  return streak;
+}
+
+function profitFactorForTrades(trades) {
+  const grossWin = trades.reduce((sum, trade) => sum + Math.max(0, tradePnl(trade)), 0);
+  const grossLoss = Math.abs(trades.reduce((sum, trade) => sum + Math.min(0, tradePnl(trade)), 0));
+  if (!grossLoss) return grossWin ? 99 : 0;
+  return grossWin / grossLoss;
+}
+
+function maxPaperDrawdownPct(curve) {
+  return round(maxDrawdown(curve || []), 4);
+}
+
+function tradeWindowDrawdownPct(trades) {
+  let equity = 0;
+  let peak = 0;
+  let worst = 0;
+  (trades || []).forEach((trade) => {
+    equity += tradePnl(trade);
+    peak = Math.max(peak, equity);
+    worst = Math.max(worst, peak > 0 ? (peak - equity) / Math.max(1, Math.abs(peak)) * 100 : 0);
+  });
+  return round(worst, 4);
+}
+
+function evaluateHandbrake(state, config) {
+  const rules = Object.assign({
+    enabled: true,
+    maxLossStreak: 5,
+    maxDrawdownPct: 8,
+    recentTradeWindow: 10,
+    minRecoveryTrades: 10,
+    minRecoveryProfitFactor: 1.2,
+    maxRecoveryDrawdownPct: 3,
+    requireManualResume: true
+  }, config.handbrake || {});
+  const trades = state.closedTrades || [];
+  const recent = trades.slice(-Number(rules.recentTradeWindow || 10));
+  const recovery = trades.slice(-Number(rules.minRecoveryTrades || 10));
+  const recentAveragePnl = recent.reduce((sum, trade) => sum + tradePnl(trade), 0) / Math.max(1, recent.length);
+  const lossStreak = currentLossStreak(trades);
+  const drawdownPct = maxPaperDrawdownPct(state.equityCurve);
+  const recoveryAveragePnl = recovery.reduce((sum, trade) => sum + tradePnl(trade), 0) / Math.max(1, recovery.length);
+  const recoveryProfitFactor = profitFactorForTrades(recovery);
+  const recoveryWins = recovery.filter((trade) => tradePnl(trade) > 0).length;
+  const recoveryDrawdownPct = tradeWindowDrawdownPct(recovery);
+  const existing = state.handbrake || {};
+  const alreadyActive = existing.state === "PAPER_RECOVERY" || existing.state === "READY_FOR_MANUAL_RESUME";
+  const triggers = [];
+  if (rules.enabled === false) {
+    return Object.assign({}, existing, {
+      enabled: false,
+      state: "OFF",
+      action: "NONE",
+      reason: "Handbrake disabled in config.",
+      checkedAt: new Date().toISOString(),
+      metrics: { lossStreak, drawdownPct, recentAveragePnl, recoveryAveragePnl, recoveryProfitFactor, recoveryWins }
+    });
+  }
+  if (lossStreak >= Number(rules.maxLossStreak || 5)) triggers.push(`${lossStreak} closed losses in a row`);
+  if (drawdownPct >= Number(rules.maxDrawdownPct || 8)) triggers.push(`drawdown ${round(drawdownPct, 2)}% >= ${rules.maxDrawdownPct}%`);
+  if (recent.length >= Number(rules.recentTradeWindow || 10) && recentAveragePnl < 0) triggers.push(`last ${recent.length} trades have negative average PnL`);
+  const recoveryReady = alreadyActive
+    && recovery.length >= Number(rules.minRecoveryTrades || 10)
+    && recoveryAveragePnl > 0
+    && recoveryProfitFactor >= Number(rules.minRecoveryProfitFactor || 1.2)
+    && recoveryDrawdownPct <= Number(rules.maxRecoveryDrawdownPct || 3);
+  const base = {
+    enabled: true,
+    checkedAt: new Date().toISOString(),
+    engagedAt: existing.engagedAt,
+    rules,
+    metrics: {
+      closedTrades: trades.length,
+      lossStreak,
+      drawdownPct,
+      recentTradeWindow: recent.length,
+      recentAveragePnl: round(recentAveragePnl, 4),
+      recoveryTrades: recovery.length,
+      recoveryWins,
+      recoveryAveragePnl: round(recoveryAveragePnl, 4),
+      recoveryProfitFactor: round(recoveryProfitFactor, 4),
+      recoveryDrawdownPct,
+      realTradingEnabled: !!config.realTradingEnabled,
+      paperEnabled: !!config.enabled
+    }
+  };
+  if (recoveryReady) {
+    return Object.assign({}, base, {
+      state: "READY_FOR_MANUAL_RESUME",
+      action: "READY",
+      engagedAt: existing.engagedAt,
+      readyAt: existing.readyAt || new Date().toISOString(),
+      reason: "Paper recovery passed: positive average PnL, sufficient trades, acceptable profit factor, and recovery drawdown within limit.",
+      triggers: existing.triggers || []
+    });
+  }
+  if (triggers.length || alreadyActive) {
+    return Object.assign({}, base, {
+      state: "PAPER_RECOVERY",
+      action: alreadyActive && !triggers.length ? "HOLD" : "ENGAGE",
+      engagedAt: existing.engagedAt || new Date().toISOString(),
+      reason: triggers.length ? `Handbrake triggered: ${triggers.join("; ")}.` : "Handbrake remains active until paper recovery passes.",
+      triggers: triggers.length ? triggers : (existing.triggers || [])
+    });
+  }
+  return Object.assign({}, base, {
+    state: "ARMED",
+    action: "NONE",
+    reason: "Handbrake armed; real trading remains allowed only if other manual safety gates allow it.",
+    triggers: []
+  });
 }
 
 function warningEvent(config, state, market, message) {
@@ -992,12 +1334,75 @@ function fetchMarketCandles(config, market, options) {
     source: config.source || "bybit",
     symbol: market.symbol,
     interval: market.interval,
-    limit: market.limit || 600,
+    limit: Number((options && options.limit) || market.limit || 600),
     forceRefresh: options && options.forceRefresh,
     withMetadata: true
   }).then((payload) => {
     if (Array.isArray(payload)) return { candles: data.normalizeCandles(payload), metadata: {} };
     return { candles: data.normalizeCandles(payload.candles), metadata: payload.metadata || {} };
+  });
+}
+
+function paperBenchmarkSymbol(config, params) {
+  const symbol = params.rsBenchmarkSymbol || params.benchmarkSymbol || config.rsBenchmarkSymbol || "";
+  return symbol ? String(symbol).trim().toUpperCase() : "";
+}
+
+function loadPaperBenchmarkCandles(config, market, params, options) {
+  const benchmarkSymbol = paperBenchmarkSymbol(config, params);
+  if (!benchmarkSymbol || benchmarkSymbol === "NONE" || benchmarkSymbol === String(market.symbol || "").toUpperCase()) {
+    return Promise.resolve(null);
+  }
+  const limit = market.limit || 600;
+  const fetchOptions = {
+    forceRefresh: options && (options.forceRefresh === true || options.refreshFirst === true)
+  };
+  if (benchmarkSymbol === "CRYPTO_BASKET") {
+    const entries = {};
+    return Promise.all(["ETHUSDT", "SOLUSDT", "BNBUSDT"].map((symbol) =>
+      fetchPaperBenchmarkSeries(config, symbol, market.interval, limit, fetchOptions).then((candles) => {
+        entries[symbol] = options && options.includeOpenCandle ? candles : latestClosedCandles(candles, market.interval);
+      })
+    )).then(() => alignPaperBasketCandles(entries));
+  }
+  return fetchPaperBenchmarkSeries(config, benchmarkSymbol, market.interval, limit, fetchOptions).then((candles) =>
+    options && options.includeOpenCandle ? candles : latestClosedCandles(candles, market.interval)
+  );
+}
+
+function fetchPaperBenchmarkSeries(config, symbol, interval, limit, options) {
+  return data.fetchCandles({
+    source: config.source || "bybit",
+    symbol,
+    interval,
+    limit,
+    forceRefresh: options && options.forceRefresh
+  }).then((payload) => data.normalizeCandles(Array.isArray(payload) ? payload : payload.candles));
+}
+
+function alignPaperBasketCandles(seriesBySymbol) {
+  const symbols = Object.keys(seriesBySymbol || {});
+  if (!symbols.length) return [];
+  const maps = {};
+  symbols.forEach((symbol) => {
+    maps[symbol] = new Map((seriesBySymbol[symbol] || []).map((row) => [Number(row.time), row]));
+  });
+  const times = Array.from(maps[symbols[0]].keys())
+    .filter((time) => symbols.every((symbol) => maps[symbol].has(time)))
+    .sort((a, b) => a - b);
+  if (!times.length) return [];
+  const first = {};
+  symbols.forEach((symbol) => {
+    const close = Number(maps[symbol].get(times[0]).close || 1);
+    first[symbol] = close || 1;
+  });
+  return times.map((time) => {
+    const values = symbols.map((symbol) => {
+      const row = maps[symbol].get(time);
+      return Number(row.close || 0) / first[symbol];
+    });
+    const close = values.reduce((sum, value) => sum + value, 0) / values.length;
+    return { time, open: close, high: close, low: close, close, volume: 0 };
   });
 }
 
@@ -1048,8 +1453,8 @@ function loadState(file, config) {
   if (!fs.existsSync(file)) return initialState(config);
   try {
     return Object.assign(initialState(config), JSON.parse(fs.readFileSync(file, "utf8")));
-  } catch {
-    return initialState(config);
+  } catch (error) {
+    throw new Error("Cannot read paper state; refusing to reset saved evidence: " + error.message);
   }
 }
 
@@ -1074,7 +1479,47 @@ function initialState(config) {
 }
 
 function writeState(file, state) {
-  fs.writeFileSync(file, JSON.stringify(state, null, 2));
+  atomicWriteJson(file, state);
+}
+
+function atomicWriteJson(file, value) {
+  const temp = file + ".tmp-" + process.pid + "-" + Date.now();
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2));
+  fs.renameSync(temp, file);
+}
+
+function acquireStateLock(statePath, lockPath) {
+  if (activeStateLocks.has(statePath)) throw new Error("Paper state is already being updated: " + statePath);
+  ensureDir(path.dirname(lockPath));
+  if (fs.existsSync(lockPath)) {
+    const existing = readJson(lockPath, {});
+    let running = false;
+    try {
+      if (existing.pid) process.kill(Number(existing.pid), 0);
+      running = !!existing.pid;
+    } catch {
+      running = false;
+    }
+    if (!running) fs.unlinkSync(lockPath);
+  }
+  try {
+    const fd = fs.openSync(lockPath, "wx");
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() }));
+    fs.closeSync(fd);
+    activeStateLocks.add(statePath);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error("Paper state lock is active: " + lockPath);
+    throw error;
+  }
+}
+
+function releaseStateLock(statePath, lockPath) {
+  activeStateLocks.delete(statePath);
+  try {
+    fs.unlinkSync(lockPath);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 }
 
 function appendJournal(reportDir, events) {
@@ -1090,8 +1535,8 @@ function appendJournal(reportDir, events) {
 
 function writeStatusReports(reportDir, state, config, events, freshness) {
   ensureDir(reportDir);
-  fs.writeFileSync(path.join(reportDir, "paper-status.json"), JSON.stringify(statusPayload(state, config, events, freshness), null, 2));
-  fs.writeFileSync(path.join(reportDir, "paper-summary.json"), JSON.stringify(summaryPayload(state, config), null, 2));
+  atomicWriteJson(path.join(reportDir, "paper-status.json"), statusPayload(state, config, events, freshness));
+  atomicWriteJson(path.join(reportDir, "paper-summary.json"), summaryPayload(state, config));
 }
 
 function statusPayload(state, config, events, freshness) {
@@ -1109,6 +1554,7 @@ function statusPayload(state, config, events, freshness) {
     unrealizedPnL: state.unrealizedPnl,
     totalFees: state.cumulativeFees,
     totalSlippage: state.cumulativeSlippage,
+    handbrake: state.handbrake || evaluateHandbrake(state, config),
     latestEvents: events.slice(-25),
     lastSignals: events.slice(-25),
     lastProcessedCandle: state.lastProcessedCandleTime,
@@ -1140,6 +1586,7 @@ function summaryPayload(state, config) {
     totalFees: state.cumulativeFees,
     totalSlippage: state.cumulativeSlippage,
     equity: state.accountEquity,
+    handbrake: state.handbrake || evaluateHandbrake(state, config),
     activeMarkets: markets.filter((market) => market.mode !== "watch").length,
     watchMarkets: markets.filter((market) => market.mode === "watch").length,
     expectedBacktestMetrics: {
@@ -1154,11 +1601,13 @@ function summary(state, config, events, status) {
     status,
     enabled: !!config.enabled,
     events: events.length,
+    processedCandles: Number(state.lastTickProcessedSignalCandles || 0),
     openPositions: state.openPositions.length,
     closedTrades: state.closedTrades.length,
     accountEquity: state.accountEquity,
     realizedPnL: state.realizedPnl,
     unrealizedPnL: state.unrealizedPnl,
+    handbrake: state.handbrake || evaluateHandbrake(state, config),
     warnings: state.warnings,
     freshness: state.freshness || {}
   };
@@ -1208,6 +1657,10 @@ function canonicalRegimeMode(config) {
 
 function tradeId(market, trade) {
   return [market.symbol, market.interval, trade.entryFillTime || trade.entryTime, trade.exitFillTime || trade.exitTime, trade.exitReason].join(":");
+}
+
+function tradeLifecycleId(market, trade) {
+  return [market.symbol, market.interval, trade.entrySignalTime || trade.entryTime, trade.entryFillTime || trade.entryTime].join(":");
 }
 
 function eventId(market, eventType, reason, candleTime, tradeKey) {

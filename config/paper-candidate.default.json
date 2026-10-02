@@ -69,6 +69,19 @@
   "slippageBps": 2,
   "accountEquity": 10000,
   "riskPct": 0.005,
+  "realTradingEnabled": false,
+  "exchangeOrders": false,
+  "requireManualConfirmation": true,
+  "handbrake": {
+    "enabled": true,
+    "maxLossStreak": 5,
+    "maxDrawdownPct": 8,
+    "recentTradeWindow": 10,
+    "minRecoveryTrades": 10,
+    "minRecoveryProfitFactor": 1.2,
+    "maxRecoveryDrawdownPct": 3,
+    "requireManualResume": true
+  },
   "maxOpenTrades": 1,
   "maxNotionalPerTrade": 100000
 }

@@ -58,6 +58,7 @@ function runBacktestOnCandles(options) {
 
     if (!position) {
       var entryResult = evaluateEntry(strategy, frame, i, row, params);
+      entryResult = applyEntryFilter(entryResult, frame, i, row, params, options);
       if (entryResult.passed) debugState.entrySignalsCount += 1;
       var blockReasons = engineBlockReasons(i, warmup, cooldown, entryResult);
       if (blockReasons.length) recordSkips(debugState, blockReasons);
@@ -109,7 +110,13 @@ function usesRegimeRunner(name) {
     "RelativeStrengthV2",
     "SimpleAtrTrendV2",
     "FibPullbackContinuationV1",
-    "RobustTrendFollowerV1"
+    "MtfPullback15mV1",
+    "VwapReversion15mV1",
+    "VwapReversion15mFastV1",
+    "RobustTrendFollowerV1",
+    "BtcMeanReversion4hV1",
+    "SqueezePullbackHold4hV1",
+    "BtcRegimeController4hV1"
   ].includes(name);
 }
 
@@ -117,6 +124,18 @@ function evaluateEntry(strategy, frame, index, row, params) {
   if (strategy.entryDiagnostics) return strategy.entryDiagnostics({ frame: frame, index: index, row: row, params: params });
   var passed = strategy.entry({ frame: frame, index: index, row: row, params: params });
   return { passed: passed, reasons: passed ? [] : ["entry_condition_false"], values: {} };
+}
+
+function applyEntryFilter(entry, frame, index, row, params, options) {
+  if (!entry || !entry.passed || typeof options.entryFilter !== "function") return entry;
+  var decision = options.entryFilter({ frame: frame, index: index, row: row, params: params, entry: entry });
+  if (decision === true || (decision && decision.allow === true)) return entry;
+  var reason = decision && decision.reason ? String(decision.reason) : "entry_filter_blocked";
+  return {
+    passed: false,
+    reasons: [reason],
+    values: Object.assign({}, entry.values || {}, { entryFilterReason: reason })
+  };
 }
 
 function evaluateExit(strategy, frame, index, row, position, params) {

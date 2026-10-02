@@ -31,6 +31,13 @@ function autoLimitFor(timeframe, days, cap) {
   return Math.max(100, Math.min(Number(cap || 5000), bars));
 }
 
+function requestedLimitFor(timeframe, days, cap) {
+  if (!args.limit || args.limit === "auto") return autoLimitFor(timeframe, days, cap);
+  if (String(args.limit).toLowerCase() === "period") return Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  const numeric = Number(args.limit);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : autoLimitFor(timeframe, days, cap);
+}
+
 function round(value, digits) {
   const factor = Math.pow(10, digits || 4);
   return Math.round(Number(value || 0) * factor) / factor;
@@ -279,7 +286,6 @@ async function main() {
   const includeStress = String(args.includeStress || "true").toLowerCase() !== "false";
   const includeWalkForward = String(args.includeWalkForward || "true").toLowerCase() !== "false";
   const includeRegime = String(args.includeRegime || "true").toLowerCase() !== "false";
-  const limit = args.limit && args.limit !== "auto" ? Number(args.limit) : null;
   const from = args.from || argsUtil.daysToFrom(days);
   const to = args.to || new Date().toISOString();
   const warnings = [];
@@ -293,7 +299,7 @@ async function main() {
         interval: candidate.timeframe,
         from,
         to,
-        limit: limit || autoLimitFor(candidate.timeframe, days, 5000)
+        limit: requestedLimitFor(candidate.timeframe, days, 5000)
       })
         .then((candles) => ({ candles: data.normalizeCandles(candles || []), error: null }))
         .catch((error) => ({ candles: [], error: error.message || String(error) }));
@@ -301,7 +307,7 @@ async function main() {
   });
   const [entries, regimeCandles] = await Promise.all([
     Promise.all(Object.keys(candleJobs).map((key) => candleJobs[key].then((result) => [key, result]))),
-    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: limit || autoLimitFor("4h", days, 3000) })
+    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor("4h", days, 3000) })
       .then((candles) => data.normalizeCandles(candles || []))
       .catch((error) => {
         warnings.push(`BTCUSDT 4h regime candles unavailable; running drilldown with empty regime candles: ${error.message || String(error)}`);

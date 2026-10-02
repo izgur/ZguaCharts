@@ -135,22 +135,22 @@ DATA_SOURCE_CONFIG = {
                 "ARBUSDT",
                 "OPUSDT",
                 "WIFUSDT",
-                "PEPEUSDT",
+                "1000PEPEUSDT",
                 "HYPEUSDT",
             ],
-            "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"],
+            "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
         },
         "hyperliquid": {
             "label": "Hyperliquid Crypto",
             "live": "websocket",
             "symbols": ["BTC", "ETH", "SOL", "HYPE", "DOGE", "XRP", "BNB", "AVAX", "LINK", "SUI"],
-            "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"],
+            "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
         },
         "yfinance": {
             "label": "Indian Stocks",
             "live": "polling",
             "symbols": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "ITC.NS", "TATAMOTORS.NS"],
-            "timeframes": ["1m", "2m", "5m", "15m", "30m", "60m", "1d"],
+            "timeframes": ["1m", "2m", "5m", "15m", "30m", "60m", "1d", "1w"],
         },
     }
 }
@@ -174,6 +174,8 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, vi
     else:
         normalized_limit = min(normalized_limit, 5000)
         candles = provider(symbol, timeframe, normalized_limit)
+    if not candles:
+        raise RuntimeError(f"{DATA_SOURCE_CONFIG['sources'][source]['label']} returned no price data for {symbol} {timeframe}")
     return {
         "source": source,
         "symbol": symbol,
@@ -342,6 +344,8 @@ def timeframe_to_minutes(timeframe: str) -> float:
         return float(text[:-1]) * 60
     if text.endswith("d"):
         return float(text[:-1]) * 1440
+    if text.endswith("w"):
+        return float(text[:-1]) * 10080
     raise ValueError(f"Unsupported timeframe: {timeframe}")
 
 
@@ -974,13 +978,14 @@ def fetch_yfinance_candles(symbol: str, timeframe: str, limit: int) -> list[dict
 
 def fetch_yfinance_candles_for_period(symbol: str, timeframe: str, period: str) -> list[dict]:
     ticker = yf.Ticker(symbol.upper())
-    history = ticker.history(period=period, interval=timeframe, auto_adjust=False, prepost=True)
+    provider_interval = "1wk" if timeframe == "1w" else timeframe
+    history = ticker.history(period=period, interval=provider_interval, auto_adjust=False, prepost=True)
 
     if history.empty:
         history = yf.download(
             symbol.upper(),
             period=period,
-            interval=timeframe,
+            interval=provider_interval,
             auto_adjust=False,
             prepost=True,
             progress=False,
@@ -1019,6 +1024,8 @@ def interval_to_ms(interval: str) -> int:
         return amount * 60 * 60_000
     if unit == "d":
         return amount * 24 * 60 * 60_000
+    if unit == "w":
+        return amount * 7 * 24 * 60 * 60_000
     raise ValueError(f"Unsupported timeframe: {interval}")
 
 
@@ -1029,6 +1036,8 @@ def bybit_interval(interval: str) -> str:
         return str(int(interval[:-1]) * 60)
     if interval == "1d":
         return "D"
+    if interval == "1w":
+        return "W"
     raise ValueError(f"Unsupported Bybit timeframe: {interval}")
 
 
@@ -1037,7 +1046,7 @@ def period_for_yfinance(interval: str, limit: int) -> str:
         minutes = interval_to_ms(interval) / 60_000
         days = max(2, min(60, int((minutes * limit / 390) + 3)))
         return f"{days}d"
-    return "2y"
+    return "max" if interval == "1w" else "2y"
 
 
 def yfinance_backtest_period(interval: str) -> str:
@@ -1051,6 +1060,7 @@ def yfinance_backtest_period(interval: str) -> str:
         "60m": "730d",
         "1h": "730d",
         "1d": "max",
+        "1w": "max",
     }
     return mapping.get(interval, "60d")
 

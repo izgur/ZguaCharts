@@ -301,6 +301,134 @@ function bollinger(values, period, stddev) {
   return { upper: upper, middle: middle, lower: lower };
 }
 
+function choppiness(candles, period) {
+  var out = [];
+  var trueRanges = candles.map(function (candle, index) {
+    if (index === 0) return candle.high - candle.low;
+    var prevClose = candles[index - 1].close;
+    return Math.max(candle.high - candle.low, Math.abs(candle.high - prevClose), Math.abs(candle.low - prevClose));
+  });
+  for (var i = 0; i < candles.length; i += 1) {
+    if (i < period - 1) {
+      out[i] = null;
+      continue;
+    }
+    var slice = candles.slice(i - period + 1, i + 1);
+    var high = slice.reduce(function (max, candle) { return Math.max(max, candle.high); }, slice[0].high);
+    var low = slice.reduce(function (min, candle) { return Math.min(min, candle.low); }, slice[0].low);
+    var trSum = trueRanges.slice(i - period + 1, i + 1).reduce(function (sum, value) { return sum + value; }, 0);
+    var range = high - low;
+    out[i] = range > 0 && trSum > 0 ? 100 * Math.log10(trSum / range) / Math.log10(period) : null;
+  }
+  return out;
+}
+
+function keltner(candles, period, multiplier) {
+  var typical = candles.map(function (candle) { return (candle.high + candle.low + candle.close) / 3; });
+  var middle = ema(typical, period);
+  var atrValues = atr(candles, period);
+  var upper = [];
+  var lower = [];
+  for (var i = 0; i < candles.length; i += 1) {
+    if (middle[i] === null || atrValues[i] === null) {
+      upper[i] = null;
+      lower[i] = null;
+      continue;
+    }
+    upper[i] = middle[i] + atrValues[i] * multiplier;
+    lower[i] = middle[i] - atrValues[i] * multiplier;
+  }
+  return { upper: upper, middle: middle, lower: lower };
+}
+
+function obv(candles) {
+  var out = [];
+  var current = 0;
+  candles.forEach(function (candle, index) {
+    if (index === 0) {
+      out[index] = current;
+      return;
+    }
+    if (candle.close > candles[index - 1].close) current += Number(candle.volume || 0);
+    else if (candle.close < candles[index - 1].close) current -= Number(candle.volume || 0);
+    out[index] = current;
+  });
+  return out;
+}
+
+function volumeRoc(candles, period) {
+  return candles.map(function (candle, index) {
+    if (index < period) return null;
+    var prior = Number(candles[index - period].volume || 0);
+    return prior ? (Number(candle.volume || 0) - prior) / prior * 100 : null;
+  });
+}
+
+function cmf(candles, period) {
+  var out = [];
+  for (var i = 0; i < candles.length; i += 1) {
+    if (i < period - 1) {
+      out[i] = null;
+      continue;
+    }
+    var mfVolume = 0;
+    var volume = 0;
+    for (var j = i - period + 1; j <= i; j += 1) {
+      var candle = candles[j];
+      var range = candle.high - candle.low;
+      var multiplier = range ? ((candle.close - candle.low) - (candle.high - candle.close)) / range : 0;
+      mfVolume += multiplier * Number(candle.volume || 0);
+      volume += Number(candle.volume || 0);
+    }
+    out[i] = volume ? mfVolume / volume : null;
+  }
+  return out;
+}
+
+function rollingPercentileRank(values, period) {
+  return values.map(function (value, index) {
+    value = Number(value);
+    if (!Number.isFinite(value) || index < period - 1) return null;
+    var slice = values.slice(index - period + 1, index + 1).filter(function (item) {
+      return Number.isFinite(Number(item));
+    });
+    if (!slice.length) return null;
+    var belowOrEqual = slice.filter(function (item) { return Number(item) <= value; }).length;
+    return belowOrEqual / slice.length * 100;
+  });
+}
+
+function rollingAverageNullable(values, period) {
+  return values.map(function (_value, index) {
+    if (index < period - 1) return null;
+    var slice = values.slice(index - period + 1, index + 1);
+    if (slice.some(function (value) { return value === null || !Number.isFinite(Number(value)); })) return null;
+    return slice.reduce(function (sum, value) { return sum + Number(value); }, 0) / period;
+  });
+}
+
+function stochRsi(values, rsiPeriod, stochPeriod, smoothK, smoothD) {
+  var rsiValues = rsi(values, rsiPeriod);
+  var raw = [];
+  for (var i = 0; i < values.length; i += 1) {
+    if (i < rsiPeriod + stochPeriod - 1) {
+      raw[i] = null;
+      continue;
+    }
+    var slice = rsiValues.slice(i - stochPeriod + 1, i + 1).filter(function (value) { return value !== null; });
+    if (slice.length < stochPeriod) {
+      raw[i] = null;
+      continue;
+    }
+    var high = Math.max.apply(null, slice);
+    var low = Math.min.apply(null, slice);
+    raw[i] = high > low ? (rsiValues[i] - low) / (high - low) * 100 : 0;
+  }
+  var k = rollingAverageNullable(raw, smoothK);
+  var d = rollingAverageNullable(k, smoothD);
+  return { raw: raw, k: k, d: d };
+}
+
 function supertrend(candles, period, multiplier) {
   var atrValues = atr(candles, period);
   var line = [];
@@ -336,6 +464,8 @@ function buildIndicatorFrame(candles, params) {
   var macdData = macd(close, params.macdFast || 12, params.macdSlow || 26, params.macdSignal || 9);
   var bb = bollinger(close, params.bbPeriod || 20, params.bbStddev || 2);
   var atrValues = atr(candles, params.atrPeriod || 14);
+  var atrPctValues = candles.map(function (candle, index) { return candle.close ? atrValues[index] / candle.close : 0; });
+  var atrPctRank = rollingPercentileRank(atrPctValues, params.atrPercentilePeriod || 100);
   var adxData = adx(candles, params.adxPeriod || 14);
   var dc20 = donchian(candles, params.donchian20 || 20);
   var dc55 = donchian(candles, params.donchian55 || 55);
@@ -344,8 +474,17 @@ function buildIndicatorFrame(candles, params) {
   var pivots = pivotLevels(candles);
   var swing = swingFeatures(candles, params);
   var volumeMa20 = sma(candles.map(function (c) { return c.volume; }), params.volumeMa || 20);
+  var chop = choppiness(candles, params.choppinessPeriod || 14);
+  var kc = keltner(candles, params.keltnerPeriod || 20, params.keltnerMultiplier || 1.5);
+  var obvValues = obv(candles);
+  var obvMa = sma(obvValues, params.obvMa || 20);
+  var cmfValues = cmf(candles, params.cmfPeriod || 20);
+  var volumeRocValues = volumeRoc(candles, params.volumeRocPeriod || 20);
+  var stoch = stochRsi(close, params.stochRsiPeriod || 14, params.stochRsiLookback || 14, params.stochRsiSmoothK || 3, params.stochRsiSmoothD || 3);
   var st = supertrend(candles, params.supertrendPeriod || 10, params.supertrendMultiplier || 3);
   return candles.map(function (candle, index) {
+    var bbWidth = bb.middle[index] ? (bb.upper[index] - bb.lower[index]) / bb.middle[index] : null;
+    var kcWidth = kc.middle[index] ? (kc.upper[index] - kc.lower[index]) / kc.middle[index] : null;
     return Object.assign({}, candle, swing[index] || {}, pivots[index] || {}, {
       __index: index,
       ema9: ema9Values[index],
@@ -356,7 +495,8 @@ function buildIndicatorFrame(candles, params) {
       ema200: ema200Values[index],
       rsi14: rsiValues[index],
       atr14: atrValues[index],
-      atrPct: candle.close ? atrValues[index] / candle.close : 0,
+      atrPct: atrPctValues[index],
+      atrPctRank100: atrPctRank[index],
       adx14: adxData.adx[index],
       plusDi14: adxData.plusDi[index],
       minusDi14: adxData.minusDi[index],
@@ -373,6 +513,21 @@ function buildIndicatorFrame(candles, params) {
       bbUpper: bb.upper[index],
       bbMiddle: bb.middle[index],
       bbLower: bb.lower[index],
+      bbWidth: bbWidth,
+      keltnerUpper: kc.upper[index],
+      keltnerMiddle: kc.middle[index],
+      keltnerLower: kc.lower[index],
+      keltnerWidth: kcWidth,
+      squeezeOn: bb.upper[index] !== null && kc.upper[index] !== null ? bb.upper[index] < kc.upper[index] && bb.lower[index] > kc.lower[index] : false,
+      squeezeRatio: kcWidth ? bbWidth / kcWidth : null,
+      choppiness14: chop[index],
+      obv: obvValues[index],
+      obvMa20: obvMa[index],
+      cmf20: cmfValues[index],
+      volumeRoc20: volumeRocValues[index],
+      stochRsi: stoch.raw[index],
+      stochRsiK: stoch.k[index],
+      stochRsiD: stoch.d[index],
       supertrendLine: st.line[index],
       supertrendDirection: st.direction[index],
       volumeMa20: volumeMa20[index]
@@ -392,6 +547,13 @@ module.exports = {
   swingFeatures: swingFeatures,
   macd: macd,
   bollinger: bollinger,
+  choppiness: choppiness,
+  keltner: keltner,
+  obv: obv,
+  volumeRoc: volumeRoc,
+  cmf: cmf,
+  rollingPercentileRank: rollingPercentileRank,
+  stochRsi: stochRsi,
   supertrend: supertrend,
   buildIndicatorFrame: buildIndicatorFrame
 };

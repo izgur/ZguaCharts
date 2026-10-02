@@ -6,11 +6,12 @@ import math
 import os
 import re
 import shutil
-import subprocess
+from services import hidden_subprocess as subprocess
 import sys
 import traceback
 import uuid
-from collections import Counter
+import ctypes
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -61,6 +62,14 @@ RESEARCH_AUTOPILOT_DIR = Path(app.root_path) / "reports" / "research-autopilot"
 RESEARCH_AUTOPILOT_QUEUE_PATH = RESEARCH_AUTOPILOT_DIR / "research-queue.json"
 RESEARCH_AUTOPILOT_MEMORY_PATH = RESEARCH_AUTOPILOT_DIR / "research-memory.json"
 RESEARCH_DOSSIER_DIR = Path(app.root_path) / "reports" / "research-dossiers"
+RESEARCH_BATCH_DIR = Path(app.root_path) / "reports" / "research-batches"
+RESEARCH_CAMPAIGN_DIR = Path(app.root_path) / "reports" / "research-campaigns"
+RESEARCH_CAMPAIGN_STOP_PATH = RESEARCH_CAMPAIGN_DIR / "STOP_AFTER_CURRENT"
+RESEARCH_CAMPAIGN_RUNTIME_PATH = RESEARCH_CAMPAIGN_DIR / "runtime.json"
+RESEARCH_BRAIN_LOOP_RUNTIME_PATH = RESEARCH_CAMPAIGN_DIR / "brain-loop-runtime.json"
+RESEARCH_BRAIN_LOOP_STATE_PATH = RESEARCH_CAMPAIGN_DIR / "brain-loop-state.json"
+RESEARCH_BRAIN_LOOP_STOP_PATH = RESEARCH_CAMPAIGN_DIR / "BRAIN_LOOP_STOP"
+RESEARCH_DISCOVERY_DIR = Path(app.root_path) / "reports" / "research-discovery"
 PAPER_CANDIDATE_REVIEW_DIR = Path(app.root_path) / "reports" / "paper-candidates"
 PAPER_CANDIDATE_ENABLE_AUDIT_DIR = PAPER_CANDIDATE_REVIEW_DIR / "enable-audits"
 PAPER_TICK_AUDIT_DIR = PAPER_CANDIDATE_REVIEW_DIR / "tick-audits"
@@ -153,8 +162,46 @@ def config():
         }
     ]
     payload["optimizer_strategy_presets"] = LEARNING_OPTIMIZER_STRATEGY_OPTIONS
+    payload["chart_signal_strategies"] = chart_signal_strategy_options()
     payload["default_strategy_preset"] = DEFAULT_PRESET_ID
     return jsonify(payload)
+
+
+def chart_signal_strategy_options() -> list[dict]:
+    candidate_path = PAPER_CANDIDATE_LOCAL_PATH if PAPER_CANDIDATE_LOCAL_PATH.exists() else PAPER_CANDIDATE_DEFAULT_PATH
+    try:
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        candidate = {}
+
+    champion_path = Path(app.root_path) / "reports" / "champion-board-latest.json"
+    try:
+        champion_board = json.loads(champion_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        champion_board = {}
+    four_hour_rows = (champion_board.get("championsByTimeframe") or {}).get("4h") or []
+    four_hour = four_hour_rows[0] if four_hour_rows else {}
+
+    options = []
+    if candidate.get("strategy"):
+        options.append({
+            "id": "best_1h",
+            "label": candidate["strategy"],
+            "strategy": candidate["strategy"],
+            "timeframe": "1h",
+            "params": candidate.get("params") or {},
+            "source": candidate_path.name,
+        })
+    if four_hour.get("strategy"):
+        options.append({
+            "id": "best_4h",
+            "label": four_hour["strategy"],
+            "strategy": four_hour["strategy"],
+            "timeframe": "4h",
+            "params": four_hour.get("params") or {},
+            "source": champion_path.name,
+        })
+    return options
 
 
 @app.post("/api/config/bootstrap-local")
@@ -221,15 +268,23 @@ def indicators():
 
     try:
         candles_payload = fetch_candles(source, symbol, timeframe, limit=limit)
+        candles = candles_payload["candles"]
+        first_time = int(first_chart_candle_time or 0)
+        last_time = int(last_chart_candle_time or 0)
+        if first_time and last_time:
+            candles = [
+                candle for candle in candles
+                if first_time <= int(candle.get("time", 0)) <= last_time
+            ]
         payload = build_indicator_payload(
-            candles_payload["candles"],
+            candles,
             names.split(","),
             sma_period=sma_period,
         )
         payload.setdefault("diagnostics", {})
         payload["diagnostics"].update(candles_payload.get("diagnostics", {}))
-        payload["diagnostics"].update(candle_diagnostics(candles_payload["candles"], requested_limit=limit))
-        payload["diagnostics"]["chartCandlesCount"] = int(chart_candles_count or len(candles_payload["candles"]))
+        payload["diagnostics"].update(candle_diagnostics(candles, requested_limit=limit))
+        payload["diagnostics"]["chartCandlesCount"] = int(chart_candles_count or len(candles))
         payload["diagnostics"]["firstChartCandleTime"] = int(first_chart_candle_time or payload["diagnostics"]["firstChartCandleTime"] or 0) or None
         payload["diagnostics"]["lastChartCandleTime"] = int(last_chart_candle_time or payload["diagnostics"]["lastChartCandleTime"] or 0) or None
     except ValueError as exc:
@@ -344,6 +399,7 @@ def backtest_run_custom():
         source = str(payload.get("source") or "bybit")
         symbol = str(payload.get("symbol") or "ETHUSDT").upper()
         timeframe = str(payload.get("timeframe") or payload.get("interval") or "1h")
+        execution_timeframe = normalize_execution_timeframe(payload.get("executionTimeframe") or payload.get("executionInterval"), timeframe)
         period = str(payload.get("period") or "365d")
         strategy = str(payload.get("strategy") or payload.get("preset") or "SimpleAtrTrendV2")
         limit_arg = payload.get("limit", "auto")
@@ -356,6 +412,7 @@ def backtest_run_custom():
             "source": source,
             "symbol": symbol,
             "timeframe": timeframe,
+            "execution_timeframe": execution_timeframe,
             "period": period,
             "preset": strategy,
             "limit_arg": limit_arg,
@@ -379,6 +436,7 @@ def backtest_run_custom():
             allow_shorts=allow_shorts,
             strategy_params=params,
             include_candles=bool(payload.get("includeChartCandles")),
+            execution_timeframe=execution_timeframe,
         )
         stage = "custom response normalization"
         result_payload = normalize_backtest_response(result_payload, source, symbol, timeframe, period, strategy, fee_pct, slippage_pct)
@@ -412,6 +470,7 @@ def backtest_run_custom():
             params_used,
             active_comparison.get("paramsSource") or "custom",
             active_candidate,
+            execution_timeframe,
         )
         comparability = manual_backtest_comparability(run_context, active_comparison, context_warnings)
         metrics = manual_backtest_result_summary(result_payload, period)
@@ -436,6 +495,7 @@ def backtest_run_custom():
             "strategy": result_payload.get("strategy") or strategy,
             "symbol": symbol,
             "timeframe": timeframe,
+            "executionTimeframe": execution_timeframe,
             "period": period,
             "paramsUsed": params_used,
             "runContext": run_context,
@@ -569,11 +629,12 @@ def parse_backtest_request_args(args, force_debug: bool = False) -> dict:
 
 
 def research_limit_for(source: str, timeframe: str, period: str, limit_arg, require_number: bool = False):
-    if str(limit_arg).strip().lower() == "auto":
+    limit_text = str(limit_arg).strip().lower()
+    if limit_text in {"auto", "period", "full"}:
         if require_number:
             return historical_limit_for_period(period, timeframe, None) if source == "bybit" else 5000
         return None
-    return int(limit_arg)
+    return int(limit_text)
 
 
 def public_backtest_args(args: dict) -> dict:
@@ -1368,6 +1429,1580 @@ def good_people_history():
     })
 
 
+def campaign_state_file(campaign: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(campaign or "default").strip() or "default")
+    return RESEARCH_CAMPAIGN_DIR / f"{safe}.json"
+
+
+def read_json_file(path: Path, fallback):
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as handle:
+                return json.load(handle)
+    except Exception:
+        return fallback
+    return fallback
+
+
+def campaign_process_running(pid) -> bool:
+    try:
+        if not pid:
+            return False
+        if os.name == "nt":
+            try:
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(0x1000, False, int(pid))
+                if handle:
+                    kernel32.CloseHandle(handle)
+                    return True
+            except Exception:
+                pass
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/FO", "CSV", "/NH"],
+                text=True,
+                capture_output=True,
+                timeout=5,
+            )
+            if completed.returncode != 0:
+                return False
+            return any(
+                part.strip().strip('"') == str(int(pid))
+                for line in (completed.stdout or "").splitlines()
+                for part in line.split(",")
+            )
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def compact_campaign_job(job: dict) -> dict:
+    item = {
+        "id": job.get("id"),
+        "strategy": job.get("strategy"),
+        "symbol": job.get("symbol"),
+        "timeframe": job.get("timeframe"),
+        "status": job.get("status"),
+        "attempts": job.get("attempts"),
+        "startedAt": job.get("startedAt"),
+        "finishedAt": job.get("finishedAt"),
+        "returnCode": job.get("returnCode"),
+        "savedReport": job.get("savedReport"),
+        "logPath": job.get("logPath"),
+        "error": job.get("error"),
+    }
+    metrics = campaign_job_result_metrics(job)
+    if metrics:
+        item["result"] = metrics
+    return item
+
+
+def campaign_job_result_metrics(job: dict) -> dict:
+    saved = job.get("savedReport")
+    if not saved:
+        return {}
+    path = Path(app.root_path) / str(saved).replace("\\", "/")
+    payload = read_json_file(path, {})
+    rows = payload.get("rows") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    strategy = job.get("strategy")
+    symbol = job.get("symbol")
+    timeframe = job.get("timeframe")
+    exact = [
+        row for row in rows
+        if row.get("strategy") == strategy and row.get("symbol") == symbol and (row.get("timeframe") or row.get("interval")) == timeframe
+    ]
+    usable = exact or rows
+    if not usable:
+        return {}
+    best = sorted(usable, key=lambda row: safe_float(row.get("practicalScore", row.get("totalReturnPct")), -999999), reverse=True)[0]
+    return_pct = safe_float(best.get("totalReturnPct"), None)
+    return {
+        "status": best.get("status"),
+        "tier": best.get("finalCandidateTier") or best.get("tier") or best.get("evidenceTier"),
+        "replacementEligible": bool(best.get("replacementEligible")),
+        "sourceFile": str(saved).replace("\\", "/"),
+        "returnPct": best.get("totalReturnPct"),
+        "endEquity": round(10000 * (1 + return_pct / 100), 2) if return_pct is not None else None,
+        "profitFactor": best.get("profitFactor"),
+        "drawdownPct": best.get("maxDrawdownPct"),
+        "trades": best.get("trades"),
+        "params": best.get("params") or {},
+        "paramsSummary": compact_research_params(best.get("params") or {}, limit=14),
+        "reason": best.get("mainFailureReason") or "; ".join(best.get("replacementRejectionReasons") or best.get("qualityGateReasons") or []),
+    }
+
+
+AUTO_SEARCH_MIN_SAMPLE_TRADES = 40
+
+
+def auto_search_sample_warning(best: dict) -> str | None:
+    trades = int(safe_float(best.get("trades"), 0)) if isinstance(best, dict) else 0
+    if trades <= 0:
+        return "Rejected sample: no trades"
+    if trades < AUTO_SEARCH_MIN_SAMPLE_TRADES:
+        return f"Rejected sample: {trades} trades, need {AUTO_SEARCH_MIN_SAMPLE_TRADES}"
+    return None
+
+
+def auto_search_best_key(item: dict) -> tuple:
+    trades = safe_float(item.get("trades"), 0)
+    return_pct = safe_float(item.get("returnPct"), -999999)
+    pf = safe_float(item.get("profitFactor"), 0)
+    drawdown = safe_float(item.get("drawdownPct"), 999999)
+    return (
+        1 if item.get("replacementEligible") else 0,
+        1 if return_pct > 0 else 0,
+        1 if trades >= AUTO_SEARCH_MIN_SAMPLE_TRADES else 0,
+        min(trades, 200),
+        return_pct,
+        pf,
+        -drawdown,
+    )
+
+
+def compact_research_params(params: dict, limit: int = 5) -> list[dict]:
+    if not isinstance(params, dict):
+        return []
+    priority = [
+        "regimeMode",
+        "donchianEntry",
+        "donchianExit",
+        "adxThreshold",
+        "emaFast",
+        "emaSlow",
+        "emaTrend",
+        "emaTrendLength",
+        "rsiMin",
+        "rsiMax",
+        "rsiOversold",
+        "rsiReclaim",
+        "squeezeLookback",
+        "squeezePercentile",
+        "rangeLookback",
+        "atrMultiplier",
+        "riskPct",
+        "takeProfitAtr",
+        "retestLookback",
+        "retestAtr",
+        "indicatorFilterPreset",
+        "volumeFilter",
+    ]
+    items = []
+    seen = set()
+    for key in priority:
+        if key in params:
+            items.append({"key": key, "value": params.get(key)})
+            seen.add(key)
+        if len(items) >= limit:
+            return items
+    for key in sorted(params):
+        if key not in seen:
+            items.append({"key": key, "value": params.get(key)})
+        if len(items) >= limit:
+            return items
+    return items
+
+
+def param_change_summary(current: dict, previous: dict, limit: int = 3) -> str:
+    current = current if isinstance(current, dict) else {}
+    previous = previous if isinstance(previous, dict) else {}
+    keys = sorted(set(current.keys()) | set(previous.keys()))
+    diffs = []
+    for key in keys:
+        if current.get(key) != previous.get(key):
+            diffs.append(f"{key}={current.get(key)}")
+        if len(diffs) >= limit:
+            break
+    if not diffs:
+        return "same params"
+    extra = len([key for key in keys if current.get(key) != previous.get(key)]) - len(diffs)
+    return ", ".join(diffs) + (f" +{extra}" if extra > 0 else "")
+
+
+def campaign_payload_list(payload: dict, name: str, fallback: str) -> list[str]:
+    return parse_csv_arg(payload.get(name), parse_csv_arg(fallback, []))
+
+
+def campaign_payload_settings(payload: dict) -> dict:
+    def int_value(name: str, fallback: int) -> int:
+        return int(safe_float(payload.get(name), fallback))
+
+    return {
+        "symbols": campaign_payload_list(payload, "symbols", "BTCUSDT,ETHUSDT"),
+        "timeframes": campaign_payload_list(payload, "timeframes", "4h"),
+        "strategies": campaign_payload_list(payload, "strategies", "EmaBounceV2,BreakoutRetestV2,RegimeDonchian20,RegimeDonchianCloseConfirm,VolatilitySqueezeBreakout,RangeExpansionV2,RobustTrendFollowerV1,BtcMeanReversion4hV1,SqueezePullbackHold4hV1"),
+        "period": str(payload.get("period") or "1460d"),
+        "limit": str(payload.get("limit") or "period"),
+        "maxCandidates": int_value("maxCandidates", 240),
+        "maxCombosPerStrategy": int_value("maxCombosPerStrategy", 180),
+        "topN": int_value("topN", 50),
+        "timeoutSeconds": int_value("timeoutSeconds", 10800),
+        "runtimeBudgetSeconds": int_value("runtimeBudgetSeconds", 10500),
+        "extraArgs": str(payload.get("extraArgs") or ""),
+    }
+
+
+def campaign_job_id(strategy: str, symbol: str, timeframe: str) -> str:
+    return f"{strategy}|{symbol}|{timeframe}".replace(" ", "")
+
+
+def campaign_seed_jobs(settings: dict) -> list[dict]:
+    jobs = []
+    for timeframe in settings.get("timeframes") or []:
+        for symbol in settings.get("symbols") or []:
+            for strategy in settings.get("strategies") or []:
+                jobs.append({
+                    "id": campaign_job_id(strategy, symbol, timeframe),
+                    "strategy": strategy,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "status": "PENDING",
+                    "attempts": 0,
+                    "startedAt": None,
+                    "finishedAt": None,
+                    "returnCode": None,
+                    "savedReport": None,
+                    "logPath": None,
+                    "error": None,
+                })
+    return jobs
+
+
+def seed_resumable_campaign_state(payload: dict) -> dict:
+    campaign = str(payload.get("campaign") or "promising-4h")
+    path = campaign_state_file(campaign)
+    settings = campaign_payload_settings(payload)
+    desired = campaign_seed_jobs(settings)
+    desired_by_id = {job["id"]: job for job in desired}
+    existing = read_json_file(path, {}) if path.exists() and not payload.get("reset") else {}
+    existing_by_id = {job.get("id"): job for job in existing.get("jobs", []) if job.get("id")}
+    jobs = []
+    for job in desired:
+        if job["id"] in existing_by_id:
+            old = existing_by_id[job["id"]]
+            old.update({key: job[key] for key in ("strategy", "symbol", "timeframe")})
+            jobs.append(old)
+        else:
+            jobs.append(job)
+    for old_id, old in existing_by_id.items():
+        if old_id not in desired_by_id:
+            old["status"] = "SKIPPED_OUT_OF_SCOPE"
+            jobs.append(old)
+    now = datetime.now(timezone.utc).isoformat()
+    state = {
+        "schemaVersion": "research-campaign-resume-v1",
+        "campaign": campaign,
+        "createdAt": existing.get("createdAt") or now,
+        "updatedAt": now,
+        "settings": settings,
+        "jobs": jobs,
+        "stopRequested": False if payload.get("clearStop") else bool(existing.get("stopRequested")),
+        "lastCommand": existing.get("lastCommand"),
+        "warnings": existing.get("warnings") or [],
+        "seededByGui": True,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    return state
+
+
+def campaign_state_complete(campaign: str) -> bool:
+    state = read_json_file(campaign_state_file(campaign), {})
+    jobs = state.get("jobs") or []
+    if not jobs:
+        return False
+    pending = [job for job in jobs if job.get("status") not in {"DONE", "SKIPPED_OUT_OF_SCOPE"}]
+    return not pending
+
+
+def next_brain_campaign_name(base_name: str, force_new: bool = False) -> str:
+    if not force_new and not campaign_state_complete(base_name):
+        return base_name
+    if force_new and not campaign_state_file(base_name).exists():
+        return base_name
+    for index in range(2, 100000):
+        candidate = f"{base_name}-r{index}"
+        if not campaign_state_file(candidate).exists():
+            return candidate
+        if not force_new and not campaign_state_complete(candidate):
+            return candidate
+    return f"{base_name}-r{int(datetime.now(timezone.utc).timestamp())}"
+
+
+def build_resumable_campaign_status(args) -> dict:
+    campaign = str(args.get("campaign", "promising-4h"))
+    state = read_json_file(campaign_state_file(campaign), {})
+    runtime = read_json_file(RESEARCH_CAMPAIGN_RUNTIME_PATH, {})
+    runtime_campaign = runtime.get("campaign")
+    running = runtime_campaign == campaign and campaign_process_running(runtime.get("pid"))
+    jobs = state.get("jobs") or []
+    counts = Counter(job.get("status") or "UNKNOWN" for job in jobs)
+    pending = [job for job in jobs if job.get("status") not in {"DONE", "SKIPPED_OUT_OF_SCOPE"}]
+    stale_runtime = bool(runtime_campaign == campaign and runtime and not running)
+    if running and jobs and not pending:
+        running = False
+        stale_runtime = True
+    ordered_jobs = sorted(
+        jobs,
+        key=lambda job: (
+            {"RUNNING": 0, "PENDING": 1, "FAILED": 2, "DONE": 3, "SKIPPED_OUT_OF_SCOPE": 4}.get(job.get("status") or "", 9),
+            job.get("startedAt") or job.get("finishedAt") or "",
+        ),
+    )
+    return {
+        "ok": True,
+        "campaign": campaign,
+        "exists": bool(state),
+        "running": running,
+        "runtimeStale": stale_runtime,
+        "pid": runtime.get("pid") if running else None,
+        "startedAt": runtime.get("startedAt") if running else None,
+        "stopRequested": RESEARCH_CAMPAIGN_STOP_PATH.exists() or bool(state.get("stopRequested")),
+        "statePath": str(campaign_state_file(campaign).relative_to(Path(app.root_path))).replace("\\", "/"),
+        "stopFile": str(RESEARCH_CAMPAIGN_STOP_PATH.relative_to(Path(app.root_path))).replace("\\", "/"),
+        "counts": dict(counts),
+        "totalJobs": len(jobs),
+        "pendingJobs": len(pending),
+        "settings": state.get("settings") or {},
+        "lastCommand": state.get("lastCommand"),
+        "recentJobs": [compact_campaign_job(job) for job in ordered_jobs[:50]],
+        "jobs": [compact_campaign_job(job) for job in ordered_jobs[:200]],
+        "nextJob": compact_campaign_job(pending[0]) if pending else None,
+        "message": "Previous runtime marker is stale; campaign state is authoritative." if stale_runtime else None,
+    }
+
+
+def campaign_args_from_payload(payload: dict) -> list[str]:
+    def value(name: str, fallback: str) -> str:
+        raw = payload.get(name)
+        return str(raw if raw not in (None, "") else fallback)
+
+    args = [
+        "scripts\\research_campaign_resume.py",
+        "--campaign", value("campaign", "promising-4h"),
+        "--symbols", value("symbols", "BTCUSDT,ETHUSDT"),
+        "--timeframes", value("timeframes", "4h"),
+        "--strategies", value("strategies", "EmaBounceV2,BreakoutRetestV2,RegimeDonchian20,RegimeDonchianCloseConfirm,VolatilitySqueezeBreakout,RangeExpansionV2,RobustTrendFollowerV1,BtcMeanReversion4hV1,SqueezePullbackHold4hV1"),
+        "--period", value("period", "1460d"),
+        "--limit", value("limit", "period"),
+        "--max-candidates", value("maxCandidates", "240"),
+        "--max-combos-per-strategy", value("maxCombosPerStrategy", "180"),
+        "--top-n", value("topN", "50"),
+        "--timeout-seconds", value("timeoutSeconds", "10800"),
+        "--runtime-budget-seconds", value("runtimeBudgetSeconds", "10500"),
+        "--max-jobs", value("maxJobs", "999"),
+    ]
+    if payload.get("clearStop"):
+        args.append("--clear-stop")
+    if payload.get("reset"):
+        args.append("--reset")
+    return args
+
+
+def start_resumable_research_campaign(payload: dict) -> tuple[dict, int]:
+    RESEARCH_CAMPAIGN_DIR.mkdir(parents=True, exist_ok=True)
+    campaign = str(payload.get("campaign") or "promising-4h")
+    status = build_resumable_campaign_status({"campaign": campaign})
+    if status.get("running"):
+        return {**status, "ok": True, "message": "Campaign is already running."}, 200
+    if status.get("exists") and int(safe_float(status.get("totalJobs"), 0)) > 0 and int(safe_float(status.get("pendingJobs"), 0)) == 0 and not payload.get("reset"):
+        return {
+            **status,
+            "ok": True,
+            "message": "Campaign is already complete. Apply a new Brain Plan or reset this campaign to run it again.",
+            "alreadyComplete": True,
+        }, 200
+    if payload.get("clearStop") and RESEARCH_CAMPAIGN_STOP_PATH.exists():
+        try:
+            RESEARCH_CAMPAIGN_STOP_PATH.unlink()
+        except Exception:
+            pass
+    seeded_state = seed_resumable_campaign_state(payload)
+    command = [sys.executable] + campaign_args_from_payload(payload)
+    log_path = RESEARCH_CAMPAIGN_DIR / f"{re.sub(r'[^a-zA-Z0-9_.-]+', '_', campaign)}-runner.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    log_handle.write(f"\n=== GUI START {datetime.now(timezone.utc).isoformat()} {' '.join(command)} ===\n")
+    log_handle.flush()
+    creationflags = 0
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(
+        command,
+        cwd=app.root_path,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=creationflags,
+    )
+    log_handle.close()
+    runtime = {
+        "campaign": campaign,
+        "pid": process.pid,
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(command),
+        "logPath": str(log_path.relative_to(Path(app.root_path))).replace("\\", "/"),
+    }
+    RESEARCH_CAMPAIGN_RUNTIME_PATH.write_text(json.dumps(runtime, indent=2, sort_keys=True), encoding="utf-8")
+    return {**build_resumable_campaign_status({"campaign": campaign}), "message": "Campaign started.", "runtime": runtime, "seededJobs": len(seeded_state.get("jobs") or [])}, 202
+
+
+def stop_resumable_research_campaign(payload: dict) -> dict:
+    RESEARCH_CAMPAIGN_DIR.mkdir(parents=True, exist_ok=True)
+    RESEARCH_CAMPAIGN_STOP_PATH.write_text(
+        json.dumps({"requestedAt": datetime.now(timezone.utc).isoformat(), "source": "gui"}, indent=2),
+        encoding="utf-8",
+    )
+    campaign = str(payload.get("campaign") or "promising-4h")
+    return {**build_resumable_campaign_status({"campaign": campaign}), "message": "Safe stop requested. Current optimizer job may finish before the runner stops."}
+
+
+def campaign_result_summary(campaign: str) -> dict:
+    if not campaign:
+        return {}
+    state = read_json_file(campaign_state_file(campaign), {})
+    jobs = state.get("jobs") if isinstance(state.get("jobs"), list) else []
+    best = None
+    completed = 0
+    for job in jobs:
+        if job.get("status") == "DONE":
+            completed += 1
+        metrics = campaign_job_result_metrics(job)
+        if not metrics:
+            continue
+        item = {
+            "strategy": job.get("strategy"),
+            "symbol": job.get("symbol"),
+            "timeframe": job.get("timeframe"),
+            **metrics,
+        }
+        if best is None or auto_search_best_key(item) > auto_search_best_key(best):
+            best = item
+    if best:
+        warning = auto_search_sample_warning(best)
+        best["weakSample"] = bool(warning)
+        best["sampleWarning"] = warning
+        best["comparisonEligible"] = not warning and bool(best.get("replacementEligible"))
+    return {
+        "campaign": campaign,
+        "doneJobs": completed,
+        "totalJobs": len(jobs),
+        "pendingJobs": len([job for job in jobs if job.get("status") not in {"DONE", "SKIPPED_OUT_OF_SCOPE"}]),
+        "best": best,
+    }
+
+
+def enrich_brain_rounds(rounds: list[dict]) -> list[dict]:
+    enriched = []
+    previous_best = None
+    for round_record in rounds:
+        item = dict(round_record)
+        summary = campaign_result_summary(item.get("campaign"))
+        best = summary.get("best") if isinstance(summary, dict) else None
+        if best and best.get("weakSample"):
+            best["returnDeltaPct"] = None
+            best["paramChange"] = best.get("sampleWarning") or "Rejected sample"
+            best["bestChanged"] = False
+        elif best and previous_best:
+            best["returnDeltaPct"] = round(safe_float(best.get("returnPct"), 0) - safe_float(previous_best.get("returnPct"), 0), 4)
+            same_family = (
+                best.get("strategy") == previous_best.get("strategy")
+                and best.get("symbol") == previous_best.get("symbol")
+                and best.get("timeframe") == previous_best.get("timeframe")
+            )
+            if same_family:
+                best["paramChange"] = param_change_summary(best.get("params") or {}, previous_best.get("params") or {})
+            else:
+                best["paramChange"] = f"strategy changed {previous_best.get('strategy') or '-'} -> {best.get('strategy') or '-'}; params not comparable"
+            best["bestChanged"] = (
+                best.get("strategy") != previous_best.get("strategy")
+                or abs(safe_float(best.get("returnDeltaPct"), 0)) >= 0.01
+                or best.get("paramChange") != "same params"
+            )
+        elif best:
+            best["returnDeltaPct"] = None
+            best["paramChange"] = "-"
+            best["bestChanged"] = False
+        if best and best.get("comparisonEligible"):
+            previous_best = best
+        item["resultSummary"] = summary
+        enriched.append(item)
+    return enriched
+
+
+def unique_brain_rounds_by_campaign(rounds: list[dict]) -> list[dict]:
+    unique = []
+    seen = set()
+    for round_record in reversed(rounds or []):
+        campaign = round_record.get("campaign") or f"round-{round_record.get('round')}"
+        if campaign in seen:
+            continue
+        seen.add(campaign)
+        unique.append(round_record)
+    return list(reversed(unique))
+
+
+def brain_round_best_signature(best: dict) -> str:
+    params = best.get("params") if isinstance(best.get("params"), dict) else {}
+    compact_params = compact_research_params(params, limit=8)
+    return json.dumps({
+        "strategy": best.get("strategy") or "",
+        "symbol": best.get("symbol") or "",
+        "timeframe": best.get("timeframe") or "",
+        "returnPct": round(safe_float(best.get("returnPct"), 0), 4),
+        "params": compact_params,
+    }, sort_keys=True)
+
+
+def repeated_brain_best_summary(limit: int = 8) -> dict:
+    state = read_json_file(RESEARCH_BRAIN_LOOP_STATE_PATH, {})
+    rounds = state.get("rounds") if isinstance(state.get("rounds"), list) else []
+    rounds = unique_brain_rounds_by_campaign(rounds)
+    completed = [round_record for round_record in rounds if str(round_record.get("status") or "").upper() == "DONE"]
+    recent = enrich_brain_rounds(completed[-limit:])
+    signatures = []
+    best_rows = []
+    for round_record in recent:
+        summary = round_record.get("resultSummary") if isinstance(round_record.get("resultSummary"), dict) else {}
+        best = summary.get("best") if isinstance(summary.get("best"), dict) else None
+        if not best:
+            continue
+        signatures.append(brain_round_best_signature(best))
+        best_rows.append(best)
+    if not signatures:
+        return {"isRepeated": False, "repeatCount": 0, "recentCount": 0}
+    last_signature = signatures[-1]
+    repeat_count = 0
+    for signature in reversed(signatures):
+        if signature != last_signature:
+            break
+        repeat_count += 1
+    best = best_rows[-1] if best_rows else {}
+    return {
+        "isRepeated": repeat_count >= 3,
+        "repeatCount": repeat_count,
+        "recentCount": len(signatures),
+        "strategy": best.get("strategy"),
+        "symbol": best.get("symbol"),
+        "timeframe": best.get("timeframe"),
+        "returnPct": best.get("returnPct"),
+        "profitFactor": best.get("profitFactor"),
+        "maxDrawdownPct": best.get("maxDrawdownPct"),
+        "trades": best.get("trades"),
+        "paramsSummary": best.get("paramsSummary") or compact_research_params(best.get("params") or {}, limit=8),
+    }
+
+
+def build_brain_loop_status() -> dict:
+    state = read_json_file(RESEARCH_BRAIN_LOOP_STATE_PATH, {})
+    runtime = read_json_file(RESEARCH_BRAIN_LOOP_RUNTIME_PATH, {})
+    process_running = campaign_process_running(runtime.get("pid"))
+    rounds = state.get("rounds") if isinstance(state.get("rounds"), list) else []
+    display_rounds = unique_brain_rounds_by_campaign(rounds)
+    current = state.get("currentRound") if isinstance(state.get("currentRound"), dict) else None
+    state_running = bool(state.get("running"))
+    running = process_running and (state_running or current is not None)
+    last_round = display_rounds[-1] if display_rounds else (rounds[-1] if rounds else None)
+    current_campaign = (current or last_round or {}).get("campaign")
+    campaign_status = build_resumable_campaign_status({"campaign": current_campaign}) if current_campaign else None
+    recent_rounds = enrich_brain_rounds(display_rounds[-8:])
+    discovery = state.get("discovery") if isinstance(state.get("discovery"), dict) else {}
+    discovery_runs = state.get("discoveryRuns") if isinstance(state.get("discoveryRuns"), list) else []
+    current_discovery = state.get("currentDiscovery") if isinstance(state.get("currentDiscovery"), dict) else None
+    last_discovery = discovery_runs[-1] if discovery_runs else None
+    return {
+        "ok": True,
+        "running": bool(running),
+        "pid": runtime.get("pid") if running else None,
+        "runtimeStale": bool(runtime and process_running and not running),
+        "stopRequested": RESEARCH_BRAIN_LOOP_STOP_PATH.exists() or bool(state.get("stopRequested")),
+        "statePath": str(RESEARCH_BRAIN_LOOP_STATE_PATH.relative_to(Path(app.root_path))).replace("\\", "/"),
+        "stopFile": str(RESEARCH_BRAIN_LOOP_STOP_PATH.relative_to(Path(app.root_path))).replace("\\", "/"),
+        "logPath": runtime.get("logPath"),
+        "mode": state.get("mode"),
+        "depth": state.get("depth"),
+        "symbols": state.get("symbols"),
+        "timeframes": state.get("timeframes"),
+        "jobsPerCampaign": state.get("jobsPerCampaign"),
+        "maxRounds": state.get("maxRounds"),
+        "discovery": discovery,
+        "currentDiscovery": current_discovery,
+        "lastDiscovery": last_discovery,
+        "recentDiscoveryRuns": list(reversed(discovery_runs[-8:])),
+        "roundCount": len(rounds),
+        "uniqueRoundCount": len(display_rounds),
+        "currentRound": current,
+        "lastRound": last_round,
+        "recentRounds": list(reversed(recent_rounds)),
+        "currentCampaignStatus": campaign_status,
+        "message": "Brain loop is running." if running else "Brain loop is stopped.",
+    }
+
+
+def start_brain_loop(payload: dict) -> tuple[dict, int]:
+    RESEARCH_CAMPAIGN_DIR.mkdir(parents=True, exist_ok=True)
+    status = build_brain_loop_status()
+    if status.get("running"):
+        return {**status, "message": "Brain loop is already running."}, 200
+    if RESEARCH_BRAIN_LOOP_STOP_PATH.exists():
+        try:
+            RESEARCH_BRAIN_LOOP_STOP_PATH.unlink()
+        except Exception:
+            pass
+    args = [
+        "scripts\\research_brain_loop.py",
+        "--mode", str(payload.get("mode") or "balanced"),
+        "--depth", str(payload.get("depth") or "focused"),
+        "--symbols", str(payload.get("symbols") or "BTCUSDT"),
+        "--timeframes", str(payload.get("timeframes") or "4h"),
+        "--jobs-per-campaign", str(int(safe_float(payload.get("jobsPerCampaign"), 12))),
+        "--max-rounds", str(int(safe_float(payload.get("maxRounds"), 0))),
+        "--discovery-every-rounds", str(int(safe_float(payload.get("discoveryEveryRounds"), 1))),
+        "--discovery-days", str(int(safe_float(payload.get("discoveryDays"), 1095))),
+        "--discovery-top", str(int(safe_float(payload.get("discoveryTop"), 40))),
+    ]
+    if payload.get("disableDiscovery"):
+        args.append("--disable-discovery")
+    log_path = RESEARCH_CAMPAIGN_DIR / "brain-loop.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    log_handle.write(f"\n=== GUI BRAIN LOOP START {datetime.now(timezone.utc).isoformat()} {' '.join([sys.executable] + args)} ===\n")
+    log_handle.flush()
+    creationflags = 0
+    if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+    process = subprocess.Popen(
+        [sys.executable] + args,
+        cwd=app.root_path,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=creationflags,
+    )
+    log_handle.close()
+    runtime = {
+        "pid": process.pid,
+        "startedAt": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join([sys.executable] + args),
+        "logPath": str(log_path.relative_to(Path(app.root_path))).replace("\\", "/"),
+    }
+    RESEARCH_BRAIN_LOOP_RUNTIME_PATH.write_text(json.dumps(runtime, indent=2, sort_keys=True), encoding="utf-8")
+    return {**build_brain_loop_status(), "message": "Brain loop started.", "runtime": runtime}, 202
+
+
+def stop_brain_loop() -> dict:
+    RESEARCH_CAMPAIGN_DIR.mkdir(parents=True, exist_ok=True)
+    RESEARCH_BRAIN_LOOP_STOP_PATH.write_text(
+        json.dumps({"requestedAt": datetime.now(timezone.utc).isoformat(), "source": "gui"}, indent=2),
+        encoding="utf-8",
+    )
+    status = build_brain_loop_status()
+    campaign = (
+        (status.get("currentCampaignStatus") or {}).get("campaign")
+        or (status.get("currentRound") or {}).get("campaign")
+        or (status.get("lastRound") or {}).get("campaign")
+    )
+    if campaign:
+        stop_resumable_research_campaign({"campaign": campaign})
+        status = build_brain_loop_status()
+    return {
+        **status,
+        "message": "Auto Search stop requested. The active campaign was also safe-paused, so the current optimizer job can finish and no new campaign job should start.",
+    }
+
+
+def compact_optimizer_matrix_row(row: dict, source_file: Path) -> dict:
+    optimizer_grid = row.get("optimizerGrid") if isinstance(row.get("optimizerGrid"), dict) else {}
+    return_pct = safe_float(row.get("totalReturnPct"), None)
+    return {
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe") or row.get("interval"),
+        "status": row.get("status"),
+        "tier": row.get("finalCandidateTier") or row.get("tier") or row.get("evidenceTier"),
+        "replacementEligible": bool(row.get("replacementEligible")),
+        "trades": row.get("trades"),
+        "returnPct": row.get("totalReturnPct"),
+        "endEquity": round(10000 * (1 + return_pct / 100), 2) if return_pct is not None else None,
+        "profitFactor": row.get("profitFactor"),
+        "drawdownPct": row.get("maxDrawdownPct"),
+        "winRate": row.get("winRate"),
+        "score": row.get("practicalScore", row.get("score")),
+        "reason": row.get("mainFailureReason") or "; ".join(row.get("replacementRejectionReasons") or row.get("qualityGateReasons") or []),
+        "sourceFile": str(source_file.relative_to(Path(app.root_path))).replace("\\", "/"),
+        "rank": row.get("rank"),
+        "params": row.get("params") or {},
+        "optimizerGrid": optimizer_grid,
+        "plannedCombinations": optimizer_grid.get("plannedCombinations"),
+        "sampledCombinations": optimizer_grid.get("sampledCombinations"),
+        "sampled": optimizer_grid.get("sampled"),
+    }
+
+
+def build_research_results_matrix(args) -> dict:
+    file_limit = max(1, min(int(safe_float(args.get("fileLimit", args.get("file_limit", 80)), 80)), 250))
+    rows_by_key = {}
+    counts_by_key = Counter()
+    reports_by_key = defaultdict(set)
+    latest_search_by_file = {}
+    files = sorted(RESEARCH_BATCH_DIR.glob("multi-strategy-optimizer-batch-*.json"), key=lambda path: path.stat().st_mtime, reverse=True)[:file_limit]
+    for path in files:
+        payload = read_json_file(path, {})
+        search = payload.get("search") if isinstance(payload.get("search"), dict) else {}
+        latest_search_by_file[str(path)] = search
+        for raw in payload.get("rows") or []:
+            item = compact_optimizer_matrix_row(raw, path)
+            if not item.get("strategy") or not item.get("symbol") or not item.get("timeframe"):
+                continue
+            key = (item["symbol"], item["timeframe"], item["strategy"])
+            counts_by_key[key] += 1
+            reports_by_key[key].add(item["sourceFile"])
+            if search:
+                item["sourceSearch"] = {
+                    "period": search.get("period"),
+                    "symbols": search.get("symbols"),
+                    "timeframes": search.get("timeframes"),
+                    "strategies": search.get("strategies"),
+                    "maxCombosPerStrategy": search.get("maxCombosPerStrategy"),
+                    "maxCandidates": search.get("maxCandidates"),
+                    "topN": search.get("topN"),
+                    "runtimeBudgetHit": search.get("runtimeBudgetHit"),
+                    "evaluatedCombos": search.get("evaluatedCombos"),
+                }
+            old = rows_by_key.get(key)
+            old_score = safe_float((old or {}).get("score"), -999999)
+            new_score = safe_float(item.get("score"), -999999)
+            if old is None or item.get("replacementEligible") or new_score > old_score:
+                rows_by_key[key] = item
+    for key, item in rows_by_key.items():
+        item["savedRowsForVariant"] = counts_by_key.get(key, 0)
+        item["sourceReportCount"] = len(reports_by_key.get(key, set()))
+    items = list(rows_by_key.values())
+    strategies = sorted({item["strategy"] for item in items if item.get("strategy")})
+    markets = sorted({(item["symbol"], item["timeframe"]) for item in items if item.get("symbol") and item.get("timeframe")})
+    matrix_rows = []
+    for symbol, timeframe in markets:
+        cells = {}
+        for strategy in strategies:
+            cells[strategy] = rows_by_key.get((symbol, timeframe, strategy))
+        matrix_rows.append({"symbol": symbol, "timeframe": timeframe, "cells": cells})
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "filesRead": len(files),
+        "variants": len(items),
+        "strategies": strategies,
+        "rows": matrix_rows,
+        "readOnly": True,
+    }
+
+
+def relative_report_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(Path(app.root_path))).replace("\\", "/")
+    except Exception:
+        return str(path).replace("\\", "/")
+
+
+def resolve_research_result_row(args) -> dict:
+    source_file = str(args.get("sourceFile", args.get("source_file", ""))).replace("\\", "/").strip()
+    if not source_file:
+        raise ValueError("sourceFile is required.")
+    relative = Path(source_file)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("Invalid sourceFile.")
+    path = (Path(app.root_path) / relative).resolve()
+    batch_root = RESEARCH_BATCH_DIR.resolve()
+    if batch_root not in path.parents and path != batch_root:
+        raise ValueError("sourceFile must be a research batch report.")
+    payload = read_json_file(path, {})
+    rows = payload.get("rows") if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        raise ValueError("Report has no rows.")
+    strategy = str(args.get("strategy") or "")
+    symbol = str(args.get("symbol") or "")
+    timeframe = str(args.get("timeframe") or args.get("interval") or "")
+    requested_return = safe_float(args.get("returnPct", args.get("totalReturnPct")), None)
+    candidates = [
+        row for row in rows
+        if (not strategy or row.get("strategy") == strategy)
+        and (not symbol or row.get("symbol") == symbol)
+        and (not timeframe or (row.get("timeframe") or row.get("interval")) == timeframe)
+    ]
+    if requested_return is not None:
+        exact_return = [
+            row for row in candidates
+            if abs(safe_float(row.get("totalReturnPct"), -999999) - requested_return) < 0.01
+        ]
+        if exact_return:
+            candidates = exact_return
+    if not candidates:
+        raise ValueError("No matching row found in source report.")
+    best = sorted(candidates, key=lambda row: safe_float(row.get("practicalScore", row.get("totalReturnPct")), -999999), reverse=True)[0]
+    item = compact_optimizer_matrix_row(best, path)
+    search = payload.get("search") if isinstance(payload.get("search"), dict) else {}
+    if search:
+        item["sourceSearch"] = {
+            "period": search.get("period"),
+            "symbols": search.get("symbols"),
+            "timeframes": search.get("timeframes"),
+            "strategies": search.get("strategies"),
+            "maxCombosPerStrategy": search.get("maxCombosPerStrategy"),
+            "maxCandidates": search.get("maxCandidates"),
+            "topN": search.get("topN"),
+        }
+    item["paramsSource"] = best.get("paramsSource")
+    return {"ok": True, "row": item}
+
+
+def file_timestamp(path: Path) -> str:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+    except Exception:
+        return datetime.now(timezone.utc).isoformat()
+
+
+def ledger_record_id(source_type: str, source_file: str, parts: list) -> str:
+    raw = json.dumps([source_type, source_file, parts], sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:18]
+
+
+def parse_candidate_identity_market(identity: str) -> dict:
+    parts = str(identity or "").split("|")
+    if len(parts) >= 5 and parts[0].startswith("candidate-identity"):
+        return {"strategy": parts[1], "symbol": parts[2], "timeframe": parts[3]}
+    return {"strategy": None, "symbol": None, "timeframe": None}
+
+
+def ledger_metric_score(metrics: dict) -> float:
+    return (
+        safe_float(metrics.get("returnPct"), 0)
+        + safe_float(metrics.get("profitFactor"), 0) * 25
+        - safe_float(metrics.get("drawdownPct"), 0) * 1.8
+        + min(safe_float(metrics.get("trades"), 0), 250) * 0.05
+    )
+
+
+def ledger_bucket(record: dict) -> str:
+    source_type = record.get("sourceType")
+    status = str(record.get("status") or "").upper()
+    verdict = str(record.get("verdict") or "").upper()
+    metrics = record.get("metrics") or {}
+    if source_type == "paper_tick":
+        if record.get("openedTrade") or record.get("closedTrade") or record.get("signal") not in (None, "HOLD"):
+            return "PAPER_EVENT"
+        return "PAPER_HOLD"
+    if verdict in {"RESEARCH_MORE", "READY_FOR_REVIEW"}:
+        return "PROMISING_REVIEW"
+    if record.get("replacementEligible"):
+        return "REPLACEMENT_ELIGIBLE"
+    if status in {"ERROR", "FAIL"}:
+        return "REJECTED"
+    if status == "PASS" and safe_float(metrics.get("returnPct"), 0) > 0 and safe_float(metrics.get("profitFactor"), 0) >= 1.5:
+        return "PROMISING"
+    if status == "PASS":
+        return "PASS_WEAK"
+    return "UNKNOWN"
+
+
+def ledger_group_key(record: dict) -> str:
+    params = record.get("params") if isinstance(record.get("params"), dict) else {}
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    metric_key = {
+        "returnPct": round(safe_float(metrics.get("returnPct"), 0), 4),
+        "profitFactor": round(safe_float(metrics.get("profitFactor"), 0), 4),
+        "drawdownPct": round(safe_float(metrics.get("drawdownPct"), 0), 4),
+        "trades": safe_float(metrics.get("trades"), 0),
+    }
+    if record.get("sourceType") == "paper_tick":
+        evidence = record.get("evidence") if isinstance(record.get("evidence"), dict) else {}
+        return json.dumps([
+            record.get("sourceType"),
+            record.get("bucket"),
+            record.get("symbol"),
+            record.get("timeframe"),
+            record.get("strategy"),
+            evidence.get("targetCandleAt") or record.get("createdAt"),
+            record.get("signal"),
+        ], sort_keys=True, default=str)
+    return json.dumps([
+        record.get("sourceType"),
+        record.get("bucket"),
+        record.get("symbol"),
+        record.get("timeframe"),
+        record.get("strategy"),
+        record.get("status"),
+        record.get("verdict"),
+        params,
+        metric_key,
+    ], sort_keys=True, default=str)
+
+
+def compact_ledger_records(records: list[dict]) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for record in records:
+        key = ledger_group_key(record)
+        current = grouped.get(key)
+        if current is None:
+            item = dict(record)
+            item["occurrenceCount"] = 1
+            item["sourceFiles"] = [record.get("sourceFile")] if record.get("sourceFile") else []
+            item["latestAt"] = record.get("createdAt")
+            item["firstAt"] = record.get("createdAt")
+            grouped[key] = item
+            continue
+        current["occurrenceCount"] = int(current.get("occurrenceCount") or 1) + 1
+        if record.get("sourceFile") and record.get("sourceFile") not in current.get("sourceFiles", []):
+            current.setdefault("sourceFiles", []).append(record.get("sourceFile"))
+        if str(record.get("createdAt") or "") > str(current.get("latestAt") or ""):
+            current["latestAt"] = record.get("createdAt")
+            current["sourceFile"] = record.get("sourceFile")
+            current["evidence"] = record.get("evidence")
+        if str(record.get("createdAt") or "") < str(current.get("firstAt") or ""):
+            current["firstAt"] = record.get("createdAt")
+    return list(grouped.values())
+
+
+def ledger_optimizer_record(row: dict, path: Path, search: dict) -> dict | None:
+    item = compact_optimizer_matrix_row(row, path)
+    if not item.get("strategy") or not item.get("symbol") or not item.get("timeframe"):
+        return None
+    source_file = relative_report_path(path)
+    metrics = {
+        "returnPct": item.get("returnPct"),
+        "endEquity": item.get("endEquity"),
+        "profitFactor": item.get("profitFactor"),
+        "drawdownPct": item.get("drawdownPct"),
+        "trades": item.get("trades"),
+        "winRate": item.get("winRate"),
+        "score": item.get("score"),
+    }
+    record = {
+        "id": ledger_record_id("optimizer_row", source_file, [item.get("rank"), item.get("strategy"), item.get("symbol"), item.get("timeframe"), item.get("params")]),
+        "sourceType": "optimizer_row",
+        "sourceFile": source_file,
+        "createdAt": file_timestamp(path),
+        "strategy": item.get("strategy"),
+        "symbol": item.get("symbol"),
+        "timeframe": item.get("timeframe"),
+        "period": search.get("period"),
+        "status": item.get("status"),
+        "tier": item.get("tier"),
+        "verdict": "REPLACEMENT_ELIGIBLE" if item.get("replacementEligible") else item.get("reason"),
+        "reason": item.get("reason"),
+        "rank": item.get("rank"),
+        "replacementEligible": item.get("replacementEligible"),
+        "metrics": metrics,
+        "params": item.get("params") or {},
+        "evidence": {
+            "reproducibility": row.get("reproducibilityStatus"),
+            "qualityGate": row.get("qualityGateStatus"),
+            "stress": (row.get("stress") or {}).get("status") if isinstance(row.get("stress"), dict) else None,
+            "walkForward": (row.get("walkForward") or {}).get("status") if isinstance(row.get("walkForward"), dict) else None,
+            "plannedCombinations": item.get("plannedCombinations"),
+            "sampledCombinations": item.get("sampledCombinations"),
+            "maxCombosPerStrategy": search.get("maxCombosPerStrategy"),
+        },
+        "readOnly": True,
+    }
+    record["qualityScore"] = ledger_metric_score(metrics)
+    record["bucket"] = ledger_bucket(record)
+    return record
+
+
+def ledger_lead_review_record(payload: dict, path: Path) -> dict | None:
+    lead = payload.get("lead") if isinstance(payload.get("lead"), dict) else {}
+    if not lead.get("strategy"):
+        return None
+    source_file = relative_report_path(path)
+    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+    activity = evidence.get("leadActivity") or evidence.get("activity") or payload.get("leadActivity") or {}
+    comparison = payload.get("comparison") if isinstance(payload.get("comparison"), dict) else {}
+    verdict = payload.get("verdict") if isinstance(payload.get("verdict"), dict) else {}
+    eligibility = payload.get("replacementEligibility") if isinstance(payload.get("replacementEligibility"), dict) else {}
+    metrics = {
+        "returnPct": activity.get("totalReturnPct") or activity.get("returnPct"),
+        "profitFactor": activity.get("profitFactor"),
+        "drawdownPct": activity.get("maxDrawdownPct") or activity.get("drawdownPct"),
+        "trades": activity.get("trades"),
+        "winRate": activity.get("winRate"),
+        "returnEdgePct": comparison.get("returnEdgePct"),
+        "profitFactorEdge": comparison.get("profitFactorEdge"),
+    }
+    return_pct = safe_float(metrics.get("returnPct"), None)
+    metrics["endEquity"] = round(10000 * (1 + return_pct / 100), 2) if return_pct is not None else None
+    record = {
+        "id": ledger_record_id("lead_review", source_file, [lead.get("strategy"), lead.get("symbol"), lead.get("timeframe"), lead.get("params")]),
+        "sourceType": "lead_review",
+        "sourceFile": source_file,
+        "createdAt": file_timestamp(path),
+        "strategy": lead.get("strategy"),
+        "symbol": lead.get("symbol"),
+        "timeframe": lead.get("timeframe"),
+        "period": (payload.get("search") or {}).get("period"),
+        "status": activity.get("status") or ("OK" if payload.get("ok") else "CHECK"),
+        "tier": lead.get("paramsSource"),
+        "verdict": verdict.get("action"),
+        "reason": verdict.get("reason") or payload.get("error"),
+        "replacementEligible": eligibility.get("eligible"),
+        "metrics": metrics,
+        "params": lead.get("params") or {},
+        "evidence": {
+            "winner": comparison.get("winner"),
+            "robustness": (evidence.get("robustness") or {}).get("status") if isinstance(evidence.get("robustness"), dict) else None,
+            "stress": (evidence.get("stress") or {}).get("status") if isinstance(evidence.get("stress"), dict) else None,
+            "walkForward": (evidence.get("walkForward") or {}).get("status") if isinstance(evidence.get("walkForward"), dict) else None,
+            "reasons": eligibility.get("reasons"),
+        },
+        "readOnly": True,
+    }
+    record["qualityScore"] = ledger_metric_score(metrics)
+    record["bucket"] = ledger_bucket(record)
+    return record
+
+
+def ledger_manual_backtest_record(row: dict, index: int) -> dict | None:
+    if not row.get("strategy") or not row.get("symbol"):
+        return None
+    metrics = {
+        "returnPct": row.get("totalReturnPct"),
+        "endEquity": row.get("endEquity"),
+        "profitFactor": row.get("profitFactor"),
+        "drawdownPct": row.get("maxDrawdown") or row.get("maxDrawdownPct"),
+        "trades": row.get("trades"),
+        "winRate": row.get("winRate"),
+    }
+    record = {
+        "id": ledger_record_id("manual_backtest", "data/backtest-history.json", [row.get("id"), index]),
+        "sourceType": "manual_backtest",
+        "sourceFile": "data/backtest-history.json",
+        "createdAt": row.get("createdAt"),
+        "strategy": row.get("strategy"),
+        "symbol": row.get("symbol"),
+        "timeframe": row.get("timeframe"),
+        "period": row.get("period"),
+        "status": row.get("status") or ("PASS" if safe_float(row.get("totalReturnPct"), 0) > 0 else "FAIL"),
+        "tier": row.get("mode") or "manual",
+        "verdict": "MANUAL_HISTORY",
+        "reason": row.get("reason"),
+        "replacementEligible": False,
+        "metrics": metrics,
+        "params": row.get("params") or {},
+        "evidence": {"averageBarsHeld": row.get("averageBarsHeld")},
+        "readOnly": True,
+    }
+    record["qualityScore"] = ledger_metric_score(metrics)
+    record["bucket"] = ledger_bucket(record)
+    return record
+
+
+def ledger_paper_tick_record(payload: dict, path: Path) -> dict | None:
+    market = parse_candidate_identity_market(payload.get("candidateIdentity"))
+    source_file = relative_report_path(path)
+    metrics = {
+        "returnPct": None,
+        "profitFactor": None,
+        "drawdownPct": None,
+        "trades": payload.get("tickResult", {}).get("closedTrades") if isinstance(payload.get("tickResult"), dict) else None,
+        "equity": payload.get("equityAfter"),
+        "realizedPnL": payload.get("realizedPnL"),
+        "unrealizedPnL": (payload.get("tickResult") or {}).get("unrealizedPnL") if isinstance(payload.get("tickResult"), dict) else None,
+    }
+    record = {
+        "id": ledger_record_id("paper_tick", source_file, [payload.get("targetCandleAt"), payload.get("processedCandleAt")]),
+        "sourceType": "paper_tick",
+        "sourceFile": source_file,
+        "createdAt": file_timestamp(path),
+        "strategy": market.get("strategy"),
+        "symbol": market.get("symbol"),
+        "timeframe": market.get("timeframe"),
+        "period": None,
+        "status": "EVENT" if payload.get("openedTrade") or payload.get("closedTrade") else "TICK",
+        "tier": "paper",
+        "verdict": payload.get("proposedAction"),
+        "reason": payload.get("signal"),
+        "replacementEligible": False,
+        "metrics": metrics,
+        "params": {},
+        "evidence": {
+            "targetCandleAt": payload.get("targetCandleAt"),
+            "openedTrade": payload.get("openedTrade"),
+            "closedTrade": payload.get("closedTrade"),
+            "openPositionsAfter": payload.get("openPositionsAfter"),
+            "paperTickRan": payload.get("paperTickRan"),
+            "warnings": payload.get("warnings"),
+        },
+        "openedTrade": payload.get("openedTrade"),
+        "closedTrade": payload.get("closedTrade"),
+        "signal": payload.get("signal"),
+        "readOnly": True,
+    }
+    record["qualityScore"] = safe_float(metrics.get("equity"), 0) / 100
+    record["bucket"] = ledger_bucket(record)
+    return record
+
+
+def build_research_results_ledger(args) -> dict:
+    file_limit = max(1, min(int(safe_float(args.get("fileLimit", args.get("file_limit", 120)), 120)), 500))
+    row_limit = max(20, min(int(safe_float(args.get("rowLimit", args.get("row_limit", 250)), 250)), 2000))
+    source_filter = set(parse_csv_arg(args.get("sourceTypes") or args.get("source_types"), []))
+    records = []
+    files_read = Counter()
+
+    for path in sorted(RESEARCH_BATCH_DIR.glob("multi-strategy-optimizer-batch-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:file_limit]:
+        payload = read_json_file(path, {})
+        search = payload.get("search") if isinstance(payload.get("search"), dict) else {}
+        files_read["optimizer"] += 1
+        for raw in payload.get("rows") or []:
+            record = ledger_optimizer_record(raw, path, search)
+            if record:
+                records.append(record)
+
+    lead_dir = Path(app.root_path) / "reports" / "research-leads"
+    for path in sorted(lead_dir.glob("research-lead-review-*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:file_limit]:
+        payload = read_json_file(path, {})
+        files_read["lead_review"] += 1
+        record = ledger_lead_review_record(payload, path)
+        if record:
+            records.append(record)
+
+    history = read_json_file(BACKTEST_HISTORY_PATH, [])
+    if isinstance(history, list):
+        files_read["manual_backtest"] = 1 if history else 0
+        for index, row in enumerate(history[-row_limit:]):
+            if isinstance(row, dict):
+                record = ledger_manual_backtest_record(row, index)
+                if record:
+                    records.append(record)
+
+    tick_dir = Path(app.root_path) / "reports" / "paper-candidates" / "tick-audits"
+    for path in sorted(tick_dir.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:row_limit]:
+        payload = read_json_file(path, {})
+        files_read["paper_tick"] += 1
+        record = ledger_paper_tick_record(payload, path)
+        if record:
+            records.append(record)
+
+    if source_filter:
+        records = [record for record in records if record.get("sourceType") in source_filter]
+
+    bucket_priority = {
+        "REPLACEMENT_ELIGIBLE": 80,
+        "PROMISING_REVIEW": 70,
+        "PROMISING": 60,
+        "PASS_WEAK": 50,
+        "PAPER_EVENT": 40,
+        "PAPER_HOLD": 30,
+        "UNKNOWN": 20,
+        "REJECTED": 10,
+    }
+    records.sort(
+        key=lambda record: (
+            bucket_priority.get(record.get("bucket") or "UNKNOWN", 0),
+            safe_float(record.get("qualityScore"), -999999),
+            str(record.get("createdAt") or ""),
+        ),
+        reverse=True,
+    )
+    grouped_records = compact_ledger_records(records)
+    grouped_records.sort(
+        key=lambda record: (
+            bucket_priority.get(record.get("bucket") or "UNKNOWN", 0),
+            safe_float(record.get("qualityScore"), -999999),
+            int(record.get("occurrenceCount") or 1),
+            str(record.get("latestAt") or record.get("createdAt") or ""),
+        ),
+        reverse=True,
+    )
+    top_records = grouped_records[:row_limit]
+    buckets = Counter(record.get("bucket") or "UNKNOWN" for record in records)
+    grouped_buckets = Counter(record.get("bucket") or "UNKNOWN" for record in grouped_records)
+    source_counts = Counter(record.get("sourceType") or "unknown" for record in records)
+    markets = Counter(f"{record.get('symbol') or '-'} {record.get('timeframe') or '-'}" for record in records)
+    strategies = Counter(record.get("strategy") or "-" for record in records)
+    planner_notes = []
+    if buckets.get("REPLACEMENT_ELIGIBLE"):
+        planner_notes.append("Replacement-eligible rows exist; run lead-review before any promotion.")
+    if buckets.get("PROMISING_REVIEW") or buckets.get("PROMISING"):
+        planner_notes.append("Promising rows exist; next brain step should expand nearby params and re-run walk-forward.")
+    if buckets.get("REJECTED", 0) > buckets.get("PROMISING", 0):
+        planner_notes.append("Many rows are rejected; planner should avoid repeatedly testing failed 15m/weak families.")
+    if buckets.get("PAPER_EVENT"):
+        planner_notes.append("Paper events exist; compare paper behavior against baseline expectations before judging candidates.")
+
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "readOnly": True,
+        "filesRead": dict(files_read),
+        "totalRecords": len(records),
+        "uniqueRecords": len(grouped_records),
+        "returnedRecords": len(top_records),
+        "buckets": dict(buckets),
+        "groupedBuckets": dict(grouped_buckets),
+        "sourceCounts": dict(source_counts),
+        "topMarkets": markets.most_common(8),
+        "topStrategies": strategies.most_common(8),
+        "plannerNotes": planner_notes,
+        "records": top_records,
+    }
+
+
+def build_research_champion_board(args) -> dict:
+    from scripts.research_champion_board import build_board
+
+    batch_limit = max(1, min(int(safe_float(args.get("batchLimit", args.get("batch_limit", 220)), 220)), 1000))
+    lead_limit = max(1, min(int(safe_float(args.get("leadLimit", args.get("lead_limit", 80)), 80)), 500))
+    symbol = str(args.get("symbol") or "BTCUSDT").strip() or "BTCUSDT"
+    timeframe = str(args.get("timeframe") or "4h").strip() or "4h"
+    board = build_board(batch_limit, lead_limit, symbol=symbol, timeframe=timeframe)
+    board["readOnly"] = True
+    return board
+
+
+def brain_plan_unique_key(record: dict) -> str:
+    return "|".join(str(record.get(key) or "") for key in ("strategy", "symbol", "timeframe"))
+
+
+def brain_plan_record_weight(record: dict, mode: str) -> float:
+    metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+    if record.get("sourceType") == "candle_discovery":
+        score = 650
+        timeframe = str(record.get("timeframe") or "")
+        if timeframe == "4h":
+            score += 100
+        elif timeframe == "1h":
+            score += 60
+        elif timeframe == "15m":
+            score += 20 if mode == "scalping" else -120
+        score += min(safe_float(metrics.get("returnPct"), 0), 40) * 10
+        score += min(safe_float(metrics.get("profitFactor"), 0), 4) * 70
+        score += min(safe_float(metrics.get("trades"), 0), 40) * 2
+        score -= safe_float(metrics.get("drawdownPct"), 0) * 10
+        score -= min(safe_float(record.get("trainTestGapPct"), 0), 150) * 1.2
+        return score
+    bucket_weights = {
+        "REPLACEMENT_ELIGIBLE": 1000,
+        "PROMISING_REVIEW": 850,
+        "PROMISING": 700,
+        "PASS_WEAK": 420,
+    }
+    score = bucket_weights.get(record.get("bucket") or "", 0) + safe_float(record.get("qualityScore"), 0)
+    timeframe = str(record.get("timeframe") or "")
+    if timeframe == "4h":
+        score += 120
+    elif timeframe == "1h":
+        score += 80
+    elif timeframe == "15m":
+        score += 30 if mode == "scalping" else -120
+    if safe_float(metrics.get("trades"), 0) < 40:
+        score -= 220
+    if safe_float(metrics.get("profitFactor"), 0) < 1.2:
+        score -= 180
+    if safe_float(metrics.get("returnPct"), 0) <= 0:
+        score -= 300
+    return score
+
+
+def discovery_test_quality_score(row: dict, test: dict, train: dict) -> float:
+    test_return = safe_float(test.get("totalReturnPct"), 0)
+    test_pf = safe_float(test.get("profitFactor"), 0)
+    test_drawdown = safe_float(test.get("maxDrawdownPct"), 0)
+    test_trades = safe_float(test.get("trades"), 0)
+    train_return = safe_float(train.get("totalReturnPct"), row.get("totalReturnPct", 0))
+    train_test_gap = max(0, train_return - test_return)
+    return (
+        test_return * 24
+        + test_pf * 120
+        + min(test_trades, 40) * 3
+        - test_drawdown * 14
+        - train_test_gap * 1.8
+    )
+
+
+def discovery_strategy_suggestions(pattern: str, side: str = "long") -> list[str]:
+    text = str(pattern or "").lower()
+    if side == "short" or "bear." in text or "breakdown." in text:
+        return ["BtcMeanReversion4hV1", "RangeExpansionV2"]
+    if "squeeze" in text and "pullback" in text:
+        return ["SqueezePullbackHold4hV1", "PullbackReclaimV2"]
+    if "squeeze" in text:
+        return ["VolatilitySqueezeBreakout", "SqueezePullbackHold4hV1"]
+    if "breakout" in text or "donchian" in text or "structure.break" in text:
+        return ["BreakoutRetestV2", "RegimeDonchianCloseConfirm", "RegimeDonchian20"]
+    if "reversion" in text or "rsi_lt" in text:
+        return ["BtcMeanReversion4hV1", "MeanReversionInBullRegime"]
+    if "pullback" in text:
+        return ["PullbackReclaimV2", "EmaBounceV2"]
+    if "momentum" in text or "trend." in text:
+        return ["RelativeStrengthV2", "EmaBounceV2", "RegimeDonchian20"]
+    return ["EmaBounceV2", "RelativeStrengthV2"]
+
+
+def load_discovery_brain_records(symbols: set[str], timeframes: set[str], file_limit: int = 12) -> tuple[list[dict], list[str]]:
+    records: list[dict] = []
+    notes: list[str] = []
+    if not RESEARCH_DISCOVERY_DIR.exists():
+        return records, notes
+    files = sorted(RESEARCH_DISCOVERY_DIR.glob("candle-pattern-discovery-*.json"), key=lambda path: path.stat().st_mtime, reverse=True)[:file_limit]
+    for path in files:
+        payload = read_json_file(path, {})
+        symbol = str(payload.get("symbol") or "").upper()
+        timeframe = str(payload.get("timeframe") or "")
+        if symbols and symbol not in symbols:
+            continue
+        if timeframes and timeframe not in timeframes:
+            continue
+        source_file = relative_report_path(path)
+        scored_rows = []
+        for row in (payload.get("top") or []):
+            if not isinstance(row, dict):
+                continue
+            test = row.get("test") if isinstance(row.get("test"), dict) else {}
+            train = row.get("train") if isinstance(row.get("train"), dict) else {}
+            scored_rows.append((discovery_test_quality_score(row, test, train), row))
+        scored_rows.sort(key=lambda item: item[0], reverse=True)
+        for index, (test_quality_score, row) in enumerate(scored_rows[:8]):
+            if not isinstance(row, dict):
+                continue
+            test = row.get("test") if isinstance(row.get("test"), dict) else {}
+            train = row.get("train") if isinstance(row.get("train"), dict) else {}
+            return_pct = safe_float(test.get("totalReturnPct", row.get("totalReturnPct")), 0)
+            profit_factor = safe_float(test.get("profitFactor", row.get("profitFactor")), 0)
+            trades = safe_float(test.get("trades", row.get("trades")), 0)
+            drawdown = safe_float(test.get("maxDrawdownPct", row.get("maxDrawdownPct")), 0)
+            train_return = safe_float(train.get("totalReturnPct", row.get("totalReturnPct")), 0)
+            train_test_gap = max(0, train_return - return_pct)
+            if return_pct < 2 or profit_factor < 1.2 or trades < 10 or drawdown > 16:
+                continue
+            for strategy in discovery_strategy_suggestions(row.get("pattern"), row.get("side"))[:2]:
+                records.append({
+                    "strategy": strategy,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "bucket": "PROMISING_REVIEW",
+                    "sourceType": "candle_discovery",
+                    "sourceFile": source_file,
+                    "metrics": {
+                        "returnPct": round(return_pct, 4),
+                        "endEquity": round(10000 * (1 + return_pct / 100), 2),
+                        "profitFactor": round(profit_factor, 4),
+                        "drawdownPct": round(drawdown, 4),
+                        "trades": int(trades),
+                        "score": row.get("score"),
+                    },
+                    "reason": f"Discovery pattern: {row.get('pattern')} / {row.get('side')} hold {row.get('holdBars')} bars.",
+                    "qualityScore": round(test_quality_score, 4),
+                    "trainTestGapPct": round(train_test_gap, 4),
+                    "discoveryPattern": row.get("pattern"),
+                    "discoveryHoldBars": row.get("holdBars"),
+                    "discoverySide": row.get("side"),
+                    "readOnly": True,
+                })
+        if scored_rows:
+            best = scored_rows[0][1] or {}
+            best_test = best.get("test") if isinstance(best.get("test"), dict) else {}
+            notes.append(
+                f"Discovery read {source_file}: best test pattern {best.get('pattern')} {best.get('side')} hold {best.get('holdBars')} bars, test return {round(safe_float(best_test.get('totalReturnPct'), 0), 2)}%."
+            )
+    return records, notes
+
+
+def build_research_brain_plan(args) -> dict:
+    mode = str(args.get("mode") or "balanced").lower()
+    depth = str(args.get("depth") or "focused").lower()
+    max_jobs = max(2, min(int(safe_float(args.get("maxJobs", args.get("max_jobs", 8)), 8)), 20))
+    requested_symbols = parse_csv_arg(args.get("symbols"), ["BTCUSDT"])
+    requested_timeframes = parse_csv_arg(args.get("timeframes"), ["4h"])
+    requested_symbol_set = {str(item).upper() for item in requested_symbols}
+    requested_timeframe_set = {str(item) for item in requested_timeframes}
+    ledger = build_research_results_ledger({
+        "fileLimit": args.get("fileLimit", args.get("file_limit", 160)),
+        "rowLimit": args.get("rowLimit", args.get("row_limit", 700)),
+    })
+    discovery_records, discovery_notes = load_discovery_brain_records(requested_symbol_set, requested_timeframe_set)
+    records = (ledger.get("records") or []) + discovery_records
+    actionable_buckets = {"REPLACEMENT_ELIGIBLE", "PROMISING_REVIEW", "PROMISING", "PASS_WEAK"}
+    candidates = []
+    for record in records:
+        metrics = record.get("metrics") if isinstance(record.get("metrics"), dict) else {}
+        if record.get("bucket") not in actionable_buckets:
+            continue
+        if safe_float(metrics.get("returnPct"), 0) <= 0:
+            continue
+        if safe_float(metrics.get("profitFactor"), 0) < 1.15:
+            continue
+        if safe_float(metrics.get("trades"), 0) < 40 and record.get("bucket") != "PROMISING_REVIEW":
+            continue
+        if str(record.get("timeframe") or "") == "15m" and mode != "scalping":
+            continue
+        if requested_symbol_set and str(record.get("symbol") or "").upper() not in requested_symbol_set:
+            continue
+        if requested_timeframe_set and str(record.get("timeframe") or "") not in requested_timeframe_set:
+            continue
+        item = {
+            "strategy": record.get("strategy"),
+            "symbol": record.get("symbol"),
+            "timeframe": record.get("timeframe"),
+            "bucket": record.get("bucket"),
+            "sourceType": record.get("sourceType"),
+            "sourceFile": record.get("sourceFile"),
+            "metrics": metrics,
+            "reason": record.get("reason") or record.get("verdict") or "Ledger candidate.",
+            "score": round(brain_plan_record_weight(record, mode), 4),
+        }
+        candidates.append(item)
+    candidates.sort(key=lambda item: item.get("score") or 0, reverse=True)
+    unique_candidates = []
+    seen = set()
+    for item in candidates:
+        key = brain_plan_unique_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(item)
+    candidates = unique_candidates
+    selected = candidates[:max_jobs]
+    repeat_summary = repeated_brain_best_summary()
+    novelty_mode = (
+        bool(repeat_summary.get("isRepeated"))
+        and requested_symbol_set == {"BTCUSDT"}
+        and requested_timeframe_set == {"4h"}
+    )
+    repeated_strategy = str(repeat_summary.get("strategy") or "")
+    if novelty_mode and repeated_strategy:
+        selected = [item for item in selected if item.get("strategy") != repeated_strategy]
+    if not selected:
+        selected = [{
+            "strategy": "EmaBounceV2",
+            "symbol": requested_symbols[0] if requested_symbols else "BTCUSDT",
+            "timeframe": requested_timeframes[0] if requested_timeframes else "4h",
+            "bucket": "BASELINE",
+            "sourceType": "fallback",
+            "sourceFile": "-",
+            "metrics": {},
+            "reason": "No ledger candidate cleared minimum filters; fall back to active baseline family.",
+            "score": 0,
+        }]
+
+    def unique_ordered(values: list) -> list[str]:
+        output = []
+        for value in values:
+            if value and value not in output:
+                output.append(str(value))
+        return output
+
+    exploration_strategies = []
+    if requested_symbol_set == {"BTCUSDT"} and requested_timeframe_set == {"4h"}:
+        exploration_strategies = [
+            "SqueezePullbackHold4hV1",
+            "BtcMeanReversion4hV1",
+            "MeanReversionInBullRegime",
+            "PullbackReclaimV2",
+            "MomentumContinuation",
+            "RelativeStrengthV2",
+            "RegimeDonchian20",
+            "RegimeDonchianCloseConfirm",
+            "VolatilitySqueezeBreakout",
+            "RangeExpansionV2",
+            "RobustTrendFollowerV1",
+        ]
+    if novelty_mode and repeated_strategy:
+        exploration_strategies = [strategy for strategy in exploration_strategies if strategy != repeated_strategy]
+    strategy_candidates = [item.get("strategy") for item in selected] + exploration_strategies
+    strategies = unique_ordered(strategy_candidates)[:10]
+    symbols = unique_ordered([item.get("symbol") for item in selected if not requested_symbol_set or str(item.get("symbol") or "").upper() in requested_symbol_set])[:5]
+    timeframes = unique_ordered([item.get("timeframe") for item in selected if not requested_timeframe_set or str(item.get("timeframe") or "") in requested_timeframe_set])[:3]
+    symbols = symbols or requested_symbols or ["BTCUSDT"]
+    timeframes = timeframes or requested_timeframes or ["4h"]
+    if mode == "swing" and "4h" not in timeframes:
+        timeframes = (["4h"] + timeframes)[:3]
+    depth_settings = {
+        "quick": {"maxCandidates": 120, "maxCombosPerStrategy": 80, "topN": 30, "timeoutSeconds": 7200, "runtimeBudgetSeconds": 7000},
+        "focused": {"maxCandidates": 240, "maxCombosPerStrategy": 180, "topN": 50, "timeoutSeconds": 10800, "runtimeBudgetSeconds": 10500},
+        "deep": {"maxCandidates": 300, "maxCombosPerStrategy": 250, "topN": 60, "timeoutSeconds": 21600, "runtimeBudgetSeconds": 21000},
+    }.get(depth, {"maxCandidates": 240, "maxCombosPerStrategy": 180, "topN": 50, "timeoutSeconds": 10800, "runtimeBudgetSeconds": 10500})
+    period = "730d" if timeframes == ["15m"] else "1095d"
+    if "4h" in timeframes and depth == "deep":
+        period = "1460d"
+    campaign_market_part = "-".join([symbol.replace("/", "").replace(":", "") for symbol in symbols[:2]])
+    campaign_base_name = f"brain-{mode}-{campaign_market_part}-{'-'.join(timeframes)}"
+    campaign_name = next_brain_campaign_name(campaign_base_name, force_new=True)
+    payload = {
+        "campaign": campaign_name,
+        "symbols": ",".join(symbols),
+        "timeframes": ",".join(timeframes),
+        "strategies": ",".join(strategies),
+        "period": period,
+        "limit": "period",
+        "clearStop": True,
+        **depth_settings,
+    }
+    command = "python scripts\\research_campaign_resume.py " + " ".join([
+        "--campaign", payload["campaign"],
+        "--symbols", payload["symbols"],
+        "--timeframes", payload["timeframes"],
+        "--strategies", payload["strategies"],
+        "--period", payload["period"],
+        "--limit", payload["limit"],
+        "--max-candidates", str(payload["maxCandidates"]),
+        "--max-combos-per-strategy", str(payload["maxCombosPerStrategy"]),
+        "--top-n", str(payload["topN"]),
+        "--timeout-seconds", str(payload["timeoutSeconds"]),
+        "--runtime-budget-seconds", str(payload["runtimeBudgetSeconds"]),
+        "--clear-stop",
+    ])
+    warnings = []
+    if novelty_mode:
+        warnings.append(
+            f"Novelty mode is active: recent Auto Search rounds repeated {repeated_strategy or 'the same winner'} "
+            f"{repeat_summary.get('repeatCount')} time(s), so this plan avoids that winner and explores different BTC 4h families."
+        )
+    if len(symbols) * len(timeframes) * len(strategies) > len(selected) * 2:
+        warnings.append("Runner uses symbol/timeframe/strategy cartesian jobs, so this plan may test a few extra combinations around the selected evidence.")
+    if mode != "scalping":
+        warnings.append("15m is excluded by default because saved 15m evidence has repeatedly failed; use scalping mode to force it back into planning.")
+    elif "15m" not in timeframes:
+        warnings.append("Scalping mode found no 15m rows that cleared minimum return/PF/trade filters, so it kept the strongest higher-timeframe plan.")
+    warnings.extend(discovery_notes[:4])
+    next_steps = [
+        "Review selected rows and campaign payload.",
+        "Click Apply Brain Plan to fill the Strategy Finder form.",
+        "Click Start / Continue to run the resumable campaign.",
+        "Use Safe Pause; the current optimizer job finishes, then no new job starts.",
+    ]
+    return {
+        "ok": True,
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "depth": depth,
+        "readOnly": True,
+        "selectedJobs": selected,
+        "candidateCount": len(candidates),
+        "noveltyMode": novelty_mode,
+        "repeatSummary": repeat_summary,
+        "ledgerSummary": {
+            "totalRecords": ledger.get("totalRecords"),
+            "buckets": ledger.get("buckets"),
+            "filesRead": ledger.get("filesRead"),
+            "discoveryRecords": len(discovery_records),
+        },
+        "campaignPayload": payload,
+        "campaignBaseName": campaign_base_name,
+        "command": command,
+        "warnings": warnings,
+        "nextSteps": next_steps,
+        "safety": {
+            "researchOnly": True,
+            "paperTickRan": False,
+            "paperStateChanged": False,
+            "liveOrdersTouched": False,
+            "realTradingEnabled": False,
+            "configWritten": False,
+        },
+    }
+
+
 @app.get("/api/strategy-ranking")
 def strategy_ranking():
     source = request.args.get("source", "bybit")
@@ -1476,6 +3111,103 @@ def research_candidate_leaderboard():
         return jsonify(payload), status_code
     except Exception as exc:
         return jsonify({"error": f"Could not build research candidate leaderboard: {exc}"}), 502
+
+
+@app.get("/api/research/results-matrix")
+def research_results_matrix():
+    try:
+        payload = build_research_results_matrix(request.args)
+        return jsonify(payload), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research results matrix: {exc}"}), 502
+
+
+@app.get("/api/research/result-row")
+def research_result_row():
+    try:
+        return jsonify(resolve_research_result_row(request.args)), 200
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Could not resolve research result row: {exc}"}), 502
+
+
+@app.get("/api/research/results-ledger")
+def research_results_ledger():
+    try:
+        payload = build_research_results_ledger(request.args)
+        return jsonify(payload), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research results ledger: {exc}"}), 502
+
+
+@app.get("/api/research/champion-board")
+def research_champion_board():
+    try:
+        payload = build_research_champion_board(request.args)
+        return jsonify(payload), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research champion board: {exc}"}), 502
+
+
+@app.get("/api/research/brain-plan")
+def research_brain_plan():
+    try:
+        payload = build_research_brain_plan(request.args)
+        return jsonify(payload), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not build research brain plan: {exc}"}), 502
+
+
+@app.get("/api/research/resumable-campaign/status")
+def research_resumable_campaign_status():
+    try:
+        return jsonify(build_resumable_campaign_status(request.args)), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not read campaign status: {exc}"}), 502
+
+
+@app.post("/api/research/resumable-campaign/start")
+def research_resumable_campaign_start():
+    try:
+        payload, status_code = start_resumable_research_campaign(request.get_json(silent=True) or {})
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not start campaign: {exc}"}), 502
+
+
+@app.post("/api/research/resumable-campaign/stop")
+def research_resumable_campaign_stop():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(stop_resumable_research_campaign(payload)), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not request safe stop: {exc}"}), 502
+
+
+@app.get("/api/research/brain-loop/status")
+def research_brain_loop_status():
+    try:
+        return jsonify(build_brain_loop_status()), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not read brain loop status: {exc}"}), 502
+
+
+@app.post("/api/research/brain-loop/start")
+def research_brain_loop_start():
+    try:
+        payload, status_code = start_brain_loop(request.get_json(silent=True) or {})
+        return jsonify(payload), status_code
+    except Exception as exc:
+        return jsonify({"error": f"Could not start brain loop: {exc}"}), 502
+
+
+@app.post("/api/research/brain-loop/stop")
+def research_brain_loop_stop():
+    try:
+        return jsonify(stop_brain_loop()), 200
+    except Exception as exc:
+        return jsonify({"error": f"Could not stop brain loop: {exc}"}), 502
 
 
 @app.get("/api/research/fee-slippage-stress")
@@ -1777,6 +3509,126 @@ def research_snapshot_export():
         return jsonify({"error": f"Could not build research snapshot export: {exc}"}), 502
 
 
+def paper_trade_pnl(trade: dict) -> float:
+    return safe_float(trade.get("pnl", trade.get("netPnl", 0)), 0)
+
+
+def paper_loss_streak(trades: list[dict]) -> int:
+    streak = 0
+    for trade in reversed(trades or []):
+        if paper_trade_pnl(trade) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def paper_profit_factor(trades: list[dict]) -> float:
+    wins = sum(max(0, paper_trade_pnl(trade)) for trade in trades or [])
+    losses = abs(sum(min(0, paper_trade_pnl(trade)) for trade in trades or []))
+    if losses <= 0:
+        return 99 if wins > 0 else 0
+    return wins / losses
+
+
+def paper_equity_drawdown_pct(curve: list[dict]) -> float:
+    peak = 0.0
+    worst = 0.0
+    for point in curve or []:
+        equity = safe_float(point.get("equity"), 0) if isinstance(point, dict) else 0
+        peak = max(peak, equity)
+        if peak > 0:
+            worst = max(worst, (peak - equity) / peak * 100)
+    return round(worst, 4)
+
+
+def paper_trade_window_drawdown_pct(trades: list[dict]) -> float:
+    equity = 0.0
+    peak = 0.0
+    worst = 0.0
+    for trade in trades or []:
+        equity += paper_trade_pnl(trade)
+        peak = max(peak, equity)
+        if peak > 0:
+            worst = max(worst, (peak - equity) / max(1, abs(peak)) * 100)
+    return round(worst, 4)
+
+
+def paper_handbrake_snapshot(state: dict, candidate: dict, real_enabled: bool, paper_enabled: bool) -> dict:
+    existing = state.get("handbrake") if isinstance(state.get("handbrake"), dict) else {}
+    rules = {
+        "enabled": True,
+        "maxLossStreak": 5,
+        "maxDrawdownPct": 8,
+        "recentTradeWindow": 10,
+        "minRecoveryTrades": 10,
+        "minRecoveryProfitFactor": 1.2,
+        "maxRecoveryDrawdownPct": 3,
+        "requireManualResume": True,
+        **(candidate.get("handbrake") if isinstance(candidate.get("handbrake"), dict) else {}),
+    }
+    trades = state.get("closedTrades") if isinstance(state.get("closedTrades"), list) else []
+    recent = trades[-int(safe_float(rules.get("recentTradeWindow"), 10)):]
+    recovery = trades[-int(safe_float(rules.get("minRecoveryTrades"), 10)):]
+    loss_streak = paper_loss_streak(trades)
+    drawdown = paper_equity_drawdown_pct(state.get("equityCurve") if isinstance(state.get("equityCurve"), list) else [])
+    recent_average = sum(paper_trade_pnl(trade) for trade in recent) / max(1, len(recent))
+    recovery_average = sum(paper_trade_pnl(trade) for trade in recovery) / max(1, len(recovery))
+    recovery_pf = paper_profit_factor(recovery)
+    recovery_drawdown = paper_trade_window_drawdown_pct(recovery)
+    already_active = existing.get("state") in {"PAPER_RECOVERY", "READY_FOR_MANUAL_RESUME"}
+    triggers = []
+    if rules.get("enabled") is False:
+        state_name = "OFF"
+        reason = "Handbrake disabled in config."
+    else:
+        if loss_streak >= safe_float(rules.get("maxLossStreak"), 5):
+            triggers.append(f"{loss_streak} closed losses in a row")
+        if drawdown >= safe_float(rules.get("maxDrawdownPct"), 8):
+            triggers.append(f"drawdown {round(drawdown, 2)}% >= {rules.get('maxDrawdownPct')}%")
+        if len(recent) >= int(safe_float(rules.get("recentTradeWindow"), 10)) and recent_average < 0:
+            triggers.append(f"last {len(recent)} trades have negative average PnL")
+        recovery_ready = (
+            already_active
+            and len(recovery) >= int(safe_float(rules.get("minRecoveryTrades"), 10))
+            and recovery_average > 0
+            and recovery_pf >= safe_float(rules.get("minRecoveryProfitFactor"), 1.2)
+            and recovery_drawdown <= safe_float(rules.get("maxRecoveryDrawdownPct"), 3)
+        )
+        if recovery_ready:
+            state_name = "READY_FOR_MANUAL_RESUME"
+            reason = "Paper recovery passed; manual approval is required before real trading."
+        elif triggers or already_active:
+            state_name = "PAPER_RECOVERY"
+            reason = f"Handbrake triggered: {'; '.join(triggers)}." if triggers else "Handbrake remains active until paper recovery passes."
+        else:
+            state_name = "ARMED"
+            reason = "Handbrake armed."
+    return {
+        "enabled": rules.get("enabled") is not False,
+        "state": state_name,
+        "reason": reason,
+        "rules": rules,
+        "triggers": triggers,
+        "engagedAt": existing.get("engagedAt"),
+        "readyAt": existing.get("readyAt"),
+        "metrics": {
+            "closedTrades": len(trades),
+            "lossStreak": loss_streak,
+            "drawdownPct": round(drawdown, 4),
+            "recentTradeWindow": len(recent),
+            "recentAveragePnl": round(recent_average, 4),
+            "recoveryTrades": len(recovery),
+            "recoveryWins": len([trade for trade in recovery if paper_trade_pnl(trade) > 0]),
+            "recoveryAveragePnl": round(recovery_average, 4),
+            "recoveryProfitFactor": round(recovery_pf, 4),
+            "recoveryDrawdownPct": round(recovery_drawdown, 4),
+            "realTradingEnabled": bool(real_enabled),
+            "paperEnabled": bool(paper_enabled),
+        },
+    }
+
+
 @app.get("/api/paper/status")
 def paper_status():
     try:
@@ -1803,6 +3655,7 @@ def paper_status():
         observation_counters = build_paper_observation_counters({**dict(request.args), "activeOnly": "true"})
         compact_counters = compact_observation_counters(observation_counters)
         real_enabled, _ = paper_real_trading_enabled()
+        handbrake = paper_handbrake_snapshot(state, candidate, real_enabled, paper_enabled)
         runtime_journal = runtime.get("journal", {}) or {}
         blocking_warnings = runtime_journal.get("blockingWarnings", []) or []
         active_warnings = runtime_journal.get("activeWarnings", []) or []
@@ -1813,6 +3666,7 @@ def paper_status():
             "ok": True,
             "paperEnabled": paper_enabled,
             "realTradingEnabled": real_enabled,
+            "handbrake": handbrake,
             "consistencyWarnings": paper_enabled_consistency_warnings(candidate, paper_enabled),
             "initializationNeeded": runtime.get("initializationStatus") == "NEEDS_INIT",
             "openPositions": state.get("openPositions", []),
@@ -7996,6 +9850,12 @@ def build_research_regime_breakdown(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams"))])
+    if args.get("optimizerBaseParams"):
+        command.extend(["--optimizerBaseParams", str(args.get("optimizerBaseParams"))])
+    if args.get("optimizerGridOverrides"):
+        command.extend(["--optimizerGridOverrides", str(args.get("optimizerGridOverrides"))])
     try:
         completed = subprocess.run(
             command,
@@ -8102,6 +9962,12 @@ def build_research_regime_filter_counterfactual(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams"))])
+    if args.get("optimizerBaseParams") or args.get("optimizer_base_params"):
+        command.extend(["--optimizerBaseParams", str(args.get("optimizerBaseParams", args.get("optimizer_base_params")))])
+    if args.get("optimizerGridOverrides") or args.get("optimizer_grid_overrides"):
+        command.extend(["--optimizerGridOverrides", str(args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides")))])
     try:
         completed = subprocess.run(
             command,
@@ -8189,6 +10055,14 @@ def build_research_stability_first_challenger_search(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams"))])
+    optimizer_base_params = args.get("optimizerBaseParams", args.get("optimizer_base_params"))
+    if optimizer_base_params:
+        command.extend(["--optimizerBaseParams", str(optimizer_base_params)])
+    optimizer_grid_overrides = args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides"))
+    if optimizer_grid_overrides:
+        command.extend(["--optimizerGridOverrides", str(optimizer_grid_overrides)])
     try:
         completed = subprocess.run(
             command,
@@ -8797,6 +10671,7 @@ AUTOPILOT_DEFAULT_STRATEGIES = [
     "RelativeStrengthV2",
     "EmaBounceV2",
     "VolatilitySqueezeBreakout",
+    "BtcMeanReversion4hV1",
 ]
 AUTOPILOT_NEW_FAMILY_PREFERRED_STRATEGIES = [
     "MomentumContinuation",
@@ -8805,6 +10680,7 @@ AUTOPILOT_NEW_FAMILY_PREFERRED_STRATEGIES = [
     "VolatilitySqueezeBreakout",
     "ConservativeTrendLoose",
     "RelativeStrengthV2",
+    "BtcMeanReversion4hV1",
 ]
 AUTOPILOT_FIRST_PASS_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 AUTOPILOT_SECOND_PASS_SYMBOLS = ["BNBUSDT", "XRPUSDT"]
@@ -10711,6 +12587,8 @@ def build_paper_only_candidate_config(plan: dict) -> dict:
     risk = plan.get("proposedRiskPlaceholders") or {}
     safety = plan.get("proposedSafetySettings") or {}
     identity = plan.get("candidateIdentity") or {}
+    params = plan.get("params") or {}
+    risk_pct = safe_float(params.get("riskPct"), safe_float(risk.get("riskPct"), 0.005))
     now = autopilot_now()
     return normalize_promoted_candidate_config({
         "enabled": True,
@@ -10725,13 +12603,14 @@ def build_paper_only_candidate_config(plan: dict) -> dict:
         "paramsHash": plan.get("paramsHash"),
         "candidateKey": identity.get("candidateKey"),
         "candidateIdentity": identity,
-        "params": plan.get("params") or {},
+        "params": params,
         "symbols": [{"symbol": market.get("symbol"), "interval": market.get("timeframe"), "mode": "active"}],
         "fillModel": "next-open",
         "makerFeePct": risk.get("makerFeePct", 0.02),
         "takerFeePct": risk.get("takerFeePct", 0.055),
         "slippageBps": risk.get("slippageBps", 2),
         "accountEquity": risk.get("initialEquity", 10000),
+        "riskPct": risk_pct,
         "maxPositionPct": risk.get("maxPositionPct", 10),
         "maxDailyLossPct": risk.get("maxDailyLossPct", 2),
         "maxOpenTrades": 1 if safety.get("maxOnePosition") else 1,
@@ -12554,8 +14433,8 @@ def build_research_confirmed_paper_tick_once(args=None) -> tuple[dict, int]:
         return refused("Exact confirmation required; no paper tick was run.")
     if not canonical_paper_enabled(candidate):
         return refused("paperEnabled must be true before running one confirmed paper tick.")
-    if candidate.get("strategy") != "EmaBounceV2" or symbol != "BTCUSDT" or timeframe != "4h":
-        return refused("Active paper candidate must be EmaBounceV2 BTCUSDT 4h.")
+    if not candidate.get("strategy") or not symbol or not timeframe or not candidate_key:
+        return refused("Active paper candidate identity is incomplete.")
     if real_enabled or candidate.get("realTradingEnabled"):
         return refused(real_detail if real_enabled else "Candidate realTradingEnabled must be false.", extra={"realTradingEnabled": True})
     if candidate.get("exchangeOrders"):
@@ -14649,8 +16528,8 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
     timeframes = args.get("timeframes", "1h,4h")
     strategies = args.get("strategies", "auto")
     period = args.get("period", "365d")
-    max_candidates = max(1, min(int(safe_float(args.get("maxCandidates", args.get("max_candidates", 100)), 100)), 200))
-    max_combos = max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 50)), 50)), 250))
+    max_candidates = max(1, min(int(safe_float(args.get("maxCandidates", args.get("max_candidates", 100)), 100)), 600))
+    max_combos = max(1, min(int(safe_float(args.get("maxCombosPerStrategy", args.get("max_combos_per_strategy", 50)), 50)), 800))
     top_n = max(1, min(int(safe_float(args.get("topN", args.get("top_n", 20)), 20)), 100))
     include_walk = str(args.get("includeWalkForward", args.get("include_walk_forward", "false"))).strip().lower() in {"1", "true", "yes", "on"}
     include_stress = str(args.get("includeStress", args.get("include_stress", "false"))).strip().lower() in {"1", "true", "yes", "on"}
@@ -14701,6 +16580,14 @@ def build_research_multi_strategy_optimizer_batch(args) -> tuple[dict, int]:
     ])
     if args.get("limit"):
         command.extend(["--limit", str(args.get("limit"))])
+    if args.get("optimizerParams"):
+        command.extend(["--optimizerParams", str(args.get("optimizerParams"))])
+    optimizer_base_params = args.get("optimizerBaseParams", args.get("optimizer_base_params"))
+    if optimizer_base_params:
+        command.extend(["--optimizerBaseParams", str(optimizer_base_params)])
+    optimizer_grid_overrides = args.get("optimizerGridOverrides", args.get("optimizer_grid_overrides"))
+    if optimizer_grid_overrides:
+        command.extend(["--optimizerGridOverrides", str(optimizer_grid_overrides)])
     try:
         completed = subprocess.run(
             command,
@@ -15206,6 +17093,7 @@ def _save_research_lead_review(payload: dict) -> str:
 
 def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, lead_timeframe: str, period: str) -> tuple[dict | None, str, dict | None, list[str], int]:
     raw_params = args.get("leadParams")
+    searched_sources = ["leadParams"]
     if raw_params:
         try:
             params = json.loads(raw_params)
@@ -15214,34 +17102,73 @@ def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, le
         if not isinstance(params, dict):
             return None, "inline", {"ok": False, "error": "leadParams must decode to a JSON object."}, [], 400
         return params, "inline", None, [], 200
+    batch_search = None
     if args.get("batchFile"):
+        searched_sources.append("optimizerBatch")
         batch_payload, batch_error = _load_candidate_deep_compare_batch_file(str(args.get("batchFile")))
         if batch_error:
-            return None, "batchFile", {"ok": False, "error": batch_error}, [], 400
+            return None, "batchFile", {
+                "ok": False,
+                "error": batch_error,
+                "source": {
+                    "batchFile": args.get("batchFile"),
+                    "searchedSources": searched_sources,
+                    "requested": {"strategy": lead_strategy, "symbol": lead_symbol, "timeframe": lead_timeframe},
+                },
+            }, [], 400
         rows = [row for row in (batch_payload.get("rows") or []) if isinstance(row, dict)]
         matching_rows = []
+        candidate_rows = 0
+        rows_with_params = 0
+        inspected_rows = []
         for row in rows:
             if row.get("isActiveBaseline"):
                 continue
+            candidate_rows += 1
+            row_timeframe = str(row.get("timeframe") or row.get("interval") or "")
+            has_params = isinstance(row.get("params"), dict) and bool(row.get("params"))
+            if has_params:
+                rows_with_params += 1
+            if len(inspected_rows) < 12:
+                inspected_rows.append({
+                    "rank": row.get("rank"),
+                    "strategy": row.get("strategy"),
+                    "symbol": row.get("symbol"),
+                    "timeframe": row_timeframe,
+                    "hasParams": has_params,
+                    "paramKeys": sorted((row.get("params") or {}).keys()) if isinstance(row.get("params"), dict) else [],
+                })
             if str(row.get("strategy") or "") != lead_strategy:
                 continue
             if str(row.get("symbol") or "") != lead_symbol:
                 continue
-            if str(row.get("timeframe") or row.get("interval") or "") != lead_timeframe:
+            if row_timeframe != lead_timeframe:
                 continue
-            if isinstance(row.get("params"), dict) and row.get("params"):
+            if has_params:
                 matching_rows.append(row)
+        batch_search = {
+            "batchFile": batch_payload.get("_resolvedBatchFile"),
+            "searchedSources": searched_sources,
+            "requested": {"strategy": lead_strategy, "symbol": lead_symbol, "timeframe": lead_timeframe},
+            "totalRows": len(rows),
+            "candidateRows": candidate_rows,
+            "rowsWithParams": rows_with_params,
+            "matchedRows": len(matching_rows),
+            "inspectedRowsSample": inspected_rows,
+        }
         if matching_rows:
             matching_rows = sorted(matching_rows, key=lambda row: int(safe_float(row.get("rank"), 999999)))
+            selected_params = dict(matching_rows[0].get("params"))
+            batch_search.update({
+                "selectedRank": matching_rows[0].get("rank"),
+                "selectedParamKeys": sorted(selected_params.keys()),
+            })
             return dict(matching_rows[0].get("params")), "optimizerBatch", {
                 "ok": True,
-                "source": {
-                    "batchFile": batch_payload.get("_resolvedBatchFile"),
-                    "matchedRows": len(matching_rows),
-                    "selectedRank": matching_rows[0].get("rank"),
-                },
+                "source": batch_search,
                 "summary": batch_payload.get("summary") or {},
             }, [], 200
+    searched_sources.append("optimizerDrilldown")
     drilldown_args = {
         "symbols": lead_symbol,
         "timeframes": lead_timeframe,
@@ -15262,6 +17189,10 @@ def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, le
         drilldown_args["batchFile"] = args.get("batchFile")
     drilldown_payload, drilldown_status = build_research_reproducible_candidate_drilldown(drilldown_args)
     warnings = drilldown_payload.get("warnings") or []
+    drilldown_payload["source"] = dict(drilldown_payload.get("source") or {})
+    drilldown_payload["source"]["searchedSources"] = searched_sources
+    if batch_search:
+        drilldown_payload["source"]["batchSearch"] = batch_search
     if not drilldown_payload.get("ok"):
         return None, "unresolved", drilldown_payload, warnings, drilldown_status
     for row in drilldown_payload.get("candidates") or []:
@@ -15272,6 +17203,7 @@ def _resolve_research_lead_params(args, lead_strategy: str, lead_symbol: str, le
             and isinstance(row.get("params"), dict)
             and row.get("params")
         ):
+            drilldown_payload["source"]["selectedParamKeys"] = sorted((row.get("params") or {}).keys())
             return dict(row.get("params")), "optimizerDrilldown", drilldown_payload, warnings, 200
     return None, "unresolved", drilldown_payload, warnings, 400
 
@@ -19099,14 +21031,32 @@ def node_executable() -> str:
     return fallback or "node"
 
 
-def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None, include_candles: bool = False) -> dict:
+def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None, include_candles: bool = False, execution_timeframe: str | None = None) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
     Python keeps responsibility for broker adapters that already work here
     (yfinance, Bybit cache, Hyperliquid). Simulation rules live in /core so
     the UI, CLI optimizer, and future workers all share one backtest engine.
     """
+    execution_timeframe = normalize_execution_timeframe(execution_timeframe, timeframe)
     candles_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
+    execution_payload = None
+    regime_payload = None
+    if execution_timeframe and execution_timeframe != timeframe:
+        signal_minutes = backtest_timeframe_minutes(timeframe) or 60
+        execution_minutes = backtest_timeframe_minutes(execution_timeframe) or signal_minutes
+        signal_candle_count = limit or len(candles_payload["candles"]) or 1000
+        execution_limit = min(50000, max(300, int(math.ceil(signal_candle_count * signal_minutes / execution_minutes)) + 250))
+        if source != "bybit":
+            execution_limit = min(5000, execution_limit)
+        execution_payload = fetch_historical_candles(source, symbol, execution_timeframe, period=period, limit=execution_limit)
+    if source != "bybit":
+        signal_minutes = backtest_timeframe_minutes(timeframe) or 60
+        signal_candle_count = limit or len(candles_payload["candles"]) or 1000
+        regime_limit = min(5000, max(300, int(math.ceil(signal_candle_count * signal_minutes / 240)) + 250))
+        regime_source = "hyperliquid" if source == "hyperliquid" else "bybit"
+        regime_symbol = "BTC" if regime_source == "hyperliquid" else "BTCUSDT"
+        regime_payload = fetch_historical_candles(regime_source, regime_symbol, "4h", period=period, limit=regime_limit)
     effective_limit = int(candles_payload.get("limit") or limit or len(candles_payload["candles"]) or 0)
     params = {
         **(strategy_params or {}),
@@ -19119,6 +21069,8 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "symbol": symbol,
         "interval": timeframe,
         "timeframe": timeframe,
+        "executionInterval": execution_timeframe,
+        "executionTimeframe": execution_timeframe,
         "strategy": NODE_STRATEGIES.get(preset, preset),
         "preset": NODE_STRATEGIES.get(preset, preset),
         "limit": effective_limit,
@@ -19126,6 +21078,10 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "debug": debug,
         "candles": candles_payload["candles"],
     }
+    if regime_payload:
+        engine_input["regimeCandles"] = regime_payload["candles"]
+    if execution_payload:
+        engine_input["executionCandles"] = execution_payload["candles"]
     completed = subprocess.run(
         [node_executable(), "cli/backtest.js", "--stdin-json"],
         input=json.dumps(engine_input, allow_nan=False),
@@ -19140,6 +21096,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["source"] = source
     payload["symbol"] = symbol
     payload["timeframe"] = timeframe
+    payload["executionTimeframe"] = execution_timeframe
     payload["period"] = period
     payload["presets"] = preset_options()
     payload.setdefault("diagnostics", {})
@@ -19159,8 +21116,18 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["diagnostics"]["period_capped"] = historical_diag.get("period_capped", False)
     payload["diagnostics"].setdefault("warnings", [])
     payload["diagnostics"]["warnings"].extend(historical_diag.get("warnings", []))
+    payload["diagnostics"]["execution_timeframe"] = execution_timeframe
+    payload["diagnostics"]["executionTimeframe"] = execution_timeframe
+    if execution_payload:
+        execution_diag = execution_payload.get("diagnostics", {})
+        payload["diagnostics"]["execution_coverage"] = execution_diag
+        payload["diagnostics"]["execution_candles"] = len(execution_payload.get("candles", []))
+        payload["diagnostics"]["warnings"].extend(execution_diag.get("warnings", []))
+        payload["diagnostics"]["warnings"].append(
+            f"Execution checks used {execution_timeframe} candles where available; signal rules still use {timeframe} candles."
+        )
     if include_candles:
-        payload["chartCandles"] = candles_payload["candles"]
+        payload["chartCandles"] = (execution_payload or candles_payload)["candles"]
     return payload
 
 
@@ -19241,6 +21208,8 @@ def normalize_backtest_response(
         "symbol": symbol,
         "timeframe": timeframe,
         "interval": timeframe,
+        "executionTimeframe": payload.get("executionTimeframe") or diagnostics.get("executionTimeframe") or timeframe,
+        "execution_timeframe": payload.get("executionTimeframe") or diagnostics.get("execution_timeframe") or timeframe,
         "period": period,
         "candlesLoaded": int(candles_loaded or 0),
         "number_of_candles_loaded": int(candles_loaded or 0),
@@ -19269,6 +21238,7 @@ def normalize_backtest_response(
         "source": source,
         "symbol": symbol,
         "timeframe": timeframe,
+        "executionTimeframe": payload.get("executionTimeframe") or diagnostics.get("executionTimeframe") or timeframe,
         "period": period,
         "preset": payload.get("preset") or strategy,
         "preset_id": payload.get("preset_id") or preset,
@@ -19308,6 +21278,15 @@ def backtest_timeframe_minutes(timeframe: str) -> float | None:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def normalize_execution_timeframe(value, signal_timeframe: str) -> str:
+    execution = str(value or "").strip().lower()
+    signal = str(signal_timeframe or "1h").strip().lower()
+    if not execution:
+        signal_minutes = backtest_timeframe_minutes(signal)
+        return "5m" if signal_minutes and signal_minutes > 5 else signal
+    return execution
 
 
 def expected_backtest_candles(period: str, timeframe: str) -> int | None:
@@ -19436,6 +21415,7 @@ def manual_backtest_run_context(
     params_used: dict,
     params_source: str,
     active_candidate: dict,
+    execution_timeframe: str | None = None,
 ) -> tuple[dict, list[str]]:
     diagnostics = payload.get("diagnostics") or {}
     coverage = diagnostics.get("historical_coverage") or diagnostics.get("historicalCoverage") or {}
@@ -19483,6 +21463,7 @@ def manual_backtest_run_context(
         "strategy": strategy,
         "symbol": symbol,
         "timeframe": timeframe,
+        "executionTimeframe": execution_timeframe or timeframe,
     }, warnings
 
 

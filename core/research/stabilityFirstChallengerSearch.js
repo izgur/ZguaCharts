@@ -158,6 +158,13 @@ function autoLimitFor(timeframe, days, cap) {
   return Math.max(250, Math.min(Number(cap || 5000), bars + 300));
 }
 
+function requestedLimitFor(rawLimit, timeframe, days, cap) {
+  if (!rawLimit || rawLimit === "auto") return autoLimitFor(timeframe, days, cap);
+  if (String(rawLimit).toLowerCase() === "period") return Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  const numeric = Number(rawLimit);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : autoLimitFor(timeframe, days, cap);
+}
+
 function comboAt(ranges, index) {
   const keys = Object.keys(ranges || {});
   const out = {};
@@ -576,6 +583,31 @@ async function buildReport(options) {
     slippageBps: Number(options.slippageBps || 2)
   };
   const fillModel = options.fillModel || "next-open";
+  const checkpointPath = options.checkpointPath || null;
+  const checkpointEvery = Math.max(1, Number(options.checkpointEvery || 25));
+  function checkpoint(stage, extra) {
+    if (!checkpointPath) return;
+    const sortedRaw = rawRows ? rawRows.slice().sort((a, b) => Number(b.rawScreenScore || -999) - Number(a.rawScreenScore || -999)).slice(0, topN) : [];
+    const sortedCandidates = candidates ? candidates.slice().sort(stabilityRankComparator).slice(0, topN) : [];
+    const payload = Object.assign({
+      ok: true,
+      partial: true,
+      stage,
+      generatedAt: new Date().toISOString(),
+      runContext: { source, period: options.period || "365d", folds, from, to, costs, fillModel, topN, maxCombosPerStrategy },
+      progress: {
+        rawCombosEvaluated,
+        rawRows: rawRows ? rawRows.length : 0,
+        retained: typeof retained !== "undefined" && retained ? retained.length : 0,
+        candidatesChronologicallyTested: candidates ? candidates.length : 0
+      },
+      topRawRows: sortedRaw,
+      topCandidates: sortedCandidates,
+      bestCandidateSoFar: sortedCandidates[0] || null
+    }, extra || {});
+    fs.mkdirSync(path.dirname(checkpointPath), { recursive: true });
+    fs.writeFileSync(checkpointPath, JSON.stringify(payload, null, 2));
+  }
   const strategiesDiscovered = strategiesRegistry.listStrategies().map((item) => item.name).filter((name) => name !== "AlwaysLongTest");
   const catalog = optimizer.optimizerGridCatalog();
   const strategiesSkipped = [];
@@ -604,13 +636,13 @@ async function buildReport(options) {
         interval: market.timeframe,
         from,
         to,
-        limit: options.limit && options.limit !== "auto" ? Number(options.limit) : autoLimitFor(market.timeframe, days, 5000)
+        limit: requestedLimitFor(options.limit, market.timeframe, days, 5000)
       }).then((candles) => data.normalizeCandles(candles || []));
     }
   });
   const [candleEntries, regimeCandles] = await Promise.all([
     Promise.all(Object.keys(candleKeys).map((key) => candleKeys[key].then((candles) => [key, candles]))),
-    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: options.limit && options.limit !== "auto" ? Number(options.limit) : autoLimitFor("4h", days, 3000) }).then((candles) => data.normalizeCandles(candles || []))
+    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor(options.limit, "4h", days, 3000) }).then((candles) => data.normalizeCandles(candles || []))
   ]);
   const candlesByKey = {};
   candleEntries.forEach(([key, candles]) => { candlesByKey[key] = candles; });
@@ -618,6 +650,8 @@ async function buildReport(options) {
   let rawCombosEvaluated = 0;
   const rawRows = [];
   const candidates = [];
+  let retained = [];
+  checkpoint("data_loaded", { candlesLoaded: Object.keys(candlesByKey).reduce((out, key) => Object.assign(out, { [key]: candlesByKey[key].length }), {}) });
   markets.forEach((market) => {
     strategiesSearched.forEach((strategy) => {
       const grid = boundedOptimizerGrid(strategy, maxCombosPerStrategy);
@@ -633,13 +667,15 @@ async function buildReport(options) {
         } catch (error) {
           rawRows.push({ strategy, symbol: market.symbol, timeframe: market.timeframe, status: "ERROR", rawScreenScore: -999, warnings: [error.message], params });
         }
+        if (rawCombosEvaluated % checkpointEvery === 0) checkpoint("stage_a_screening");
       });
     });
   });
-  const retained = rawRows
+  retained = rawRows
     .filter((row) => row.status !== "ERROR" && row.trades >= 10)
     .sort((a, b) => b.rawScreenScore - a.rawScreenScore)
     .slice(0, Math.max(topN, Math.min(30, topN * 2)));
+  checkpoint("stage_a_complete");
 
   const active = {
     strategy: options.activeStrategy || "SimpleAtrTrendV2",
@@ -652,6 +688,7 @@ async function buildReport(options) {
   });
   benchmark.tier = "CHRONOLOGICALLY_TESTED";
   benchmark.eligibility = { status: "BENCHMARK", passedGates: [], failedGates: [] };
+  checkpoint("benchmark_validated", { benchmark });
 
   retained.forEach((row) => {
     const spec = { strategy: row.strategy, symbol: row.symbol, timeframe: row.timeframe, params: row.params };
@@ -659,6 +696,7 @@ async function buildReport(options) {
       source, days, costs, folds, includeStress, includeRecentWindows, includeReproAudit, reproReruns, benchmark
     });
     candidates.push(validated);
+    checkpoint("candidate_validated", { latestCandidate: validated });
   });
   candidates.forEach((candidate) => {
     candidate.benchmarkComparison = benchmarkComparison(candidate, benchmark);

@@ -394,6 +394,35 @@ def print_lead_review(payload: dict) -> None:
     print(f"Comparison: winner={comparison.get('winner') or '-'} {comparison.get('tradeoffSummary') or ''}".strip())
     print(f"Replacement eligible: {eligibility.get('eligible')} reasons=" + ("; ".join(str(item) for item in (eligibility.get("reasons") or [])) if eligibility.get("reasons") else "-"))
     print(f"Verdict: {verdict.get('action') or '-'} - {verdict.get('reason') or '-'}")
+    resolver = payload.get("resolver") or {}
+    resolver_source = resolver.get("source") or {}
+    if resolver_source:
+        requested = resolver_source.get("requested") or {}
+        print(
+            "Resolver: "
+            f"source={lead.get('paramsSource') or '-'} "
+            f"batchFile={resolver_source.get('batchFile') or '-'} "
+            f"requested={requested.get('strategy') or '-'} {requested.get('symbol') or '-'} {requested.get('timeframe') or '-'} "
+            f"rows={resolver_source.get('totalRows', '-')} "
+            f"candidates={resolver_source.get('candidateRows', '-')} "
+            f"withParams={resolver_source.get('rowsWithParams', '-')} "
+            f"matched={resolver_source.get('matchedRows', '-')} "
+            f"selectedRank={resolver_source.get('selectedRank') or '-'}"
+        )
+        if resolver_source.get("selectedParamKeys"):
+            print("Resolved param keys: " + ", ".join(str(item) for item in resolver_source.get("selectedParamKeys") or []))
+        batch_search = resolver_source.get("batchSearch") or {}
+        if batch_search:
+            batch_requested = batch_search.get("requested") or {}
+            print(
+                "Batch search: "
+                f"batchFile={batch_search.get('batchFile') or '-'} "
+                f"requested={batch_requested.get('strategy') or '-'} {batch_requested.get('symbol') or '-'} {batch_requested.get('timeframe') or '-'} "
+                f"rows={batch_search.get('totalRows', '-')} "
+                f"candidates={batch_search.get('candidateRows', '-')} "
+                f"withParams={batch_search.get('rowsWithParams', '-')} "
+                f"matched={batch_search.get('matchedRows', '-')}"
+            )
     checks = [
         ("Robustness", (evidence.get("robustness") or {}).get("status")),
         ("Stress", (evidence.get("feeSlippageStress") or {}).get("status")),

@@ -364,7 +364,8 @@ def cipher_b_markers(df: pd.DataFrame, wt1: pd.Series, wt2: pd.Series) -> list[d
                 "position": "belowBar",
                 "color": "#12b886",
                 "shape": "arrowUp",
-                "text": "WT LONG",
+                "text": "",
+                "label": "WT LONG",
             })
         elif previous_diff >= 0 > current_diff:
             markers.append({
@@ -372,7 +373,8 @@ def cipher_b_markers(df: pd.DataFrame, wt1: pd.Series, wt2: pd.Series) -> list[d
                 "position": "aboveBar",
                 "color": "#ff5c7a",
                 "shape": "arrowDown",
-                "text": "WT SHORT",
+                "text": "",
+                "label": "WT SHORT",
             })
 
     swing_window = 8
@@ -393,7 +395,8 @@ def cipher_b_markers(df: pd.DataFrame, wt1: pd.Series, wt2: pd.Series) -> list[d
                 "position": "belowBar",
                 "color": "#69db7c",
                 "shape": "circle",
-                "text": "Bull div",
+                "text": "",
+                "label": "Bull div",
             })
         if recent_price_high > prior_price_high and recent_wt_high < prior_wt_high:
             markers.append({
@@ -401,7 +404,8 @@ def cipher_b_markers(df: pd.DataFrame, wt1: pd.Series, wt2: pd.Series) -> list[d
                 "position": "aboveBar",
                 "color": "#ffa8b6",
                 "shape": "circle",
-                "text": "Bear div",
+                "text": "",
+                "label": "Bear div",
             })
     return markers[-40:]
 

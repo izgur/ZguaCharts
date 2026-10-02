@@ -12,6 +12,7 @@
     "paper:init": "node cli/paper_init.js",
     "paper:refresh": "node cli/paper_refresh.js",
     "paper:run-once": "python scripts/paper_run_once.py",
+    "paper:multi": "node cli/paper_multi.js",
     "paper:status": "node cli/paper_status.js",
     "paper:signal-diagnostics": "node cli/paper_signal_diagnostics.js",
     "paper:discover-fast-candidate": "node cli/paper_discover_fast_candidate.js",
@@ -32,6 +33,15 @@
     "research:optimizer-reproducibility-audit": "node cli/research_optimizer_reproducibility_audit.js",
     "research:reproducible-candidate-drilldown": "node cli/research_reproducible_candidate_drilldown.js",
     "research:lead-review": "node cli/research_lead_review.js",
+    "research:rs-nearby": "node scripts/relative_strength_nearby_robustness.js",
+    "research:rs-15m-confirmation": "node scripts/rs_15m_confirmation_research.js",
+    "research:rs-execution-policy": "node scripts/rs_execution_policy_research.js",
+    "research:short-timeframe": "node scripts/research_short_timeframe.js",
+    "research:sol-15m-validation": "node scripts/validate_sol_15m_breakout.js",
+    "research:trade-flow": "node scripts/analyze_trade_flow.js",
+    "research:passive-flow": "node scripts/analyze_passive_flow_entries.js",
+    "research:microstructure-regime": "node scripts/search_microstructure_regime_strategies.js",
+    "research:week-summary": "node scripts/research_week_summary.js",
     "paper:enable": "node cli/paper_config.js --enable",
     "paper:disable": "node cli/paper_config.js --disable",
     "optimize:v2": "node cli/optimize_v2.js",
@@ -42,6 +52,7 @@
     "test:cli-exit": "node tests/cli_exit_smoke.js",
     "test:overlays": "node tests/overlay_alignment_smoke.js",
     "test:paper": "node tests/paper_smoke.js",
+    "test:paper-incremental": "node tests/paper_incremental_smoke.js",
     "test:regime": "node tests/regime_strategy_smoke.js"
   }
 }

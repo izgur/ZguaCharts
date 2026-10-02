@@ -143,12 +143,23 @@ function parseDateToSeconds(value) {
   return Number.isNaN(parsed) ? null : Math.floor(parsed / 1000);
 }
 
+function minNumber(values, accessor) {
+  var min = Infinity;
+  for (var i = 0; i < values.length; i += 1) {
+    var value = Number(accessor ? accessor(values[i]) : values[i]);
+    if (Number.isFinite(value) && value < min) min = value;
+  }
+  return min;
+}
+
 function intervalToBybit(interval) {
   if (String(interval) === "240") return "240";
   if (String(interval).toUpperCase() === "D") return "D";
+  if (String(interval).toUpperCase() === "W") return "W";
   if (/^\d+m$/.test(interval)) return interval.slice(0, -1);
   if (/^\d+h$/.test(interval)) return String(Number(interval.slice(0, -1)) * 60);
   if (interval === "1d") return "D";
+  if (interval === "1w") return "W";
   return interval;
 }
 
@@ -156,11 +167,13 @@ function intervalToMs(interval) {
   interval = String(interval);
   if (/^\d+$/.test(interval)) return Number(interval) * 60 * 1000;
   if (interval.toUpperCase() === "D") return 24 * 60 * 60 * 1000;
+  if (interval.toUpperCase() === "W") return 7 * 24 * 60 * 60 * 1000;
   var amount = Number(interval.slice(0, -1));
   var unit = interval.slice(-1);
   if (unit === "m") return amount * 60 * 1000;
   if (unit === "h") return amount * 60 * 60 * 1000;
   if (unit === "d") return amount * 24 * 60 * 60 * 1000;
+  if (unit === "w") return amount * 7 * 24 * 60 * 60 * 1000;
   return 60 * 1000;
 }
 
@@ -169,6 +182,7 @@ function intervalToOpenInterestInterval(interval) {
   if (/^\d+m$/.test(value)) return value.replace("m", "min");
   if (/^\d+h$/.test(value)) return value;
   if (/^\d+d$/.test(value)) return value;
+  if (/^\d+w$/.test(value)) return "1d";
   if (/^\d+$/.test(value)) return value + "min";
   if (value === "240") return "4h";
   if (value.toUpperCase && value.toUpperCase() === "D") return "1d";
@@ -233,7 +247,7 @@ function fetchBybitCandles(options) {
 
   logger.info("Candle cache miss", { symbol: symbol, interval: interval, requested: requested, cached: cached.length });
   var rows = cached.map(candleToBybitRow);
-  var endTime = options.forceRefresh ? undefined : (rows.length ? Math.min.apply(null, rows.map(function (row) { return Number(row[0]); })) - 1 : undefined);
+  var endTime = options.forceRefresh ? undefined : (rows.length ? minNumber(rows, function (row) { return row[0]; }) - 1 : undefined);
   var maxRequests = Math.ceil(requested / BYBIT_REQUEST_LIMIT) + 2;
   var requestCount = 0;
 
@@ -256,7 +270,7 @@ function fetchBybitCandles(options) {
         fetchedFromBybit: requestCount > 0,
         bybitRequests: requestCount
       }, options);
-      var oldest = Math.min.apply(null, batch.map(function (row) { return Number(row[0]); }));
+      var oldest = minNumber(batch, function (row) { return row[0]; });
       rows = rows.concat(batch);
       if (endTime !== undefined && oldest >= endTime) {
         return withMetadata(normalizeCandles(rows.map(bybitRowToCandle)).slice(-requested), {

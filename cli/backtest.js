@@ -25,7 +25,10 @@ function usesRegimeRunner(strategy) {
     "RelativeStrengthV2",
     "SimpleAtrTrendV2",
     "FibPullbackContinuationV1",
-    "RobustTrendFollowerV1"
+    "RobustTrendFollowerV1",
+    "BtcMeanReversion4hV1",
+    "SqueezePullbackHold4hV1",
+    "BtcRegimeController4hV1"
   ].includes(strategy);
 }
 
@@ -41,6 +44,7 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     source: args.source || input.source || "bybit",
     symbol: args.symbol || input.symbol || "BTCUSDT",
     interval: args.interval || input.interval || input.timeframe || "1h",
+    executionInterval: args.executionInterval || args["execution-interval"] || input.executionInterval || input.executionTimeframe || input.execution_timeframe,
     from: args.from || input.from || (args.days ? argsUtil.daysToFrom(args.days) : input.from),
     to: args.to || input.to || new Date().toISOString(),
     strategy: args.strategy || input.strategy || input.preset || "ConservativeTrend",
@@ -71,11 +75,29 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     }
     return { candles: candles, regimeCandles: input.regimeCandles };
   }).then(function (loaded) {
+    if (input.executionCandles || !options.executionInterval || options.executionInterval === options.interval) {
+      return Object.assign({}, loaded, { executionCandles: input.executionCandles });
+    }
+    var signalMinutes = intervalMinutes(options.interval);
+    var executionMinutes = intervalMinutes(options.executionInterval);
+    var limitMultiplier = signalMinutes && executionMinutes ? Math.max(1, Math.ceil(signalMinutes / executionMinutes)) : 1;
+    return data.fetchCandles({
+      source: options.source,
+      symbol: options.symbol,
+      interval: options.executionInterval,
+      from: options.from,
+      to: options.to,
+      limit: Math.min(50000, Math.max(options.limit, options.limit * limitMultiplier))
+    }).then(function (executionCandles) {
+      return Object.assign({}, loaded, { executionCandles: executionCandles });
+    });
+  }).then(function (loaded) {
     return {
       candles: loaded.candles,
       result: backtest.runBacktestOnCandles(Object.assign({}, options, {
         candles: loaded.candles,
-        regimeCandles: loaded.regimeCandles
+        regimeCandles: loaded.regimeCandles,
+        executionCandles: loaded.executionCandles
       }))
     };
   });
@@ -104,3 +126,13 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     exitCode: 1
   });
 });
+
+function intervalMinutes(interval) {
+  var text = String(interval || "").trim().toLowerCase();
+  var value = Number(text.slice(0, -1));
+  if (!Number.isFinite(value)) return null;
+  if (text.endsWith("m")) return value;
+  if (text.endsWith("h")) return value * 60;
+  if (text.endsWith("d")) return value * 1440;
+  return null;
+}

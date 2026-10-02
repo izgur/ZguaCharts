@@ -19,6 +19,8 @@ reports/research-snapshots/
 reports/stability-first-search/
 reports-smoke/
 reports-cli-smoke/
+reports-optimizer-15m-1h-simpleatr/
+reports-research-15m-1h/
 config/backups/
 config/local/
 zguacharts-*.patch

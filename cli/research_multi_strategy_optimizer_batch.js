@@ -17,6 +17,8 @@ const AUTO_STRATEGIES = [
   "BreakoutRetestV2",
   "RangeExpansionV2",
   "RelativeStrengthV2",
+  "BtcMeanReversion4hV1",
+  "SqueezePullbackHold4hV1",
   "EmaPullbackContinuation",
   "TrendBreakoutRetest",
   "VolatilitySqueezeBreakout",
@@ -75,6 +77,17 @@ function timeframeHours(timeframe) {
 function autoLimitFor(timeframe, days, cap) {
   const bars = Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
   return Math.max(100, Math.min(Number(cap || 5000), bars));
+}
+
+function defaultExecutionTimeframe(timeframe) {
+  return timeframeHours(timeframe) > (5 / 60) ? "5m" : timeframe;
+}
+
+function requestedExecutionLimitFor(signalTimeframe, executionTimeframe) {
+  const signalHours = timeframeHours(signalTimeframe);
+  const executionHours = timeframeHours(executionTimeframe);
+  const multiplier = executionHours ? Math.max(1, Math.ceil(signalHours / executionHours)) : 1;
+  return Math.min(50000, Math.max(requestedLimitFor(signalTimeframe), requestedLimitFor(signalTimeframe) * multiplier));
 }
 
 function strategyExists(name) {
@@ -155,6 +168,7 @@ function compactResult(result, context) {
     practicalScore: 0,
     mainFailureReason: null,
     warnings: result.warnings || [],
+    executionTimeframe: result.executionTimeframe || result.executionInterval || context.executionTimeframe || context.timeframe,
     isActiveBaseline: !!context.isActiveBaseline
   };
   row.mainFailureReason = classify(row);
@@ -309,7 +323,7 @@ function reproReasons(original, status, diffs, reruns) {
   return reasons;
 }
 
-function auditRowReproducibility(row, candles, regimeCandles, context, reruns) {
+function auditRowReproducibility(row, candles, regimeCandles, executionCandles, context, reruns) {
   if (row.isActiveBaseline) return;
   const rerunRows = [];
   for (let index = 0; index < reruns; index += 1) {
@@ -318,8 +332,10 @@ function auditRowReproducibility(row, candles, regimeCandles, context, reruns) {
         source: context.source,
         symbol: row.symbol,
         interval: row.timeframe,
+        executionInterval: context.executionTimeframe || row.executionTimeframe || row.timeframe,
         strategy: row.strategy,
         candles,
+        executionCandles,
         regimeCandles,
         params: Object.assign({}, row.params, context.costs),
         feePct: context.costs.feePct,
@@ -485,7 +501,7 @@ function boundedGridCombos(strategy, maxCombos, selectedParams, baseParams, grid
   };
 }
 
-function stressSummary(row, candles, regimeCandles, context) {
+function stressSummary(row, candles, regimeCandles, executionCandles, context) {
   const scenarios = [
     { name: "baseline", feePct: context.costs.feePct, slippagePct: context.costs.slippagePct },
     { name: "doubleSlippage", feePct: context.costs.feePct, slippagePct: context.costs.slippagePct * 2 },
@@ -496,8 +512,10 @@ function stressSummary(row, candles, regimeCandles, context) {
     source: context.source,
     symbol: row.symbol,
     interval: row.timeframe,
+    executionInterval: context.executionTimeframe || row.executionTimeframe || row.timeframe,
     strategy: row.strategy,
     candles,
+    executionCandles,
     regimeCandles,
     params: Object.assign({}, row.params, { feePct: scenario.feePct, slippagePct: scenario.slippagePct }),
     feePct: scenario.feePct,
@@ -508,6 +526,7 @@ function stressSummary(row, candles, regimeCandles, context) {
     timeframe: row.timeframe,
     params: row.params,
     paramsSource: row.paramsSource,
+    executionTimeframe: context.executionTimeframe || row.executionTimeframe || row.timeframe,
     days: context.days,
     isActiveBaseline: row.isActiveBaseline
   }));
@@ -519,7 +538,7 @@ function stressSummary(row, candles, regimeCandles, context) {
   };
 }
 
-function walkForwardSummary(row, candles, regimeCandles, context) {
+function walkForwardSummary(row, candles, regimeCandles, executionCandles, context) {
   const count = 4;
   const size = Math.max(1, Math.floor(candles.length / count));
   const folds = [];
@@ -532,8 +551,10 @@ function walkForwardSummary(row, candles, regimeCandles, context) {
       source: context.source,
       symbol: row.symbol,
       interval: row.timeframe,
+      executionInterval: context.executionTimeframe || row.executionTimeframe || row.timeframe,
       strategy: row.strategy,
       candles: slice,
+      executionCandles: sliceExecutionCandles(executionCandles, slice),
       regimeCandles,
       params: row.params,
       feePct: context.costs.feePct,
@@ -544,6 +565,7 @@ function walkForwardSummary(row, candles, regimeCandles, context) {
       timeframe: row.timeframe,
       params: row.params,
       paramsSource: row.paramsSource,
+      executionTimeframe: context.executionTimeframe || row.executionTimeframe || row.timeframe,
       days: context.days,
       isActiveBaseline: row.isActiveBaseline
     })));
@@ -557,6 +579,13 @@ function walkForwardSummary(row, candles, regimeCandles, context) {
     failFoldCount,
     negativeFoldCount
   };
+}
+
+function sliceExecutionCandles(executionCandles, signalSlice) {
+  if (!executionCandles || !executionCandles.length || !signalSlice.length) return [];
+  const first = signalSlice[0].time;
+  const last = signalSlice[signalSlice.length - 1].time;
+  return executionCandles.filter((candle) => candle.time >= first && candle.time <= last);
 }
 
 function buildSummary(rows, skippedStrategies, activeEvidence, rules, options) {
@@ -631,8 +660,8 @@ const days = periodDays(args.period);
 const symbols = parseCsv(args.symbols, ["ETHUSDT", "BTCUSDT", "SOLUSDT"]);
 const timeframes = parseCsv(args.timeframes, ["1h", "4h"]);
 const requestedStrategies = parseCsv(args.strategies, AUTO_STRATEGIES);
-const maxCandidates = Math.max(1, Math.min(Number(args.maxCandidates || args.max_candidates || 100), 200));
-const maxCombosPerStrategy = Math.max(1, Math.min(Number(args.maxCombosPerStrategy || args.max_combos_per_strategy || 50), 250));
+const maxCandidates = Math.max(1, Math.min(Number(args.maxCandidates || args.max_candidates || 100), 600));
+const maxCombosPerStrategy = Math.max(1, Math.min(Number(args.maxCombosPerStrategy || args.max_combos_per_strategy || 50), 800));
 const topN = Math.max(1, Math.min(Number(args.topN || args.top_n || 20), 100));
 const source = args.source || "bybit";
 const activeParams = args.activeParams ? JSON.parse(args.activeParams) : {};
@@ -701,6 +730,7 @@ symbols.forEach((symbol) => {
 });
 const cappedCombos = combos.slice(0, maxCandidates);
 const candleJobs = {};
+const executionCandleJobs = {};
 cappedCombos.concat([{ symbol: active.symbol, timeframe: active.timeframe, strategy: active.strategy }]).forEach((combo) => {
   const key = combo.symbol + ":" + combo.timeframe;
   if (!candleJobs[key]) {
@@ -716,14 +746,29 @@ cappedCombos.concat([{ symbol: active.symbol, timeframe: active.timeframe, strat
       : candles
     ).then((candles) => data.normalizeCandles(candles || []));
   }
+  const executionTimeframe = defaultExecutionTimeframe(combo.timeframe);
+  const executionKey = combo.symbol + ":" + combo.timeframe + ":" + executionTimeframe;
+  if (executionTimeframe !== combo.timeframe && !executionCandleJobs[executionKey]) {
+    executionCandleJobs[executionKey] = data.fetchCandles({
+      source,
+      symbol: combo.symbol,
+      interval: executionTimeframe,
+      from,
+      to,
+      limit: requestedExecutionLimitFor(combo.timeframe, executionTimeframe)
+    }).then((candles) => data.normalizeCandles(candles || []));
+  }
 });
 
 Promise.all([
   Promise.all(Object.keys(candleJobs).map((key) => candleJobs[key].then((candles) => [key, candles]))),
+  Promise.all(Object.keys(executionCandleJobs).map((key) => executionCandleJobs[key].then((candles) => [key, candles]))),
   data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor("4h") }).then((candles) => data.normalizeCandles(candles || []))
-]).then(async ([entries, regimeCandles]) => {
+]).then(async ([entries, executionEntries, regimeCandles]) => {
   const candlesByKey = {};
+  const executionCandlesByKey = {};
   entries.forEach(([key, candles]) => { candlesByKey[key] = candles; });
+  executionEntries.forEach(([key, candles]) => { executionCandlesByKey[key] = candles; });
   const warnings = [];
   const timings = {
     startedAt: new Date(startedAt).toISOString(),
@@ -739,13 +784,17 @@ Promise.all([
 
   const rows = [];
   const activeCandles = candlesByKey[active.symbol + ":" + active.timeframe] || [];
+  const activeExecutionTimeframe = defaultExecutionTimeframe(active.timeframe);
+  const activeExecutionCandles = executionCandlesByKey[active.symbol + ":" + active.timeframe + ":" + activeExecutionTimeframe] || [];
   try {
     rows.push(compactResult(backtest.runBacktestOnCandles({
       source,
       symbol: active.symbol,
       interval: active.timeframe,
+      executionInterval: activeExecutionTimeframe,
       strategy: active.strategy,
       candles: activeCandles,
+      executionCandles: activeExecutionCandles,
       regimeCandles,
       params: Object.assign({}, activeParams, costs),
       feePct: costs.feePct,
@@ -756,6 +805,7 @@ Promise.all([
       timeframe: active.timeframe,
       params: activeParams,
       paramsSource: "activeBaseline",
+      executionTimeframe: activeExecutionTimeframe,
       days,
       isActiveBaseline: true
     }));
@@ -765,6 +815,8 @@ Promise.all([
 
   cappedCombos.forEach((combo) => {
     const candles = candlesByKey[combo.symbol + ":" + combo.timeframe] || [];
+    const executionTimeframe = defaultExecutionTimeframe(combo.timeframe);
+    const executionCandles = executionCandlesByKey[combo.symbol + ":" + combo.timeframe + ":" + executionTimeframe] || [];
     try {
       const grid = boundedGridCombos(combo.strategy, maxCombosPerStrategy, optimizerParams, optimizerBaseParams, optimizerGridOverrides);
       timings.plannedCandidateBacktests += grid.combos.length;
@@ -780,8 +832,10 @@ Promise.all([
           source,
           symbol: combo.symbol,
           interval: combo.timeframe,
+          executionInterval: executionTimeframe,
           strategy: combo.strategy,
           candles,
+          executionCandles,
           regimeCandles,
           params: withCosts,
           feePct: costs.feePct,
@@ -794,6 +848,7 @@ Promise.all([
           timeframe: combo.timeframe,
           params,
           paramsSource: "optimized",
+          executionTimeframe,
           days,
           isActiveBaseline: false
         });
@@ -830,6 +885,8 @@ Promise.all([
     for (const row of rows.filter((item) => !item.isActiveBaseline).slice(0, reproTopN)) {
       const fallbackCandles = candlesByKey[row.symbol + ":" + row.timeframe] || [];
       let candles = fallbackCandles;
+      const executionTimeframe = row.executionTimeframe || defaultExecutionTimeframe(row.timeframe);
+      let executionCandles = executionCandlesByKey[row.symbol + ":" + row.timeframe + ":" + executionTimeframe] || [];
       try {
         candles = await data.fetchCandles({
           source,
@@ -839,10 +896,20 @@ Promise.all([
           to,
           limit: args.limit && args.limit !== "auto" ? requestedLimitFor(row.timeframe) : autoLimitFor(row.timeframe, days, 5000)
         }).then((raw) => data.normalizeCandles(raw || []));
+        if (executionTimeframe !== row.timeframe) {
+          executionCandles = await data.fetchCandles({
+            source,
+            symbol: row.symbol,
+            interval: executionTimeframe,
+            from,
+            to,
+            limit: requestedExecutionLimitFor(row.timeframe, executionTimeframe)
+          }).then((raw) => data.normalizeCandles(raw || []));
+        }
       } catch (error) {
         warnings.push(`Reproducibility audit used optimizer-window candles for ${row.strategy} ${row.symbol} ${row.timeframe} because full-window refresh failed: ${error.message}`);
       }
-      auditRowReproducibility(row, candles, regimeCandles, { source, costs }, reproReruns);
+      auditRowReproducibility(row, candles, regimeCandles, executionCandles, { source, costs, executionTimeframe }, reproReruns);
     }
   } else if (includeReproAudit && runtimeBudgetHit) {
     warnings.push("Reproducibility audit skipped because optimizer runtime budget was hit.");
@@ -855,8 +922,10 @@ Promise.all([
   rows.forEach((row) => {
     if (enriched.has(row.rank) && !runtimeBudgetHit) {
       const candles = candlesByKey[row.symbol + ":" + row.timeframe] || [];
-      if (includeStress) row.stress = stressSummary(row, candles, regimeCandles, { source, days, costs });
-      if (includeWalkForward) row.walkForward = walkForwardSummary(row, candles, regimeCandles, { source, days, costs });
+      const executionTimeframe = row.executionTimeframe || defaultExecutionTimeframe(row.timeframe);
+      const executionCandles = executionCandlesByKey[row.symbol + ":" + row.timeframe + ":" + executionTimeframe] || [];
+      if (includeStress) row.stress = stressSummary(row, candles, regimeCandles, executionCandles, { source, days, costs, executionTimeframe });
+      if (includeWalkForward) row.walkForward = walkForwardSummary(row, candles, regimeCandles, executionCandles, { source, days, costs, executionTimeframe });
     }
   });
   if (runtimeBudgetHit && (includeStress || includeWalkForward)) warnings.push("Stress and walk-forward summaries skipped because optimizer runtime budget was hit.");
@@ -871,6 +940,7 @@ Promise.all([
     search: {
       symbols,
       timeframes,
+      executionTimeframe: "5m",
       strategies: selectedStrategies,
       period: args.period || "365d",
       limit: args.limit || "auto",

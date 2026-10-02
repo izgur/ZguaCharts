@@ -41,6 +41,8 @@ async function main() {
     folds: Number(args.folds || 4),
     limit: args.limit || "auto",
     params: baseParams,
+    feePct: args.feePct !== undefined ? Number(args.feePct) : undefined,
+    slippagePct: args.slippagePct !== undefined ? Number(args.slippagePct) : undefined,
     makerFeePct: Number(args.makerFeePct || args["maker-fee-pct"] || 0),
     takerFeePct: Number(args.takerFeePct || args["taker-fee-pct"] || 0),
     slippageBps: Number(args.slippageBps || args["slippage-bps"] || 0),

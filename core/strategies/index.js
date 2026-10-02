@@ -80,7 +80,13 @@ registerStrategy({
   "RelativeStrengthV2",
   "SimpleAtrTrendV2",
   "FibPullbackContinuationV1",
-  "RobustTrendFollowerV1"
+  "MtfPullback15mV1",
+  "VwapReversion15mV1",
+  "VwapReversion15mFastV1",
+  "RobustTrendFollowerV1",
+  "BtcMeanReversion4hV1",
+  "SqueezePullbackHold4hV1",
+  "BtcRegimeController4hV1"
 ].forEach(function (name) {
   registerStrategy({
     name: name,

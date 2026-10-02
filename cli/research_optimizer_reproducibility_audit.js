@@ -29,6 +29,14 @@ function autoLimitFor(timeframe, days, cap) {
   return Math.max(100, Math.min(Number(cap || 5000), bars));
 }
 
+function requestedLimitFor(rawLimit, timeframe, days, cap) {
+  if (String(rawLimit || "").toLowerCase() === "period") {
+    return Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  }
+  if (rawLimit && rawLimit !== "auto") return Number(rawLimit);
+  return autoLimitFor(timeframe, days, cap);
+}
+
 function round(value, digits) {
   const factor = Math.pow(10, digits || 4);
   return Math.round(Number(value || 0) * factor) / factor;
@@ -214,7 +222,6 @@ async function main() {
   const days = periodDays(args.period);
   const source = args.source || "bybit";
   const reruns = Math.max(1, Math.min(Number(args.reruns || 2), 5));
-  const limit = args.limit && args.limit !== "auto" ? Number(args.limit) : null;
   const from = args.from || argsUtil.daysToFrom(days);
   const to = args.to || new Date().toISOString();
   const options = {
@@ -233,13 +240,13 @@ async function main() {
         interval: candidate.timeframe,
         from,
         to,
-        limit: limit || autoLimitFor(candidate.timeframe, days, 5000)
+        limit: requestedLimitFor(args.limit, candidate.timeframe, days, 5000)
       }).then((candles) => data.normalizeCandles(candles || []));
     }
   });
   const [entries, regimeCandles] = await Promise.all([
     Promise.all(Object.keys(candleJobs).map((key) => candleJobs[key].then((candles) => [key, candles]))),
-    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: limit || autoLimitFor("4h", days, 3000) }).then((candles) => data.normalizeCandles(candles || []))
+    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor(args.limit, "4h", days, 3000) }).then((candles) => data.normalizeCandles(candles || []))
   ]);
   const candlesByKey = {};
   entries.forEach(([key, candles]) => { candlesByKey[key] = candles; });

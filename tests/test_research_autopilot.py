@@ -924,6 +924,100 @@ class ResearchAutopilotTests(unittest.TestCase):
         self.assertFalse(payload["candidates"][0]["safety"]["realTradingEnabled"])
         self.assert_autopilot_safety(payload)
 
+    def test_lead_review_resolves_params_from_optimizer_batch_row(self):
+        batch_dir = Path(zgua_app.app.root_path) / "reports" / "research-batches"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        batch_path = batch_dir / "multi-strategy-optimizer-batch-unit-lead-review.json"
+        self.addCleanup(lambda: batch_path.exists() and batch_path.unlink())
+        lead_params = {
+            "emaMid": 80,
+            "donchianEntry": 55,
+            "adxThreshold": 24,
+            "volumeMultiplier": 1.1,
+            "useOpenInterestFilter": True,
+            "minOpenInterestChangePct": -2,
+            "atrMultiplier": 2,
+            "riskPct": 0.0075,
+            "cooldownBars": 4,
+            "fillModel": "next-open",
+        }
+        batch_path.write_text(json.dumps({
+            "ok": True,
+            "rows": [
+                {
+                    "rank": 1,
+                    "isActiveBaseline": True,
+                    "strategy": "EmaBounceV2",
+                    "symbol": "BTCUSDT",
+                    "timeframe": "4h",
+                    "params": {"emaBounceAtr": 0.8},
+                    "trades": 56,
+                    "totalReturnPct": 8.208,
+                },
+                {
+                    "rank": 2,
+                    "strategy": "RobustTrendFollowerV1",
+                    "symbol": "XRPUSDT",
+                    "timeframe": "1h",
+                    "params": lead_params,
+                    "trades": 86,
+                    "totalReturnPct": 5.4254,
+                    "profitFactor": 1.6359,
+                    "maxDrawdownPct": 2.4729,
+                },
+            ],
+            "summary": {"recommendation": {"action": "KEEP_BASELINE"}},
+        }), encoding="utf-8")
+
+        completed_payload = {
+            "ok": True,
+            "lead": {"strategy": "RobustTrendFollowerV1", "symbol": "XRPUSDT", "timeframe": "1h"},
+            "baseline": {"strategy": "EmaBounceV2", "symbol": "BTCUSDT", "timeframe": "4h"},
+            "evidence": {
+                "activity": {
+                    "lead": {"status": "PASS", "trades": 86, "totalReturnPct": 5.4254, "profitFactor": 1.6359, "maxDrawdownPct": 2.4729},
+                    "baseline": {"status": "PASS", "trades": 56, "totalReturnPct": 8.208, "profitFactor": 2.396, "maxDrawdownPct": 3.3519},
+                },
+                "robustness": {"status": "ROBUST"},
+                "feeSlippageStress": {"status": "RESILIENT"},
+                "walkForward": {"status": "WATCH"},
+                "deepCompare": {"status": "BASELINE_EDGE"},
+            },
+            "comparison": {"winner": "BASELINE", "tradeoffSummary": "Baseline remains stronger."},
+            "replacementEligibility": {"eligible": False, "reasons": ["INSUFFICIENT_RETURN_EDGE"]},
+            "verdict": {"action": "KEEP_BASELINE", "reason": "The active baseline remains stronger."},
+            "warnings": [],
+        }
+
+        class Completed:
+            returncode = 0
+            stdout = json.dumps(completed_payload)
+            stderr = ""
+
+        with patch.object(zgua_app.subprocess, "run", return_value=Completed()) as run_mock:
+            payload, status = self.run_with_forbidden_boundaries(zgua_app.build_research_lead_review, {
+                "leadStrategy": "RobustTrendFollowerV1",
+                "leadSymbol": "XRPUSDT",
+                "leadTimeframe": "1h",
+                "period": "730d",
+                "limit": "period",
+                "batchFile": str(batch_path.relative_to(Path(zgua_app.app.root_path))).replace("\\", "/"),
+                "save": "false",
+            })
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["lead"]["paramsSource"], "optimizerBatch")
+        resolver_source = payload["resolver"]["source"]
+        self.assertEqual(resolver_source["matchedRows"], 1)
+        self.assertEqual(resolver_source["selectedRank"], 2)
+        self.assertEqual(resolver_source["requested"]["strategy"], "RobustTrendFollowerV1")
+        self.assertIn("emaMid", resolver_source["selectedParamKeys"])
+        command = run_mock.call_args[0][0]
+        lead_params_arg = json.loads(command[command.index("--leadParams") + 1])
+        self.assertEqual(lead_params_arg["emaMid"], 80)
+        self.assertTrue(lead_params_arg["useOpenInterestFilter"])
+
     def test_plan_paper_enable_candidate_dry_run_returns_full_params(self):
         package = self.disabled_candidate_package()
         package["warnings"] = [
@@ -3183,7 +3277,7 @@ class ResearchAutopilotTests(unittest.TestCase):
             response = client.get("/good-people")
         self.assertEqual(response.status_code, 200)
         html = response.get_data(as_text=True)
-        self.assertIn("Only for good people", html)
+        self.assertIn("<h2>Strategy Lab</h2>", html)
         self.assertIn("good-history-body", html)
         self.assertIn("good-param-options", html)
         self.assertIn("good-filter-suggestions", html)

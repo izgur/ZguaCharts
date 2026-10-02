@@ -38,7 +38,9 @@ async function main() {
     makerFeePct: Number(args.makerFeePct || args["maker-fee-pct"] || 0),
     takerFeePct: Number(args.takerFeePct || args["taker-fee-pct"] || 0.055),
     slippageBps: Number(args.slippageBps || args["slippage-bps"] || 2),
-    paperEnabled: boolArg("paperEnabled", false)
+    paperEnabled: boolArg("paperEnabled", false),
+    checkpointPath: args.checkpointPath || args.checkpoint_path || null,
+    checkpointEvery: Number(args.checkpointEvery || args.checkpoint_every || 25)
   });
   process.stdout.write(JSON.stringify(payload, null, 2));
   runtime.finishCli({ debugHandles: args["debug-handles"] === true, forceExit: args["force-exit"] === true, exitCode: 0 });

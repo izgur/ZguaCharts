@@ -2,6 +2,7 @@ const STORAGE_KEY = "tvk-dashboard-state";
 const UI_PREF_KEY = "zgua-ui-preferences";
 const MANUAL_BACKTEST_COMPARISON_KEY = "zgua-manual-backtest-comparisons";
 const GOOD_PEOPLE_PRESETS_KEY = "zgua-good-people-presets";
+const DEFAULT_CHART_LAYOUT_KEY = "zgua-default-chart-layout-v2";
 // Frontend boundary:
 // This file owns UI state, chart rendering, marker rendering, websocket candle
 // display, and API calls only. Indicator formulas, signal scoring, strategy
@@ -16,6 +17,26 @@ const CHART_LIBRARY_URLS = [
   "https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js",
 ];
 const WATCHLIST_REFRESH_MS = 30000;
+const STRATEGY_CACHE_BUCKET_MS = 5 * 60 * 1000;
+const STRATEGY_CACHE_LIMIT = 24;
+const strategyResponseCache = new Map();
+const DEFAULT_RESEARCH_STRATEGIES = "EmaBounceV2,BreakoutRetestV2,RegimeDonchian20,RegimeDonchianCloseConfirm,VolatilitySqueezeBreakout,RangeExpansionV2,RobustTrendFollowerV1,BtcMeanReversion4hV1,SqueezePullbackHold4hV1";
+
+function defaultExecutionTimeframe(signalTimeframe = "1h") {
+  const signalMinutes = timeframeMinutes(signalTimeframe);
+  if (!signalMinutes || signalMinutes <= 5) return signalTimeframe || "5m";
+  return "5m";
+}
+
+function timeframeMinutes(timeframe) {
+  const text = String(timeframe || "").trim().toLowerCase();
+  const value = Number(text.slice(0, -1));
+  if (!Number.isFinite(value)) return null;
+  if (text.endsWith("m")) return value;
+  if (text.endsWith("h")) return value * 60;
+  if (text.endsWith("d")) return value * 1440;
+  return null;
+}
 
 const grid = document.querySelector("#chart-grid");
 const countSelect = document.querySelector("#chart-count");
@@ -29,10 +50,14 @@ const globalIndicatorButton = document.querySelector("#global-indicator-button")
 const globalIndicatorMenu = document.querySelector("#global-indicator-menu");
 const globalIndicatorList = document.querySelector("#global-indicator-list");
 const globalSignalToggle = document.querySelector("#global-signal-toggle");
+const headerSignalStrip = document.querySelector("#header-signal-strip");
 const activeSignalsList = document.querySelector("#active-signals-list");
 const watchlistContent = document.querySelector("#watchlist-content");
+const currentStrategyContent = document.querySelector("#current-strategy-content");
+const currentStrategyTitle = document.querySelector("#current-strategy-title");
 const watchlistAddCurrent = document.querySelector("#watchlist-add-current");
 const watchlistAddAll = document.querySelector("#watchlist-add-all");
+const watchlistSignalToggle = document.querySelector("#watchlist-signal-toggle");
 const watchlistSection = document.querySelector("#watchlist-section");
 const activeSignalsSection = document.querySelector("#active-signals-section");
 const bottomPanel = document.querySelector(".bottom-panel");
@@ -42,6 +67,7 @@ const backtestResults = document.querySelector("#backtest-results");
 const backtestModal = document.querySelector("#backtest-modal");
 const backtestClose = document.querySelector("#backtest-close");
 const backtestHistoryButton = document.querySelector("#backtest-history-button");
+const backtestReplayButton = document.querySelector("#backtest-replay-button");
 const backtestTitle = document.querySelector("#backtest-title");
 const backtestContent = document.querySelector("#backtest-content");
 const paperTabButton = document.querySelector("#paper-tab-button");
@@ -67,6 +93,7 @@ let strategyBuilderCurrentPreset = "default";
 let lastManualBacktestPayload = null;
 let manualBacktestComparisons = loadManualBacktestComparisons();
 let lastSensitivityResults = [];
+let lastBrainPlanPayload = null;
 let sensitivityRunActive = false;
 let goodPeopleParams = {};
 let goodPeopleSort = { key: "createdAt", direction: "desc" };
@@ -81,6 +108,8 @@ let lastPaperReplacementSuggestion = null;
 let watchlistQuotes = new Map();
 let watchlistRefreshTimer = null;
 let watchlistRefreshInFlight = false;
+let strategyFinderPollTimer = null;
+let strategyFinderPollInFlight = false;
 
 window.api = window.api || {
   get: apiGet,
@@ -88,7 +117,24 @@ window.api = window.api || {
 
 function loadState() {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    const loaded = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    if (localStorage.getItem(DEFAULT_CHART_LAYOUT_KEY) !== "done") {
+      const firstPane = loaded.panes?.[0] || {};
+      const migrated = {
+        ...loaded,
+        count: 1,
+        panes: [{
+          ...firstPane,
+          source: firstPane.source || "bybit",
+          symbol: "BTCUSDT",
+          timeframe: "1h",
+        }],
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(migrated));
+      localStorage.setItem(DEFAULT_CHART_LAYOUT_KEY, "done");
+      return migrated;
+    }
+    return loaded;
   } catch {
     return {};
   }
@@ -104,8 +150,10 @@ function saveState() {
         symbol: pane.symbolSelect.value,
         timeframe: pane.timeframeSelect.value,
         preset: pane.presetSelect.value,
+        signalStrategy: pane.presetSelect.value,
         indicators: selectedIndicators(pane),
         signalMarkers: pane.signalMarkerToggle.checked,
+        logarithmicScale: pane.logarithmicScale,
       })),
     }),
   );
@@ -114,14 +162,17 @@ function saveState() {
 function loadUiPrefs() {
   try {
     const parsed = JSON.parse(localStorage.getItem(UI_PREF_KEY)) || {};
+    const watchlistAliases = { PEPEUSDT: "1000PEPEUSDT" };
+    const savedWatchlist = Array.isArray(parsed.watchlist) && parsed.watchlist.length ? parsed.watchlist : ["BTCUSDT"];
     return {
-      watchlist: Array.isArray(parsed.watchlist) && parsed.watchlist.length ? parsed.watchlist : ["BTCUSDT"],
+      watchlist: Array.from(new Set(savedWatchlist.map((symbol) => watchlistAliases[symbol] || symbol))),
       watchlistOpen: parsed.watchlistOpen !== false,
       activeSignalsOpen: parsed.activeSignalsOpen !== false,
       syncIndicators: parsed.syncIndicators !== false,
+      campaignForm: parsed.campaignForm && typeof parsed.campaignForm === "object" ? parsed.campaignForm : {},
     };
   } catch {
-    return { watchlist: ["BTCUSDT"], watchlistOpen: true, activeSignalsOpen: true, syncIndicators: true };
+    return { watchlist: ["BTCUSDT"], watchlistOpen: true, activeSignalsOpen: true, syncIndicators: true, campaignForm: {} };
   }
 }
 
@@ -153,6 +204,32 @@ async function apiPost(url, body) {
   return payload;
 }
 
+function strategyCacheKey(pane, preset, candleLimit) {
+  const lastCandleTime = pane.candles[pane.candles.length - 1]?.time || 0;
+  const executionBucket = Math.floor(Date.now() / STRATEGY_CACHE_BUCKET_MS);
+  return JSON.stringify([
+    pane.sourceSelect.value,
+    pane.symbolSelect.value,
+    pane.timeframeSelect.value,
+    defaultExecutionTimeframe(pane.timeframeSelect.value),
+    preset.id,
+    preset.params || {},
+    candleLimit,
+    lastCandleTime,
+    executionBucket,
+  ]);
+}
+
+async function cachedStrategyBacktest(key, request) {
+  if (strategyResponseCache.has(key)) return { payload: strategyResponseCache.get(key), cached: true };
+  const payload = await apiPost("/api/backtest/run-custom", request);
+  strategyResponseCache.set(key, payload);
+  while (strategyResponseCache.size > STRATEGY_CACHE_LIMIT) {
+    strategyResponseCache.delete(strategyResponseCache.keys().next().value);
+  }
+  return { payload, cached: false };
+}
+
 async function boot() {
   await loadChartLibrary();
 
@@ -170,6 +247,10 @@ async function boot() {
   setupSidebar();
   backtestClose.addEventListener("click", closeBacktestModal);
   backtestHistoryButton?.addEventListener("click", openBacktestHistory);
+  backtestReplayButton?.addEventListener("click", () => {
+    if (!backtestReplayButton.dataset.researchReplay) return;
+    replayResearchResult(backtestReplayButton);
+  });
   backtestModal.addEventListener("click", (event) => {
     if (event.target === backtestModal) closeBacktestModal();
   });
@@ -196,6 +277,31 @@ async function boot() {
     const diagnoseButton = event.target?.closest?.("[data-diagnose-backtest]");
     if (diagnoseButton) {
       runBacktestDiagnosis(diagnoseButton);
+      return;
+    }
+    const researchCellButton = event.target?.closest?.("[data-research-cell]");
+    if (researchCellButton) {
+      replayResearchResult(researchCellButton);
+      return;
+    }
+    const researchTestButton = event.target?.closest?.("[data-research-test]");
+    if (researchTestButton) {
+      copyResearchCellToStrategyBuilder(researchTestButton);
+      return;
+    }
+    const researchReplayButton = event.target?.closest?.("[data-research-replay]");
+    if (researchReplayButton) {
+      replayResearchResult(researchReplayButton);
+      return;
+    }
+    const ledgerButton = event.target?.closest?.("[data-ledger-record]");
+    if (ledgerButton) {
+      openResearchLedgerRecord(ledgerButton);
+      return;
+    }
+    const brainRoundButton = event.target?.closest?.("[data-brain-round]");
+    if (brainRoundButton) {
+      openBrainLoopRound(brainRoundButton);
       return;
     }
     const infoButton = event.target?.closest?.(".indicator-info-button");
@@ -230,6 +336,8 @@ async function boot() {
   window.addEventListener("popstate", () => showPage(pathToPage(window.location.pathname)));
   showPage(pathToPage(window.location.pathname));
   window.setInterval(() => refreshWatchlistData(), WATCHLIST_REFRESH_MS);
+  refreshHeaderSignalStrip();
+  window.setInterval(() => refreshHeaderSignalStrip(), 60000);
 }
 
 function setupNavigation() {
@@ -246,13 +354,13 @@ function setupNavigation() {
 }
 
 function pathToPage(pathname) {
-  if (pathname === "/" || pathname === "/dashboard") return "dashboard";
+  if (pathname === "/") return "charts";
+  if (pathname === "/dashboard") return "dashboard";
   if (pathname === "/backtest") return "backtest";
   if (pathname === "/good-people") return "good-people";
   if (pathname === "/analysis" || pathname === "/research") return "research";
   if (pathname === "/research/paper-review" || pathname === "/research/paper-operator") return "research";
-  if (pathname === "/candidate") return "candidate";
-  if (pathname === "/paper") return "paper";
+  if (pathname === "/candidate" || pathname === "/paper") return "research";
   if (pathname === "/learning") return "research";
   if (pathname === "/ops") return "ops";
   if (pathname === "/settings") return "settings";
@@ -278,7 +386,64 @@ function showPage(page) {
 }
 
 function setupDashboardControls() {
-  document.querySelector("#dashboard-refresh")?.addEventListener("click", () => loadWorkflowDashboard(true));
+  restoreCampaignForm();
+  document.querySelectorAll("[data-campaign-field]").forEach((input) => {
+    input.addEventListener("change", persistCampaignForm);
+    input.addEventListener("input", persistCampaignForm);
+  });
+  document.querySelector("#dashboard-refresh")?.addEventListener("click", () => {
+    loadBrainLoopStatus();
+    loadResumableCampaignStatus();
+    loadBrainPlan();
+    loadWorkflowDashboard(true);
+  });
+  document.querySelector("#brain-plan-refresh")?.addEventListener("click", loadBrainPlan);
+  document.querySelector("#brain-plan-apply")?.addEventListener("click", applyBrainPlan);
+  document.querySelector("#campaign-status-refresh")?.addEventListener("click", loadResumableCampaignStatus);
+  document.querySelector("#campaign-start")?.addEventListener("click", startResumableCampaign);
+  document.querySelector("#campaign-stop")?.addEventListener("click", stopResumableCampaign);
+  document.querySelector("#brain-loop-start")?.addEventListener("click", startBrainLoop);
+  document.querySelector("#brain-loop-stop")?.addEventListener("click", stopBrainLoop);
+  document.querySelector("#campaign-results-refresh")?.addEventListener("click", loadResearchResultsMatrix);
+  document.querySelector("#research-champion-board-refresh")?.addEventListener("click", loadResearchChampionBoard);
+  document.querySelector("#research-results-matrix-refresh")?.addEventListener("click", loadResearchResultsMatrix);
+  document.querySelector("#research-results-ledger-refresh")?.addEventListener("click", loadResearchResultsLedger);
+}
+
+function campaignFormFields() {
+  return {
+    campaign: document.querySelector("#campaign-name"),
+    symbols: document.querySelector("#campaign-symbols"),
+    timeframes: document.querySelector("#campaign-timeframes"),
+    strategies: document.querySelector("#campaign-strategies"),
+    period: document.querySelector("#campaign-period"),
+    depth: document.querySelector("#campaign-depth"),
+    brainMode: document.querySelector("#brain-plan-mode"),
+  };
+}
+
+function restoreCampaignForm() {
+  const form = uiPrefs.campaignForm || {};
+  if (!uiPrefs.btc4hAutoSearchDefaultApplied) {
+    if (!form.symbols || form.symbols === "BTCUSDT,ETHUSDT") form.symbols = "BTCUSDT";
+    if (!form.timeframes) form.timeframes = "4h";
+    if (!form.strategies || form.strategies === "EmaBounceV2,BreakoutRetestV2") form.strategies = DEFAULT_RESEARCH_STRATEGIES;
+    uiPrefs.btc4hAutoSearchDefaultApplied = true;
+    uiPrefs.campaignForm = form;
+    saveUiPrefs();
+  }
+  Object.entries(campaignFormFields()).forEach(([key, input]) => {
+    if (input && form[key] !== undefined && form[key] !== null && form[key] !== "") input.value = form[key];
+  });
+}
+
+function persistCampaignForm() {
+  const values = {};
+  Object.entries(campaignFormFields()).forEach(([key, input]) => {
+    if (input) values[key] = input.value;
+  });
+  uiPrefs.campaignForm = values;
+  saveUiPrefs();
 }
 
 function setupWorkflowTabs() {
@@ -347,29 +512,36 @@ function organizeWorkflowPages() {
     ["research-strategy-variant-lab-panel", "research-diagnostics"],
     ["research-candidate-deep-compare-panel", "research-diagnostics"],
     ["research-lead-review-panel", "research-diagnostics"],
-    ["candidate-review-panel", "candidate-workflow-panels"],
-    ["research-candidate-review-report-panel", "candidate-workflow-panels"],
-    ["research-evidence-scorecard-panel", "candidate-workflow-panels"],
-    ["candidate-stability-panel", "candidate-workflow-panels"],
-    ["research-activity-lab-panel", "candidate-workflow-panels"],
-    ["paper-control-panel", "paper-workflow-panels"],
-    ["paper-readiness-panel", "paper-workflow-panels"],
-    ["paper-runtime-panel", "paper-workflow-panels"],
-    ["paper-tick-readiness-panel", "paper-workflow-panels"],
-    ["paper-active-observation-panel", "paper-workflow-panels"],
-    ["paper-session-panel", "paper-workflow-panels"],
-    ["paper-observation-report-panel", "paper-workflow-panels"],
-    ["paper-observation-counters-panel", "paper-workflow-panels"],
-    ["paper-observation-targets-panel", "paper-workflow-panels"],
-    ["paper-observation-panel", "paper-workflow-panels"],
-    ["paper-runner-instructions-panel", "paper-workflow-panels"],
-    ["paper-runner-summary-panel", "paper-workflow-panels"],
-    ["paper-run-quality-report-panel", "paper-workflow-panels"],
-    ["paper-session-events-panel", "paper-workflow-panels"],
-    ["paper-session-events-detail-panel", "paper-workflow-panels"],
-    ["paper-session-trades-panel", "paper-workflow-panels"],
+    ["candidate-review-panel", "research-overview"],
+    ["research-candidate-review-report-panel", "research-overview"],
+    ["research-evidence-scorecard-panel", "research-overview"],
+    ["candidate-stability-panel", "research-overview"],
+    ["research-activity-lab-panel", "research-overview"],
+    ["paper-control-panel", "research-overview"],
+    ["paper-readiness-panel", "research-overview"],
+    ["paper-runtime-panel", "research-overview"],
+    ["paper-tick-readiness-panel", "research-overview"],
+    ["paper-active-observation-panel", "research-overview"],
+    ["paper-session-panel", "research-overview"],
+    ["paper-observation-report-panel", "research-overview"],
+    ["paper-observation-counters-panel", "research-overview"],
+    ["paper-observation-targets-panel", "research-overview"],
+    ["paper-observation-panel", "research-overview"],
+    ["paper-runner-instructions-panel", "research-overview"],
+    ["paper-runner-summary-panel", "research-overview"],
+    ["paper-run-quality-report-panel", "research-overview"],
+    ["paper-session-events-panel", "research-overview"],
+    ["paper-session-events-detail-panel", "research-overview"],
+    ["paper-session-trades-panel", "research-overview"],
   ];
   moves.forEach(([panelId, targetId]) => moveWorkflowPanel(panelId, targetId));
+  const overviewTarget = document.querySelector("#research-overview");
+  ["research-search", "research-validation", "research-diagnostics"].forEach((panelId) => {
+    const panel = document.querySelector(`#${panelId}`);
+    if (overviewTarget && panel) {
+      Array.from(panel.children).forEach((child) => overviewTarget.appendChild(child));
+    }
+  });
   const exportTarget = document.querySelector("#research-export");
   if (exportTarget) {
     exportTarget.innerHTML = `
@@ -480,6 +652,9 @@ function dashboardNextAction(results) {
   const quality = results.quality?.payload?.quality || {};
   const review = results.review?.payload || {};
   const report = results.observation?.payload || {};
+  const handbrake = paperStatus.handbrake || {};
+  if (handbrake.state === "PAPER_RECOVERY") return { action: "Handbrake: paper recovery", status: "BLOCKED", reason: handbrake.reason || "Real trading is blocked until paper recovery passes." };
+  if (handbrake.state === "READY_FOR_MANUAL_RESUME") return { action: "Review handbrake resume", status: "READY", reason: handbrake.reason || "Paper recovery passed; manual approval required." };
   if (paperStatus.realTradingEnabled) return { action: "Do not enable real trading", status: "BLOCKED", reason: "Real trading safety flag is not false." };
   if (quality.status === "DEGRADED" || quality.status === "INVALID") return { action: "Investigate paper run quality", status: quality.status, reason: quality.recommendation?.reason || "Paper evidence reliability needs review." };
   if (report.verdict?.status === "READY_FOR_REVIEW" || review.verdict?.action === "READY_FOR_LONGER_PAPER") return { action: "Review longer paper observation", status: "READY", reason: "Paper/research evidence is ready for review, not automatic action." };
@@ -489,7 +664,9 @@ function dashboardNextAction(results) {
 }
 
 async function renderDashboardPage() {
-  loadWorkflowDashboard(false);
+  loadBrainPlan();
+  loadResumableCampaignStatus();
+  loadBrainLoopStatus();
 }
 
 async function loadWorkflowDashboard(force = false) {
@@ -525,6 +702,10 @@ async function loadWorkflowDashboard(force = false) {
   const review = results.review.payload || {};
   const signal = results.signal.payload || {};
   const signalDiag = signal.diagnostics || signal;
+  const handbrake = paperStatus.handbrake || {};
+  const handbrakeState = handbrake.state || "ARMED";
+  const handbrakeBlocked = handbrakeState === "PAPER_RECOVERY";
+  const handbrakeReady = handbrakeState === "READY_FOR_MANUAL_RESUME";
   const freshness = runtime.operationalFreshness || {};
   const freshnessWarnings = freshnessWarningList([
     { label: "Paper state", ...(freshness.paperState || {}) },
@@ -540,12 +721,12 @@ async function loadWorkflowDashboard(force = false) {
       { label: "Market", value: `${market.symbol} ${market.timeframe}` },
       { label: "Evidence", value: evidence.status || "-" },
       { label: "Config warnings", value: (candidate.configWarnings || []).length || 0 },
-    ], `<a class="small-action-button" href="/candidate" data-route="candidate">Open Candidate</a>`)}
+    ], `<a class="small-action-button" href="/research" data-route="research">Open Research</a>`)}
     ${workflowCard("Paper Status", paperStatus.paperEnabled ? "PAPER_ENABLED" : "DISABLED", runtime.initialized ? "Runtime initialized for active market." : "Runtime may need review before paper actions.", [
       { label: "Paper", value: paperStatus.paperEnabled ? "enabled" : "disabled" },
       { label: "Initialized", value: runtime.initialized ? "yes" : "no" },
       { label: "Last tick", value: runtime.lastTick?.updatedAt || "-" },
-    ], `<a class="small-action-button" href="/paper" data-route="paper">Open Paper</a>`)}
+    ], `<a class="small-action-button" href="/research" data-route="research">Open Research</a>`)}
     ${workflowCard("Freshness", freshness.activeMarketData?.status || freshness.paperState?.status || "NOT_CHECKED", freshnessWarnings[0] || "Paper state, active data, and tick timing are current enough for review.", [
       { label: "Paper state", value: freshnessLabel(freshness.paperState) },
       { label: "Last tick", value: freshnessLabel(freshness.lastTick) },
@@ -554,6 +735,14 @@ async function loadWorkflowDashboard(force = false) {
     ${workflowCard("Real Trading Safety", paperStatus.realTradingEnabled ? "BLOCKED" : "DISABLED", paperStatus.realTradingEnabled ? "Real trading flag is not false." : "Real trading is disabled.", [
       { label: "realTradingEnabled", value: String(Boolean(paperStatus.realTradingEnabled)) },
       { label: "Paper clone", value: "separate" },
+      { label: "Handbrake", value: handbrakeState },
+      { label: "Loss streak", value: handbrake.metrics?.lossStreak ?? "-" },
+    ])}
+    ${workflowCard("Handbrake", handbrakeBlocked ? "BLOCKED" : handbrakeReady ? "READY" : handbrakeState, handbrake.reason || "Handbrake monitors loss streak, drawdown, and recent paper/live performance.", [
+      { label: "Recent avg PnL", value: handbrake.metrics?.recentAveragePnl ?? "-" },
+      { label: "Drawdown", value: handbrake.metrics?.drawdownPct !== undefined ? `${handbrake.metrics.drawdownPct}%` : "-" },
+      { label: "Recovery PF", value: handbrake.metrics?.recoveryProfitFactor ?? "-" },
+      { label: "Manual resume", value: handbrake.rules?.requireManualResume === false ? "no" : "yes" },
     ])}
     ${workflowCard("Latest Signal", signalDiag.signal || signalDiag.action || "HOLD", signalDiag.reason || signalDiag.primaryBlocker || "No actionable active-market signal returned.", [
       { label: "Primary blocker", value: signalDiag.primaryBlocker || "-" },
@@ -568,12 +757,986 @@ async function loadWorkflowDashboard(force = false) {
       { label: "Signals", value: observation.evidence?.signalsObserved ?? "-" },
       { label: "Closed", value: observation.evidence?.closedTrades ?? "-" },
       { label: "Trust", value: quality.quality?.evidenceTrust || "-" },
-    ], `<a class="small-action-button" href="/paper" data-route="paper">Review Evidence</a>`)}
+    ], `<a class="small-action-button" href="/research" data-route="research">Review Evidence</a>`)}
     ${workflowCard("Next Action", next.status, next.action, [
       { label: "Reason", value: next.reason },
     ])}
     ${failures.length ? workflowCard("Dashboard Fetch Notes", "WATCH", "Some dashboard cards could not refresh.", failures.slice(0, 4).map((failure, index) => ({ label: `Issue ${index + 1}`, value: failure }))) : ""}
   `;
+}
+
+function campaignRequestPayload() {
+  persistCampaignForm();
+  const depth = document.querySelector("#campaign-depth")?.value || "focused";
+  const depthSettings = {
+    quick: { maxCandidates: 80, maxCombosPerStrategy: 60, topN: 20, timeoutSeconds: 3600, runtimeBudgetSeconds: 3400 },
+    focused: { maxCandidates: 240, maxCombosPerStrategy: 180, topN: 50, timeoutSeconds: 10800, runtimeBudgetSeconds: 10500 },
+    deep: { maxCandidates: 300, maxCombosPerStrategy: 250, topN: 60, timeoutSeconds: 21600, runtimeBudgetSeconds: 21000 },
+  }[depth] || {};
+  return {
+    campaign: document.querySelector("#campaign-name")?.value || "promising-4h",
+    symbols: document.querySelector("#campaign-symbols")?.value || "BTCUSDT",
+    timeframes: document.querySelector("#campaign-timeframes")?.value || "4h",
+    strategies: document.querySelector("#campaign-strategies")?.value || DEFAULT_RESEARCH_STRATEGIES,
+    period: document.querySelector("#campaign-period")?.value || "1460d",
+    limit: "period",
+    clearStop: true,
+    ...depthSettings,
+  };
+}
+
+async function loadBrainPlan() {
+  const host = document.querySelector("#brain-plan-panel");
+  if (!host) return;
+  const button = document.querySelector("#brain-plan-refresh");
+  const mode = encodeURIComponent(document.querySelector("#brain-plan-mode")?.value || "balanced");
+  const depth = encodeURIComponent(document.querySelector("#campaign-depth")?.value || "focused");
+  const symbols = encodeURIComponent(document.querySelector("#campaign-symbols")?.value || "BTCUSDT");
+  const timeframes = encodeURIComponent(document.querySelector("#campaign-timeframes")?.value || "4h");
+  try {
+    button?.classList.add("is-loading");
+    host.innerHTML = `<p class="pane-status">Thinking through the next safe campaign...</p>`;
+    const payload = await apiGet(`/api/research/brain-plan?mode=${mode}&depth=${depth}&maxJobs=8&symbols=${symbols}&timeframes=${timeframes}`);
+    lastBrainPlanPayload = payload;
+    host.innerHTML = renderBrainPlan(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Brain plan failed: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button?.classList.remove("is-loading");
+  }
+}
+
+function applyBrainPlan() {
+  const payload = lastBrainPlanPayload;
+  const plan = payload?.campaignPayload;
+  const host = document.querySelector("#brain-plan-panel");
+  if (!plan) {
+    if (host) host.innerHTML = `<p class="pane-status">Load a brain plan first.</p>`;
+    return;
+  }
+  const fields = {
+    "#campaign-name": plan.campaign,
+    "#campaign-symbols": plan.symbols,
+    "#campaign-timeframes": plan.timeframes,
+    "#campaign-strategies": plan.strategies,
+    "#campaign-period": plan.period,
+  };
+  Object.entries(fields).forEach(([selector, value]) => {
+    const input = document.querySelector(selector);
+    if (input && value !== undefined && value !== null) input.value = value;
+  });
+  persistCampaignForm();
+  document.querySelector("#brain-plan-apply")?.classList.add("is-applied");
+  if (host) host.innerHTML = renderBrainPlan({ ...payload, applied: true });
+  loadResumableCampaignStatus();
+}
+
+function renderBrainPlan(payload) {
+  const plan = payload.campaignPayload || {};
+  const rows = (payload.selectedJobs || []).slice(0, 10).map((job) => {
+    const metrics = job.metrics || {};
+    return `
+      <tr>
+        <td>${escapeHtml(job.bucket || "-")}</td>
+        <td title="${escapeHtml(job.strategy || "-")}">${escapeHtml(shortStrategyName(job.strategy || "-"))}</td>
+        <td>${escapeHtml(job.symbol || "-")} ${escapeHtml(job.timeframe || "")}</td>
+        <td class="${Number(metrics.returnPct || 0) >= 0 ? "positive" : "negative"}">${metrics.returnPct === null || metrics.returnPct === undefined ? "-" : `${formatSigned(metrics.returnPct)}%`}</td>
+        <td>${formatEndEquity(metrics.returnPct, metrics.endEquity)}</td>
+        <td>${metrics.profitFactor === null || metrics.profitFactor === undefined ? "-" : formatNumber(metrics.profitFactor)}</td>
+        <td>${metrics.trades ?? "-"}</td>
+        <td>${escapeHtml(job.reason || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+  const warnings = (payload.warnings || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  const steps = (payload.nextSteps || []).map((item) => `<li>${escapeHtml(item)}</li>`).join("");
+  return `
+    <div class="metric-grid">
+      <div class="metric"><span>Mode</span><strong>${escapeHtml(payload.mode || "-")}</strong></div>
+      <div class="metric"><span>Evidence rows</span><strong>${payload.ledgerSummary?.totalRecords ?? 0}</strong></div>
+      <div class="metric"><span>Candidate rows</span><strong>${payload.candidateCount ?? 0}</strong></div>
+      <div class="metric"><span>Applied</span><strong>${payload.applied ? "Yes" : "No"}</strong></div>
+      <div class="metric"><span>Campaign</span><strong>${escapeHtml(plan.campaign || "-")}</strong></div>
+      <div class="metric"><span>Base</span><strong>${escapeHtml(payload.campaignBaseName || "-")}</strong></div>
+      <div class="metric"><span>Symbols</span><strong>${escapeHtml(plan.symbols || "-")}</strong></div>
+      <div class="metric"><span>Timeframes</span><strong>${escapeHtml(plan.timeframes || "-")}</strong></div>
+      <div class="metric"><span>Strategies</span><strong>${escapeHtml(plan.strategies || "-")}</strong></div>
+      <div class="metric"><span>Combos</span><strong>${plan.maxCombosPerStrategy ?? "-"}</strong></div>
+    </div>
+    ${warnings ? `<ul class="ledger-notes">${warnings}</ul>` : ""}
+    <div class="wide-table-wrap">
+      <table class="trade-table brain-plan-table compact-table">
+        <thead><tr><th>Bucket</th><th>Strat</th><th>Market</th><th>Return</th><th>$10k end</th><th>PF</th><th>Trades</th><th>Why</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="8">No brain-plan rows selected.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <pre class="copy-command">${escapeHtml(payload.command || "")}</pre>
+    ${steps ? `<ol class="brain-plan-steps">${steps}</ol>` : ""}
+    <p class="modal-note">Brain Plan is research-only. Apply fills the form; Run Campaign starts or continues one campaign. Pause Campaign stops before the next job.</p>
+  `;
+}
+
+async function loadResumableCampaignStatus(options = {}) {
+  const quiet = Boolean(options.quiet);
+  const schedule = options.schedule !== false;
+  const host = document.querySelector("#campaign-status-panel");
+  if (!host) return;
+  const campaign = encodeURIComponent(document.querySelector("#campaign-name")?.value || "promising-4h");
+  try {
+    if (!quiet) host.innerHTML = `<p class="pane-status">Loading strategy finder status...</p>`;
+    const payload = await apiGet(`/api/research/resumable-campaign/status?campaign=${campaign}`);
+    host.innerHTML = renderResumableCampaignStatus(payload);
+    if (schedule) updateStrategyFinderPolling();
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Strategy finder status failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function startResumableCampaign() {
+  const host = document.querySelector("#campaign-status-panel");
+  const button = document.querySelector("#campaign-start");
+  if (host) host.innerHTML = `<p class="pane-status">Starting strategy finder in the background...</p>`;
+  try {
+    button?.classList.add("is-loading");
+    const payload = await apiPost("/api/research/resumable-campaign/start", campaignRequestPayload());
+    if (host) host.innerHTML = renderResumableCampaignStatus(payload);
+    updateStrategyFinderPolling();
+  } catch (error) {
+    if (host) host.innerHTML = `<p class="pane-status">Could not start strategy finder: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button?.classList.remove("is-loading");
+  }
+}
+
+async function stopResumableCampaign() {
+  const host = document.querySelector("#campaign-status-panel");
+  const button = document.querySelector("#campaign-stop");
+  if (host) host.innerHTML = `<p class="pane-status">Safe pause requested. The current optimizer job can finish; no new campaign job should start after that.</p>`;
+  try {
+    button?.classList.add("is-loading");
+    const payload = await apiPost("/api/research/resumable-campaign/stop", { campaign: document.querySelector("#campaign-name")?.value || "promising-4h" });
+    if (host) host.innerHTML = renderResumableCampaignStatus(payload);
+    updateStrategyFinderPolling();
+  } catch (error) {
+    if (host) host.innerHTML = `<p class="pane-status">Could not request safe pause: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button?.classList.remove("is-loading");
+  }
+}
+
+function renderResumableCampaignStatus(payload) {
+  const counts = payload.counts || {};
+  const settings = payload.settings || {};
+  updateCampaignActionButtons(payload);
+  const stateLabel = payload.running ? "Running" : payload.stopRequested ? "Pausing" : payload.pendingJobs ? "Ready" : "Complete";
+  const stateClass = payload.running ? "badge-running" : payload.stopRequested ? "badge-watch" : payload.pendingJobs ? "badge-raw" : "badge-pass";
+  const activeJob = (payload.jobs || payload.recentJobs || []).find((job) => String(job.status || "").toUpperCase() === "RUNNING");
+  const nextJob = payload.nextJob || {};
+  const progress = Number(payload.totalJobs || 0) ? Math.max(0, Math.min(100, ((Number(payload.totalJobs || 0) - Number(payload.pendingJobs || 0)) / Number(payload.totalJobs || 1)) * 100)) : 0;
+  const actionText = payload.stopRequested
+    ? "Safe pause is armed. The current optimizer job may finish, then the campaign runner should stop before the next job."
+    : payload.running
+      ? "Campaign runner is active in the background."
+      : payload.pendingJobs
+        ? "Campaign is ready to continue."
+        : "Campaign has no pending jobs.";
+  const recent = (payload.jobs || payload.recentJobs || []).map((job) => {
+    const result = job.result || {};
+    return `
+    <tr>
+      <td>${escapeHtml(job.status || "-")}</td>
+      <td>${escapeHtml(job.strategy || "-")}</td>
+      <td>${escapeHtml(job.symbol || "-")} ${escapeHtml(job.timeframe || "")}</td>
+      <td>${job.attempts ?? 0}</td>
+      <td class="${Number(result.returnPct || 0) >= 0 ? "positive" : "negative"}">${result.returnPct === null || result.returnPct === undefined ? "-" : `${formatSigned(result.returnPct)}%`}</td>
+      <td>${formatEndEquity(result.returnPct, result.endEquity)}</td>
+      <td>${result.profitFactor === null || result.profitFactor === undefined ? "-" : formatNumber(result.profitFactor)}</td>
+      <td>${result.drawdownPct === null || result.drawdownPct === undefined ? "-" : `${formatNumber(result.drawdownPct)}%`}</td>
+      <td>${result.trades ?? "-"}</td>
+      <td>${escapeHtml(formatCompactDateTime(job.finishedAt || job.startedAt))}</td>
+      <td>${escapeHtml(job.savedReport || "-")}</td>
+    </tr>
+  `;
+  }).join("");
+  return `
+    <div class="finder-status-summary">
+      <div class="finder-status-main">
+        <span class="status-badge ${stateClass}">${stateLabel}</span>
+        <strong>${escapeHtml(payload.campaign || document.querySelector("#campaign-name")?.value || "Campaign")}</strong>
+        <span>${escapeHtml(actionText)}</span>
+      </div>
+      <div class="finder-progress" aria-label="Campaign progress"><span style="width: ${progress}%"></span></div>
+    </div>
+    <div class="metric-grid">
+      <div class="metric"><span>Status</span><strong><span class="status-badge ${stateClass}">${stateLabel}</span></strong></div>
+      <div class="metric"><span>Pending</span><strong>${payload.pendingJobs ?? 0}/${payload.totalJobs ?? 0}</strong></div>
+      <div class="metric"><span>Done</span><strong>${counts.DONE || 0}</strong></div>
+      <div class="metric"><span>Failed</span><strong>${counts.FAILED || 0}</strong></div>
+      <div class="metric"><span>Active job</span><strong>${escapeHtml(activeJob ? `${shortStrategyName(activeJob.strategy || "-")} ${activeJob.symbol || ""} ${activeJob.timeframe || ""}` : "-")}</strong></div>
+      <div class="metric"><span>Next job</span><strong>${escapeHtml(nextJob.strategy ? `${shortStrategyName(nextJob.strategy)} ${nextJob.symbol || ""} ${nextJob.timeframe || ""}` : "-")}</strong></div>
+      <div class="metric"><span>Symbols</span><strong>${escapeHtml((settings.symbols || []).join(", ") || "-")}</strong></div>
+      <div class="metric"><span>Strategies</span><strong>${escapeHtml((settings.strategies || []).join(", ") || "-")}</strong></div>
+    </div>
+    <p class="modal-note">${escapeHtml(payload.message || (payload.running ? "Optimizer is running in the background." : payload.nextJob ? `Next: ${payload.nextJob.strategy} ${payload.nextJob.symbol} ${payload.nextJob.timeframe}` : "No pending jobs."))}</p>
+    <div class="wide-table-wrap">
+      <table class="trade-table campaign-job-table">
+        <thead><tr><th>Status</th><th>Strategy</th><th>Market</th><th>Attempts</th><th>Return</th><th>$10k end</th><th>PF</th><th>DD</th><th>Trades</th><th>Time</th><th>Saved report</th></tr></thead>
+        <tbody>${recent || `<tr><td colspan="11">No campaign jobs yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="modal-note">State: ${escapeHtml(payload.statePath || "-")} · Stop file: ${escapeHtml(payload.stopFile || "-")}</p>
+  `;
+}
+
+function updateCampaignActionButtons(payload) {
+  const start = document.querySelector("#campaign-start");
+  const stop = document.querySelector("#campaign-stop");
+  start?.classList.toggle("is-running", Boolean(payload.running));
+  stop?.classList.toggle("is-pausing", Boolean(payload.running && payload.stopRequested));
+  start?.classList.toggle("is-complete", !payload.running && !payload.stopRequested && Number(payload.pendingJobs || 0) === 0 && Number(payload.totalJobs || 0) > 0);
+}
+
+async function loadBrainLoopStatus(options = {}) {
+  const schedule = options.schedule !== false;
+  const host = document.querySelector("#brain-loop-status-panel");
+  if (!host) return;
+  try {
+    const payload = await apiGet("/api/research/brain-loop/status");
+    host.innerHTML = renderBrainLoopStatus(payload);
+    updateBrainLoopButtons(payload);
+    if (schedule) updateStrategyFinderPolling();
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Auto search status failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function startBrainLoop() {
+  const host = document.querySelector("#brain-loop-status-panel");
+  const button = document.querySelector("#brain-loop-start");
+  const mode = document.querySelector("#brain-plan-mode")?.value || "balanced";
+  const depth = document.querySelector("#campaign-depth")?.value || "focused";
+  const symbols = document.querySelector("#campaign-symbols")?.value || "BTCUSDT";
+  const timeframes = document.querySelector("#campaign-timeframes")?.value || "4h";
+  if (host) host.innerHTML = `<p class="pane-status">Starting autonomous research loop...</p>`;
+  try {
+    button?.classList.add("is-loading");
+    const payload = await apiPost("/api/research/brain-loop/start", { mode, depth, symbols, timeframes, jobsPerCampaign: 12, maxRounds: 0, discoveryEveryRounds: 1, discoveryDays: 1095, discoveryTop: 40 });
+    if (host) host.innerHTML = renderBrainLoopStatus(payload);
+    updateBrainLoopButtons(payload);
+    loadResumableCampaignStatus();
+  } catch (error) {
+    if (host) host.innerHTML = `<p class="pane-status">Could not start auto search: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button?.classList.remove("is-loading");
+  }
+}
+
+async function stopBrainLoop() {
+  const host = document.querySelector("#brain-loop-status-panel");
+  const button = document.querySelector("#brain-loop-stop");
+  if (host) host.innerHTML = `<p class="pane-status">Stop Auto requested. Auto Search will stop before launching another campaign; the current campaign is also being safe-paused.</p>`;
+  try {
+    button?.classList.add("is-loading");
+    const payload = await apiPost("/api/research/brain-loop/stop", {});
+    if (host) host.innerHTML = renderBrainLoopStatus(payload);
+    updateBrainLoopButtons(payload);
+    loadResumableCampaignStatus();
+    updateStrategyFinderPolling();
+  } catch (error) {
+    if (host) host.innerHTML = `<p class="pane-status">Could not stop auto search: ${escapeHtml(error.message)}</p>`;
+  } finally {
+    button?.classList.remove("is-loading");
+  }
+}
+
+function updateBrainLoopButtons(payload) {
+  document.querySelector("#brain-loop-start")?.classList.toggle("is-running", Boolean(payload.running));
+  document.querySelector("#brain-loop-stop")?.classList.toggle("is-pausing", Boolean(payload.running && payload.stopRequested));
+}
+
+function renderBrainLoopStatus(payload) {
+  const campaign = payload.currentCampaignStatus || {};
+  const loopLabel = payload.running ? (payload.stopRequested ? "Stopping" : "Running") : payload.stopRequested ? "Paused" : "Stopped";
+  const loopClass = payload.running ? "badge-running" : payload.stopRequested ? "badge-watch" : "badge-raw";
+  const campaignLabel = campaign.running ? (campaign.stopRequested ? "Pausing" : "Running") : campaign.stopRequested ? "Pause armed" : campaign.pendingJobs ? "Ready" : campaign.totalJobs ? "Complete" : "No campaign";
+  const campaignClass = campaign.running ? "badge-running" : campaign.stopRequested ? "badge-watch" : campaign.pendingJobs ? "badge-raw" : "badge-pass";
+  const activeJob = (campaign.jobs || campaign.recentJobs || []).find((job) => String(job.status || "").toUpperCase() === "RUNNING");
+  const doneJobs = Number((campaign.counts || {}).DONE || 0);
+  const totalJobs = Number(campaign.totalJobs || 0);
+  const pendingJobs = Number(campaign.pendingJobs || 0);
+  const progressText = totalJobs ? `${doneJobs}/${totalJobs} done, ${pendingJobs} pending` : "-";
+  const campaignName = campaign.campaign || payload.currentRound?.campaign || payload.lastRound?.campaign || "-";
+  const market = `${payload.symbols || "BTCUSDT"} ${payload.timeframes || "4h"}`;
+  const discovery = payload.discovery || {};
+  const currentDiscovery = payload.currentDiscovery || {};
+  const lastDiscovery = payload.lastDiscovery || {};
+  const discoveryTop = (currentDiscovery.top || lastDiscovery.top || [])[0] || {};
+  const discoveryLabel = discovery.enabled === false ? "Off" : `Every ${discovery.everyRounds || 1} round`;
+  const discoveryText = currentDiscovery.status
+    ? `${currentDiscovery.status} ${currentDiscovery.symbol || ""} ${currentDiscovery.timeframe || ""}`
+    : lastDiscovery.savedPath
+      ? `${formatCompactDateTime(lastDiscovery.finishedAt)} ${lastDiscovery.symbol || ""} ${lastDiscovery.timeframe || ""}`
+      : "-";
+  const discoveryBestText = discoveryTop.pattern
+    ? `${discoveryTop.pattern} ${discoveryTop.side || ""} ${formatSigned(discoveryTop.totalReturnPct || discoveryTop.test?.totalReturnPct || 0)}%`
+    : "-";
+  const stopText = payload.stopRequested
+    ? "Stop request received. Auto Search will not launch another campaign, and the active campaign has been asked to safe-pause."
+    : payload.running
+      ? "Auto Search is choosing and running resumable campaigns."
+      : "Auto Search is idle.";
+  const rounds = (payload.recentRounds || []).map((round) => renderBrainLoopRoundRow(round)).join("");
+  return `
+    <div class="auto-search-strip">
+      <div class="auto-search-title">
+        <span class="status-badge ${loopClass}">${loopLabel}</span>
+        <strong>Auto Search</strong>
+        <span>${escapeHtml(market)}</span>
+      </div>
+      <div class="auto-search-facts">
+        <span><b>Campaign</b> ${escapeHtml(campaignName)}</span>
+        <span><b>State</b> <span class="status-badge ${campaignClass}">${campaignLabel}</span></span>
+        <span><b>Progress</b> ${escapeHtml(progressText)}</span>
+        <span><b>Now</b> ${escapeHtml(activeJob ? `${shortStrategyName(activeJob.strategy || "-")} ${activeJob.symbol || ""} ${activeJob.timeframe || ""}` : "-")}</span>
+        <span><b>Rounds</b> ${payload.roundCount ?? 0}</span>
+        <span><b>PID</b> ${payload.running ? payload.pid || "-" : "-"}</span>
+        <span><b>Stop</b> ${payload.stopRequested ? "armed" : "off"}</span>
+        <span><b>Discovery</b> ${escapeHtml(discoveryLabel)}</span>
+        <span><b>Last discovery</b> ${escapeHtml(discoveryText)}</span>
+        <span><b>Discovery best</b> ${escapeHtml(discoveryBestText)}</span>
+      </div>
+    </div>
+    <p class="modal-note compact-note">${escapeHtml(stopText)}</p>
+    <div class="wide-table-wrap">
+      <table class="trade-table brain-plan-table compact-table auto-search-round-table">
+        <thead><tr><th>Status</th><th>Campaign</th><th>Result / Change / Params</th><th>Jobs</th><th>Time</th></tr></thead>
+        <tbody>${rounds || `<tr><td colspan="5">No loop rounds yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="modal-note">State: ${escapeHtml(payload.statePath || "-")} · Stop file: ${escapeHtml(payload.stopFile || "-")}</p>
+  `;
+}
+
+function renderBrainLoopRoundRow(round) {
+  const summary = round.resultSummary || {};
+  const best = summary.best || {};
+  const hasReturn = best.returnPct !== null && best.returnPct !== undefined;
+  const delta = best.returnDeltaPct;
+  const deltaClass = Number(delta || 0) > 0 ? "positive" : Number(delta || 0) < 0 ? "negative" : "";
+  const sampleWarning = best.sampleWarning || "";
+  const bestText = hasReturn
+    ? `${shortStrategyName(best.strategy || "-")} ${formatSigned(best.returnPct)}% PF ${formatNumber(best.profitFactor)} DD ${formatNumber(best.drawdownPct)}% ${best.trades ?? "-"}t${sampleWarning ? " WEAK" : ""}`
+    : "-";
+  const paramsText = (best.paramsSummary || [])
+    .map((item) => `<span class="param-chip">${escapeHtml(item.key)}=${escapeHtml(String(item.value))}</span>`)
+    .join("");
+  const encodedRound = encodeURIComponent(JSON.stringify(round));
+  const bestCell = normalizeResearchReplayRow({
+    ...best,
+    sourceSearch: round.campaignPayload || {},
+    period: round.campaignPayload?.period || best.period || "1095d",
+    sourceFile: best.sourceFile || summary.best?.sourceFile || round.resultSummary?.best?.sourceFile,
+  });
+  const encodedBest = encodeURIComponent(JSON.stringify(bestCell));
+  const changeText = delta === null || delta === undefined
+    ? "-"
+    : `${Number(delta) > 0 ? "+" : ""}${formatNumber(delta, 2)}%${best.bestChanged ? "" : " same"}`;
+  const paramChangeText = best.paramChange || "-";
+  const changeLabel = sampleWarning ? "Status" : "Change";
+  return `
+    <tr>
+      <td>${escapeHtml(round.status || "-")}</td>
+      <td><button type="button" class="ledger-row-button auto-search-round-button" data-brain-round="${encodedRound}">${escapeHtml(round.campaign || "-")}</button></td>
+      <td class="auto-search-best-cell">
+        <div class="auto-search-result-stack">
+          <div class="auto-search-result-line">
+            ${hasReturn
+              ? `<button type="button" class="ledger-row-button auto-search-result-main ${sampleWarning ? "weak-sample" : Number(best.returnPct || 0) >= 0 ? "positive" : "negative"}" data-research-cell="${encodedBest}">${escapeHtml(bestText)}</button>`
+              : `<span class="auto-search-result-main negative">-</span>`}
+            <span class="auto-search-result-change ${sampleWarning ? "weak-sample" : deltaClass}">${escapeHtml(changeLabel)} ${escapeHtml(sampleWarning || changeText)}</span>
+          </div>
+          <div class="auto-search-change-row">
+            <span>Param change</span>
+            <strong>${escapeHtml(paramChangeText)}</strong>
+          </div>
+        </div>
+        ${paramsText ? `<div class="param-chip-cell auto-search-param-list">${paramsText}</div>` : ""}
+      </td>
+      <td>${summary.doneJobs ?? 0}/${summary.totalJobs ?? 0}</td>
+      <td>${escapeHtml(formatCompactDateTime(round.finishedAt || round.startedAt))}</td>
+    </tr>
+  `;
+}
+
+function renderKeyValueRows(object, emptyText = "No data.") {
+  const rows = Object.entries(object || {}).map(([key, value]) => `
+    <tr><th>${escapeHtml(key)}</th><td>${escapeHtml(typeof value === "object" ? JSON.stringify(value) : String(value ?? "-"))}</td></tr>
+  `).join("");
+  return rows || `<tr><td>${escapeHtml(emptyText)}</td></tr>`;
+}
+
+function renderBrainRoundJobs(jobs) {
+  return (jobs || []).slice(0, 20).map((job) => {
+    const metrics = job.metrics || job.result || {};
+    const replayCell = normalizeResearchReplayRow({
+      ...job,
+      ...metrics,
+      params: job.params || metrics.params || {},
+      sourceSearch: job.sourceSearch || {},
+    });
+    const encoded = encodeURIComponent(JSON.stringify(replayCell));
+    return `
+      <tr>
+        <td><button type="button" class="ledger-row-button" data-research-cell="${encoded}">${escapeHtml(job.strategy || "-")}</button></td>
+        <td>${escapeHtml(job.sourceType || job.status || "-")}</td>
+        <td>${escapeHtml(job.symbol || "-")} ${escapeHtml(job.timeframe || "")}</td>
+        <td class="${Number(metrics.returnPct || 0) >= 0 ? "positive" : "negative"}">${metrics.returnPct === null || metrics.returnPct === undefined ? "-" : `${formatSigned(metrics.returnPct)}%`}</td>
+        <td>${metrics.profitFactor === null || metrics.profitFactor === undefined ? "-" : formatNumber(metrics.profitFactor)}</td>
+        <td>${metrics.drawdownPct === null || metrics.drawdownPct === undefined ? "-" : `${formatNumber(metrics.drawdownPct)}%`}</td>
+        <td>${metrics.trades ?? "-"}</td>
+        <td>${escapeHtml(job.reason || job.sourceFile || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function renderBrainRoundDiscovery(runs) {
+  return (runs || []).map((run) => {
+    const top = (run.top || [])[0] || {};
+    return `
+      <tr>
+        <td>${escapeHtml(run.status || "-")}</td>
+        <td>${escapeHtml(run.symbol || "-")} ${escapeHtml(run.timeframe || "")}</td>
+        <td>${escapeHtml(run.viableRows ?? "-")}</td>
+        <td>${escapeHtml(top.pattern || "-")}</td>
+        <td class="${Number(top.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${top.totalReturnPct === null || top.totalReturnPct === undefined ? "-" : `${formatSigned(top.totalReturnPct)}%`}</td>
+        <td>${escapeHtml(run.savedPath || "-")}</td>
+      </tr>
+    `;
+  }).join("");
+}
+
+function openBrainLoopRound(button) {
+  try {
+    const round = JSON.parse(decodeURIComponent(button.dataset.brainRound || "{}"));
+    const summary = round.resultSummary || {};
+    const best = summary.best || {};
+    const plan = round.plan || {};
+    const payload = round.campaignPayload || {};
+    const jobs = plan.selectedJobs || [];
+    const discoveryRuns = plan.discoveryRuns || [];
+    openBacktestModal(`
+      <div class="metric-grid">
+        <div class="metric"><span>Status</span><strong>${escapeHtml(round.status || "-")}</strong></div>
+        <div class="metric"><span>Campaign</span><strong>${escapeHtml(round.campaign || "-")}</strong></div>
+        <div class="metric"><span>Best</span><strong>${escapeHtml(best.strategy || "-")}</strong></div>
+        <div class="metric"><span>Return</span><strong>${best.returnPct === null || best.returnPct === undefined ? "-" : `${formatSigned(best.returnPct)}%`}</strong></div>
+        <div class="metric"><span>PF</span><strong>${best.profitFactor === null || best.profitFactor === undefined ? "-" : formatNumber(best.profitFactor)}</strong></div>
+        <div class="metric"><span>DD</span><strong>${best.drawdownPct === null || best.drawdownPct === undefined ? "-" : `${formatNumber(best.drawdownPct)}%`}</strong></div>
+        <div class="metric"><span>$10k end</span><strong>${formatEndEquity(best.returnPct, best.endEquity)}</strong></div>
+        <div class="metric"><span>Jobs</span><strong>${summary.doneJobs ?? 0}/${summary.totalJobs ?? 0}</strong></div>
+      </div>
+      <h3 class="modal-section-title">Campaign Payload</h3>
+      <table class="trade-table"><tbody>${renderKeyValueRows(payload)}</tbody></table>
+      <h3 class="modal-section-title">Selected Jobs</h3>
+      <table class="trade-table compact-table"><thead><tr><th>Strategy</th><th>Source</th><th>Market</th><th>Return</th><th>PF</th><th>DD</th><th>Trades</th><th>Reason</th></tr></thead><tbody>${renderBrainRoundJobs(jobs) || `<tr><td colspan="8">No selected jobs stored.</td></tr>`}</tbody></table>
+      <h3 class="modal-section-title">Discovery Runs</h3>
+      <table class="trade-table compact-table"><thead><tr><th>Status</th><th>Market</th><th>Viable</th><th>Top pattern</th><th>Return</th><th>Report</th></tr></thead><tbody>${renderBrainRoundDiscovery(discoveryRuns) || `<tr><td colspan="6">No discovery run attached to this round.</td></tr>`}</tbody></table>
+      <h3 class="modal-section-title">Raw Round JSON</h3>
+      <pre class="copy-command">${escapeHtml(JSON.stringify(round, null, 2))}</pre>
+    `, `${round.campaign || "Auto Search Round"}`);
+  } catch (error) {
+    openBacktestModal(`<p class="pane-status">${escapeHtml(error.message)}</p>`, "Auto Search round");
+  }
+}
+
+function strategyFinderShouldPoll() {
+  const campaignActive = document.querySelector("#campaign-start")?.classList.contains("is-running")
+    || document.querySelector("#campaign-stop")?.classList.contains("is-pausing");
+  const loopActive = document.querySelector("#brain-loop-start")?.classList.contains("is-running")
+    || document.querySelector("#brain-loop-stop")?.classList.contains("is-pausing");
+  return Boolean(campaignActive || loopActive);
+}
+
+function updateStrategyFinderPolling() {
+  const shouldPoll = strategyFinderShouldPoll();
+  if (!shouldPoll && strategyFinderPollTimer) {
+    clearInterval(strategyFinderPollTimer);
+    strategyFinderPollTimer = null;
+    return;
+  }
+  if (!shouldPoll || strategyFinderPollTimer) return;
+  strategyFinderPollTimer = setInterval(async () => {
+    if (strategyFinderPollInFlight) return;
+    strategyFinderPollInFlight = true;
+    try {
+      await Promise.all([
+        loadResumableCampaignStatus({ quiet: true, schedule: false }),
+        loadBrainLoopStatus({ schedule: false }),
+      ]);
+    } finally {
+      strategyFinderPollInFlight = false;
+      updateStrategyFinderPolling();
+    }
+  }, 5000);
+}
+
+async function loadResearchResultsMatrix() {
+  const host = document.querySelector("#research-results-matrix-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading tested strategy matrix...</p>`;
+    const payload = await apiGet("/api/research/results-matrix?fileLimit=120");
+    host.innerHTML = renderResearchResultsMatrix(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Results matrix failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+async function loadResearchChampionBoard() {
+  const host = document.querySelector("#research-champion-board-panel");
+  if (!host) return;
+  const symbol = encodeURIComponent(document.querySelector("#campaign-symbols")?.value || "BTCUSDT");
+  const timeframe = encodeURIComponent(document.querySelector("#campaign-timeframes")?.value || "4h");
+  try {
+    host.innerHTML = `<p class="pane-status">Loading BTC 4h champion board...</p>`;
+    const payload = await apiGet(`/api/research/champion-board?symbol=${symbol}&timeframe=${timeframe}&batchLimit=260&leadLimit=80`);
+    host.innerHTML = renderResearchChampionBoard(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Champion board failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchChampionBoard(payload) {
+  const scope = payload.scope || {};
+  const champions = Object.values(payload.championsByTimeframe || {}).flat();
+  const best = champions[0] || {};
+  const active = payload.activeBaseline || {};
+  const bestReturn = Number(best.returnPct || 0);
+  const activeReturn = Number(active.returnPct || active.totalReturnPct || 0);
+  const edge = bestReturn - activeReturn;
+  const decision = bestReturn >= 25
+    ? "New high-water mark found. Run lead review before considering promotion."
+    : edge > 1
+      ? "Small edge only. Keep researching, but more identical loops are low-value."
+      : "Plateau: current search is mostly repeating the same 21-22% ceiling.";
+  const notes = (payload.notes || []).map((note) => `<li>${escapeHtml(note)}</li>`).join("");
+  const rows = champions.slice(0, 12).map((row, index) => renderChampionRow(row, index + 1)).join("");
+  return `
+    <div class="result-decision-strip">
+      <span><b>Best</b> ${escapeHtml(best.strategy || "-")} ${best.returnPct === null || best.returnPct === undefined ? "-" : `${formatSigned(best.returnPct)}%`} PF ${best.profitFactor === null || best.profitFactor === undefined ? "-" : formatNumber(best.profitFactor)} DD ${best.maxDrawdownPct === null || best.maxDrawdownPct === undefined ? "-" : `${formatNumber(best.maxDrawdownPct)}%`}</span>
+      <span><b>Baseline</b> ${escapeHtml(active.strategy || "-")} ${activeReturn ? `${formatSigned(activeReturn)}%` : "-"}</span>
+      <span><b>Decision</b> ${escapeHtml(decision)}</span>
+    </div>
+    <div class="metric-grid">
+      <div class="metric"><span>Scope</span><strong>${escapeHtml(`${scope.symbol || "BTCUSDT"} ${scope.timeframe || "4h"}`)}</strong></div>
+      <div class="metric"><span>Reports read</span><strong>${payload.counts?.batchFilesRead ?? 0}</strong></div>
+      <div class="metric"><span>Candidate rows</span><strong>${payload.counts?.candidateRows ?? 0}</strong></div>
+      <div class="metric"><span>Review needed</span><strong>${(payload.reviewNeeded || []).length}</strong></div>
+    </div>
+    ${notes ? `<ul class="ledger-notes">${notes}</ul>` : ""}
+    <div class="wide-table-wrap">
+      <table class="trade-table champion-board-table">
+        <thead><tr><th>#</th><th>Strategy</th><th>Return</th><th>$10k end</th><th>PF</th><th>DD</th><th>Trades</th><th>Time</th><th>Key params</th><th>Source</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="10">No champions found for this scope yet.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="modal-note">This board ranks saved optimizer rows for the selected scope. It shows the best stored row per strategy/market, not every sampled parameter combination.</p>
+  `;
+}
+
+function renderChampionRow(row, index) {
+  const params = (row.paramsSummary || []).map((item) => `<span class="param-chip">${escapeHtml(item.key)}=${escapeHtml(String(item.value))}</span>`).join("");
+  const encoded = encodeURIComponent(JSON.stringify(normalizeResearchReplayRow(row)));
+  return `
+    <tr>
+      <td>${index}</td>
+      <td title="${escapeHtml(row.strategy || "-")}"><button type="button" class="ledger-row-button" data-research-cell="${encoded}">${escapeHtml(row.strategy || "-")}</button></td>
+      <td class="${Number(row.returnPct || 0) >= 0 ? "positive" : "negative"}">${row.returnPct === null || row.returnPct === undefined ? "-" : `${formatSigned(row.returnPct)}%`}</td>
+      <td>${formatEndEquity(row.returnPct, row.endEquity)}</td>
+      <td>${row.profitFactor === null || row.profitFactor === undefined ? "-" : formatNumber(row.profitFactor)}</td>
+      <td>${row.maxDrawdownPct === null || row.maxDrawdownPct === undefined ? "-" : `${formatNumber(row.maxDrawdownPct)}%`}</td>
+      <td>${row.trades ?? "-"}</td>
+      <td>${escapeHtml(formatReportSourceTime(row.source))}</td>
+      <td class="param-chip-cell">${params || "-"}</td>
+      <td>${escapeHtml(row.source || "-")}</td>
+    </tr>
+  `;
+}
+
+function renderResearchResultsMatrix(payload) {
+  const strategies = payload.strategies || [];
+  const rows = payload.rows || [];
+  const topCells = rows.flatMap((row) => strategies.map((strategy) => row.cells?.[strategy]).filter(Boolean))
+    .filter((cell) => Number.isFinite(Number(cell.returnPct)))
+    .sort((a, b) => Number(b.returnPct || 0) - Number(a.returnPct || 0))
+    .slice(0, 5);
+  const bestByMarket = rows.map((row) => {
+    const best = strategies.map((strategy) => row.cells?.[strategy]).filter(Boolean)
+      .filter((cell) => Number.isFinite(Number(cell.returnPct)))
+      .sort((a, b) => Number(b.returnPct || 0) - Number(a.returnPct || 0))[0];
+    return best ? { market: `${row.symbol || "-"} ${row.timeframe || "-"}`, best } : null;
+  }).filter(Boolean);
+  const topKeys = new Map(topCells.map((cell, index) => [`${cell.strategy}|${cell.symbol}|${cell.timeframe}`, index + 1]));
+  const header = strategies.map((strategy) => `<th class="strategy-short-header" title="${escapeHtml(strategy)}">${escapeHtml(shortStrategyName(strategy))}</th>`).join("");
+  const body = rows.map((row) => `
+    <tr>
+      <th>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")}</th>
+      ${strategies.map((strategy) => renderResearchMatrixCompactCell(row.cells?.[strategy], topKeys)).join("")}
+    </tr>
+  `).join("");
+  return `
+    <div class="metric-grid">
+      <div class="metric"><span>Reports read</span><strong>${payload.filesRead ?? 0}</strong></div>
+      <div class="metric"><span>Variants</span><strong>${payload.variants ?? 0}</strong></div>
+      <div class="metric"><span>Strategies</span><strong>${strategies.length}</strong></div>
+    </div>
+    <div class="best-market-strip">
+      ${bestByMarket.map(({ market, best }) => `
+        <span><b>${escapeHtml(market)}</b> ${escapeHtml(shortStrategyName(best.strategy || "-"))} ${formatSigned(best.returnPct || 0)}% PF ${formatNumber(best.profitFactor, 2)} DD ${formatNumber(best.drawdownPct, 1)}%</span>
+      `).join("") || `<span class="muted">No timeframe winners yet.</span>`}
+    </div>
+    <div class="wide-table-wrap">
+      <table class="trade-table strategy-matrix-table">
+        <thead><tr><th>Market</th>${header}</tr></thead>
+        <tbody>${body || `<tr><td colspan="${strategies.length + 1}">No saved optimizer rows found.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="modal-note">Cells show return / PF / drawdown from saved optimizer reports. Click a cell for details and source report.</p>
+  `;
+}
+
+async function loadResearchResultsLedger() {
+  const host = document.querySelector("#research-results-ledger-panel");
+  if (!host) return;
+  try {
+    host.innerHTML = `<p class="pane-status">Loading research ledger...</p>`;
+    const payload = await apiGet("/api/research/results-ledger?fileLimit=160&rowLimit=220");
+    host.innerHTML = renderResearchResultsLedger(payload);
+  } catch (error) {
+    host.innerHTML = `<p class="pane-status">Research ledger failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function renderResearchResultsLedger(payload) {
+  const records = payload.records || [];
+  const bucketHtml = Object.entries(payload.groupedBuckets || payload.buckets || {})
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([label, count]) => `<span class="ledger-bucket">${escapeHtml(label)} <strong>${count}</strong></span>`)
+    .join("");
+  const notes = (payload.plannerNotes || [])
+    .map((note) => `<li>${escapeHtml(note)}</li>`)
+    .join("");
+  const rows = records.slice(0, 60).map((record) => renderLedgerRow(record)).join("");
+  return `
+    <div class="metric-grid">
+      <div class="metric"><span>Raw rows</span><strong>${payload.totalRecords ?? 0}</strong></div>
+      <div class="metric"><span>Unique rows</span><strong>${payload.uniqueRecords ?? payload.returnedRecords ?? 0}</strong></div>
+      <div class="metric"><span>Shown</span><strong>${payload.returnedRecords ?? 0}</strong></div>
+      <div class="metric"><span>Optimizer files</span><strong>${payload.filesRead?.optimizer ?? 0}</strong></div>
+      <div class="metric"><span>Lead reviews</span><strong>${payload.filesRead?.lead_review ?? 0}</strong></div>
+      <div class="metric"><span>Paper ticks</span><strong>${payload.filesRead?.paper_tick ?? 0}</strong></div>
+    </div>
+    <div class="ledger-buckets">${bucketHtml || `<span class="muted">No buckets yet.</span>`}</div>
+    ${notes ? `<ul class="ledger-notes">${notes}</ul>` : `<p class="modal-note">No planner notes yet.</p>`}
+    <div class="wide-table-wrap">
+      <table class="trade-table ledger-table">
+        <thead><tr><th>Bucket</th><th>Seen</th><th>Source</th><th>Market</th><th>Strategy</th><th>Return</th><th>$10k end</th><th>PF</th><th>DD</th><th>Trades</th><th>Verdict</th></tr></thead>
+        <tbody>${rows || `<tr><td colspan="11">No ledger records found.</td></tr>`}</tbody>
+      </table>
+    </div>
+    <p class="modal-note">Ledger rows are grouped by source, market, strategy, params, and metrics. Seen shows repeated evidence from multiple saved campaign files. Click a row for params/source/evidence.</p>
+  `;
+}
+
+function renderLedgerRow(record) {
+  const encoded = encodeURIComponent(JSON.stringify(record));
+  const replayEncoded = encodeURIComponent(JSON.stringify(normalizeResearchReplayRow(record)));
+  const metrics = record.metrics || {};
+  return `
+    <tr>
+      <td><button type="button" class="ledger-row-button" data-ledger-record="${encoded}">${escapeHtml(record.bucket || "-")}</button></td>
+      <td>${Number(record.occurrenceCount || 1) > 1 ? `${record.occurrenceCount}x` : "1x"}</td>
+      <td>${escapeHtml(record.sourceType || "-")}</td>
+      <td>${escapeHtml(record.symbol || "-")} ${escapeHtml(record.timeframe || "")}</td>
+      <td><button type="button" class="ledger-row-button" data-research-cell="${replayEncoded}">${escapeHtml(shortStrategyName(record.strategy || "-"))}</button></td>
+      <td class="${Number(metrics.returnPct || 0) >= 0 ? "positive" : "negative"}">${metrics.returnPct === null || metrics.returnPct === undefined ? "-" : `${formatSigned(metrics.returnPct)}%`}</td>
+      <td>${formatEndEquity(metrics.returnPct, metrics.endEquity)}</td>
+      <td>${metrics.profitFactor === null || metrics.profitFactor === undefined ? "-" : formatNumber(metrics.profitFactor)}</td>
+      <td>${metrics.drawdownPct === null || metrics.drawdownPct === undefined ? "-" : `${formatNumber(metrics.drawdownPct)}%`}</td>
+      <td>${metrics.trades ?? "-"}</td>
+      <td>${escapeHtml(record.verdict || record.reason || "-")}</td>
+    </tr>
+  `;
+}
+
+function openResearchLedgerRecord(button) {
+  try {
+    const record = JSON.parse(decodeURIComponent(button.dataset.ledgerRecord || "{}"));
+    const replayRow = normalizeResearchReplayRow(record);
+    const replayEncoded = encodeURIComponent(JSON.stringify(replayRow));
+    const metrics = record.metrics || {};
+    const evidence = Object.entries(record.evidence || {}).map(([key, value]) => `
+      <tr><th>${escapeHtml(key)}</th><td>${escapeHtml(typeof value === "object" ? JSON.stringify(value) : String(value ?? "-"))}</td></tr>
+    `).join("");
+    const params = Object.entries(record.params || {}).map(([key, value]) => `
+      <tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(value))}</td></tr>
+    `).join("");
+    openBacktestModal(`
+      <div class="metric-grid">
+        <div class="metric"><span>Bucket</span><strong>${escapeHtml(record.bucket || "-")}</strong></div>
+        <div class="metric"><span>Return</span><strong>${metrics.returnPct === null || metrics.returnPct === undefined ? "-" : `${formatSigned(metrics.returnPct)}%`}</strong></div>
+        <div class="metric"><span>$10k end</span><strong>${formatEndEquity(metrics.returnPct, metrics.endEquity)}</strong></div>
+        <div class="metric"><span>PF</span><strong>${metrics.profitFactor === null || metrics.profitFactor === undefined ? "-" : formatNumber(metrics.profitFactor)}</strong></div>
+        <div class="metric"><span>Trades</span><strong>${metrics.trades ?? "-"}</strong></div>
+      </div>
+      <table class="trade-table">
+        <tbody>
+          <tr><th>Source type</th><td>${escapeHtml(record.sourceType || "-")}</td></tr>
+          <tr><th>Seen</th><td>${Number(record.occurrenceCount || 1)} time(s)</td></tr>
+          <tr><th>Latest at</th><td>${escapeHtml(record.latestAt || record.createdAt || "-")}</td></tr>
+          <tr><th>Strategy</th><td>${escapeHtml(record.strategy || "-")}</td></tr>
+          <tr><th>Market</th><td>${escapeHtml(record.symbol || "-")} ${escapeHtml(record.timeframe || "-")}</td></tr>
+          <tr><th>Period</th><td>${escapeHtml(record.period || "-")}</td></tr>
+          <tr><th>Status</th><td>${escapeHtml(record.status || "-")}</td></tr>
+          <tr><th>Verdict</th><td>${escapeHtml(record.verdict || "-")}</td></tr>
+          <tr><th>Reason</th><td>${escapeHtml(record.reason || "-")}</td></tr>
+          <tr><th>Source file</th><td>${escapeHtml(record.sourceFile || "-")}</td></tr>
+          <tr><th>Source files counted</th><td>${escapeHtml((record.sourceFiles || []).slice(0, 8).join(", ") || "-")}</td></tr>
+        </tbody>
+      </table>
+      <h3 class="modal-section-title">Evidence</h3>
+      <table class="trade-table"><tbody>${evidence || `<tr><td>No evidence fields stored.</td></tr>`}</tbody></table>
+      <div class="button-row">
+        <button type="button" data-research-replay="${replayEncoded}">Open chart replay</button>
+        <button type="button" data-research-test="${replayEncoded}">Copy to Backtest</button>
+      </div>
+      <h3 class="modal-section-title">Parameters</h3>
+      <table class="trade-table"><tbody>${params || `<tr><td>No params stored.</td></tr>`}</tbody></table>
+      <h3 class="modal-section-title">Raw JSON</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(record, null, 2))}</pre>
+    `, `${record.bucket || "Ledger"} ${record.strategy || ""} ${record.symbol || ""} ${record.timeframe || ""}`, "", { replayRow });
+  } catch (error) {
+    openBacktestModal(`<p class="pane-status">${escapeHtml(error.message)}</p>`, "Ledger record");
+  }
+}
+
+function shortStrategyName(strategy) {
+  const cleaned = String(strategy || "-").replace(/V\d+$/i, "").replace(/\d+m/i, "").replace(/[^A-Za-z0-9]/g, "");
+  const initials = cleaned.match(/[A-Z0-9]/g)?.join("") || cleaned;
+  return (initials || cleaned || "-").slice(0, 5);
+}
+
+function renderResearchMatrixCompactCell(cell, topKeys = new Map()) {
+  if (!cell) return `<td class="muted-cell">-</td>`;
+  const tone = cell.replacementEligible ? "positive" : cell.status === "ERROR" ? "error" : Number(cell.returnPct || 0) > 0 && Number(cell.profitFactor || 0) >= 1.5 ? "neutral" : "negative";
+  const topRank = topKeys.get(`${cell.strategy}|${cell.symbol}|${cell.timeframe}`);
+  const topClass = topRank ? "top-return" : "";
+  const encoded = encodeURIComponent(JSON.stringify(cell));
+  const tooltip = `${topRank ? `Top ${topRank} return · ` : ""}${cell.strategy || "-"} ${cell.symbol || ""} ${cell.timeframe || ""}: return ${formatSigned(cell.returnPct || 0)}%, PF ${formatNumber(cell.profitFactor)}, DD ${formatNumber(cell.drawdownPct)}%, trades ${cell.trades ?? "-"}`;
+  return `
+    <td>
+      <button class="matrix-cell ${tone} ${topClass}" type="button" data-research-cell="${encoded}" title="${escapeHtml(tooltip)}">
+        <strong>${formatSigned(cell.returnPct || 0)}%</strong>
+        <span>PF ${formatNumber(cell.profitFactor, 2)} DD ${formatNumber(cell.drawdownPct, 1)}%</span>
+        ${topRank ? `<em>#${topRank}</em>` : ""}
+      </button>
+    </td>
+  `;
+}
+
+function renderResearchMatrixCell(cell) {
+  if (!cell) return `<td class="muted-cell">-</td>`;
+  const tone = cell.replacementEligible ? "positive" : Number(cell.returnPct || 0) > 0 && Number(cell.profitFactor || 0) >= 1.5 ? "neutral" : "negative";
+  const encoded = encodeURIComponent(JSON.stringify(cell));
+  return `
+    <td>
+      <button class="matrix-cell ${tone}" type="button" data-research-cell="${encoded}">
+        <strong>${formatSigned(cell.returnPct || 0)}%</strong>
+        <span>PF ${formatNumber(cell.profitFactor, 2)} DD ${formatNumber(cell.drawdownPct, 1)}%</span>
+      </button>
+    </td>
+  `;
+}
+
+function openResearchMatrixCell(button) {
+  try {
+    const cell = JSON.parse(decodeURIComponent(button.dataset.researchCell || "{}"));
+    const replayRow = normalizeResearchReplayRow(cell);
+    const replayEncoded = encodeURIComponent(JSON.stringify(replayRow));
+    const params = Object.entries(cell.params || {}).slice(0, 40).map(([key, value]) => `
+      <tr><th>${escapeHtml(key)}</th><td>${escapeHtml(String(value))}</td></tr>
+    `).join("");
+    const encodedCell = encodeURIComponent(JSON.stringify(cell));
+    const sourceSearch = cell.sourceSearch || {};
+    const planned = cell.plannedCombinations ?? cell.optimizerGrid?.plannedCombinations ?? "-";
+    const sampled = cell.sampledCombinations ?? cell.optimizerGrid?.sampledCombinations ?? sourceSearch.maxCombosPerStrategy ?? "-";
+    const savedRows = cell.savedRowsForVariant ?? "-";
+    const reportCount = cell.sourceReportCount ?? "-";
+    const contextNote = `This is the best saved row for this strategy/market in the matrix, not proof that only one parameter set was tested. The optimizer report saved ${savedRows} row(s) for this exact variant from ${reportCount} report(s); this row's grid planned ${planned} combo(s) and sampled/tested ${sampled} combo(s) where that metadata was saved.`;
+    openBacktestModal(`
+      <div class="metric-grid">
+        <div class="metric"><span>Return</span><strong>${formatSigned(cell.returnPct || 0)}%</strong></div>
+        <div class="metric"><span>$10k end</span><strong>${formatEndEquity(cell.returnPct, cell.endEquity)}</strong></div>
+        <div class="metric"><span>Profit factor</span><strong>${formatNumber(cell.profitFactor)}</strong></div>
+        <div class="metric"><span>Drawdown</span><strong>${formatNumber(cell.drawdownPct)}%</strong></div>
+        <div class="metric"><span>Trades</span><strong>${cell.trades ?? "-"}</strong></div>
+        <div class="metric"><span>Status</span><strong>${escapeHtml(cell.status || "-")}</strong></div>
+        <div class="metric"><span>Tier</span><strong>${escapeHtml(cell.tier || "-")}</strong></div>
+      </div>
+      <table class="trade-table">
+        <tbody>
+          <tr><th>Strategy</th><td>${escapeHtml(cell.strategy || "-")}</td></tr>
+          <tr><th>Market</th><td>${escapeHtml(cell.symbol || "-")} ${escapeHtml(cell.timeframe || "-")}</td></tr>
+          <tr><th>Replacement eligible</th><td>${cell.replacementEligible ? "yes" : "no"}</td></tr>
+          <tr><th>Reason</th><td>${escapeHtml(cell.reason || "-")}</td></tr>
+          <tr><th>Source</th><td>${escapeHtml(cell.sourceFile || "-")}</td></tr>
+          <tr><th>Saved rows for this variant</th><td>${escapeHtml(String(savedRows))}</td></tr>
+          <tr><th>Source reports for this variant</th><td>${escapeHtml(String(reportCount))}</td></tr>
+          <tr><th>Grid planned combos</th><td>${escapeHtml(String(planned))}</td></tr>
+          <tr><th>Grid sampled/tested combos</th><td>${escapeHtml(String(sampled))}</td></tr>
+          <tr><th>Search period</th><td>${escapeHtml(String(sourceSearch.period || "-"))}</td></tr>
+        </tbody>
+      </table>
+      <p class="modal-note">${escapeHtml(contextNote)}</p>
+      <div class="button-row">
+        <button type="button" data-research-replay="${replayEncoded}">Open chart replay</button>
+        <button type="button" data-research-test="${encodedCell}">Test with these params</button>
+      </div>
+      <h3 class="modal-section-title">Parameters</h3>
+      <table class="trade-table"><tbody>${params || `<tr><td>No params stored for this row.</td></tr>`}</tbody></table>
+      <h3 class="modal-section-title">Raw JSON</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(cell, null, 2))}</pre>
+    `, `${cell.strategy || "Strategy"} ${cell.symbol || ""} ${cell.timeframe || ""}`, "", { replayRow });
+  } catch (error) {
+    openBacktestModal(`<p class="pane-status">${escapeHtml(error.message)}</p>`, "Strategy result");
+  }
+}
+
+function normalizeResearchReplayRow(row = {}) {
+  const metrics = row.metrics || {};
+  const sourceSearch = row.sourceSearch || row.search || {};
+  const returnPct = row.returnPct ?? row.totalReturnPct ?? metrics.returnPct;
+  const drawdownPct = row.drawdownPct ?? row.maxDrawdownPct ?? metrics.drawdownPct ?? metrics.maxDrawdownPct;
+  const period = row.period || sourceSearch.period || row.runContext?.period || "1095d";
+  const timeframe = row.timeframe || row.interval || "4h";
+  return {
+    ...row,
+    source: row.exchange || row.dataSource || "bybit",
+    symbol: row.symbol || row.marketSymbol || "BTCUSDT",
+    timeframe,
+    executionTimeframe: row.executionTimeframe || row.executionInterval || defaultExecutionTimeframe(timeframe),
+    strategy: row.strategy,
+    period,
+    returnPct,
+    totalReturnPct: row.totalReturnPct ?? returnPct,
+    profitFactor: row.profitFactor ?? metrics.profitFactor,
+    drawdownPct,
+    maxDrawdownPct: row.maxDrawdownPct ?? drawdownPct,
+    trades: row.trades ?? metrics.trades,
+    endEquity: row.endEquity ?? metrics.endEquity,
+    params: row.params || {},
+    sourceSearch,
+  };
+}
+
+async function replayResearchResult(button) {
+  let row = {};
+  try {
+    row = JSON.parse(decodeURIComponent(button.dataset.researchReplay || button.dataset.researchCell || "{}"));
+    row = normalizeResearchReplayRow(row);
+    if ((!row.params || !Object.keys(row.params).length) && row.sourceFile) {
+      const resolved = await apiGet(`/api/research/result-row?${new URLSearchParams({
+        sourceFile: row.sourceFile,
+        strategy: row.strategy || "",
+        symbol: row.symbol || "",
+        timeframe: row.timeframe || "",
+        returnPct: String(row.returnPct ?? row.totalReturnPct ?? ""),
+      }).toString()}`);
+      row = normalizeResearchReplayRow({ ...row, ...(resolved.row || {}) });
+    }
+    if (!row.strategy || !row.symbol || !row.timeframe || !row.params || !Object.keys(row.params).length) {
+      openBacktestModal(`<p class="pane-status">This result does not contain enough saved params to replay.</p><pre class="params-preview">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`, "Chart replay");
+      return;
+    }
+    openBacktestModal(renderGoodPeopleStoredDetail({
+      ...row,
+      mode: "optimizer replay",
+      totalReturnPct: row.totalReturnPct ?? row.returnPct,
+    }, true, "Replaying saved optimizer params to load trades and chart..."), `${row.strategy || "Strategy"} ${row.symbol || ""} ${row.timeframe || ""}`);
+    const replay = await apiPost("/api/backtest/run-custom", {
+      source: row.source || "bybit",
+      symbol: row.symbol,
+      timeframe: row.timeframe,
+      executionTimeframe: row.executionTimeframe || defaultExecutionTimeframe(row.timeframe),
+      period: row.period || "1095d",
+      strategy: row.strategy,
+      limit: "period",
+      params: row.params,
+      paramsSource: "saved optimizer result replay",
+      saveHistory: false,
+      includeFullTrades: true,
+      includeChartCandles: true,
+    });
+    backtestContent.innerHTML = renderGoodPeopleReplayDetail(row, replay) + `
+      <h3 class="modal-section-title">Saved Result JSON</h3>
+      <pre class="params-preview">${escapeHtml(JSON.stringify(row, null, 2))}</pre>
+    `;
+    await renderGoodPeopleReplayChart(row, replay);
+  } catch (error) {
+    openBacktestModal(`<p class="pane-status">Replay failed: ${escapeHtml(error.message)}</p><pre class="params-preview">${escapeHtml(JSON.stringify(row, null, 2))}</pre>`, "Chart replay");
+  }
+}
+
+async function copyResearchCellToStrategyBuilder(button) {
+  try {
+    const cell = JSON.parse(decodeURIComponent(button.dataset.researchTest || "{}"));
+    closeBacktestModal();
+    history.pushState({}, "", "/backtest");
+    showPage("backtest");
+    await waitForStrategyBuilderReady();
+    fillStrategyBuilderFromResearchCell(cell);
+  } catch (error) {
+    openBacktestModal(`<p class="pane-status">${escapeHtml(error.message)}</p>`, "Could not copy result");
+  }
+}
+
+async function waitForStrategyBuilderReady() {
+  const started = Date.now();
+  while (Date.now() - started < 6000) {
+    const strategySelect = document.querySelector("#lab-strategy-select");
+    if (backtestStrategyMetadata && strategySelect?.options?.length) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+function fillStrategyBuilderFromResearchCell(cell) {
+  const sourceSelect = document.querySelector("#lab-source-select");
+  const symbolSelect = document.querySelector("#lab-symbol-select");
+  const timeframeSelect = document.querySelector("#lab-timeframe-select");
+  const strategySelect = document.querySelector("#lab-strategy-select");
+  const presetSelect = document.querySelector("#lab-preset-select");
+  const periodSelect = document.querySelector("#lab-period-input");
+  const status = document.querySelector("#backtest-results");
+  if (sourceSelect) sourceSelect.value = "bybit";
+  populateLabSymbolAndTimeframe();
+  if (symbolSelect && Array.from(symbolSelect.options).some((option) => option.value === cell.symbol)) symbolSelect.value = cell.symbol;
+  if (timeframeSelect && Array.from(timeframeSelect.options).some((option) => option.value === cell.timeframe)) timeframeSelect.value = cell.timeframe;
+  if (strategySelect && Array.from(strategySelect.options).some((option) => option.value === cell.strategy)) {
+    strategySelect.value = cell.strategy;
+    onStrategyBuilderStrategyChange();
+  }
+  strategyBuilderParams = strategyApplicableParams(currentStrategyMetadata(), cell.params || {});
+  if (presetSelect) presetSelect.value = Array.from(presetSelect.options).some((option) => option.value === "custom") ? "custom" : presetSelect.value;
+  const period = cell.sourceSearch?.period || "1095d";
+  if (periodSelect && Array.from(periodSelect.options).some((option) => option.value === period)) periodSelect.value = period;
+  renderStrategyBuilderSummary(currentStrategyMetadata() || { name: cell.strategy, label: cell.strategy }, { name: "custom", label: "Copied matrix params" });
+  renderStrategyParamEditor(currentStrategyMetadata() || { paramSchema: {} });
+  if (status) {
+    status.innerHTML = `<p class="pane-status">Copied ${escapeHtml(cell.strategy || "-")} ${escapeHtml(cell.symbol || "-")} ${escapeHtml(cell.timeframe || "-")} into the builder. Adjust params and run the backtest.</p>`;
+  }
+  document.querySelector("#strategy-param-editor")?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function loadResearchWorkflowSummary() {
@@ -693,6 +1856,15 @@ function setupSidebar() {
     renderWatchlist();
     refreshWatchlistData(true);
   });
+  watchlistSignalToggle?.addEventListener("click", () => {
+    const pane = panes[0];
+    if (!pane) return;
+    pane.signalMarkerToggle.checked = !pane.signalMarkerToggle.checked;
+    if (globalSignalToggle) globalSignalToggle.checked = pane.signalMarkerToggle.checked;
+    updateChartMarkers(pane);
+    updateWatchlistSignalToggle();
+    saveState();
+  });
   renderWatchlist();
   refreshWatchlistData(true);
 }
@@ -726,8 +1898,8 @@ function populateGlobalSymbolAndTimeframe(saved = {}) {
   const sourceConfig = config.sources[globalSourceSelect.value];
   globalSymbolSelect.innerHTML = sourceConfig.symbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
   globalTimeframeSelect.innerHTML = sourceConfig.timeframes.map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`).join("");
-  globalSymbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols[0];
-  globalTimeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes[0];
+  globalSymbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols.includes("BTCUSDT") ? "BTCUSDT" : sourceConfig.symbols[0];
+  globalTimeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes.includes("1h") ? "1h" : sourceConfig.timeframes[0];
 }
 
 function populateGlobalIndicatorMenu() {
@@ -764,7 +1936,12 @@ function updateGlobalIndicatorButton() {
 
 function applyGlobalMarketControls() {
   if (!panes.length) return;
-  if (document.activeElement === globalSourceSelect) populateGlobalSymbolAndTimeframe({});
+  if (document.activeElement === globalSourceSelect) {
+    populateGlobalSymbolAndTimeframe({
+      symbol: globalSymbolSelect.value,
+      timeframe: globalTimeframeSelect.value,
+    });
+  }
   panes.forEach((pane) => {
     pane.sourceSelect.value = globalSourceSelect.value;
     populateSymbolAndTimeframe(pane, {
@@ -817,6 +1994,7 @@ function renderPaperStatus(payload) {
   const activeSymbols = candidate.activeSymbols || [];
   const watchSymbols = candidate.watchSymbols || [];
   const paperEnabled = Boolean(payload.paperEnabled ?? candidate.enabled);
+  const handbrake = payload.handbrake || {};
   return `
     <div class="paper-warning">Simulated only. No real order execution, no exchange account connection, no API keys.</div>
     <div class="metric-grid">
@@ -826,9 +2004,12 @@ function renderPaperStatus(payload) {
       <div class="metric"><span>Unrealized PnL</span><strong class="${payload.unrealizedPnL >= 0 ? "positive" : "negative"}">${formatSigned(payload.unrealizedPnL)}</strong></div>
       <div class="metric"><span>Fees</span><strong>${formatPrice(Number(payload.totalFees || 0))}</strong></div>
       <div class="metric"><span>Slippage</span><strong>${formatPrice(Number(payload.totalSlippage || 0))}</strong></div>
+      <div class="metric"><span>Handbrake</span><strong>${escapeHtml(handbrake.state || "ARMED")}</strong></div>
+      <div class="metric"><span>Loss streak</span><strong>${handbrake.metrics?.lossStreak ?? "-"}</strong></div>
       <div class="metric"><span>Strategy</span><strong>${escapeHtml(candidate.strategy || "-")}</strong></div>
       <div class="metric"><span>Fill</span><strong>${escapeHtml(candidate.fillModel || "-")}</strong></div>
     </div>
+    <p class="modal-note">${escapeHtml(handbrake.reason || "Handbrake monitors loss streak, drawdown, and recent average PnL.")}</p>
     <h3 class="modal-section-title">Current Candidate</h3>
     <table class="trade-table">
       <tbody>
@@ -1106,6 +2287,118 @@ function renderWatchlist() {
   watchlistContent.querySelectorAll("[data-watch-symbol]").forEach((button) => {
     button.addEventListener("click", () => setPrimaryChartSymbol(button.dataset.watchSymbol));
   });
+  if (currentStrategyContent) {
+    currentStrategyContent.innerHTML = renderCurrentStrategySummary();
+    bindCurrentStrategyTrades();
+  }
+  updateWatchlistSignalToggle();
+}
+
+function updateWatchlistSignalToggle() {
+  if (!watchlistSignalToggle) return;
+  const pane = panes[0];
+  const preset = (config.chart_signal_strategies || []).find((item) => item.id === pane?.presetSelect?.value);
+  const fullName = preset?.label || (pane?.presetSelect?.value === "none" ? "None" : "Signal");
+  const shortName = fullName.slice(0, 5);
+  const visible = pane?.signalMarkerToggle?.checked !== false;
+  watchlistSignalToggle.textContent = shortName;
+  watchlistSignalToggle.classList.toggle("is-off", !visible);
+  watchlistSignalToggle.setAttribute("aria-pressed", String(visible));
+  watchlistSignalToggle.title = `${visible ? "Hide" : "Show"} ${fullName} chart signals`;
+}
+
+function renderCurrentStrategySummary() {
+  const pane = panes[0];
+  const summary = pane?.strategySummary;
+  if (currentStrategyTitle) {
+    currentStrategyTitle.textContent = summary?.strategy || "Current Strategy";
+  }
+  if (!summary || summary.status === "off") {
+    return `
+      <section class="watch-strategy-summary is-off">
+        <div class="watch-strategy-heading"><strong>Current strategy</strong><span>Off</span></div>
+        <p>Select a strategy on the chart to see entries, exits, and results.</p>
+      </section>
+    `;
+  }
+  if (summary.status === "loading") {
+    return `
+      <section class="watch-strategy-summary">
+        <div class="watch-strategy-heading"><strong>${escapeHtml(summary.strategy)}</strong><span>Loading</span></div>
+      </section>
+    `;
+  }
+  if (summary.status === "error") {
+    return `
+      <section class="watch-strategy-summary has-error">
+        <div class="watch-strategy-heading"><strong>${escapeHtml(summary.strategy)}</strong><span>Error</span></div>
+        <p>${escapeHtml(summary.message || "Strategy calculation failed.")}</p>
+      </section>
+    `;
+  }
+  const returnPct = Number(summary.totalReturnPct || 0);
+  const tradeRows = (summary.trades || []).map((trade, index) => `
+    <tr class="strategy-trade-row" data-strategy-trade-index="${index}" tabindex="0" title="Zoom chart to this trade">
+      <td>${escapeHtml(formatCompactDateTime(trade.entryTime))}</td>
+      <td>${escapeHtml(formatCompactDateTime(trade.exitTime))}</td>
+      <td class="${Number(trade.returnPct) >= 0 ? "positive" : "negative"}" title="Risk-sized account return; underlying price move ${formatSigned(trade.priceMovePct)}%">${formatSigned(trade.returnPct)}%</td>
+    </tr>
+  `).join("");
+  return `
+    <section class="watch-strategy-summary">
+      <div class="watch-strategy-heading">
+        <strong>${escapeHtml(summary.strategy)}</strong>
+        <span>${escapeHtml(summary.symbol)} ${escapeHtml(summary.timeframe)} · ${escapeHtml(summary.executionTimeframe)} exits</span>
+      </div>
+      <div class="watch-strategy-metrics">
+        <span><small>TRADES</small><strong>${summary.completedTrades}</strong></span>
+        <span><small>WIN</small><strong>${formatNumber(summary.winRate, 1)}%</strong></span>
+        <span title="Compounded, risk-sized account return"><small>ACCT RETURN</small><strong class="${returnPct >= 0 ? "positive" : "negative"}">${formatSigned(returnPct)}%</strong></span>
+        <span><small>SPAN</small><strong>${summary.tradingDays}d</strong></span>
+      </div>
+      <p class="strategy-history-range" title="${escapeHtml(summary.historyLabel)}">${escapeHtml(summary.historyLabel)}</p>
+      <p class="strategy-watcher-status">${escapeHtml(summary.executionTimeframe)} watcher · checked ${escapeHtml(formatClockTime(summary.checkedAt))}</p>
+      <div class="watch-strategy-trades">
+        <table class="compact-table">
+          <thead><tr><th>Buy</th><th>Exit</th><th title="Risk-sized account return">Acct.</th></tr></thead>
+          <tbody>${tradeRows || `<tr><td colspan="3">No completed trades.</td></tr>`}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function bindCurrentStrategyTrades() {
+  currentStrategyContent?.querySelectorAll("[data-strategy-trade-index]").forEach((row) => {
+    const activate = () => zoomToStrategyTrade(Number(row.dataset.strategyTradeIndex), row);
+    row.addEventListener("click", activate);
+    row.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      activate();
+    });
+  });
+}
+
+function zoomToStrategyTrade(index, row) {
+  const pane = panes[0];
+  const trade = pane?.strategySummary?.trades?.[index];
+  const entryTime = normalizeMarkerTime(trade?.entryTime);
+  const exitTime = normalizeMarkerTime(trade?.exitTime);
+  if (!pane?.chart || entryTime === null || exitTime === null) return;
+  const duration = Math.max(1, exitTime - entryTime);
+  const intervalSeconds = timeframeSeconds(pane.timeframeSelect.value);
+  const padding = Math.max(intervalSeconds * 5, duration * 0.35);
+  pane.chart.timeScale().setVisibleRange({ from: entryTime - padding, to: exitTime + padding });
+  syncIndicatorTimeRanges(pane);
+  currentStrategyContent?.querySelectorAll(".strategy-trade-row.is-selected").forEach((item) => item.classList.remove("is-selected"));
+  row?.classList.add("is-selected");
+}
+
+function timeframeSeconds(timeframe) {
+  const match = String(timeframe || "").toLowerCase().match(/^(\d+)(m|h|d|w)$/);
+  if (!match) return 3600;
+  return Number(match[1]) * ({ m: 60, h: 3600, d: 86400, w: 604800 }[match[2]] || 3600);
 }
 
 function scheduleWatchlistRefresh() {
@@ -1128,7 +2421,7 @@ async function refreshWatchlistData(force = false) {
         const source = sourceForWatchSymbol(symbol, activeSource);
         const timeframe = timeframeForWatchSymbol(source, activeTimeframe);
         const [candlesPayload, signalPayload] = await Promise.all([
-          apiGet(`/api/candles?${new URLSearchParams({ source, symbol, timeframe, limit: "1", visible_charts: String(visibleChartCount()) })}`),
+          apiGet(`/api/candles?${new URLSearchParams({ source, symbol, timeframe, limit: "50", visible_charts: String(visibleChartCount()) })}`),
           apiGet(`/api/signals?${new URLSearchParams({ source, symbol, timeframe, limit: "300", include_timeframes: "false" })}`),
         ]);
         const candle = candlesPayload.candles?.[candlesPayload.candles.length - 1];
@@ -1232,7 +2525,9 @@ function cleanupPanes() {
   panes.forEach((pane) => {
     if (pane.ws) pane.ws.close();
     if (pane.pollTimer) clearInterval(pane.pollTimer);
+    if (pane.strategyPollTimer) clearTimeout(pane.strategyPollTimer);
     if (pane.resizeObserver) pane.resizeObserver.disconnect();
+    cancelPaneRangeSync(pane);
     clearIndicatorSeries(pane);
     if (pane.chart) pane.chart.remove();
   });
@@ -1251,6 +2546,8 @@ function createPane(node, index) {
     indicatorMenu: node.querySelector(".indicator-menu"),
     indicatorList: node.querySelector(".indicator-list"),
     signalMarkerToggle: node.querySelector(".signal-marker-toggle"),
+    scaleToggle: node.querySelector(".chart-scale-toggle"),
+    nowButton: node.querySelector(".chart-now-button"),
     signalBadge: node.querySelector(".signal-badge"),
     ticker: node.querySelector(".ticker"),
     tickerSymbol: node.querySelector(".ticker-symbol"),
@@ -1273,13 +2570,22 @@ function createPane(node, index) {
     signalMarkerPrimitive: null,
     ws: null,
     pollTimer: null,
+    strategyPollTimer: null,
+    strategyWatcherRunning: false,
+    pollFailures: 0,
     resizeObserver: null,
     lastPrice: null,
     requestId: 0,
     indicatorRequestId: 0,
+    strategyRequestId: 0,
     lastSignalPayload: null,
+    strategySummary: { status: "off" },
+    logarithmicScale: false,
     rangeSyncing: false,
+    rangeSyncFrame: null,
+    pendingRangeSyncSource: null,
     syncIndicators: uiPrefs.syncIndicators !== false,
+    performanceTimings: {},
   };
   pane.dataDiagnosticsEl = document.createElement("div");
   pane.dataDiagnosticsEl.className = "data-diagnostics";
@@ -1292,16 +2598,23 @@ function createPane(node, index) {
 
   const saved = state.panes?.[index] || {};
   pane.sourceSelect.value = config.sources[saved.source] ? saved.source : "bybit";
-  pane.presetSelect.value = config.strategy_presets?.some((preset) => preset.id === saved.preset)
-    ? saved.preset
-    : config.default_strategy_preset;
+  pane.presetSelect.value = config.chart_signal_strategies?.some((preset) => preset.id === saved.signalStrategy)
+    ? saved.signalStrategy
+    : "none";
   populateSymbolAndTimeframe(pane, saved);
   restoreIndicators(pane, saved.indicators || []);
   pane.signalMarkerToggle.checked = saved.signalMarkers !== false;
+  pane.logarithmicScale = saved.logarithmicScale === true;
+  applyPanePriceScale(pane);
 
   [pane.sourceSelect, pane.symbolSelect, pane.timeframeSelect].forEach((select) => {
     select.addEventListener("change", () => {
-      if (select === pane.sourceSelect) populateSymbolAndTimeframe(pane, {});
+      if (select === pane.sourceSelect) {
+        populateSymbolAndTimeframe(pane, {
+          symbol: pane.symbolSelect.value,
+          timeframe: pane.timeframeSelect.value,
+        });
+      }
       startPane(pane);
       saveState();
       renderWatchlist();
@@ -1309,7 +2622,11 @@ function createPane(node, index) {
     });
   });
 
-  pane.presetSelect.addEventListener("change", saveState);
+  pane.presetSelect.addEventListener("change", () => {
+    renderSelectedStrategy(pane, pane.requestId);
+    updateWatchlistSignalToggle();
+    saveState();
+  });
 
   pane.indicatorButton.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -1323,14 +2640,66 @@ function createPane(node, index) {
 
   pane.signalMarkerToggle.addEventListener("change", () => {
     updateChartMarkers(pane);
+    updateWatchlistSignalToggle();
     saveState();
   });
   pane.signalBadge.addEventListener("click", () => openSignalDetails(pane));
 
   pane.backtestButton.addEventListener("click", () => openBacktestControls(pane));
+  pane.scaleToggle.addEventListener("click", () => {
+    pane.logarithmicScale = !pane.logarithmicScale;
+    applyPanePriceScale(pane);
+    saveState();
+  });
+  pane.nowButton.addEventListener("click", () => jumpPaneToNow(pane));
 
   startPane(pane);
+  startStrategyWatcher(pane);
   return pane;
+}
+
+function applyPanePriceScale(pane) {
+  const normalMode = LightweightCharts.PriceScaleMode?.Normal ?? 0;
+  const logarithmicMode = LightweightCharts.PriceScaleMode?.Logarithmic ?? 1;
+  pane.chart.priceScale("right").applyOptions({ mode: pane.logarithmicScale ? logarithmicMode : normalMode });
+  pane.scaleToggle.classList.toggle("is-active", pane.logarithmicScale);
+  pane.scaleToggle.setAttribute("aria-pressed", String(pane.logarithmicScale));
+  pane.scaleToggle.title = `${pane.logarithmicScale ? "Disable" : "Enable"} logarithmic price scale`;
+}
+
+function jumpPaneToNow(pane) {
+  const candleCount = pane.candles?.length || 0;
+  const visibleCount = Math.min(candleCount, 180);
+  const range = visibleCount
+    ? { from: candleCount - visibleCount, to: candleCount + 4 }
+    : null;
+  const scrollToLatest = (chart) => {
+    const timeScale = chart?.timeScale?.();
+    if (range && timeScale?.setVisibleLogicalRange) timeScale.setVisibleLogicalRange(range);
+    else if (timeScale?.scrollToRealTime) timeScale.scrollToRealTime();
+    else timeScale?.scrollToPosition?.(0, true);
+  };
+  scrollToLatest(pane.chart);
+  pane.indicatorCharts.forEach((item) => scrollToLatest(item.chart));
+}
+
+function startStrategyWatcher(pane) {
+  if (pane.strategyPollTimer) clearTimeout(pane.strategyPollTimer);
+  const intervalMs = 5 * 60 * 1000;
+  const closeGraceMs = 5000;
+  const now = Date.now();
+  const nextCheckAt = (Math.floor(now / intervalMs) + 1) * intervalMs + closeGraceMs;
+  pane.strategyPollTimer = setTimeout(async () => {
+    if (pane.presetSelect.value && pane.presetSelect.value !== "none" && !pane.strategyWatcherRunning) {
+      pane.strategyWatcherRunning = true;
+      try {
+        await renderSelectedStrategy(pane, pane.requestId, { silent: true });
+      } finally {
+        pane.strategyWatcherRunning = false;
+      }
+    }
+    startStrategyWatcher(pane);
+  }, Math.max(1000, nextCheckAt - now));
 }
 
 function syncChartsToolbarFromPane(pane) {
@@ -1375,11 +2744,13 @@ function setupChart(pane) {
   pane.series = addSeries(pane.chart, "candlestick", candleOptions);
 
   pane.resizeObserver = new ResizeObserver(() => {
-    syncIndicatorTimeRanges(pane);
+    schedulePaneRangeSync(pane, pane.chart);
   });
   pane.resizeObserver.observe(pane.chartEl);
-  if (pane.chart.timeScale().subscribeVisibleTimeRangeChange) {
-    pane.chart.timeScale().subscribeVisibleTimeRangeChange(() => syncIndicatorTimeRanges(pane));
+  if (pane.chart.timeScale().subscribeVisibleLogicalRangeChange) {
+    pane.chart.timeScale().subscribeVisibleLogicalRangeChange(() => schedulePaneRangeSync(pane, pane.chart));
+  } else if (pane.chart.timeScale().subscribeVisibleTimeRangeChange) {
+    pane.chart.timeScale().subscribeVisibleTimeRangeChange(() => schedulePaneRangeSync(pane, pane.chart));
   }
   if (pane.chart.subscribeCrosshairMove) {
     pane.chart.subscribeCrosshairMove((param) => showMarkerDetailsForCrosshair(pane, param));
@@ -1428,9 +2799,10 @@ function populateSourceSelect(pane) {
 }
 
 function populatePresetSelect(pane) {
-  pane.presetSelect.innerHTML = (config.strategy_presets || [])
-    .map((preset) => `<option value="${preset.id}">${preset.label}</option>`)
-    .join("");
+  pane.presetSelect.innerHTML = [
+    `<option value="none">None (signals off)</option>`,
+    ...(config.chart_signal_strategies || []).map((preset) => `<option value="${preset.id}">${preset.label}</option>`),
+  ].join("");
 }
 
 function populateSymbolAndTimeframe(pane, saved) {
@@ -1442,8 +2814,8 @@ function populateSymbolAndTimeframe(pane, saved) {
     .map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`)
     .join("");
 
-  pane.symbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols[0];
-  pane.timeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes[0];
+  pane.symbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols.includes("BTCUSDT") ? "BTCUSDT" : sourceConfig.symbols[0];
+  pane.timeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes.includes("1h") ? "1h" : sourceConfig.timeframes[0];
 }
 
 function populateIndicatorMenu(pane) {
@@ -1469,6 +2841,7 @@ function selectedIndicators(pane) {
 }
 
 async function startPane(pane) {
+  const loadStartedAt = performance.now();
   const requestId = pane.requestId + 1;
   pane.requestId = requestId;
   if (pane.ws) pane.ws.close();
@@ -1476,6 +2849,8 @@ async function startPane(pane) {
   pane.ws = null;
   pane.pollTimer = null;
   pane.lastPrice = null;
+  pane.historyLoaded = false;
+  pane.historyError = null;
   clearIndicatorSeries(pane);
   clearSignalMarkers(pane);
   clearBacktestMarkers(pane);
@@ -1483,30 +2858,39 @@ async function startPane(pane) {
   pane.tickerSymbol.textContent = pane.symbolSelect.value;
   pane.tickerPrice.textContent = "Loading";
 
+  try {
+    const candlePayload = await loadCandles(pane, { limit: historyLimitForPane() });
+    if (requestId !== pane.requestId) return;
+    const candles = candlePayload.candles;
+    if (!candles.length) throw new Error("No historical candles returned");
+    pane.candleDiagnostics = candlePayload.diagnostics || {};
+    pane.candles = candles;
+    pane.historyLoaded = true;
+    const chartStartedAt = performance.now();
+    pane.series.setData(candles);
+    pane.performanceTimings.chartSetDataMs = Math.round((performance.now() - chartStartedAt) * 10) / 10;
+    jumpPaneToNow(pane);
+    if (candles.length) updateTicker(pane, candles[candles.length - 1].close);
+    const strategySelected = pane.presetSelect.value && pane.presetSelect.value !== "none";
+    await Promise.allSettled([
+      renderIndicators(pane, requestId),
+      renderSelectedStrategy(pane, requestId),
+      renderSignals(pane, requestId, { sidebarOnly: strategySelected }),
+    ]);
+    pane.status.textContent = candleStatusText(candlePayload);
+    pane.performanceTimings.totalLoadMs = Math.round((performance.now() - loadStartedAt) * 10) / 10;
+    console.debug("ZguaCharts render timing", pane.symbolSelect.value, pane.timeframeSelect.value, pane.performanceTimings);
+    renderDataDiagnostics(pane);
+  } catch (error) {
+    if (requestId !== pane.requestId) return;
+    pane.historyError = error.message;
+    pane.status.textContent = `Historical candles unavailable: ${error.message}`;
+  }
+
   if (pane.sourceSelect.value === "bybit") {
     connectBybit(pane, requestId);
   } else if (pane.sourceSelect.value === "hyperliquid") {
     connectHyperliquid(pane, requestId);
-  }
-
-  try {
-    const candlePayload = await loadCandles(pane, { limit: 1000 });
-    if (requestId !== pane.requestId) return;
-    const candles = candlePayload.candles;
-    pane.candleDiagnostics = candlePayload.diagnostics || {};
-    pane.candles = candles;
-    pane.series.setData(candles);
-    pane.chart.timeScale().fitContent();
-    if (candles.length) updateTicker(pane, candles[candles.length - 1].close);
-    await renderIndicators(pane, requestId);
-    await renderSignals(pane, requestId);
-    pane.status.textContent = candleStatusText(candlePayload);
-    renderDataDiagnostics(pane);
-    loadOlderHistory(pane, requestId);
-  } catch (error) {
-    if (requestId !== pane.requestId) return;
-    pane.series.setData([]);
-    pane.status.textContent = error.message;
   }
 
   if (pane.sourceSelect.value === "yfinance") {
@@ -1514,45 +2898,26 @@ async function startPane(pane) {
   }
 }
 
-async function loadOlderHistory(pane, requestId) {
-  if (pane.sourceSelect.value !== "bybit") return;
-  try {
-    const candlePayload = await loadCandles(pane, { limit: historyLimitForPane() });
-    if (requestId !== pane.requestId) return;
-    const candles = candlePayload.candles;
-    if (candles.length <= pane.candles.length) return;
-    const visibleRange = currentVisibleRange(pane.chart);
-    pane.candleDiagnostics = candlePayload.diagnostics || {};
-    pane.candles = candles;
-    pane.series.setData(candles);
-    restoreVisibleRange(pane.chart, visibleRange);
-    pane.status.textContent = candleStatusText(candlePayload);
-    renderDataDiagnostics(pane);
-    await renderIndicators(pane, requestId);
-    await renderSignals(pane, requestId);
-  } catch (error) {
-    if (requestId === pane.requestId) pane.status.textContent = `Older history unavailable: ${error.message}`;
-  }
-}
-
-async function renderSignals(pane, requestId) {
+async function renderSignals(pane, requestId, options = {}) {
   // Signals are scored by /api/signals. The browser only renders the returned
   // badge, details, and optional chart markers.
-  resetSignalBadge(pane);
-  clearSignalMarkers(pane);
+  if (!options.sidebarOnly) {
+    resetSignalBadge(pane);
+    clearSignalMarkers(pane);
+  }
 
   const params = new URLSearchParams({
     source: pane.sourceSelect.value,
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
-    limit: String(Math.max(pane.candles.length, 300)),
+    limit: String(Math.min(Math.max(pane.candles.length, 300), 500)),
+    include_timeframes: "false",
   });
   const response = await fetch(`/api/signals?${params}`);
   const payload = await response.json();
   if (requestId !== pane.requestId) return;
   if (!response.ok) throw new Error(payload.error || "Signal request failed");
 
-  pane.signalMarkers = payload.markers || [];
   pane.lastSignalPayload = payload;
   watchlistQuotes.set(pane.symbolSelect.value, {
     ...(watchlistQuotes.get(pane.symbolSelect.value) || {}),
@@ -1561,9 +2926,151 @@ async function renderSignals(pane, requestId) {
     direction: payload.signalDirection || "NEUTRAL",
     updatedAt: Date.now(),
   });
-  updateSignalBadge(pane, payload);
-  updateChartMarkers(pane);
+  if (!options.sidebarOnly) {
+    pane.signalMarkers = payload.markers || [];
+    updateSignalBadge(pane, payload);
+    updateChartMarkers(pane);
+  }
   updateChartsPanels(pane, payload);
+}
+
+async function renderSelectedStrategy(pane, requestId, options = {}) {
+  const strategyRequestId = ++pane.strategyRequestId;
+  if (!options.silent) {
+    clearSignalMarkers(pane);
+    clearBacktestMarkers(pane);
+    resetSignalBadge(pane);
+  }
+
+  const presetId = pane.presetSelect.value;
+  if (!presetId || presetId === "none") {
+    pane.strategySummary = { status: "off" };
+    pane.signalBadge.textContent = "SIGNALS OFF";
+    pane.signalBadge.title = "Choose a tested strategy to show entries and exits.";
+    renderWatchlist();
+    return;
+  }
+
+  const preset = (config.chart_signal_strategies || []).find((item) => item.id === presetId);
+  if (!options.silent) pane.strategySummary = { status: "loading", strategy: preset?.label || presetId };
+  if (!options.silent) {
+    pane.signalBadge.textContent = "LOADING";
+    pane.signalBadge.title = preset?.label || presetId;
+    renderWatchlist();
+  }
+  try {
+    const strategyStartedAt = performance.now();
+    const strategyCandleLimit = Math.min(Math.max(pane.candles.length, 300), 5000);
+    const request = {
+      source: pane.sourceSelect.value,
+      symbol: pane.symbolSelect.value,
+      timeframe: pane.timeframeSelect.value,
+      executionTimeframe: defaultExecutionTimeframe(pane.timeframeSelect.value),
+      period: periodForChartCandles(pane.timeframeSelect.value, strategyCandleLimit),
+      strategy: preset.strategy,
+      params: preset.params || {},
+      paramsSource: preset.label,
+      limit: String(strategyCandleLimit),
+      feePct: 0,
+      slippagePct: 0,
+      allowShorts: false,
+      includeFullTrades: true,
+    };
+    const cachedResult = await cachedStrategyBacktest(strategyCacheKey(pane, preset, strategyCandleLimit), request);
+    const payload = cachedResult.payload;
+    pane.performanceTimings.strategyMs = Math.round((performance.now() - strategyStartedAt) * 10) / 10;
+    pane.performanceTimings.strategyCached = cachedResult.cached;
+    if (requestId !== pane.requestId || strategyRequestId !== pane.strategyRequestId) return;
+
+    pane.backtestMarkers = markersFromBacktestPayload(payload, {
+      includeEndOfDataExit: false,
+      prefix: "",
+      strategyName: preset.label,
+      strategyParams: preset.params || {},
+    });
+    renderBacktestOverlays(pane, payload);
+    pane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
+    updateChartMarkers(pane);
+    renderDataDiagnostics(pane);
+    updateStrategyBadge(pane, payload, preset);
+    const trades = normalizedTrades(payload);
+    const completedTrades = trades.filter((trade) => !/end of data/i.test(String(trade.exit_reason ?? trade.exitReason ?? "")));
+    const winningTrades = completedTrades.filter((trade) => Number(trade.return_pct ?? trade.returnPct ?? 0) > 0).length;
+    const completedReturnPct = completedTrades.reduce(
+      (total, trade) => total + Number(trade.return_pct ?? trade.returnPct ?? 0),
+      0,
+    );
+    const entryTimes = completedTrades.map((trade) => normalizeMarkerTime(trade.entry_time ?? trade.entryTime)).filter((time) => time !== null);
+    const exitTimes = completedTrades.map((trade) => normalizeMarkerTime(trade.exit_time ?? trade.exitTime)).filter((time) => time !== null);
+    const tradingDays = entryTimes.length && exitTimes.length
+      ? Math.max(1, Math.ceil((Math.max(...exitTimes) - Math.min(...entryTimes)) / 86400))
+      : 0;
+    const strategyCandles = pane.candles.slice(-strategyCandleLimit);
+    const historyStart = strategyCandles[0]?.time;
+    const historyEnd = strategyCandles[strategyCandles.length - 1]?.time;
+    pane.strategySummary = {
+      status: "ready",
+      strategy: preset.label,
+      symbol: pane.symbolSelect.value,
+      timeframe: pane.timeframeSelect.value,
+      executionTimeframe: payload.executionTimeframe || defaultExecutionTimeframe(pane.timeframeSelect.value),
+      completedTrades: completedTrades.length,
+      winRate: completedTrades.length ? (winningTrades / completedTrades.length) * 100 : 0,
+      totalReturnPct: completedReturnPct,
+      candlesEvaluated: strategyCandleLimit,
+      historyLabel: `${strategyCandleLimit} candles · ${formatCompactDate(historyStart)} to ${formatCompactDate(historyEnd)}`,
+      checkedAt: Date.now(),
+      tradingDays,
+      trades: completedTrades.map((trade) => ({
+        entryTime: trade.entry_time ?? trade.entryTime,
+        exitTime: trade.exit_time ?? trade.exitTime,
+        returnPct: Number(trade.return_pct ?? trade.returnPct ?? 0),
+        priceMovePct: (() => {
+          const entry = Number(trade.entry_price ?? trade.entryPrice ?? trade.entry_fill_price ?? trade.entryFillPrice);
+          const exit = Number(trade.exit_price ?? trade.exitPrice ?? trade.exit_fill_price ?? trade.exitFillPrice);
+          return entry > 0 && Number.isFinite(exit) ? ((exit - entry) / entry) * 100 : 0;
+        })(),
+        exitReason: trade.exit_reason ?? trade.exitReason ?? "-",
+      })),
+    };
+    renderWatchlist();
+  } catch (error) {
+    if (requestId !== pane.requestId || strategyRequestId !== pane.strategyRequestId) return;
+    if (options.silent) {
+      pane.strategySummary = { ...pane.strategySummary, watcherError: error.message };
+      renderWatchlist();
+      return;
+    }
+    pane.signalBadge.textContent = "ERROR";
+    pane.signalBadge.title = error.message;
+    pane.strategySummary = {
+      status: "error",
+      strategy: preset?.label || presetId,
+      message: error.message,
+    };
+    renderWatchlist();
+  }
+}
+
+function periodForChartCandles(timeframe, candleCount) {
+  const match = String(timeframe || "").toLowerCase().match(/^(\d+)(m|h|d|w)$/);
+  if (!match) return "365d";
+  const amount = Number(match[1]);
+  const unitMinutes = { m: 1, h: 60, d: 1440, w: 10080 }[match[2]];
+  const days = Math.max(2, Math.ceil((amount * unitMinutes * candleCount) / 1440));
+  return `${days}d`;
+}
+
+function updateStrategyBadge(pane, payload, preset) {
+  const trades = normalizedTrades(payload);
+  const latest = trades[trades.length - 1];
+  const stillOpen = latest && /end of data/i.test(String(latest.exit_reason ?? latest.exitReason ?? ""));
+  const side = String(latest?.side || "LONG").toUpperCase();
+  const direction = stillOpen ? (side === "SHORT" ? "SHORT" : "LONG") : "FLAT";
+  pane.signalBadge.textContent = direction;
+  pane.signalBadge.classList.remove("buy", "sell", "neutral");
+  pane.signalBadge.classList.add(direction === "LONG" ? "buy" : direction === "SHORT" ? "sell" : "neutral");
+  pane.signalBadge.title = `${preset?.label || pane.presetSelect.value}: ${direction}. ${trades.length} completed or current trade(s).`;
 }
 
 async function loadCandles(pane, options = {}) {
@@ -1594,12 +3101,7 @@ function visibleChartCount() {
 }
 
 function historyLimitForPane() {
-  const count = visibleChartCount();
-  if (count <= 1) return 20000;
-  if (count <= 2) return 12000;
-  if (count <= 4) return 8000;
-  if (count <= 6) return 5000;
-  return 3000;
+  return 2000;
 }
 
 async function renderIndicators(pane, requestId) {
@@ -1620,7 +3122,7 @@ async function renderIndicators(pane, requestId) {
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
     indicators: indicators.join(","),
-    limit: String(Math.max(pane.candles.length, 300)),
+    limit: String(Math.max(pane.candles.length, 1)),
     chart_candles_count: String(pane.candles.length),
     first_chart_candle_time: String(pane.candles[0]?.time || ""),
     last_chart_candle_time: String(pane.candles[pane.candles.length - 1]?.time || ""),
@@ -1665,6 +3167,7 @@ async function renderIndicators(pane, requestId) {
       // A pane can be destroyed while an async indicator request is still returning.
     }
   });
+  cancelPaneRangeSync(pane);
   oldIndicatorCharts.forEach((item) => item.chart.remove());
   pane.indicatorPanesEl.innerHTML = "";
   nextPaneElements.forEach((item) => {
@@ -1679,6 +3182,11 @@ async function renderIndicators(pane, requestId) {
     const paneMarkers = normalizeMarkers(item.pane.markers || []);
     if (markerSeries && paneMarkers.length) setSeriesMarkers(markerSeries, paneMarkers);
     nextIndicatorCharts.push({ chart, element: item.element });
+    if (chart.timeScale().subscribeVisibleLogicalRangeChange) {
+      chart.timeScale().subscribeVisibleLogicalRangeChange(() => schedulePaneRangeSync(pane, chart));
+    } else if (chart.timeScale().subscribeVisibleTimeRangeChange) {
+      chart.timeScale().subscribeVisibleTimeRangeChange(() => schedulePaneRangeSync(pane, chart));
+    }
   });
   pane.overlaySeries = nextOverlaySeries;
   pane.indicatorCharts = nextIndicatorCharts;
@@ -1763,10 +3271,9 @@ function resetSignalBadge(pane) {
 }
 
 function updateChartMarkers(pane) {
-  const visibleMarkers = [
-    ...(pane.signalMarkerToggle.checked ? pane.signalMarkers : []),
-    ...pane.backtestMarkers,
-  ].sort((a, b) => a.time - b.time);
+  const visibleMarkers = pane.signalMarkerToggle.checked
+    ? [...pane.signalMarkers, ...pane.backtestMarkers].sort((a, b) => a.time - b.time)
+    : [];
   pane.markerDetailsByTime = buildMarkerDetailsMap(visibleMarkers);
   if (pane.series.setMarkers) {
     pane.series.setMarkers(visibleMarkers);
@@ -1820,22 +3327,100 @@ function currentVisibleRange(chart) {
   }
 }
 
+function currentVisibleLogicalRange(chart) {
+  try {
+    return chart.timeScale().getVisibleLogicalRange?.() || null;
+  } catch {
+    return null;
+  }
+}
+
+function currentVisibleSyncRange(chart) {
+  const logical = currentVisibleLogicalRange(chart);
+  if (logical) return { type: "logical", range: logical };
+  const time = currentVisibleRange(chart);
+  if (time) return { type: "time", range: time };
+  return null;
+}
+
 function restoreVisibleRange(chart, range) {
   try {
-    if (range?.from && range?.to) chart.timeScale().setVisibleRange(range);
+    if (!range?.from || !range?.to) return;
+    const current = currentVisibleRange(chart);
+    if (current && String(current.from) === String(range.from) && String(current.to) === String(range.to)) return;
+    chart.timeScale().setVisibleRange(range);
   } catch {
     // If the chart library rejects a stale range, leave the current viewport as-is.
   }
 }
 
+function restoreVisibleLogicalRange(chart, range) {
+  try {
+    if (Number.isFinite(range?.from) && Number.isFinite(range?.to)) {
+      const current = currentVisibleLogicalRange(chart);
+      if (current && Math.abs(current.from - range.from) < 0.001 && Math.abs(current.to - range.to) < 0.001) {
+        return true;
+      }
+      chart.timeScale().setVisibleLogicalRange(range);
+      return true;
+    }
+  } catch {
+    // If the chart library rejects a stale range, leave the current viewport as-is.
+  }
+  return false;
+}
+
 function syncIndicatorTimeRanges(pane) {
   if (!pane.syncIndicators) return;
   if (pane.rangeSyncing) return;
-  const range = currentVisibleRange(pane.chart);
-  if (!range) return;
+  const syncRange = currentVisibleSyncRange(pane.chart);
+  if (!syncRange) return;
+  syncPaneTimeRange(pane, syncRange, pane.chart);
+}
+
+function schedulePaneRangeSync(pane, sourceChart) {
+  if (!pane.syncIndicators || pane.rangeSyncing) return;
+  pane.pendingRangeSyncSource = sourceChart;
+  if (pane.rangeSyncFrame !== null) return;
+  pane.rangeSyncFrame = requestAnimationFrame(() => {
+    pane.rangeSyncFrame = null;
+    const latestSource = pane.pendingRangeSyncSource;
+    pane.pendingRangeSyncSource = null;
+    if (!latestSource) return;
+    if (latestSource === pane.chart) {
+      syncIndicatorTimeRanges(pane);
+    } else {
+      syncPaneTimeRangeFromChart(pane, latestSource);
+    }
+  });
+}
+
+function cancelPaneRangeSync(pane) {
+  if (pane.rangeSyncFrame !== null) cancelAnimationFrame(pane.rangeSyncFrame);
+  pane.rangeSyncFrame = null;
+  pane.pendingRangeSyncSource = null;
+}
+
+function syncPaneTimeRangeFromChart(pane, sourceChart) {
+  if (!pane.syncIndicators) return;
+  if (pane.rangeSyncing) return;
+  const syncRange = currentVisibleSyncRange(sourceChart);
+  if (!syncRange) return;
+  syncPaneTimeRange(pane, syncRange, sourceChart);
+}
+
+function syncPaneTimeRange(pane, syncRange, sourceChart = null) {
+  const { type, range } = syncRange || {};
+  const restoreRange = (chart) => {
+    if (type === "logical" && restoreVisibleLogicalRange(chart, range)) return;
+    restoreVisibleRange(chart, range);
+  };
   pane.rangeSyncing = true;
   try {
-    pane.indicatorCharts.forEach((item) => restoreVisibleRange(item.chart, range));
+    if (sourceChart !== pane.chart) restoreRange(pane.chart);
+    pane.indicatorCharts.forEach((item) => {
+      if (item.chart !== sourceChart) restoreRange(item.chart);
+    });
   } finally {
     pane.rangeSyncing = false;
   }
@@ -1946,7 +3531,7 @@ function renderMarkerDetails(markers, time) {
         <h3>${escapeHtml(marker.text || marker.type || "Marker")} - ${formatDateTime(time)}</h3>
         <p>${escapeHtml(marker.reason || marker.summary || "Backend-returned marker detail.")}</p>
         <dl class="marker-detail-list">
-          ${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}
+          ${rows.map(([label, value, tone]) => `<div class="${tone || ""}"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}
         </dl>
       </section>
     `;
@@ -1967,11 +3552,25 @@ function markerRows(marker) {
     return rows;
   }
   if (marker.trade) {
+    const returnPct = Number(marker.trade.return_pct ?? marker.trade.returnPct ?? 0);
+    const entryTime = marker.trade.entry_time ?? marker.trade.entryTime;
+    const exitTime = marker.trade.exit_time ?? marker.trade.exitTime;
+    const entryPrice = marker.trade.entry_price ?? marker.trade.entryPrice ?? 0;
+    const exitPrice = marker.trade.exit_price ?? marker.trade.exitPrice ?? 0;
+    const exitReason = marker.trade.exit_reason ?? marker.trade.exitReason ?? "-";
+    const parameterRows = Object.entries(marker.strategyParams || {}).map(([name, value]) => [
+      `Parameter: ${name}`,
+      typeof value === "object" ? JSON.stringify(value) : String(value),
+    ]);
     return [
-      ["Entry", `${formatDateTime(marker.trade.entry_time)} @ ${formatPrice(Number(marker.trade.entry_price || 0))}`],
-      ["Exit", `${formatDateTime(marker.trade.exit_time)} @ ${formatPrice(Number(marker.trade.exit_price || 0))}`],
-      ["Return", `${formatSigned(marker.trade.return_pct)}%`],
-      ["Exit reason", marker.trade.exit_reason || "-"],
+      ["Strategy", marker.strategyName || "Backtest strategy"],
+      ["Entry rules", "Passed - strategy generated this signal"],
+      ["Entry", `${formatDateTime(entryTime)} @ ${formatPrice(Number(entryPrice))}`],
+      ["Exit", `${formatDateTime(exitTime)} @ ${formatPrice(Number(exitPrice))}`],
+      ["Bars held", String(marker.trade.bars_held ?? marker.trade.barsHeld ?? "-")],
+      ["Return", `${formatSigned(returnPct)}%`, returnPct >= 0 ? "positive" : "negative"],
+      ["Exit reason", exitReason],
+      ...parameterRows,
     ];
   }
   return [
@@ -1989,6 +3588,7 @@ function initBacktestPage() {
   document.querySelector("#lab-source-select")?.addEventListener("change", populateLabSymbolAndTimeframe);
   document.querySelector("#lab-strategy-select")?.addEventListener("change", onStrategyBuilderStrategyChange);
   document.querySelector("#lab-preset-select")?.addEventListener("change", onStrategyBuilderPresetChange);
+  document.querySelector("#lab-show-optional-params")?.addEventListener("change", () => renderStrategyParamEditor(currentStrategyMetadata() || { paramSchema: {} }));
   document.querySelector("#sensitivity-generate-values")?.addEventListener("click", generateSensitivityValues);
   document.querySelector("#sensitivity-run")?.addEventListener("click", runParamSensitivityLab);
   document.querySelector("#sensitivity-add-all")?.addEventListener("click", addAllSensitivityRowsToComparison);
@@ -2332,10 +3932,12 @@ function saveGoodPeoplePreset() {
 }
 
 function goodPeopleBaseRequest() {
+  const timeframe = document.querySelector("#good-timeframe-select")?.value || "1h";
   return {
     source: "bybit",
     symbol: document.querySelector("#good-symbol-select")?.value || "BTCUSDT",
-    timeframe: document.querySelector("#good-timeframe-select")?.value || "1h",
+    timeframe,
+    executionTimeframe: defaultExecutionTimeframe(timeframe),
     period: document.querySelector("#good-period-select")?.value || "365d",
     strategy: document.querySelector("#good-strategy-select")?.value || "SimpleAtrTrendV2",
     limit: document.querySelector("#good-limit-select")?.value || "period",
@@ -2555,7 +4157,7 @@ async function loadGoodPeopleHistory() {
   const body = document.querySelector("#good-history-body");
   if (body) body.innerHTML = `<tr><td colspan="11">Loading history...</td></tr>`;
   try {
-    const payload = await apiGet("/api/good-people/history?limit=400");
+    const payload = await apiGet("/api/good-people/history?limit=80");
     goodPeopleHistoryRows = payload.rows || [];
     updateGoodPeopleFilterOptions();
     renderGoodPeopleHistory();
@@ -2918,9 +4520,15 @@ function renderGoodPeopleStoredDetail(row, loading = false, note = "") {
 
 function renderGoodPeopleReplayDetail(row, payload) {
   const result = payload.result || {};
+  const diagnostics = payload.diagnostics || {};
   const trades = payload.trades || [];
   const chartCandles = payload.chartCandles || [];
   const expectedTrades = payload.tradeCount ?? result.trades ?? row.trades ?? trades.length;
+  const replayReturn = Number(result.totalReturnPct || 0);
+  const savedReturn = Number(row.totalReturnPct ?? row.returnPct ?? replayReturn);
+  const returnDelta = replayReturn - savedReturn;
+  const paramsUsed = payload.paramsUsed || row.params || {};
+  const paramChips = compactParamChips(paramsUsed, 18);
   const tradeRows = trades.slice(0, 80).map((trade) => `
     <tr>
       <td>${formatDateTime(trade.entry_time || trade.entryTime)}</td>
@@ -2932,22 +4540,31 @@ function renderGoodPeopleReplayDetail(row, payload) {
     </tr>
   `).join("");
   return `
-    <div class="good-result-detail">
-      <p class="modal-note">Read-only replay of this history row. No paper tick, config write, live trading, or exchange order.</p>
-      <div class="metric-grid diagnostics-grid">
-        <div class="metric"><span>Market</span><strong>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "")}</strong></div>
-        <div class="metric"><span>Strategy</span><strong>${escapeHtml(row.strategy || "-")}</strong></div>
-        <div class="metric"><span>Period</span><strong>${escapeHtml(row.period || "-")}</strong></div>
-        <div class="metric"><span>Status</span><strong>${escapeHtml(result.status || "-")}</strong></div>
-        <div class="metric"><span>Return</span><strong class="${Number(result.totalReturnPct || 0) >= 0 ? "positive" : "negative"}">${formatSigned(result.totalReturnPct)}%</strong></div>
-        <div class="metric"><span>End $</span><strong>$${formatNumber(10000 * (1 + Number(result.totalReturnPct || 0) / 100), 2)}</strong></div>
-        <div class="metric"><span>Trades</span><strong>${expectedTrades}</strong></div>
-        <div class="metric"><span>Win</span><strong>${formatNumber(result.winRate, 1)}%</strong></div>
+    <div class="good-result-detail replay-detail-compact">
+      <div class="replay-summary-row">
+        <div class="replay-title-block">
+          <strong>${escapeHtml(row.strategy || "-")}</strong>
+          <span>${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")} signal / ${escapeHtml(payload.executionTimeframe || diagnostics.executionTimeframe || row.executionTimeframe || row.timeframe || "-")} execution · ${escapeHtml(row.period || payload.period || "-")}</span>
+        </div>
+        <div class="replay-result-line ${replayReturn >= 0 ? "positive" : "negative"}">
+          ${formatSigned(replayReturn)}% / $${formatNumber(10000 * (1 + replayReturn / 100), 2)}
+          <span>PF ${formatNumber(result.profitFactor, 2)} DD ${formatNumber(result.maxDrawdownPct, 2)}% ${expectedTrades}t</span>
+        </div>
       </div>
+      <div class="auto-result-subline replay-subline">
+        <span>Status ${escapeHtml(result.status || "-")}</span>
+        <span>Saved ${formatSigned(savedReturn)}%</span>
+        <span class="${returnDelta >= 0 ? "positive" : "negative"}">Replay change ${formatSigned(returnDelta)}%</span>
+        <span>Win ${formatNumber(result.winRate, 1)}%</span>
+        <span>Candles ${chartCandles.length || diagnostics.candlesLoaded || "-"}</span>
+      </div>
+      <div class="param-chip-row replay-param-row">${paramChips || `<span class="param-chip">No params stored</span>`}</div>
       <div id="good-detail-chart" class="good-detail-chart"><p class="pane-status">Loading ${chartCandles.length || "test"} candles...</p></div>
       <p id="good-detail-chart-note" class="modal-note">Chart uses the same ${escapeHtml(row.symbol || "-")} ${escapeHtml(row.timeframe || "-")} candles as this replay. Exit marker color shows win/loss.</p>
-      <h3 class="modal-section-title">Params</h3>
-      <pre class="params-preview">${escapeHtml(JSON.stringify(payload.paramsUsed || row.params || {}, null, 2))}</pre>
+      <details class="compact-replay-details">
+        <summary>All parameters and raw replay data</summary>
+        <pre class="params-preview">${escapeHtml(JSON.stringify(paramsUsed, null, 2))}</pre>
+      </details>
       <h3 class="modal-section-title">Trades</h3>
       <table class="trade-table compact-table">
         <thead><tr><th>Entry</th><th>Exit</th><th>Entry Price</th><th>Exit Price</th><th>Return</th><th>Reason</th></tr></thead>
@@ -2956,6 +4573,14 @@ function renderGoodPeopleReplayDetail(row, payload) {
       ${trades.length > 80 ? `<p class="modal-note">Showing first 80 trade rows; chart markers include all ${escapeHtml(String(trades.length))} returned trades.</p>` : ""}
     </div>
   `;
+}
+
+function compactParamChips(params = {}, limit = 14) {
+  return Object.entries(params || {})
+    .filter(([, value]) => value !== null && value !== undefined && value !== "")
+    .slice(0, limit)
+    .map(([key, value]) => `<span class="param-chip">${escapeHtml(key)}=${escapeHtml(String(value))}</span>`)
+    .join("");
 }
 
 async function renderGoodPeopleReplayChart(row, payload) {
@@ -2989,18 +4614,34 @@ async function renderGoodPeopleReplayChart(row, payload) {
       host.innerHTML = `<p class="pane-status">No candles returned for chart.</p>`;
       return;
     }
-    const chart = createChart(host);
+    const chart = createBaseChart(host);
     const series = addSeries(chart, "candlestick", {});
     series.setData(candles);
     const markerPayload = goodPeopleTradeMarkers(payload, candles[0].time, candles[candles.length - 1].time);
     setSeriesMarkers(series, markerPayload.markers);
     chart.timeScale().fitContent();
+    setReplayChartVisibleRange(chart, candles, row, payload);
     const note = document.querySelector("#good-detail-chart-note");
     if (note) {
       note.textContent = `${row.symbol || "-"} ${row.timeframe || "-"} chart loaded from ${sourceLabel}: ${candles.length} candles, ${markerPayload.visibleTrades}/${markerPayload.totalTrades} trades plotted. Exit marker color shows win/loss.`;
     }
   } catch (error) {
     host.innerHTML = `<p class="pane-status">Chart failed: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function setReplayChartVisibleRange(chart, candles, row = {}, payload = {}) {
+  if (!chart?.timeScale || !candles.length) return;
+  const chartTimeframe = payload.executionTimeframe || payload.diagnostics?.executionTimeframe || row.executionTimeframe || row.timeframe || "4h";
+  const minutes = timeframeMinutes(chartTimeframe) || timeframeMinutes(row.timeframe) || 240;
+  const desiredDays = minutes <= 5 ? 120 : minutes <= 15 ? 180 : 365;
+  const desiredCandles = Math.max(120, Math.ceil(desiredDays * 1440 / minutes));
+  const to = candles.length - 1;
+  const from = Math.max(0, to - Math.min(desiredCandles, candles.length - 1));
+  try {
+    chart.timeScale().setVisibleLogicalRange({ from, to });
+  } catch (_) {
+    chart.timeScale().fitContent();
   }
 }
 
@@ -3017,16 +4658,20 @@ function goodPeopleTradeMarkers(payload, firstTime, lastTime) {
   trades.forEach((trade, index) => {
     const entryTime = normalizeMarkerTime(trade.entry_time ?? trade.entryTime);
     const exitTime = normalizeMarkerTime(trade.exit_time ?? trade.exitTime);
+    const entryPrice = Number(trade.entry_price ?? trade.entryPrice);
+    const exitPrice = Number(trade.exit_price ?? trade.exitPrice);
     const returnPct = Number(trade.return_pct ?? trade.returnPct ?? 0);
     const resultText = Number.isFinite(returnPct) ? `${returnPct >= 0 ? "+" : ""}${returnPct.toFixed(2)}%` : "";
     const exitIsVisible = exitTime && exitTime >= firstTime && exitTime <= lastTime;
     const entryIsVisible = entryTime && entryTime >= firstTime && entryTime <= lastTime;
     if (entryIsVisible || exitIsVisible) visibleTrades += 1;
     if (entryTime && entryTime >= firstTime && entryTime <= lastTime) {
-      markers.push({ time: entryTime, position: "belowBar", color: "#12b886", shape: "arrowUp", text: `BUY #${index + 1}` });
+      const priceText = Number.isFinite(entryPrice) ? ` @ ${formatPrice(entryPrice)}` : "";
+      markers.push({ time: entryTime, position: "belowBar", color: "#12b886", shape: "arrowUp", text: `BUY #${index + 1}${priceText}` });
     }
     if (exitTime && exitTime >= firstTime && exitTime <= lastTime) {
-      markers.push({ time: exitTime, position: "aboveBar", color: returnPct >= 0 ? "#0ca678" : "#ff5c7a", shape: "arrowDown", text: `SELL ${resultText}` });
+      const priceText = Number.isFinite(exitPrice) ? ` @ ${formatPrice(exitPrice)}` : "";
+      markers.push({ time: exitTime, position: "aboveBar", color: returnPct >= 0 ? "#0ca678" : "#ff5c7a", shape: "arrowDown", text: `SELL${priceText} ${resultText}` });
     }
   });
   markers.sort((a, b) => a.time - b.time);
@@ -3119,7 +4764,7 @@ function applyStrategyPreset(presetName) {
   if (!strategy) return;
   const preset = (strategy.presets || []).find((item) => item.name === presetName) || strategy.presets?.[0] || { name: "default", params: {} };
   strategyBuilderCurrentPreset = preset.name;
-  strategyBuilderParams = structuredCloneSafe(preset.params || strategy.defaultParams || {});
+  strategyBuilderParams = strategyApplicableParams(strategy, preset.params || strategy.defaultParams || {});
   const presetSelect = document.querySelector("#lab-preset-select");
   if (presetSelect && presetSelect.value !== preset.name) presetSelect.value = preset.name;
   renderStrategyBuilderSummary(strategy, preset);
@@ -3128,6 +4773,36 @@ function applyStrategyPreset(presetName) {
 
 function structuredCloneSafe(value) {
   return JSON.parse(JSON.stringify(value || {}));
+}
+
+function strategyApplicableParams(strategy, params = {}) {
+  const schema = strategy?.paramSchema || {};
+  const defaults = strategy?.defaultParams || {};
+  const next = {};
+  usableStrategyParamKeys(strategy).forEach((key) => {
+    if (params[key] !== undefined) next[key] = params[key];
+    else if (defaults[key] !== undefined) next[key] = defaults[key];
+  });
+  return next;
+}
+
+function isUsableStrategyParam(entry = {}) {
+  return !entry.hidden && !entry.internal && !entry.deprecated && !entry.notUsed && !entry.unused && !entry.readOnly;
+}
+
+function usableStrategyParamKeys(strategy, options = {}) {
+  const schema = strategy?.paramSchema || {};
+  const includeOptional = options.includeOptional ?? true;
+  return Object.keys(schema).filter((key) => {
+    const entry = schema[key] || {};
+    if (!isUsableStrategyParam(entry)) return false;
+    return includeOptional || (!entry.optional && !entry.advanced);
+  });
+}
+
+function visibleStrategyParamKeys(strategy) {
+  const includeOptional = Boolean(document.querySelector("#lab-show-optional-params")?.checked);
+  return usableStrategyParamKeys(strategy, { includeOptional });
 }
 
 function renderStrategyBuilderSummary(strategy, preset) {
@@ -3147,10 +4822,21 @@ function renderStrategyParamEditor(strategy) {
   const host = document.querySelector("#strategy-param-editor");
   if (!host) return;
   const schema = strategy.paramSchema || {};
-  const keys = Object.keys(schema);
+  const keys = visibleStrategyParamKeys(strategy);
+  const allUsableKeys = usableStrategyParamKeys(strategy, { includeOptional: true });
+  const coreKeys = usableStrategyParamKeys(strategy, { includeOptional: false });
+  const hiddenOptionalCount = allUsableKeys.length - keys.length;
+  const optionalToggle = document.querySelector("#lab-show-optional-params")?.closest("label");
+  if (optionalToggle) {
+    optionalToggle.hidden = allUsableKeys.length === coreKeys.length;
+    const label = optionalToggle.querySelector("span");
+    if (label) label.textContent = `Show optional params${allUsableKeys.length === coreKeys.length ? "" : ` (${allUsableKeys.length - coreKeys.length})`}`;
+  }
+  strategyBuilderParams = strategyApplicableParams(strategy, strategyBuilderParams);
   host.innerHTML = `
-    <h3>Parameters</h3>
-    ${keys.map((key) => renderStrategyParamField(key, schema[key], strategyBuilderParams[key])).join("")}
+    <h3>Parameters used by ${escapeHtml(strategy.label || strategy.name || "selected strategy")}</h3>
+    ${keys.length ? keys.map((key) => renderStrategyParamField(key, schema[key], strategyBuilderParams[key])).join("") : `<p class="pane-status">This strategy exposes no editable parameters.</p>`}
+    ${hiddenOptionalCount > 0 ? `<p class="details-collapsed">${hiddenOptionalCount} optional param${hiddenOptionalCount === 1 ? "" : "s"} hidden.</p>` : ""}
     <details class="details-collapsed">
       <summary>Params Used JSON</summary>
       <pre>${escapeHtml(JSON.stringify(strategyBuilderParams, null, 2))}</pre>
@@ -3161,6 +4847,13 @@ function renderStrategyParamEditor(strategy) {
     input.addEventListener("change", onStrategyParamEdit);
   });
   populateSensitivityParamSelect(strategy);
+}
+
+function formatParamChipValue(value) {
+  if (value === undefined || value === null || value === "") return "N/A";
+  if (Number.isNaN(value)) return "N/A";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 function renderStrategyParamField(key, schema, value) {
@@ -3227,10 +4920,14 @@ function labBacktestSettings() {
 
 function labBacktestRequest(paramsOverride = null, paramsSourceOverride = null) {
   const settings = labBacktestSettings();
+  const strategy = currentStrategyMetadata();
+  const params = strategyApplicableParams(strategy, paramsOverride || strategyBuilderParams);
+  const timeframe = document.querySelector("#lab-timeframe-select")?.value || "1h";
   return {
     source: document.querySelector("#lab-source-select")?.value || "bybit",
     symbol: document.querySelector("#lab-symbol-select")?.value || "ETHUSDT",
-    timeframe: document.querySelector("#lab-timeframe-select")?.value || "1h",
+    timeframe,
+    executionTimeframe: defaultExecutionTimeframe(timeframe),
     period: settings.period,
     strategy: settings.strategy,
     limit: settings.limit,
@@ -3238,7 +4935,7 @@ function labBacktestRequest(paramsOverride = null, paramsSourceOverride = null) 
     slippagePct: Number(settings.slippage_pct || 0),
     allowShorts: settings.allowShorts === "true",
     paramsSource: paramsSourceOverride || settings.preset,
-    params: structuredCloneSafe(paramsOverride || strategyBuilderParams),
+    params,
   };
 }
 
@@ -3261,7 +4958,9 @@ async function runLabBacktest() {
 
 function numericStrategyParams(strategy = currentStrategyMetadata()) {
   const schema = strategy?.paramSchema || {};
+  const visible = new Set(visibleStrategyParamKeys(strategy));
   return Object.entries(schema)
+    .filter(([key]) => visible.has(key))
     .filter(([, item]) => item?.type === "number")
     .map(([key, item]) => ({ key, schema: item }));
 }
@@ -3658,32 +5357,40 @@ function renderBacktestOverlays(pane, payload) {
   });
 }
 
-function markersFromBacktestPayload(payload) {
+function markersFromBacktestPayload(payload, options = {}) {
   const trades = normalizedTrades(payload);
   const markers = [];
+  const prefix = options.prefix === undefined ? "BT " : options.prefix;
   trades.forEach((trade) => {
     const entryTime = normalizeMarkerTime(trade.entry_time ?? trade.entryTime);
     const exitTime = normalizeMarkerTime(trade.exit_time ?? trade.exitTime);
+    const side = String(trade.side || "LONG").toUpperCase();
+    const isShort = side === "SHORT";
+    const exitReason = String(trade.exit_reason ?? trade.exitReason ?? "strategy exit");
     if (entryTime !== null) {
       markers.push({
         time: entryTime,
-        position: "belowBar",
-        color: "#12b886",
-        shape: "arrowUp",
-        text: "BT BUY",
+        position: isShort ? "aboveBar" : "belowBar",
+        color: isShort ? "#ff5c7a" : "#12b886",
+        shape: isShort ? "arrowDown" : "arrowUp",
+        text: `${prefix}${isShort ? "SHORT" : "BUY"}`,
         reason: "Backtest entry returned by the backend strategy engine.",
         trade,
+        strategyName: options.strategyName,
+        strategyParams: options.strategyParams,
       });
     }
-    if (exitTime !== null) {
+    if (exitTime !== null && (options.includeEndOfDataExit !== false || !/end of data/i.test(exitReason))) {
       markers.push({
         time: exitTime,
-        position: "aboveBar",
-        color: "#ff5c7a",
-        shape: "arrowDown",
-        text: "BT SELL",
-        reason: `Backtest exit: ${trade.exit_reason || "strategy exit"}.`,
+        position: isShort ? "belowBar" : "aboveBar",
+        color: isShort ? "#12b886" : "#ff5c7a",
+        shape: isShort ? "arrowUp" : "arrowDown",
+        text: `${prefix}${isShort ? "COVER" : "EXIT"}`,
+        reason: `Backtest exit: ${exitReason}.`,
         trade,
+        strategyName: options.strategyName,
+        strategyParams: options.strategyParams,
       });
     }
   });
@@ -3764,10 +5471,19 @@ async function optimizeStrategy(pane, presetId) {
   }
 }
 
-function openBacktestModal(html, title = "Backtest", className = "") {
+function openBacktestModal(html, title = "Backtest", className = "", options = {}) {
   if (backtestTitle) backtestTitle.textContent = title;
   backtestContent.innerHTML = html;
   backtestModal.classList.toggle("signal-modal", className === "signal-modal");
+  if (backtestReplayButton) {
+    const replayRow = options.replayRow || null;
+    backtestReplayButton.hidden = !replayRow;
+    if (replayRow) {
+      backtestReplayButton.dataset.researchReplay = encodeURIComponent(JSON.stringify(normalizeResearchReplayRow(replayRow)));
+    } else {
+      delete backtestReplayButton.dataset.researchReplay;
+    }
+  }
   backtestModal.hidden = false;
 }
 
@@ -3935,6 +5651,42 @@ function renderSignalDetails(pane, payload) {
   `;
 }
 
+async function refreshHeaderSignalStrip() {
+  if (!headerSignalStrip) return;
+  const symbol = "BTCUSDT";
+  const source = "bybit";
+  const timeframes = ["4h", "1h", "15m"];
+  const rows = await Promise.all(timeframes.map(async (timeframe) => {
+    try {
+      const payload = await apiGet(`/api/signals?${new URLSearchParams({
+        source,
+        symbol,
+        timeframe,
+        limit: "500",
+        include_timeframes: "false",
+      })}`);
+      return {
+        timeframe,
+        direction: payload.signalDirection || "NEUTRAL",
+        longPct: payload.longSignalPct ?? payload.buySuggestionPct ?? 0,
+        shortPct: payload.shortSignalPct ?? 0,
+        score: payload.score ?? 0,
+        tone: payload.tone || "neutral",
+      };
+    } catch (error) {
+      return { timeframe, direction: "ERR", longPct: 0, shortPct: 0, score: "-", tone: "neutral", error: error.message };
+    }
+  }));
+  headerSignalStrip.innerHTML = rows.map((row) => {
+    const pct = row.direction === "SHORT" ? row.shortPct : row.longPct;
+    const label = row.direction === "SHORT" ? "S" : row.direction === "LONG" ? "L" : row.direction === "ERR" ? "ERR" : "N";
+    const title = row.error
+      ? `BTC ${row.timeframe}: ${row.error}`
+      : `BTC ${row.timeframe}: ${row.direction}, long ${row.longPct}%, short ${row.shortPct}%, score ${row.score}`;
+    return `<span class="header-signal-pill ${escapeHtml(row.tone)}" title="${escapeHtml(title)}">BTC ${escapeHtml(row.timeframe)} ${escapeHtml(label)}${escapeHtml(String(pct))}%</span>`;
+  }).join("");
+}
+
 function renderTimeframeSignalMatrix(payload) {
   const matrix = payload.timeframeMatrix || [];
   if (!matrix.length) return `<p class="pane-status">No timeframe matrix returned.</p>`;
@@ -4020,6 +5772,7 @@ function renderCustomBacktestResult(payload) {
     ["Strategy", payload.strategy],
     ["Symbol", payload.symbol],
     ["Timeframe", payload.timeframe],
+    ["Execution TF", payload.executionTimeframe || diagnostics.executionTimeframe || diagnostics.execution_timeframe || payload.timeframe],
     ["Period", payload.period],
     ["Read-only", payload.readOnly ? "yes" : "no"],
     ["Paper enabled", String(Boolean(payload.paperEnabled))],
@@ -4035,6 +5788,7 @@ function renderCustomBacktestResult(payload) {
     ["First candle", runContext.firstCandleTime],
     ["Last candle", runContext.lastCandleTime],
     ["Source", runContext.source],
+    ["Execution TF", runContext.executionTimeframe || payload.executionTimeframe || diagnostics.executionTimeframe || "-"],
     ["Fill model", runContext.fillModel],
     ["Maker fee", runContext.makerFeePct],
     ["Taker fee", runContext.takerFeePct],
@@ -4322,6 +6076,7 @@ function renderBacktestResults(payload) {
     ["Last candle", formatBacktestTime(diagnostics.lastCandleTime || diagnostics.last_candle_time || diagnostics.last_candle_date)],
     ["Candles loaded", diagnostics.candlesLoaded],
     ["Timeframe", diagnostics.timeframe],
+    ["Execution TF", diagnostics.executionTimeframe || diagnostics.execution_timeframe || payload.executionTimeframe || diagnostics.timeframe],
     ["Actual days", diagnostics.actualDays],
     ["Reliability", diagnostics.backtest_reliability],
     ["Warmup skipped", diagnostics.warmup_candles_skipped],
@@ -4364,6 +6119,11 @@ function renderBacktestResults(payload) {
   const warnings = Array.from(new Set(warningsList.filter(Boolean))).map((warning) => `<li>${escapeHtml(warning)}</li>`).join("");
   const trades = normalizedTrades(payload);
   const zeroTradePanel = trades.length === 0 ? renderZeroTradePanel(payload) : "";
+  const resultParams = payload.params || payload.paramsUsed || diagnostics.params || {};
+  const resultParamEntries = Object.entries(resultParams).filter(([key]) => key !== undefined && key !== null);
+  const resultParamChips = resultParamEntries.length
+    ? resultParamEntries.map(([key, value]) => `<span class="param-chip">${escapeHtml(key)}=${escapeHtml(formatParamChipValue(value))}</span>`).join("")
+    : `<span class="pane-status">No params returned with this result.</span>`;
   const rows = trades.map((trade) => `
     <tr>
       <td>${formatDateTime(trade.entry_time)}</td>
@@ -4380,6 +6140,8 @@ function renderBacktestResults(payload) {
     <div class="metric-grid">
       ${metrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("")}
     </div>
+    <h3 class="modal-section-title">Params Used</h3>
+    <div class="param-chip-cell backtest-result-param-chips">${resultParamChips}</div>
     <h3 class="modal-section-title">Diagnostics</h3>
     <div class="metric-grid diagnostics-grid">
       ${diagnosticMetrics.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${displayValue(value)}</strong></div>`).join("")}
@@ -10132,6 +11894,18 @@ function formatNumber(value, digits = 2) {
   return number.toFixed(digits);
 }
 
+function equityFromReturn(returnPct, startEquity = 10000) {
+  const number = Number(returnPct);
+  if (!Number.isFinite(number)) return null;
+  return startEquity * (1 + number / 100);
+}
+
+function formatEndEquity(returnPct, endEquity) {
+  const explicit = Number(endEquity);
+  const computed = Number.isFinite(explicit) && explicit > 0 ? explicit : equityFromReturn(returnPct);
+  return Number.isFinite(computed) ? `$${formatNumber(computed, 2)}` : "-";
+}
+
 function formatDateTime(timestamp) {
   if (!timestamp) return "-";
   const numeric = Number(timestamp);
@@ -10140,6 +11914,47 @@ function formatDateTime(timestamp) {
     : new Date(timestamp);
   if (Number.isNaN(date.getTime())) return escapeHtml(String(timestamp));
   return date.toLocaleString();
+}
+
+function formatCompactDateTime(value) {
+  if (!value) return "-";
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 1_000_000_000_000 ? numeric : numeric * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function formatClockTime(value) {
+  if (!value) return "-";
+  const date = new Date(Number(value));
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatCompactDate(value) {
+  if (!value) return "-";
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric > 1_000_000_000_000 ? numeric : numeric * 1000)
+    : new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+function formatReportSourceTime(source) {
+  const match = String(source || "").match(/(\d{8})-(\d{6})/);
+  if (!match) return "-";
+  const date = match[1];
+  const time = match[2];
+  const iso = `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}T${time.slice(0, 2)}:${time.slice(2, 4)}:${time.slice(4, 6)}Z`;
+  return formatCompactDateTime(iso);
 }
 
 function escapeHtml(value) {
@@ -10167,7 +11982,11 @@ function connectBybit(pane, requestId) {
       op: "subscribe",
       args: [`kline.${timeframe}.${symbol}`],
     }));
-    if (requestId === pane.requestId) pane.status.textContent = "Bybit websocket connected";
+    if (requestId === pane.requestId && !pane.historyLoaded) {
+      pane.status.textContent = pane.historyError
+        ? `Live feed connected; history unavailable: ${pane.historyError}`
+        : "Live feed connected; loading history...";
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -10181,6 +12000,7 @@ function connectBybit(pane, requestId) {
       low: Number(row.low),
       close: Number(row.close),
     };
+    mergeLiveCandle(pane, candle);
     pane.series.update(candle);
     updateTicker(pane, candle.close);
   });
@@ -10194,6 +12014,13 @@ function connectBybit(pane, requestId) {
   });
 }
 
+function mergeLiveCandle(pane, candle) {
+  if (!Array.isArray(pane.candles)) pane.candles = [];
+  const last = pane.candles[pane.candles.length - 1];
+  if (!last || candle.time > last.time) pane.candles.push(candle);
+  else if (candle.time === last.time) pane.candles[pane.candles.length - 1] = candle;
+}
+
 function connectHyperliquid(pane, requestId) {
   const symbol = pane.symbolSelect.value;
   const timeframe = pane.timeframeSelect.value;
@@ -10205,7 +12032,11 @@ function connectHyperliquid(pane, requestId) {
       method: "subscribe",
       subscription: { type: "candle", coin: symbol, interval: timeframe },
     }));
-    if (requestId === pane.requestId) pane.status.textContent = "Hyperliquid websocket connected";
+    if (requestId === pane.requestId && !pane.historyLoaded) {
+      pane.status.textContent = pane.historyError
+        ? `Live feed connected; history unavailable: ${pane.historyError}`
+        : "Live feed connected; loading history...";
+    }
   });
 
   ws.addEventListener("message", (event) => {
@@ -10219,6 +12050,7 @@ function connectHyperliquid(pane, requestId) {
       low: Number(row.l),
       close: Number(row.c),
     };
+    mergeLiveCandle(pane, candle);
     pane.series.update(candle);
     updateTicker(pane, candle.close);
   });
@@ -10236,11 +12068,17 @@ function bybitInterval(timeframe) {
   if (timeframe.endsWith("m")) return timeframe.slice(0, -1);
   if (timeframe.endsWith("h")) return String(Number(timeframe.slice(0, -1)) * 60);
   if (timeframe === "1d") return "D";
+  if (timeframe === "1w") return "W";
   return timeframe;
 }
 
 function startYfinancePolling(pane) {
   const refresh = async () => {
+    if (pane.sourceSelect.value !== "yfinance") {
+      clearInterval(pane.pollTimer);
+      pane.pollTimer = null;
+      return;
+    }
     try {
       const candles = await loadCandles(pane);
       pane.candleDiagnostics = candles.diagnostics || {};
@@ -10249,17 +12087,25 @@ function startYfinancePolling(pane) {
         pane.status.textContent = "No yfinance candles returned";
         return;
       }
+      pane.pollFailures = 0;
       pane.series.setData(pane.candles);
       updateTicker(pane, pane.candles[pane.candles.length - 1].close);
       await renderIndicators(pane, pane.requestId);
-      await renderSignals(pane, pane.requestId);
+      await renderSelectedStrategy(pane, pane.requestId);
       renderDataDiagnostics(pane);
       pane.status.textContent = `yfinance refreshed ${new Date().toLocaleTimeString()}`;
     } catch (error) {
       pane.status.textContent = error.message;
+      pane.pollFailures = (pane.pollFailures || 0) + 1;
+      if (pane.pollFailures >= 3) {
+        clearInterval(pane.pollTimer);
+        pane.pollTimer = null;
+        pane.status.textContent = `${error.message}. Automatic refresh paused.`;
+      }
     }
   };
 
+  pane.pollFailures = 0;
   pane.pollTimer = setInterval(refresh, 15000);
 }
 

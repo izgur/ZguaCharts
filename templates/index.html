@@ -4,22 +4,20 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260701-good-people-v6">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260909-header-signal-strip-v1">
   </head>
   <body>
     <header class="topbar">
-      <a class="brand" href="/dashboard" data-route="dashboard">
+      <a class="brand" href="/charts" data-route="charts">
         <span class="brand-mark"></span>
         <h1>ZguaCharts</h1>
       </a>
       <nav class="app-nav" aria-label="Main navigation">
-        <a href="/dashboard" data-route="dashboard">Dashboard</a>
         <a href="/charts" data-route="charts">Charts</a>
+        <a href="/dashboard" data-route="dashboard">Dashboard</a>
         <a href="/research" data-route="research">Research</a>
-        <a href="/candidate" data-route="candidate">Candidate</a>
-        <a href="/paper" data-route="paper">Paper</a>
         <a href="/backtest" data-route="backtest">Backtest</a>
-        <a href="/good-people" data-route="good-people">Only for good people</a>
+        <a href="/good-people" data-route="good-people">Strategy Lab</a>
         <a href="/ops" data-route="ops">Ops</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
@@ -33,20 +31,103 @@
           <option value="8">8</option>
         </select>
       </label>
+      <div id="header-signal-strip" class="header-signal-strip" aria-live="polite">
+        <span class="header-signal-pill neutral">BTC 4h --</span>
+        <span class="header-signal-pill neutral">BTC 1h --</span>
+        <span class="header-signal-pill neutral">BTC 15m --</span>
+      </div>
       <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
     </header>
 
     <main class="app-shell">
       <section id="dashboard-page" class="route-page workflow-page" data-page="dashboard">
-        <div class="workflow-hero">
-          <div>
-            <h2>Dashboard</h2>
-            <p>Current candidate, paper safety, research verdict, and the next useful action.</p>
+        <section class="status-card strategy-finder-card">
+          <div class="status-card-header">
+            <div>
+              <h2>AI Strategy Finder</h2>
+              <p>Plan candidates, run one resumable campaign, or let Auto Search start campaign after campaign.</p>
+            </div>
+            <button id="dashboard-refresh" type="button">Refresh</button>
           </div>
-          <button id="dashboard-refresh" type="button">Refresh Dashboard</button>
-        </div>
+          <div id="brain-loop-status-panel" class="paper-validation-result auto-search-first">
+            <p class="pane-status">Auto search status has not loaded yet.</p>
+          </div>
+          <div class="strategy-finder-controls">
+            <label><span>Campaign</span><input id="campaign-name" data-campaign-field value="promising-4h"></label>
+            <label><span>Symbols</span><input id="campaign-symbols" data-campaign-field value="BTCUSDT"></label>
+            <label><span>Timeframes</span><input id="campaign-timeframes" data-campaign-field value="4h"></label>
+            <label><span>Strategies</span><input id="campaign-strategies" data-campaign-field value="EmaBounceV2,BreakoutRetestV2,RegimeDonchian20,RegimeDonchianCloseConfirm,VolatilitySqueezeBreakout,RangeExpansionV2,RobustTrendFollowerV1,BtcMeanReversion4hV1,SqueezePullbackHold4hV1"></label>
+            <label><span>Period</span><select id="campaign-period" data-campaign-field>
+              <option value="1095d">1095d</option>
+              <option value="1460d" selected>1460d</option>
+              <option value="730d">730d</option>
+            </select></label>
+            <label><span>Depth</span><select id="campaign-depth" data-campaign-field>
+              <option value="focused" selected>Focused</option>
+              <option value="deep">Deep</option>
+              <option value="quick">Quick</option>
+            </select></label>
+            <label><span>Brain Mode</span><select id="brain-plan-mode" data-campaign-field>
+              <option value="balanced" selected>Balanced</option>
+              <option value="swing">Swing</option>
+              <option value="scalping">15m Scalping</option>
+            </select></label>
+          </div>
+          <div class="button-row">
+            <button id="brain-plan-refresh" type="button">Brain Plan</button>
+            <button id="brain-plan-apply" type="button">Apply Brain Plan</button>
+            <button id="campaign-status-refresh" type="button">Refresh Status</button>
+            <button id="campaign-start" type="button">Run Campaign</button>
+            <button id="campaign-stop" type="button">Pause Campaign</button>
+            <button id="brain-loop-start" type="button">Start Auto Search</button>
+            <button id="brain-loop-stop" type="button">Stop Auto Search</button>
+            <button id="campaign-results-refresh" type="button">Refresh Results Matrix</button>
+          </div>
+          <div id="brain-plan-panel" class="paper-validation-result">
+            <p class="pane-status">Brain plan has not loaded yet.</p>
+          </div>
+          <div id="campaign-status-panel" class="paper-validation-result compact-status-panel">
+            <p class="pane-status">Campaign status has not loaded yet.</p>
+          </div>
+        </section>
+        <section class="status-card">
+          <div class="status-card-header">
+            <div>
+              <h2>BTC 4h Champion Board</h2>
+              <p>Best saved variants with key parameters, so repeated tests are easier to compare.</p>
+            </div>
+            <button id="research-champion-board-refresh" type="button">Refresh Champions</button>
+          </div>
+          <div id="research-champion-board-panel" class="paper-validation-result">
+            <p class="pane-status">Click Refresh Champions to load this evidence table.</p>
+          </div>
+        </section>
+        <section class="status-card">
+          <div class="status-card-header">
+            <div>
+              <h2>Tested Strategy Matrix</h2>
+              <p>Saved optimizer evidence by symbol, timeframe, and strategy. Click a result for detail.</p>
+            </div>
+            <button id="research-results-matrix-refresh" type="button">Refresh Matrix</button>
+          </div>
+          <div id="research-results-matrix-panel" class="paper-validation-result">
+            <p class="pane-status">Click Refresh Matrix to load saved optimizer evidence.</p>
+          </div>
+        </section>
+        <section class="status-card">
+          <div class="status-card-header">
+            <div>
+              <h2>Research Ledger</h2>
+              <p>Unified memory from optimizer rows, lead reviews, manual tests, and paper ticks.</p>
+            </div>
+            <button id="research-results-ledger-refresh" type="button">Refresh Ledger</button>
+          </div>
+          <div id="research-results-ledger-panel" class="paper-validation-result">
+            <p class="pane-status">Click Refresh Ledger to load unified research memory.</p>
+          </div>
+        </section>
         <div id="dashboard-status-cards" class="workflow-card-grid">
-          <div class="status-card"><p class="pane-status">Dashboard has not loaded yet.</p></div>
+          <div class="status-card"><p class="pane-status">Click Refresh to load workflow diagnostics.</p></div>
         </div>
       </section>
 
@@ -59,11 +140,7 @@
           <div id="research-next-action" class="workflow-next-action">Next action: refresh overview.</div>
         </div>
         <div class="workflow-tabs" role="tablist" aria-label="Research workflow tabs">
-          <button class="workflow-tab active" type="button" data-workflow-tab="research-overview">Overview</button>
-          <button class="workflow-tab" type="button" data-workflow-tab="research-search">Search</button>
-          <button class="workflow-tab" type="button" data-workflow-tab="research-validation">Validation</button>
-          <button class="workflow-tab" type="button" data-workflow-tab="research-diagnostics">Diagnostics</button>
-          <button class="workflow-tab" type="button" data-workflow-tab="research-export">Export</button>
+          <button class="workflow-tab active" type="button" data-workflow-tab="research-overview">All Research Tools</button>
         </div>
         <div id="research-overview" class="workflow-tab-panel"></div>
         <div id="research-search" class="workflow-tab-panel" hidden></div>
@@ -103,10 +180,15 @@
             <details id="watchlist-section" class="sidebar-section" open>
               <summary><span class="sidebar-title"><span class="star-icon">★</span> Watchlist</span></summary>
               <div class="watchlist-actions">
-                <button id="watchlist-add-current" type="button">★ Add current</button>
-                <button id="watchlist-add-all" type="button">Add all</button>
+                <button id="watchlist-add-current" type="button" title="Add current symbol">★ Add</button>
+                <button id="watchlist-add-all" type="button" title="Add all symbols">All</button>
+                <button id="watchlist-signal-toggle" class="watchlist-signal-toggle" type="button" aria-pressed="true" title="Hide strategy signals">None</button>
               </div>
               <div id="watchlist-content" class="sidebar-placeholder">Loading watchlist...</div>
+            </details>
+            <details id="current-strategy-section" class="sidebar-section" open>
+              <summary><span id="current-strategy-title" class="sidebar-title">Current Strategy</span></summary>
+              <div id="current-strategy-content" class="sidebar-placeholder">Select a chart strategy to view its trades.</div>
             </details>
             <details id="active-signals-section" class="sidebar-section" open>
               <summary><span class="sidebar-title">Active Signals</span></summary>
@@ -130,74 +212,86 @@
             <p>Build a read-only manual backtest by selecting a strategy, preset, market, and editable parameters.</p>
           </div>
         </div>
-        <div class="lab-layout">
-          <aside class="lab-controls strategy-builder-card">
-            <label><span>Source</span><select id="lab-source-select"></select></label>
-            <label><span>Symbol</span><select id="lab-symbol-select"></select></label>
-            <label><span>Timeframe</span><select id="lab-timeframe-select">
-              <option value="15m">15m</option>
-              <option value="1h">1h</option>
-              <option value="4h">4h</option>
-            </select></label>
-            <label><span>Period</span><select id="lab-period-input">
-              <option value="30d">30d</option>
-              <option value="90d">90d</option>
-              <option value="180d">180d</option>
-              <option value="365d" selected>365d</option>
-            </select></label>
-            <label><span>Strategy</span><select id="lab-strategy-select"></select></label>
-            <label><span>Preset</span><select id="lab-preset-select"></select></label>
-            <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.001" value="0"></label>
-            <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.001" value="0"></label>
-            <label><span>Candle limit</span><select id="lab-limit-input">
-              <option value="auto">Auto</option>
-              <option value="1000">1000</option>
-              <option value="5000">5000</option>
-              <option value="9000">9000</option>
-              <option value="20000">20000</option>
-              <option value="35000">35000</option>
-              <option value="50000">50000</option>
-            </select></label>
-            <label class="allow-short-toggle">
-              <input id="lab-allow-shorts" type="checkbox">
-              <span>Allow shorts when strategy supports them</span>
-            </label>
-            <div id="strategy-builder-summary" class="builder-summary">Loading strategy metadata...</div>
-            <div id="strategy-param-editor" class="param-editor"></div>
-            <div class="button-row">
+        <div class="lab-layout backtest-compact-layout">
+          <section class="lab-controls strategy-builder-card backtest-control-panel">
+            <div class="backtest-control-grid">
+              <label><span>Source</span><select id="lab-source-select"></select></label>
+              <label><span>Symbol</span><select id="lab-symbol-select"></select></label>
+              <label><span>Timeframe</span><select id="lab-timeframe-select">
+                <option value="15m">15m</option>
+                <option value="1h">1h</option>
+                <option value="4h">4h</option>
+              </select></label>
+              <label><span>Period</span><select id="lab-period-input">
+                <option value="30d">30d</option>
+                <option value="90d">90d</option>
+                <option value="180d">180d</option>
+                <option value="365d" selected>365d</option>
+                <option value="730d">730d</option>
+                <option value="1095d">1095d</option>
+                <option value="1460d">1460d</option>
+              </select></label>
+              <label><span>Strategy</span><select id="lab-strategy-select"></select></label>
+              <label><span>Preset</span><select id="lab-preset-select"></select></label>
+              <label><span>Fee % / side</span><input id="lab-fee-input" type="number" min="0" step="0.001" value="0"></label>
+              <label><span>Slippage % / side</span><input id="lab-slippage-input" type="number" min="0" step="0.001" value="0"></label>
+              <label><span>Candle limit</span><select id="lab-limit-input">
+                <option value="auto">Auto</option>
+                <option value="1000">1000</option>
+                <option value="5000">5000</option>
+                <option value="9000">9000</option>
+                <option value="20000">20000</option>
+                <option value="35000">35000</option>
+                <option value="50000">50000</option>
+              </select></label>
+              <label class="allow-short-toggle">
+                <input id="lab-allow-shorts" type="checkbox">
+                <span>Allow shorts</span>
+              </label>
+            </div>
+            <div class="button-row builder-run-row backtest-run-row">
               <button id="lab-reset-preset" type="button">Reset to Preset</button>
               <button id="lab-run-backtest" type="button">Run Backtest</button>
             </div>
-            <p class="modal-note">Manual backtests are read-only: no promotion, no paper tick, no config write, and no real trading.</p>
-          </aside>
+          </section>
           <section class="lab-main">
-            <div id="backtest-chart-host" class="backtest-chart-host" hidden></div>
-            <div id="backtest-results" class="lab-results">
-              <p class="pane-status">Choose a strategy preset, adjust parameters, and run a manual backtest.</p>
-            </div>
-            <section class="status-card manual-sensitivity-card">
+            <section class="status-card backtest-param-panel">
               <div class="status-card-header">
                 <div>
-                  <h2>Param Sensitivity Mini-Lab</h2>
-                  <p>Vary one numeric parameter using the current manual builder settings.</p>
+                  <h2>Parameters</h2>
+                  <p>Current strategy, preset, and exact values used by the next manual run.</p>
                 </div>
                 <span class="status-badge badge-raw">READ_ONLY</span>
               </div>
+              <div id="strategy-builder-summary" class="builder-summary">Loading strategy metadata...</div>
+              <label class="allow-short-toggle backtest-optional-toggle">
+                <input id="lab-show-optional-params" type="checkbox">
+                <span>Show optional params</span>
+              </label>
+              <div id="strategy-param-editor" class="param-editor"></div>
+              <p class="modal-note">Manual backtests are read-only: no promotion, no paper tick, no config write, and no real trading.</p>
+            </section>
+            <details class="sidebar-tool-card manual-sensitivity-card backtest-sensitivity-card">
+              <summary>Param Sensitivity Mini-Lab</summary>
+              <p class="modal-note">Optional helper: test one numeric parameter at several values while keeping all other current settings unchanged.</p>
               <div class="mini-lab-controls">
                 <label><span>Parameter</span><select id="sensitivity-param-select"></select></label>
                 <label><span>Values</span><input id="sensitivity-values-input" value="20,25,30,35,40"></label>
               </div>
               <div class="button-row">
-                <button id="sensitivity-generate-values" type="button">Generate Around Current</button>
+                <button id="sensitivity-generate-values" type="button">Around Current</button>
                 <button id="sensitivity-run" type="button">Run Sensitivity</button>
-                <button id="sensitivity-add-all" type="button" disabled>Add All Results to Comparison</button>
+                <button id="sensitivity-add-all" type="button" disabled>Add to Comparison</button>
               </div>
-              <p class="modal-note">Manual sensitivity is research-only. It does not promote candidates, write config, enable paper, run a paper tick, or touch real trading.</p>
               <div id="sensitivity-progress" class="pane-status" hidden></div>
               <div id="sensitivity-results" class="manual-sensitivity-table">
-                <p class="pane-status">No sensitivity run yet.</p>
+                <p class="pane-status">Use after a normal test when you want to see whether one parameter is fragile or has a better nearby value.</p>
               </div>
-            </section>
+            </details>
+            <div id="backtest-chart-host" class="backtest-chart-host" hidden></div>
+            <div id="backtest-results" class="lab-results">
+              <p class="pane-status">Choose a strategy preset, adjust parameters, and run a manual backtest.</p>
+            </div>
             <section class="status-card manual-comparison-card">
               <div class="status-card-header">
                 <div>
@@ -223,7 +317,7 @@
       <section id="good-people-page" class="route-page good-people-page" data-page="good-people" hidden>
         <div class="page-heading">
           <div>
-            <h2>Only for good people</h2>
+            <h2>Strategy Lab</h2>
             <p>Compact read-only backtest lab for manual tests, optimizer scans, saved presets, and result history.</p>
           </div>
           <span class="status-badge badge-raw">RESEARCH_ONLY</span>
@@ -1224,7 +1318,6 @@
             <select class="source-select" aria-label="Data source"></select>
             <select class="symbol-select" aria-label="Symbol"></select>
             <select class="timeframe-select" aria-label="Timeframe"></select>
-            <select class="preset-select" aria-label="Strategy preset"></select>
             <button class="backtest-button" type="button">Backtest</button>
             <div class="indicator-control">
               <button class="indicator-button" type="button">Indicators</button>
@@ -1238,6 +1331,7 @@
             </div>
           </div>
           <div class="pane-right">
+            <select class="preset-select" aria-label="Chart signal strategy"></select>
             <div class="signal-badge neutral">NEUTRAL</div>
             <div class="ticker neutral">
               <span class="ticker-symbol">--</span>
@@ -1246,7 +1340,13 @@
           </div>
         </div>
         <div class="chart-stack">
-          <div class="chart"></div>
+          <div class="main-chart-wrap">
+            <div class="chart"></div>
+            <div class="chart-corner-controls">
+              <button class="chart-scale-toggle" type="button" aria-pressed="false" title="Toggle logarithmic price scale">Log</button>
+              <button class="chart-now-button" type="button" title="Jump to latest candle">Now</button>
+            </div>
+          </div>
           <div class="indicator-panes"></div>
           <div class="marker-detail-popover" hidden></div>
         </div>
@@ -1259,6 +1359,7 @@
         <div class="modal-header">
           <h2 id="backtest-title">Backtest</h2>
           <div class="modal-header-actions">
+            <button id="backtest-replay-button" type="button" hidden>Open chart replay</button>
             <button id="backtest-history-button" type="button">History</button>
             <button id="backtest-close" class="modal-close" type="button" aria-label="Close">Close</button>
           </div>
@@ -1290,6 +1391,6 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260701-good-people-v6" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20261001-execution-safety-v1" defer></script>
   </body>
 </html>

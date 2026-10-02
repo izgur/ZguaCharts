@@ -7,6 +7,8 @@ const data = require("../core/data");
 const paper = require("../core/paper");
 
 let staleMode = false;
+let sawExecutionCandles = false;
+let sawExecutionRefresh = false;
 const fixedNowSeconds = Math.floor(Date.now() / 1000);
 
 function candles(count, stepSeconds) {
@@ -50,6 +52,11 @@ function alreadyClosedTailCandles(count, stepSeconds) {
 const originalFetch = data.fetchCandles;
 data.fetchCandles = function (options) {
   if (options.symbol === "BTCUSDT" && options.interval === "4h") return Promise.resolve(candles(320, 14400));
+  if (options.interval === "5m") {
+    sawExecutionCandles = true;
+    if (options.forceRefresh) sawExecutionRefresh = true;
+    return Promise.resolve(candles(Math.min(Number(options.limit || 1000), 6000), 300));
+  }
   return Promise.resolve(candles(420, 3600));
 };
 
@@ -124,7 +131,13 @@ async function testInitAndNoHistoricalImport() {
 }
 
 async function testTickAfterInitDoesNotImportHistory() {
-  const first = await paper.runPaperTick({ configPath, statePath, reportDir });
+  const firstPromise = paper.runPaperTick({ configPath, statePath, reportDir });
+  assert.throws(
+    () => paper.runPaperTick({ configPath, statePath, reportDir }),
+    /lock|already being updated/i,
+    "overlapping paper ticks must be refused"
+  );
+  const first = await firstPromise;
   const state1 = readState();
   assert.strictEqual(first.status, "processed");
   assert.strictEqual(state1.closedTrades.length, 0, "tick after init should not import historical trades");
@@ -149,6 +162,7 @@ async function testWatchCannotTrade() {
   state.lastProcessedCandleTime["TESTUSDT:1h"] = candles(420, 3600)[300].time;
   writeState(state);
   await paper.runPaperTick({ configPath, statePath, reportDir });
+  assert.strictEqual(sawExecutionCandles, true, "paper tick should load 5m execution candles for a 1h strategy");
   const next = readState();
   assert.strictEqual(next.closedTrades.length, 0, "watch mode must not close trades");
   assert.strictEqual(next.openPositions.length, 0, "watch mode must not open positions");
@@ -232,6 +246,33 @@ async function testAlreadyClosedTailIsNotDiscarded() {
   data.fetchCandles = originalFetch;
 }
 
+async function testIncrementalRestartAndCorruption() {
+  writeConfig({ ...baseConfig("active"), maxPositionPct: 10, maxDailyLossPct: 2 });
+  await paper.initializePaper({ configPath, statePath, reportDir });
+  const seed = readState();
+  seed.lastProcessedCandleTime["TESTUSDT:1h"] = candles(420, 3600)[300].time;
+  writeState(seed);
+  await paper.runPaperTick({ configPath, statePath, reportDir, refreshFirst: true });
+  const first = readState();
+  const checkpoint = first.engineCheckpoints["TESTUSDT:1h"];
+  assert(checkpoint, "paper must persist an engine checkpoint");
+  const settings = JSON.parse(checkpoint.identity)[3];
+  assert.strictEqual(settings.maxPositionPct, 10, "paper runner must pass position cap to engine");
+  assert.strictEqual(settings.maxDailyLossPct, 2, "paper runner must pass daily-loss gate to engine");
+  assert(sawExecutionRefresh, "refresh-first must refresh execution candles too");
+  first.openPositions.forEach((position) => assert(position.notional <= 1000, "new paper positions must respect cap"));
+  await paper.runPaperTick({ configPath, statePath, reportDir });
+  const second = readState();
+  assert.deepStrictEqual(second.closedTrades, first.closedTrades, "same candles must not duplicate completed trades");
+  assert.deepStrictEqual(second.engineCheckpoints["TESTUSDT:1h"].state, checkpoint.state, "same candles must preserve checkpoint state");
+  const backup = fs.readFileSync(statePath, "utf8");
+  fs.writeFileSync(statePath, "{invalid-json");
+  assert.throws(() => paper.runPaperTick({ configPath, statePath, reportDir }), /refusing to reset/);
+  assert.strictEqual(fs.readFileSync(statePath, "utf8"), "{invalid-json", "corrupt evidence must remain available for recovery");
+  assert(!fs.existsSync(statePath + ".lock"), "failed state load must release its lock");
+  fs.writeFileSync(statePath, backup);
+}
+
 async function main() {
   await expectEnableRefusesBeforeInit();
   await testInitAndNoHistoricalImport();
@@ -241,6 +282,7 @@ async function main() {
   await testMaxOpenTradesAndDryRun();
   await testStaleAndRefresh();
   await testEnableDisableAfterInit();
+  await testIncrementalRestartAndCorruption();
   await testAlreadyClosedTailIsNotDiscarded();
   const rebuilt = paper.rebuildStateFromJournal(baseConfig("active"), path.join(reportDir, "paper-journal.jsonl"));
   assert.strictEqual(typeof rebuilt.accountEquity, "number", "paper state can be rebuilt from journal");

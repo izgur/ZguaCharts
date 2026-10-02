@@ -1,0 +1,79 @@
+ZGUA COMMANDS CHEATSHEET
+Run from: C:\Users\izgur\Documents\Codex\2026-05-21\tradingviewkiller-please-initialize-the-project-and
+
+EVERY DAY STRATEGY PLAN
+1. Build champion board: see best candidates, review needed, recent reviews.
+python scripts\research_champion_board.py --batch-limit 10 --lead-limit 25
+2. Check paper first: see if candle is due, catch-up is needed, or wait.
+python scripts\research_autopilot.py paper:next-action --refresh
+3. Check paper trades/equity: quick account and last closed trades.
+python scripts\paper_trade_summary.py --limit 5
+4. If paper is behind and only HOLD: safely catch up until current or until trade/action appears.
+python scripts\paper_catchup_until_current.py --max-steps 20
+5. If a trade opened/closed or signal is not HOLD: stop and paste output to Codex.
+python scripts\research_autopilot.py paper:next-action --refresh
+6. If optimizer finished: review only replacement-eligible/top promising rows, never promote raw output.
+python scripts\research_autopilot.py research:lead-review --strategy STRATEGY --symbol SYMBOL --timeframe TIMEFRAME --period 1095d --limit period --batch-file BATCH_PATH --timeout-seconds 3000 --review-timeout-seconds 3000 --save
+7. If no good lead remains: run the new 15m MTF tactic overnight first.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies MtfPullback15mV1 --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+
+MOST USED COMMANDS
+Champion board: ranks saved optimizer/review reports by timeframe.
+python scripts\research_champion_board.py --batch-limit 10 --lead-limit 25
+Paper trade summary: account equity, open count, recent closed trades.
+python scripts\paper_trade_summary.py --limit 5
+Safe paper catch-up until current: use when behind and only HOLD / would hold position.
+python scripts\paper_catchup_until_current.py --max-steps 20
+Check paper next action: tells you catch-up, single tick, wait, blockers, exact command.
+python scripts\research_autopilot.py paper:next-action --refresh
+Main 15m strategy search: dedicated 15m hunt, good for overnight.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies EmaBounceV2,SimpleAtrTrendV2,BreakoutRetestV2,RangeExpansionV2,RelativeStrengthV2,FibPullbackContinuationV1,MomentumScalping,MeanReversion --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 80 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+New 15m MTF search: 15m entries filtered by closed 1h/4h symbol trend.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies MtfPullback15mV1 --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+New 15m MTF short/both search: use after long-only MTF failed across symbols.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies MtfPullback15mV1 --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200 --optimizer-grid-overrides '{\"mtfDirection\":[\"short\",\"both\"]}'
+New 15m VWAP reversion search: range/mean-reversion tactic, separate from failed MTF trend.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies VwapReversion15mV1 --period 180d --limit period --max-candidates 120 --max-combos-per-strategy 80 --top-n 30 --timeout-seconds 7200 --runtime-budget-seconds 7000
+Fast 15m VWAP reversion search: higher trade-count follow-up after strict VWAP lead failed.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies VwapReversion15mFastV1 --period 180d --limit period --max-candidates 160 --max-combos-per-strategy 100 --top-n 40 --timeout-seconds 7200 --runtime-budget-seconds 7000
+Review optimizer lead: replace STRATEGY, SYMBOL, TIMEFRAME, BATCH_PATH from optimizer output.
+python scripts\research_autopilot.py research:lead-review --strategy STRATEGY --symbol SYMBOL --timeframe TIMEFRAME --period 1095d --limit period --batch-file BATCH_PATH --timeout-seconds 3000 --review-timeout-seconds 3000 --save
+
+PAPER MANUAL COMMANDS
+Manual catch-up tick: use exact command printed by paper:next-action.
+python scripts\research_autopilot.py paper:catch-up-next --confirm "RUN ONE PAPER CATCH-UP TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca YYYY-MM-DDTHH:MM:SS+00:00"
+Manual current tick: use when paper:next-action says SAFE_TO_RUN_SINGLE_CONFIRMED_TICK.
+python scripts\research_autopilot.py paper:tick-once --confirm "RUN ONE PAPER TICK candidate-identity-v1|EmaBounceV2|BTCUSDT|4h|f09aabfcd7a47bd2|ea006941770e9dca YYYY-MM-DDTHH:MM:SS+00:00"
+
+RESEARCH SEARCHES
+15m MTF-only overnight search: new tactic, separate from older plain 15m strategies.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies MtfPullback15mV1 --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+15m MTF short/both overnight search: tests whether failed long setup is an inverted edge.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies MtfPullback15mV1 --period 730d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200 --optimizer-grid-overrides '{\"mtfDirection\":[\"short\",\"both\"]}'
+15m VWAP reversion medium probe: run this before any larger 15m search.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies VwapReversion15mV1 --period 180d --limit period --max-candidates 120 --max-combos-per-strategy 80 --top-n 30 --timeout-seconds 7200 --runtime-budget-seconds 7000
+15m fast VWAP reversion medium probe: higher trade count, still research-only.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m --strategies VwapReversion15mFastV1 --period 180d --limit period --max-candidates 160 --max-combos-per-strategy 100 --top-n 40 --timeout-seconds 7200 --runtime-budget-seconds 7000
+1h + 4h overnight search: broader swing/intraday research, still manageable.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 1h,4h --strategies EmaBounceV2,SimpleAtrTrendV2,BreakoutRetestV2,RangeExpansionV2,RelativeStrengthV2,FibPullbackContinuationV1 --period 1095d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+4h focused search: longer swing candidates only.
+python scripts\research_autopilot.py research:focused-optimizer --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 4h --strategies EmaBounceV2,SimpleAtrTrendV2,BreakoutRetestV2,RangeExpansionV2,RelativeStrengthV2,FibPullbackContinuationV1,MeanReversion,ConservativeTrend,RegimePullbackTrend --period 1095d --limit period --max-candidates 240 --max-combos-per-strategy 160 --top-n 50 --timeout-seconds 28800 --runtime-budget-seconds 28200
+History coverage check: use if data looks stale, short, or weird.
+python scripts\research_autopilot.py research:history-coverage --symbols BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT --timeframes 15m,1h,4h --period 1095d --limit period
+
+TESTS
+JS research smoke test.
+node tests\research_smoke.js
+JS strategy/indicator smoke test.
+node tests\regime_strategy_smoke.js
+Python helper syntax check.
+python -m py_compile scripts\paper_catchup_until_current.py scripts\paper_trade_summary.py scripts\research_champion_board.py scripts\paper_dedupe_state.py
+Paper state duplicate dry-run: check only, no changes.
+python scripts\paper_dedupe_state.py
+Paper state duplicate repair: creates backups, only use if dry-run says duplicates.
+python scripts\paper_dedupe_state.py --apply
+
+RULES
+Never promote from raw optimizer output. Only consider candidates that survive lead-review, robustness, stress, and walk-forward.
+Keep tactics timeframe-specific: 15m, 1h, and 4h can each need different rules.
+Research shorts separately; do not mix unproven shorts into the active long paper baseline.

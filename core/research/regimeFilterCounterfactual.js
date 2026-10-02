@@ -25,6 +25,26 @@ function iso(time) {
   return time ? new Date(Number(time) * 1000).toISOString() : null;
 }
 
+function timeframeHours(timeframe) {
+  const raw = String(timeframe || "1h").trim().toLowerCase();
+  if (raw.endsWith("m")) return Math.max(1, Number(raw.slice(0, -1)) || 60) / 60;
+  if (raw.endsWith("h")) return Math.max(1, Number(raw.slice(0, -1)) || 1);
+  if (raw.endsWith("d")) return Math.max(1, Number(raw.slice(0, -1)) || 1) * 24;
+  return 1;
+}
+
+function autoLimitFor(timeframe, days, cap) {
+  const bars = Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  return Math.max(250, Math.min(Number(cap || 5000), bars + 300));
+}
+
+function requestedLimitFor(rawLimit, timeframe, days, cap) {
+  if (!rawLimit || rawLimit === "auto") return autoLimitFor(timeframe, days, cap);
+  if (String(rawLimit).toLowerCase() === "period") return Math.ceil(Number(days || 365) * 24 / timeframeHours(timeframe));
+  const numeric = Number(rawLimit);
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : autoLimitFor(timeframe, days, cap);
+}
+
 function nearestFrameIndex(frame, time) {
   let chosen = -1;
   for (let index = 0; index < frame.length; index += 1) {
@@ -505,14 +525,16 @@ function applyStress(variant, candles, regimeCandles, params, context, basisFram
   if (variant.id === "excludeAllHistoricallyWeakRegimes") return;
   const base = {
     makerFeePct: Number(params.makerFeePct || 0),
-    takerFeePct: Number(params.takerFeePct || 0),
-    slippageBps: Number(params.slippageBps || 0)
+    takerFeePct: Number(params.takerFeePct || params.feePct || 0),
+    slippageBps: Number(params.slippageBps || (Number(params.slippagePct || 0) * 100)),
+    feePct: Number(params.feePct !== undefined ? params.feePct : params.takerFeePct || 0),
+    slippagePct: Number(params.slippagePct !== undefined ? params.slippagePct : Number(params.slippageBps || 0) / 100)
   };
   const scenarios = [
-    { scenario: "baselineCosts", makerFeePct: base.makerFeePct, takerFeePct: base.takerFeePct, slippageBps: base.slippageBps },
-    { scenario: "doubleFees", makerFeePct: base.makerFeePct * 2, takerFeePct: base.takerFeePct * 2, slippageBps: base.slippageBps },
-    { scenario: "doubleSlippage", makerFeePct: base.makerFeePct, takerFeePct: base.takerFeePct, slippageBps: base.slippageBps * 2 },
-    { scenario: "doubleFeesDoubleSlippage", makerFeePct: base.makerFeePct * 2, takerFeePct: base.takerFeePct * 2, slippageBps: base.slippageBps * 2 }
+    { scenario: "baselineCosts", makerFeePct: base.makerFeePct, takerFeePct: base.takerFeePct, feePct: base.feePct, slippageBps: base.slippageBps, slippagePct: base.slippagePct },
+    { scenario: "doubleFees", makerFeePct: base.makerFeePct * 2, takerFeePct: base.takerFeePct * 2, feePct: base.feePct * 2, slippageBps: base.slippageBps, slippagePct: base.slippagePct },
+    { scenario: "doubleSlippage", makerFeePct: base.makerFeePct, takerFeePct: base.takerFeePct, feePct: base.feePct, slippageBps: base.slippageBps * 2, slippagePct: base.slippagePct * 2 },
+    { scenario: "doubleFeesDoubleSlippage", makerFeePct: base.makerFeePct * 2, takerFeePct: base.takerFeePct * 2, feePct: base.feePct * 2, slippageBps: base.slippageBps * 2, slippagePct: base.slippagePct * 2 }
   ];
   const definition = variantDefinitions().find((item) => item.id === variant.id) || variantDefinitions()[0];
   const rows = scenarios.map((scenario) => {
@@ -531,7 +553,7 @@ async function buildReport(options) {
   const source = options.source || "bybit";
   const to = options.to || new Date().toISOString();
   const from = options.from || new Date(Date.now() - days * 86400 * 1000).toISOString();
-  const limit = options.limit && options.limit !== "auto" ? Number(options.limit) : 5000;
+  const limit = requestedLimitFor(options.limit, options.timeframe || "1h", days, 5000);
   const context = {
     source,
     symbol: options.symbol || "ETHUSDT",
@@ -540,16 +562,20 @@ async function buildReport(options) {
   };
   const [candlesRaw, regimeRaw, basisRaw] = await Promise.all([
     data.fetchCandles({ source, symbol: context.symbol, interval: context.timeframe, from, to, limit }),
-    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: 3000 }),
-    data.fetchCandles({ source, symbol: context.symbol, interval: "1h", from, to, limit: 5000 })
+    data.fetchCandles({ source, symbol: "BTCUSDT", interval: "4h", from, to, limit: requestedLimitFor(options.limit, "4h", days, 3000) }),
+    data.fetchCandles({ source, symbol: context.symbol, interval: "1h", from, to, limit: requestedLimitFor(options.limit, "1h", days, 5000) })
   ]);
   const candles = data.normalizeCandles(candlesRaw || []);
   const regimeCandles = data.normalizeCandles(regimeRaw || []);
   const basisFrame = indicators.buildIndicatorFrame(data.normalizeCandles(basisRaw || []), options.params || {});
+  const takerFeePct = Number(options.takerFeePct || 0);
+  const slippageBps = Number(options.slippageBps || 0);
   const params = Object.assign({}, options.params || {}, {
     makerFeePct: Number(options.makerFeePct || 0),
-    takerFeePct: Number(options.takerFeePct || 0),
-    slippageBps: Number(options.slippageBps || 0)
+    takerFeePct,
+    slippageBps,
+    feePct: options.feePct !== undefined ? Number(options.feePct) : takerFeePct,
+    slippagePct: options.slippagePct !== undefined ? Number(options.slippagePct) : slippageBps / 100
   });
   const folds = foldSlices(candles, options.folds || 4);
   const baselineDefinition = variantDefinitions()[0];

@@ -683,9 +683,10 @@ function optimizerGridCatalog() {
       minHoldBars: [0, 2, 4, 8],
       cooldownBars: [0, 2, 3, 6],
       requireVolume: [false],
-      requireBreakout: [false, true]
+      requireBreakout: [false, true],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
     },
-    maxCombinations: 500,
+    maxCombinations: 800,
     notes: ["Uses existing trend/risk parameters with wider RSI and optional breakout to reduce zero-trade scans."],
     riskLevel: "medium"
   };
@@ -704,9 +705,11 @@ function optimizerGridCatalog() {
       rsiMax: [68, 72, 76, 82],
       cooldownBars: [0, 2, 3, 6],
       minHoldBars: [0, 1, 3, 6],
-      volumeFilter: [false]
+      volumeFilter: [false],
+      indicatorFilterPreset: ["none", "trendQuality", "pullbackTiming"],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
     },
-    maxCombinations: 500,
+    maxCombinations: 800,
     notes: ["Matches existing SimpleAtrTrendV2-style parameters and avoids strict BTC-only gating by testing symbol trend modes."],
     riskLevel: "medium"
   };
@@ -724,9 +727,10 @@ function optimizerGridCatalog() {
       retestLookback: [3, 5, 8, 12],
       retestAtr: [0.5, 0.8, 1.2, 1.6],
       volumeFilter: [false],
-      shortMode: [false]
+      shortMode: [false],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
     },
-    maxCombinations: 500,
+    maxCombinations: 800,
     notes: ["Tests existing Donchian/ADX/retest parameters with volume optional to avoid over-filtering."],
     riskLevel: "medium-high"
   };
@@ -742,7 +746,8 @@ function optimizerGridCatalog() {
       takeProfitAtr: [1.5, 2, 2.5],
       minHoldBars: [1, 2, 4],
       cooldownBars: [0, 3, 6],
-      volumeFilter: [false]
+      volumeFilter: [false],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
     },
     maxCombinations: 250,
     notes: ["Uses existing RSI/ATR mean-reversion parameters only; no new rules are introduced."],
@@ -764,9 +769,10 @@ function optimizerGridCatalog() {
       trailingAtr: [1.5, 2, 2.5],
       cooldownBars: [0, 2, 3, 6],
       minHoldBars: [0, 1, 3, 6],
-      volumeFilter: [false]
+      volumeFilter: [false],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
     },
-    maxCombinations: 500,
+    maxCombinations: 800,
     notes: ["Wider pullback/reclaim thresholds for existing pullback strategies."],
     riskLevel: "medium"
   };
@@ -825,6 +831,129 @@ function optimizerGridCatalog() {
       liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     }
   };
+  var mtfPullback15mGrid = {
+    strategyKey: "mtf_pullback_15m_v1",
+    gridName: "MTF pullback 15m V1",
+    humanName: "Multi-timeframe Pullback 15m V1",
+    params: {
+      regimeMode: ["symbolFastTrend", "symbolTrend"],
+      mtfRequire1h: [true],
+      mtfRequire4h: [true, false],
+      mtf1hTrendEma: [50, 100],
+      mtf4hTrendEma: [50, 100, 200],
+      mtfMinRsi: [42, 45, 50],
+      mtfDirection: ["long", "short", "both"],
+      mtfEntryMode: ["pullback", "either", "breakout"],
+      rsiPullbackLevel: [38, 42, 45],
+      rsiReclaimLevel: [48, 50, 53],
+      emaBounceAtr: [0.4, 0.8, 1.2],
+      atrMultiplier: [1.4, 1.8, 2.2],
+      takeProfitAtr: [2.2, 2.8, 3.4],
+      cooldownBars: [4, 8, 12],
+      minHoldBars: [1, 2, 4],
+      donchianEntry: [10, 20],
+      donchianExit: [10, 20],
+      volumeFilter: [false],
+      indicatorFilterPreset: ["none", "pullbackTiming", "trendQuality"],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 650,
+    notes: [
+      "Research-only 15m strategy that derives closed 1h/4h trend confirmation from the 15m candle stream.",
+      "Long-only: entries require 15m pullback/reclaim or breakout timing after higher-timeframe trend agreement.",
+      "Uses next-open fills and normal lead-review/stress/walk-forward gates before any promotion discussion."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "15m",
+    acceptanceNotes: {
+      minFullTrades: 80,
+      minFoldPassCount: 4,
+      maxBestFoldContributionPct: 55,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+    }
+  };
+  var vwapReversion15mGrid = {
+    strategyKey: "vwap_reversion_15m_v1",
+    gridName: "VWAP reversion 15m V1",
+    humanName: "VWAP Reversion 15m V1",
+    params: {
+      regimeMode: ["noRegime"],
+      reversionDirection: ["long", "short", "both"],
+      minVwapDistanceAtr: [0.6, 0.9, 1.2, 1.6],
+      requireBbTouch: [true, false],
+      rsiOversold: [25, 30, 32, 35],
+      rsiOverbought: [65, 68, 70, 75],
+      stochRsiOversold: [10, 20, 30],
+      stochRsiOverbought: [70, 80, 90],
+      maxAdx: [18, 24, 30, 36],
+      minChoppiness: [0, 45, 50, 55],
+      atrMultiplier: [1, 1.4, 1.8, 2.2],
+      takeProfitAtr: [1.2, 1.8, 2.4],
+      cooldownBars: [2, 4, 8],
+      minHoldBars: [0, 1, 2],
+      requireCmfConfirm: [false, true],
+      minCmf: [-0.1, -0.05, 0],
+      volumeFilter: [false],
+      fillModel: ["next-open"],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
+    },
+    maxCombinations: 700,
+    notes: [
+      "Research-only 15m range strategy: fade VWAP/Bollinger extensions in low-trend or choppy regimes.",
+      "Can test long, short, or both directions separately from the failed MTF trend-pullback family.",
+      "Exits use VWAP reversion, ATR take profit, ATR trailing stop, and normal cost/stress/walk-forward gates."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "15m",
+    acceptanceNotes: {
+      minFullTrades: 80,
+      minFoldPassCount: 4,
+      maxBestFoldContributionPct: 55,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+    }
+  };
+  var vwapReversion15mFastGrid = {
+    strategyKey: "vwap_reversion_15m_fast_v1",
+    gridName: "VWAP reversion 15m fast V1",
+    humanName: "VWAP Reversion 15m Fast V1",
+    params: {
+      regimeMode: ["noRegime"],
+      reversionDirection: ["long", "short", "both"],
+      minVwapDistanceAtr: [0.2, 0.35, 0.5, 0.7],
+      requireBbTouch: [false],
+      rsiOversold: [38, 42, 45, 48],
+      rsiOverbought: [52, 55, 58, 62],
+      stochRsiOversold: [35, 45, 55],
+      stochRsiOverbought: [45, 55, 65],
+      maxAdx: [30, 40, 50, 100],
+      minChoppiness: [0, 35, 45],
+      atrMultiplier: [0.8, 1.1, 1.4, 1.8],
+      takeProfitAtr: [0.8, 1.2, 1.6],
+      cooldownBars: [0, 1, 2],
+      minHoldBars: [0, 1],
+      requireCmfConfirm: [false],
+      minCmf: [-0.1],
+      volumeFilter: [false],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 500,
+    notes: [
+      "Research-only higher-trade-count version of VWAP Reversion 15m.",
+      "Looser VWAP distance and no mandatory Bollinger touch are intentional to test whether the rare V1 SOL result was overfit.",
+      "Use this only after VwapReversion15mV1 lead review fails."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "15m",
+    acceptanceNotes: {
+      minFullTrades: 100,
+      minFoldPassCount: 4,
+      maxBestFoldContributionPct: 50,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+    }
+  };
   var robustTrendFollowerGrid = {
     strategyKey: "robust_trend_follower_v1",
     gridName: "Robust trend follower V1",
@@ -861,6 +990,123 @@ function optimizerGridCatalog() {
     riskLevel: "medium-research-only",
     timeframeHint: "1h"
   };
+  var btcMeanReversion4hGrid = {
+    strategyKey: "btc_mean_reversion_4h_v1",
+    gridName: "BTC mean reversion 4h V1",
+    humanName: "BTC Mean Reversion 4h V1",
+    params: {
+      regimeMode: ["symbolTrend", "noRegime", "looseBtcBull"],
+      rsiOversold: [40, 45, 35, 30, 25],
+      rsiReclaim: [45, 50, 40, 35],
+      pullbackLookback: [3, 5, 8],
+      maxAdx: [100, 60, 45, 32, 24],
+      minChoppiness: [0, 38, 45, 52],
+      requireBbTouch: [false, true],
+      atrMultiplier: [1.6, 1.2, 2, 2.4],
+      takeProfitAtr: [1.2, 1.8, 2.4, 3],
+      cooldownBars: [0, 2, 4, 8],
+      minHoldBars: [0, 1, 2, 4],
+      requireCmfConfirm: [false, true],
+      minCmf: [-0.1, -0.05, 0],
+      volumeFilter: [false],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 650,
+    notes: [
+      "Research-only BTC 4h long mean-reversion family: RSI/Bollinger pullback, reclaim timing, and mean/VWAP/Bollinger-mid exits.",
+      "Loose trade-producing candidates are ordered first so capped Auto Search does not spend a full round on no-trade settings.",
+      "This intentionally differs from Donchian breakout/retest variants that have clustered below the current ceiling.",
+      "noRegime is included for diagnosis; promotion still depends on normal lead-review and walk-forward gates."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "4h",
+    acceptanceNotes: {
+      minFullTrades: 30,
+      minFoldPassCount: 3,
+      maxBestFoldContributionPct: 60,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT"]
+    }
+  };
+  var squeezePullbackHold4hGrid = {
+    strategyKey: "squeeze_pullback_hold_4h_v1",
+    gridName: "Squeeze pullback hold 4h V1",
+    humanName: "Squeeze Pullback Hold 4h V1",
+    params: {
+      regimeMode: ["symbolTrend", "looseBtcBull", "noRegime"],
+      squeezeMode: ["squeezeOn", "bbWidthLow"],
+      squeezeLookback: [50, 80, 100],
+      squeezePercentile: [0.2, 0.25, 0.35],
+      pullbackEma: [50, 20, 100],
+      requireTrend: [false, true],
+      requireMomentum: [false, true],
+      minRsi: [45, 50, 55],
+      atrMultiplier: [3, 4, 5, 6],
+      takeProfitAtr: [99, 8, 12],
+      maxHoldBars: [12, 18, 24, 30],
+      cooldownBars: [0, 2, 4],
+      volumeFilter: [false],
+      fillModel: ["next-open"],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
+    },
+    maxCombinations: 800,
+    notes: [
+      "Discovered from candle-pattern mining: BTC 4h squeeze plus EMA pullback/reclaim showed positive 24-bar forward edge.",
+      "Research-only. Uses max-hold exits to approximate the discovered forward-hold behavior, with ATR stop/take-profit guards.",
+      "Requires walk-forward and concentration review before any promotion discussion."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "4h",
+    acceptanceNotes: {
+      minFullTrades: 40,
+      minFoldPassCount: 3,
+      maxBestFoldContributionPct: 55,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT"]
+    }
+  };
+  var btcRegimeController4hGrid = {
+    strategyKey: "btc_regime_controller_4h_v1",
+    gridName: "BTC regime controller 4h V1",
+    humanName: "BTC Regime Controller 4h V1",
+    params: {
+      regimeMode: ["symbolTrend", "looseBtcBull", "noRegime"],
+      controllerMode: ["adaptive", "trendOnly", "pullbackOnly", "meanReversionOnly"],
+      donchianEntry: [10, 20, 35, 55],
+      donchianExit: [5, 10, 20],
+      minTrendAdx: [0, 8, 12, 18],
+      trendRsiMin: [45, 50, 55],
+      rsiPullbackLevel: [38, 42, 45, 48],
+      rsiReclaimLevel: [48, 50, 53],
+      rsiOversold: [32, 35, 38, 42],
+      rsiReclaim: [42, 45, 48, 50],
+      meanReversionLookback: [3, 5, 8],
+      maxMeanReversionAdx: [24, 32, 45, 100],
+      minMeanReversionChoppiness: [0, 38, 45, 52],
+      atrMultiplier: [1.8, 2.3, 2.8, 3.3],
+      takeProfitAtr: [2.5, 3.5, 4.5, 99],
+      maxHoldBars: [12, 18, 24, 36],
+      cooldownBars: [0, 2, 4, 8],
+      volumeFilter: [false],
+      riskPct: [0.05, 0.03, 0.02, 0.015, 0.01],
+      fillModel: ["next-open"]
+    },
+    maxCombinations: 800,
+    notes: [
+      "Research-only BTC 4h controller: trend breakout, bull pullback, quiet mean-reversion, or no-trade in bad regimes.",
+      "Designed after high-return candidates clustered near 20-25% drawdown and the low-DD squeeze lead failed validation.",
+      "Long-only first version; shorts can be added after this baseline is measured."
+    ],
+    riskLevel: "high-research-only",
+    timeframeHint: "4h",
+    acceptanceNotes: {
+      minFullTrades: 40,
+      minFoldPassCount: 3,
+      maxBestFoldContributionPct: 55,
+      fillModel: "next-open",
+      liquidSymbols: ["BTCUSDT"]
+    }
+  };
   var fallbackGrid = {
     strategyKey: "default_fallback",
     gridName: "Default fallback",
@@ -891,11 +1137,15 @@ function optimizerGridCatalog() {
     PullbackTrend: pullbackGrid,
     RegimePullbackTrend: pullbackGrid,
     EmaPullbackContinuation: pullbackGrid,
-    PullbackReclaimV2: pullbackGrid,
+    PullbackReclaimV2: Object.assign({}, pullbackGrid, {
+      strategyKey: "pullback_reclaim_v2",
+      gridName: "Pullback reclaim V2",
+      params: Object.assign({}, pullbackGrid.params, { indicatorFilterPreset: ["none", "pullbackTiming", "trendQuality"] })
+    }),
     EmaBounceV2: Object.assign({}, pullbackGrid, {
       strategyKey: "ema_bounce_v2",
       gridName: "EMA bounce V2",
-      params: Object.assign({}, pullbackGrid.params, { emaBounceAtr: [0.4, 0.8, 1.2] })
+      params: Object.assign({}, pullbackGrid.params, { indicatorFilterPreset: ["none", "pullbackTiming", "trendQuality"], emaBounceAtr: [0.4, 0.8, 1.2] })
     }),
     RegimeFilteredTrendStrategy: breakoutGrid,
     RegimeDonchian20: breakoutGrid,
@@ -913,10 +1163,24 @@ function optimizerGridCatalog() {
         closeHighPct: [0.55, 0.65, 0.75, 0.85],
         adxThreshold: [0, 10, 14, 18],
         atrMultiplier: [2, 2.5, 3],
-        volumeFilter: [false]
+        volumeFilter: [false],
+        indicatorFilterPreset: ["none", "breakoutQuality", "trendQuality"],
+        riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
       }
     }),
-    BreakoutRetestV2: breakoutGrid,
+    BreakoutRetestV2: Object.assign({}, breakoutGrid, {
+      strategyKey: "breakout_retest_v2",
+      gridName: "Breakout/retest V2",
+      params: Object.assign({}, breakoutGrid.params, {
+        regimeMode: ["symbolFastTrend", "looseBtcBull", "symbolTrend"],
+        donchianEntry: [20, 10, 55],
+        adxThreshold: [18, 0, 10, 14],
+        emaTrendLength: [200, 50, 100, 150],
+        retestAtr: [1.2, 1.6, 0.5, 0.8],
+        riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005],
+        indicatorFilterPreset: ["none", "breakoutQuality", "trendQuality"]
+      })
+    }),
     RangeExpansionV2: Object.assign({}, oscillatorGrid, {
       strategyKey: "range_expansion_v2",
       gridName: "Range expansion V2",
@@ -928,7 +1192,9 @@ function optimizerGridCatalog() {
         rangeSma: [10, 20, 30],
         closeHighPct: [0.5, 0.6, 0.7, 0.85],
         atrMultiplier: [2, 2.5, 3],
-        volumeFilter: [false]
+        volumeFilter: [false],
+        indicatorFilterPreset: ["none", "breakoutQuality", "trendQuality"],
+        riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
       }
     }),
     RelativeStrengthV2: Object.assign({}, oscillatorGrid, {
@@ -941,11 +1207,19 @@ function optimizerGridCatalog() {
         rsiMin: [38, 42, 48, 52],
         rsiMax: [68, 74, 80, 84],
         atrMultiplier: [2, 2.5, 3],
-        volumeFilter: [false]
+        volumeFilter: [false],
+        indicatorFilterPreset: ["none", "trendQuality"],
+        riskPct: [0.05, 0.03, 0.02, 0.015, 0.01, 0.005]
       }
     }),
     FibPullbackContinuationV1: fibPullback15mGrid,
+    MtfPullback15mV1: mtfPullback15mGrid,
+    VwapReversion15mV1: vwapReversion15mGrid,
+    VwapReversion15mFastV1: vwapReversion15mFastGrid,
     RobustTrendFollowerV1: robustTrendFollowerGrid,
+    BtcMeanReversion4hV1: btcMeanReversion4hGrid,
+    SqueezePullbackHold4hV1: squeezePullbackHold4hGrid,
+    BtcRegimeController4hV1: btcRegimeController4hGrid,
     SimpleAtrTrendV2: v2TrendGrid
   };
 }
@@ -997,10 +1271,9 @@ function selectOptimizerGrid(strategy, explicitRanges, maxCombos, fallbackMode, 
     grid = fallbackGridForStrategy(strategy, catalog);
   }
   var ranges = grid.params || defaultRanges();
-  var expanded = expandGrid(ranges).map(normalizeParamAliases).filter(validCombo);
-  var planned = expanded.length;
   var limit = Math.max(1, Math.min(Number(maxCombos || grid.maxCombinations || 1000), Number(grid.maxCombinations || maxCombos || 1000)));
-  var sampled = stableSample(expanded, limit);
+  var planned = countValidGridCandidates(ranges);
+  var sampled = sampleGrid(ranges, limit);
   return {
     combos: sampled,
     metadata: gridMetadata(grid, ranges, planned, sampled.length, sampled.length < planned, fallbackMode === true, fallbackReason || null)
@@ -1085,13 +1358,14 @@ function fallbackGridForStrategy(strategy, catalog) {
 }
 
 function gridMetadata(grid, ranges, planned, tested, sampled, fallbackUsed, fallbackReason) {
+  var plannedCount = planned !== undefined && planned !== null ? planned : countValidGridCandidates(ranges || {});
   return {
     strategyKey: grid.strategyKey,
     gridName: grid.gridName || grid.humanName,
     humanName: grid.humanName || grid.gridName,
     params: ranges,
     paramCount: Object.keys(ranges || {}).length,
-    candidateCountPlanned: planned || expandGrid(ranges || {}).filter(validCombo).length,
+    candidateCountPlanned: plannedCount,
     candidateCountTested: tested || 0,
     maxCombinations: grid.maxCombinations,
     fallbackUsed: fallbackUsed === true,
@@ -1118,6 +1392,66 @@ function stableSample(combos, maxCount) {
   var byKey = {};
   output.forEach(function (combo) { byKey[stableParamKey(combo)] = combo; });
   return Object.keys(byKey).sort().map(function (key) { return byKey[key]; });
+}
+
+function gridDimensions(ranges) {
+  var keys = Object.keys(ranges || {});
+  var values = keys.map(function (key) {
+    return Array.isArray(ranges[key]) ? ranges[key] : [ranges[key]];
+  });
+  var total = values.reduce(function (product, items) { return product * Math.max(1, items.length); }, 1);
+  return { keys: keys, values: values, total: total };
+}
+
+function comboAt(dimensions, flatIndex) {
+  var combo = {};
+  var cursor = flatIndex;
+  for (var i = dimensions.keys.length - 1; i >= 0; i -= 1) {
+    var options = dimensions.values[i];
+    var optionIndex = cursor % options.length;
+    cursor = Math.floor(cursor / options.length);
+    combo[dimensions.keys[i]] = options[optionIndex];
+  }
+  return combo;
+}
+
+function countValidGridCandidates(ranges) {
+  var dimensions = gridDimensions(ranges);
+  var count = 0;
+  for (var i = 0; i < dimensions.total; i += 1) {
+    if (validCombo(normalizeParamAliases(comboAt(dimensions, i)))) count += 1;
+  }
+  return count;
+}
+
+function sampleGrid(ranges, maxCount) {
+  var dimensions = gridDimensions(ranges);
+  if (dimensions.total <= maxCount) return expandGrid(ranges).map(normalizeParamAliases).filter(validCombo);
+  if (maxCount <= 1) {
+    for (var first = 0; first < dimensions.total; first += 1) {
+      var firstCombo = normalizeParamAliases(comboAt(dimensions, first));
+      if (validCombo(firstCombo)) return [firstCombo];
+    }
+    return [];
+  }
+  var output = [];
+  var seen = {};
+  function addCandidate(index) {
+    var combo = normalizeParamAliases(comboAt(dimensions, index));
+    if (!validCombo(combo)) return;
+    var key = stableParamKey(combo);
+    if (seen[key]) return;
+    seen[key] = true;
+    output.push(combo);
+  }
+  var lastIndex = dimensions.total - 1;
+  for (var i = 0; i < maxCount; i += 1) {
+    addCandidate(Math.floor(i * lastIndex / (maxCount - 1)));
+  }
+  for (var cursor = 0; output.length < maxCount && cursor < dimensions.total; cursor += 1) {
+    addCandidate(cursor);
+  }
+  return output.sort(function (a, b) { return stableParamKey(a).localeCompare(stableParamKey(b)); });
 }
 
 function defaultRanges() {
