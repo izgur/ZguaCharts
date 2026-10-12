@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ section|title }} Library | ZguaCharts</title><link rel="stylesheet" href="/static/library.css?v=1"></head>
+<body>
+<header class="library-header"><a class="library-brand" href="/charts" aria-label="Back to charts">Z</a><strong>ZguaCharts Library</strong><nav><a href="/community/library/indicators" {% if section == 'indicators' %}aria-current="page"{% endif %}>Indicators</a><a href="/community/library/patterns" {% if section == 'patterns' %}aria-current="page"{% endif %}>Patterns</a></nav><a class="chart-link" href="/charts">Charts</a></header>
+<main class="library-layout"><aside class="library-index"><label for="library-search">{{ section|title }}</label><input id="library-search" type="search" placeholder="Search {{ section }}" autocomplete="off"><p id="library-count" role="status"></p><nav id="library-toc" aria-label="Table of contents"></nav></aside><article id="library-content" tabindex="-1"></article></main>
+<script id="library-data" type="application/json">{{ {"section": section, "indicators": indicators}|tojson }}</script>
+<script src="/static/indicator-help.js?v=library-1"></script><script src="/static/library.js?v=1"></script>
+</body></html>

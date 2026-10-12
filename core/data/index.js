@@ -170,6 +170,7 @@ function intervalToMs(interval) {
   if (interval.toUpperCase() === "W") return 7 * 24 * 60 * 60 * 1000;
   var amount = Number(interval.slice(0, -1));
   var unit = interval.slice(-1);
+    if (unit === 's') return amount * 1000;
   if (unit === "m") return amount * 60 * 1000;
   if (unit === "h") return amount * 60 * 60 * 1000;
   if (unit === "d") return amount * 24 * 60 * 60 * 1000;

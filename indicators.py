@@ -4,6 +4,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
+from indicator_catalog import CATALOG, calculate as calculate_catalog_indicator
 
 try:
     import pandas_ta as ta
@@ -28,10 +29,100 @@ INDICATOR_LABELS = {
 OVERLAY_INDICATORS = {"ema", "sma", "vwap", "bbands", "supertrend"}
 LOWER_PANE_INDICATORS = {"rsi", "macd", "atr", "stochrsi", "volume", "cipherb"}
 
+INDICATOR_PARAMETERS = {
+    "ema": "close; lengths 9, 21, 50, 200",
+    "sma": "close; length 20",
+    "vwap": "HLC3; volume weighted; cumulative loaded history",
+    "bbands": "close; length 20; deviation 2; population variance",
+    "rsi": "close; length 14; levels 70, 50, 30",
+    "macd": "close; fast 12; slow 26; signal 9",
+    "atr": "length 14; true range",
+    "supertrend": "HL2; ATR length 10; multiplier 3",
+    "stochrsi": "close; RSI 14; stochastic 14; K 3; D 3; levels 80, 50, 20",
+    "volume": "volume; SMA length 20",
+    "cipherb": "HLC3; WT channel 10; average 21; signal SMA 4; scale 0.015; volume SMA 20; flow EMA 8; RSI 14; levels 60, 53, 0, -53, -60",
+}
+
+INDICATOR_DEFAULTS = {
+    "ema": {"length1": 9, "length2": 21, "length3": 50, "length4": 200},
+    "sma": {"length": 20}, "vwap": {},
+    "bbands": {"length": 20, "deviation": 2},
+    "rsi": {"length": 14, "upper": 70, "middle": 50, "lower": 30},
+    "macd": {"fast": 12, "slow": 26, "signal": 9},
+    "atr": {"length": 14}, "supertrend": {"length": 10, "multiplier": 3},
+    "stochrsi": {"rsi": 14, "stochastic": 14, "k": 3, "d": 3, "upper": 80, "middle": 50, "lower": 20},
+    "volume": {"length": 20},
+    "cipherb": {"channel": 10, "average": 21, "signal": 4, "volume": 20, "flow": 8, "rsi": 14},
+}
+for _key, _study in CATALOG.items():
+    INDICATOR_LABELS[_key] = _study["label"]
+    INDICATOR_PARAMETERS[_key] = _study["parameters"]
+    INDICATOR_DEFAULTS[_key] = _study["defaults"]
+    (OVERLAY_INDICATORS if _study["placement"] == "overlay" else LOWER_PANE_INDICATORS).add(_key)
+
+
+def parameter_schema(key):
+    fields = [{"name": name, "label": name.replace("length", "Length ").title(), "default": value,
+             "min": 0 if name in ("upper", "middle", "lower") else 0.1 if name in ("deviation", "multiplier") else 2,
+             "max": 100 if name in ("upper", "middle", "lower") else 20 if name in ("deviation", "multiplier") else 500,
+             "step": 0.1 if name in ("deviation", "multiplier") else 1}
+            for name, value in INDICATOR_DEFAULTS[key].items()]
+    for field in fields:
+        if key == "zgua":
+            if field["name"] in ("draw_lines", "engulfing", "sweep") or field["name"].endswith(("_enabled", "_bullish", "_bearish")):
+                field.update(min=0, max=1, step=1, type="boolean")
+            elif field["name"] in ("price_equal_pct", "osc_equal_pct", "min_osc_pct"):
+                field.update(min=0, max=20, step=0.01)
+            elif field["name"] in ("left", "right", "lookback"):
+                field.update(min=1, max=10, step=1)
+            elif field["name"] == "max_events":
+                field.update(min=1, max=200, step=1)
+        if field["name"] == "offset": field.update(min=0, max=1, step=0.01)
+        if field["name"] in ("sigma", "percent"): field.update(min=0.1, max=100, step=0.1)
+        if field["name"] == "annualization": field.update(min=1, max=1000000, step=1)
+        toggles = {"heikin_ashi": "Heikin Ashi source", "true_range": "Use true range", "legacy_bb": "Legacy BB multiplier", "atr_sma": "Use SMA ATR", "source_close": "Use close price"}
+        if field["name"] in toggles: field.update(min=0, max=1, step=1, type="boolean", label=toggles[field["name"]])
+        if field["name"] == "sensitivity": field.update(min=0.1, max=20, step=0.1)
+        if key == "psar": field.update(min=0.001, max=1, step=0.001)
+        if field["name"] == "factor": field.update(min=0.1, max=5, step=0.1)
+        if field["name"].endswith("_shift"): field.update(min=0, max=100, step=1)
+        if field["name"] == "scale": field.update(min=1, max=1000000000, step=1)
+        if field["name"] in ("high_factor", "low_factor"): field.update(min=0.01, max=5, step=0.01)
+    return fields
+
+
+def normalize_indicator_settings(settings):
+    if settings is None:
+        settings = {}
+    if not isinstance(settings, dict) or set(settings) - set(INDICATOR_DEFAULTS):
+        raise ValueError("Invalid indicator settings")
+    result = {}
+    for key, defaults in INDICATOR_DEFAULTS.items():
+        custom = settings.get(key, {})
+        if not isinstance(custom, dict) or set(custom) - set(defaults):
+            raise ValueError("Invalid parameters for " + key)
+        values = dict(defaults)
+        for field in parameter_schema(key):
+            name = field["name"]
+            value = custom.get(name, field["default"])
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not field["min"] <= value <= field["max"] or field["step"] == 1 and value != int(value):
+                raise ValueError("Invalid " + key + " " + name)
+            values[name] = int(value) if field["step"] == 1 else float(value)
+        if key in ("rsi", "stochrsi") and not values["lower"] < values["middle"] < values["upper"]:
+            raise ValueError("Indicator levels must increase: lower, middle, upper")
+        if "fast" in values and "slow" in values and values["fast"] >= values["slow"]:
+            raise ValueError(INDICATOR_LABELS[key] + " fast length must be less than slow length")
+        if key == "psar" and values["start"] > values["maximum"]:
+            raise ValueError("SAR start must not exceed maximum acceleration")
+        if key == "zgua" and values["min_bars"] > values["max_bars"]:
+            raise ValueError("Zgua minimum pivot distance must not exceed maximum")
+        result[key] = values
+    return result
+
 
 def available_indicators() -> list[dict]:
     return [
-        {"id": key, "label": label, "placement": "overlay" if key in OVERLAY_INDICATORS else "pane"}
+        {"id": key, "label": label, "parameters": INDICATOR_PARAMETERS[key], "schema": parameter_schema(key), "placement": "overlay" if key in OVERLAY_INDICATORS else "pane"}
         for key, label in INDICATOR_LABELS.items()
     ]
 
@@ -40,6 +131,7 @@ def build_indicator_payload(
     candles: list[dict],
     requested: Iterable[str],
     sma_period: int = 20,
+    settings=None,
 ) -> dict:
     """Return Lightweight Charts-friendly indicator series.
 
@@ -47,6 +139,9 @@ def build_indicator_payload(
     candles. This module intentionally stays broker-agnostic.
     """
     requested_set = {item.strip().lower() for item in requested if item.strip()}
+    settings = normalize_indicator_settings(settings)
+    if sma_period != 20:
+        settings["sma"]["length"] = max(2, min(int(sma_period), 500))
     df = candles_to_frame(candles)
 
     overlays = []
@@ -55,80 +150,87 @@ def build_indicator_payload(
         return {"overlays": overlays, "panes": panes}
 
     if "ema" in requested_set:
-        for period, color in [(9, "#f5b84b"), (21, "#3bc9db"), (50, "#748ffc"), (200, "#ff8787")]:
+        for period, color in zip(settings["ema"].values(), ["#f5b84b", "#3bc9db", "#748ffc", "#ff8787"]):
             overlays.append(line_series(f"EMA {period}", timed(ema(df["close"], period), df), color, warmup=period))
 
     if "sma" in requested_set:
-        period = max(2, min(int(sma_period), 500))
+        period = settings["sma"]["length"]
         overlays.append(line_series(f"SMA {period}", timed(sma(df["close"], period), df), "#ced4da", warmup=period))
 
     if "vwap" in requested_set:
         overlays.append(line_series("VWAP", timed(vwap(df), df), "#b197fc"))
 
     if "bbands" in requested_set:
-        upper, middle, lower = bollinger_bands(df["close"], 20, 2)
+        length = settings["bbands"]["length"]
+        upper, middle, lower = bollinger_bands(df["close"], length, settings["bbands"]["deviation"])
         overlays.extend(
             [
-                line_series("BB Upper", timed(upper, df), "#91a7ff", warmup=20),
-                line_series("BB Middle", timed(middle, df), "#adb5bd", warmup=20),
-                line_series("BB Lower", timed(lower, df), "#91a7ff", warmup=20),
+                line_series("BB Upper", timed(upper, df), "#91a7ff", warmup=length),
+                line_series("BB Middle", timed(middle, df), "#adb5bd", warmup=length),
+                line_series("BB Lower", timed(lower, df), "#91a7ff", warmup=length),
             ]
         )
 
     if "supertrend" in requested_set:
-        trend = supertrend(df, 10, 3)
-        overlays.append(line_series("Supertrend 10/3", timed(trend, df), "#69db7c", warmup=10))
+        length, multiplier = settings["supertrend"]["length"], settings["supertrend"]["multiplier"]
+        trend = supertrend(df, length, multiplier)
+        overlays.append(line_series(f"Supertrend {length}/{multiplier:g}", timed(trend, df), "#69db7c", warmup=length))
 
     if "rsi" in requested_set:
+        p = settings["rsi"]
         panes.append(
             {
                 "id": "rsi",
-                "title": "RSI 14",
+                "title": "RSI " + str(p["length"]),
                 "series": [
-                    guide_line("Overbought 70", df, 70, "#ff5c7a"),
-                    guide_line("Midline 50", df, 50, "#64748b"),
-                    guide_line("Oversold 30", df, 30, "#12b886"),
-                    line_series("RSI", timed(rsi(df["close"], 14), df), "#fab005", warmup=14),
+                    guide_line("Overbought " + str(p["upper"]), df, p["upper"], "#ff5c7a"),
+                    guide_line("Midline " + str(p["middle"]), df, p["middle"], "#64748b"),
+                    guide_line("Oversold " + str(p["lower"]), df, p["lower"], "#12b886"),
+                    line_series("RSI", timed(rsi(df["close"], p["length"]), df), "#fab005", warmup=p["length"]),
                 ],
             }
         )
 
     if "macd" in requested_set:
-        macd_line, signal, histogram = macd(df["close"], 12, 26, 9)
+        p = settings["macd"]
+        macd_line, signal, histogram = macd(df["close"], p["fast"], p["slow"], p["signal"])
         panes.append(
             {
                 "id": "macd",
-                "title": "MACD 12/26/9",
+                "title": "MACD {fast}/{slow}/{signal}".format(**p),
                 "series": [
                     histogram_series("Histogram", timed(histogram, df)),
                     guide_line("Zero", df, 0, "#64748b"),
-                    line_series("MACD", timed(macd_line, df), "#4dabf7", warmup=26),
-                    line_series("Signal", timed(signal, df), "#ff922b", warmup=35),
+                    line_series("MACD", timed(macd_line, df), "#4dabf7", warmup=p["slow"]),
+                    line_series("Signal", timed(signal, df), "#ff922b", warmup=p["slow"] + p["signal"]),
                 ],
             }
         )
 
     if "atr" in requested_set:
-        panes.append({"id": "atr", "title": "ATR 14", "series": [line_series("ATR", timed(atr(df, 14), df), "#20c997", warmup=14)]})
+        length = settings["atr"]["length"]
+        panes.append({"id": "atr", "title": "ATR " + str(length), "series": [line_series("ATR", timed(atr(df, length), df), "#20c997", warmup=length)]})
 
     if "stochrsi" in requested_set:
-        k, d = stoch_rsi(df["close"], 14, 14, 3, 3)
+        p = settings["stochrsi"]
+        k, d = stoch_rsi(df["close"], p["rsi"], p["stochastic"], p["k"], p["d"])
         panes.append(
             {
                 "id": "stochrsi",
                 "title": "Stoch RSI",
                 "series": [
-                    guide_line("Upper 80", df, 80, "#ff5c7a"),
-                    guide_line("Middle 50", df, 50, "#64748b"),
-                    guide_line("Lower 20", df, 20, "#12b886"),
-                    line_series("%K", timed(k, df), "#12b886", warmup=30),
-                    line_series("%D", timed(d, df), "#f06595", warmup=33),
+                    guide_line("Upper " + str(p["upper"]), df, p["upper"], "#ff5c7a"),
+                    guide_line("Middle " + str(p["middle"]), df, p["middle"], "#64748b"),
+                    guide_line("Lower " + str(p["lower"]), df, p["lower"], "#12b886"),
+                    line_series("%K", timed(k, df), "#12b886", warmup=p["rsi"] + p["stochastic"] + p["k"] - 1),
+                    line_series("%D", timed(d, df), "#f06595", warmup=p["rsi"] + p["stochastic"] + p["k"] + p["d"] - 1),
                 ],
             }
         )
 
     if "cipherb" in requested_set:
-        wt1, wt2, money_flow, rsi_line = cipher_b_style(df)
+        p = settings["cipherb"]
+        wt1, wt2, money_flow, rsi_line = cipher_b_style(df, p["channel"], p["average"], p["signal"], p["volume"], p["flow"], p["rsi"])
         cipher_signal = cipher_b_signal(wt1, wt2, money_flow, rsi_line)
         cipher_markers = cipher_b_markers(df, wt1, wt2)
         panes.append(
@@ -145,25 +247,46 @@ def build_indicator_payload(
                     guide_line("Lower -53", df, -53, "#12b886"),
                     guide_line("Extreme low -60", df, -60, "#0ca678"),
                     histogram_series("Money flow", timed(money_flow, df)),
-                    line_series("WaveTrend", timed(wt1, df), "#4dabf7", warmup=28),
-                    line_series("WT signal", timed(wt2, df), "#f5b84b", warmup=32),
-                    line_series("RSI scaled", timed(rsi_line, df), "#b197fc", warmup=14),
+                    line_series("WaveTrend", timed(wt1, df), "#4dabf7", warmup=p["channel"] + p["average"] - 3),
+                    line_series("WT signal", timed(wt2, df), "#f5b84b", warmup=p["channel"] + p["average"] + p["signal"] - 3),
+                    line_series("RSI scaled", timed(rsi_line, df), "#b197fc", warmup=p["rsi"]),
                 ],
             }
         )
 
     if "volume" in requested_set:
+        length = settings["volume"]["length"]
         panes.append(
             {
                 "id": "volume",
                 "title": "Volume",
                 "series": [
                     histogram_series("Volume", timed(df["volume"], df), use_direction_colors=True, close=df["close"]),
-                    line_series("Volume MA20", timed(sma(df["volume"], 20), df), "#f5b84b", warmup=20),
+                    line_series("Volume MA" + str(length), timed(sma(df["volume"], length), df), "#f5b84b", warmup=length),
                 ],
             }
         )
 
+    for key in CATALOG:
+        if key not in requested_set:
+            continue
+        rendered = []
+        for item in calculate_catalog_indicator(df, key, settings[key]):
+            values = timed(item["values"], df)
+            output = histogram_series(item["name"], values) if item["type"] == "histogram" else line_series(item["name"], values, item["color"])
+            output.update(indicatorId=key, guide=item.get("guide", False))
+            for field in ("offset", "cloud", "pointOnly", "segments", "events", "markerGroup"):
+                if field in item: output[field] = item[field]
+            if item.get("colors") is not None:
+                for point, color in zip(output["data"], item["colors"]):
+                    point["color"] = str(color)
+            if "markers" in item:
+                output["markers"] = item["markers"]
+            rendered.append(output)
+        if key in OVERLAY_INDICATORS:
+            overlays.extend(rendered)
+        else:
+            panes.append({"id": key, "title": INDICATOR_LABELS[key], "series": rendered})
     diagnostics = indicator_diagnostics(df, overlays, panes)
     return {"overlays": compact_series(overlays), "panes": compact_panes(panes), "diagnostics": diagnostics}
 
@@ -293,7 +416,7 @@ def stoch_rsi(
     return k, d
 
 
-def cipher_b_style(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+def cipher_b_style(df: pd.DataFrame, channel=10, average=21, signal=4, volume=20, flow=8, rsi_length=14) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
     """Open, auditable WaveTrend/money-flow oscillator inspired by common Cipher B theory.
 
     This is not proprietary Market Cipher B code. It combines the public
@@ -302,17 +425,17 @@ def cipher_b_style(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series, p
     one lower pane.
     """
     hlc3 = (df["high"] + df["low"] + df["close"]) / 3
-    esa = ema(hlc3, 10)
-    deviation = ema((hlc3 - esa).abs(), 10)
+    esa = ema(hlc3, channel)
+    deviation = ema((hlc3 - esa).abs(), channel)
     ci = (hlc3 - esa) / (0.015 * deviation.replace(0, np.nan))
-    wt1 = ema(ci, 21)
-    wt2 = sma(wt1, 4)
+    wt1 = ema(ci, average)
+    wt2 = sma(wt1, signal)
 
     candle_range = (df["high"] - df["low"]).replace(0, np.nan)
     raw_flow = ((df["close"] - df["open"]) / candle_range).clip(-1, 1) * 100
-    volume_weight = df["volume"] / sma(df["volume"], 20).replace(0, np.nan)
-    money_flow = ema((raw_flow * volume_weight).clip(-100, 100), 8)
-    rsi_line = rsi(df["close"], 14) - 50
+    volume_weight = df["volume"] / sma(df["volume"], volume).replace(0, np.nan)
+    money_flow = ema((raw_flow * volume_weight).clip(-100, 100), flow)
+    rsi_line = rsi(df["close"], rsi_length) - 50
     return wt1, wt2, money_flow, rsi_line
 
 

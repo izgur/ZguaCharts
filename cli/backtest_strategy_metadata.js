@@ -4,11 +4,13 @@ const regimeTrend = require("../core/backtest/regimeTrend");
 const runtime = require("./runtime");
 
 const MANUAL_STRATEGIES = [
+  "ZGUA",
   "SimpleAtrTrendV2",
   "ConservativeTrend",
   "ConservativeTrendLoose",
   "EmaBounceV2",
   "RelativeStrengthV2",
+  "RelativeStrengthFreshV3",
   "PullbackReclaimV2",
   "RegimePullbackTrend",
   "MeanReversion",
@@ -425,6 +427,7 @@ function isRegimeRunner(name) {
     "BreakoutRetestV2",
     "RangeExpansionV2",
     "RelativeStrengthV2",
+    "RelativeStrengthFreshV3",
     "SimpleAtrTrendV2",
     "MtfPullback15mV1",
     "VwapReversion15mV1",

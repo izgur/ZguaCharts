@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict');
+const {compare,recentComplete}=require('../cli/research_exit_quality');
+const start=1700000100;
+const lower=Array.from({length:2100},(_,i)=>{const close=100+i*.006+Math.sin(i/15)*2;return {time:start+i*300,open:close-.1,high:close+.4,low:close-.4,close,volume:100};});
+const benchmark=Array.from({length:300},(_,i)=>({time:start-200*14400+i*14400,open:100,high:101,low:99,close:100,volume:100}));
+const input=recentComplete({executionCandles:lower,regimeCandles:benchmark,benchmarkCandles:benchmark,params:{regimeMode:'noRegime',volumeFilter:false,rsiMin:0,rsiMax:100,rsThreshold:-.01}});
+const report=compare(input);
+assert.equal(report.training.length,4);assert.equal(report.finalHoldout.evaluated,false);
+assert.equal(report.paperOnly,true);assert.equal(report.modeledCosts.maxPositionPct,100);
+const changed=compare({...input,candles:input.candles.map((bar,i)=>i<Math.floor(input.candles.length*.8)?bar:{...bar,close:bar.close*10})});
+assert.deepEqual(report.training,changed.training);assert.deepEqual(report.chosen,changed.chosen);
+const missing=compare({...input,executionCandles:input.executionCandles.filter((bar,i)=>i%7!==0)});
+assert.equal(missing.status,'BLOCKED_DATA');assert.equal(missing.finalHoldout.eligible,false);
+const overlap=recentComplete({...input,candles:input.candles.slice(0,500)});
+assert.ok(overlap.priorHoldoutOverlap);assert.equal(compare(overlap).finalHoldout.eligible,false);
+console.log('Exit research: frozen training selection, chronology, untouched holdout, complete execution gate and cost cap passed');

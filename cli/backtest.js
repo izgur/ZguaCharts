@@ -51,6 +51,7 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     params: params || {},
     limit: Number(args.limit || input.limit || 5000),
     candles: input.candles,
+    divergenceEvents: input.divergenceEvents,
     debug: args.debug === true || input.debug === true
   };
   return data.fetchCandles(options).then(function (candles) {

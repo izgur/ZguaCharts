@@ -11,6 +11,9 @@ from typing import Callable
 
 import requests
 import yfinance as yf
+from binance_data import fetch_binance_candles
+from exchange_market_data import MARKETS, PROVIDERS as EXTRA_PROVIDERS, fetch_exchange_candles
+from free_exchange_data import FREE_MARKETS, PROVIDERS as FREE_PROVIDERS, fetch_free_candles
 
 
 BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
@@ -111,6 +114,7 @@ def safe_symbol_list(symbols: list[str] | str | None, fallback: list[str]) -> li
 
 DATA_SOURCE_CONFIG = {
     "sources": {
+        "binance": {"label": "Binance Spot", "live": "polling", "symbols": ["BTCUSDT", "ETHUSDT"], "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]},
         "bybit": {
             "label": "Bybit Crypto",
             "live": "websocket",
@@ -147,7 +151,7 @@ DATA_SOURCE_CONFIG = {
             "timeframes": ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"],
         },
         "yfinance": {
-            "label": "Indian Stocks",
+            "label": "Yahoo Finance",
             "live": "polling",
             "symbols": ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "ITC.NS", "TATAMOTORS.NS"],
             "timeframes": ["1m", "2m", "5m", "15m", "30m", "60m", "1d", "1w"],
@@ -156,12 +160,76 @@ DATA_SOURCE_CONFIG = {
 }
 
 
+for _source, (_exchange, _kind, _category) in MARKETS.items():
+    DATA_SOURCE_CONFIG["sources"][_source] = {
+        "label": {"bybit_spot": "Bybit Spot", "bybit_inverse": "Bybit Inverse Futures", "binance_futures": "Binance USD-M Futures", "binance_coinm": "Binance Coin-M Futures"}[_source],
+        "live": "polling", "symbols": ["BTCUSD_PERP" if _source == "binance_coinm" else "BTCUSD" if _source == "bybit_inverse" else "BTCUSDT"],
+        "timeframes": list(DATA_SOURCE_CONFIG["sources"]["bybit" if _source.startswith("bybit") else "binance"]["timeframes"]),
+    }
+
+for _source, _info in DATA_SOURCE_CONFIG["sources"].items():
+    if _source.startswith(("bybit", "binance")):
+        _info["timeframes"] = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h"] + (["8h"] if _source.startswith("binance") else []) + ["12h", "1d"] + (["3d"] if _source.startswith("binance") else []) + ["1w"]
+
+
+for _source, _info in FREE_MARKETS.items():
+    if _source.startswith('okx_') and _source != 'okx_options':
+        _info['timeframes'] = ['1s'] + list(_info['timeframes'])
+    DATA_SOURCE_CONFIG["sources"][_source] = dict(_info, live="polling", symbols=[_info["seed"]] if _info["seed"] else [])
+for _source in ('bybit', 'bybit_spot', 'bybit_inverse', 'binance'):
+    DATA_SOURCE_CONFIG['sources'][_source]['timeframes'].insert(0, '1s')
+for _source, _info in DATA_SOURCE_CONFIG["sources"].items():
+    if "exchange" not in _info:
+        _info["exchange"] = "Binance" if _source.startswith("binance") else "Bybit" if _source.startswith("bybit") else "Hyperliquid" if _source == "hyperliquid" else "Yahoo Finance"
+        _info["marketType"] = "Stock" if _source == "yfinance" else "Spot" if _source in ("binance", "bybit_spot") else "Perpetual"
+
+
+def aggregate_chart_candles(rows, timeframe, base):
+    interval = interval_to_ms(timeframe) // 1000
+    step = interval_to_ms(base) // 1000
+    groups = {}
+    for row in sorted(rows, key=lambda item: item["time"]):
+        start = row["time"] // interval * interval
+        groups.setdefault(start, {})[row["time"]] = row
+    output = []
+    for start, members in sorted(groups.items()):
+        points = [members[key] for key in sorted(members)]
+        # Discard missing/partial historical buckets; allow the currently forming bar.
+        expected = min(interval // step, max(1, (int(time.time()) - start) // step + 1))
+        if points[0]["time"] != start or len(points) != expected or any(b["time"] - a["time"] != step for a, b in zip(points, points[1:])):
+            continue
+        output.append({"time": start, "open": points[0]["open"], "high": max(p["high"] for p in points),
+                       "low": min(p["low"] for p in points), "close": points[-1]["close"], "volume": sum(p.get("volume", 0) for p in points)})
+    return output
+
+
+def custom_chart_base(source, timeframe):
+    frames = DATA_SOURCE_CONFIG["sources"].get(source, {}).get("timeframes", [])
+    if timeframe == "2m" and timeframe not in frames and "1m" in frames:
+        return "1m"
+    if timeframe in ("6m", "12m"):
+        return "3m" if "3m" in frames else "1m" if "1m" in frames else None
+    return None
+
+
 def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, visible_charts: int | None = None, force_network: bool = False) -> dict:
     """Single public data entry point used by Flask.
 
     To add a broker later, implement a fetch function with this signature and
     register it in PROVIDERS plus DATA_SOURCE_CONFIG.
     """
+    if timeframe == '1s' and source in ('bybit','bybit_spot','bybit_inverse'):
+        from services.second_candles import fetch_recent_seconds
+        return fetch_recent_seconds(source, symbol, limit)
+    base = custom_chart_base(source, timeframe)
+    if base:
+        ratio = interval_to_ms(timeframe) // interval_to_ms(base)
+        payload = fetch_candles(source, symbol, base, min(50000, (int(limit) + 2) * ratio), visible_charts, force_network)
+        if source == "bybit" and payload.get("diagnostics", {}).get("degraded_to_stale_cache") and not force_network:
+            payload = fetch_candles(source, symbol, base, min(50000, (int(limit) + 2) * ratio), visible_charts, True)
+        return dict(payload, timeframe=timeframe, requested_limit=limit,
+                    candles=aggregate_chart_candles(payload["candles"], timeframe, base)[-int(limit):],
+                    diagnostics=dict(payload.get("diagnostics", {}), aggregatedFrom=base))
     provider = PROVIDERS.get(source)
     if provider is None:
         raise ValueError(f"Unknown data source: {source}")
@@ -172,7 +240,7 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, vi
         normalized_limit = adaptive_bybit_limit(normalized_limit, visible_charts)
         candles, diagnostics = fetch_bybit_candles_with_diagnostics(symbol, timeframe, normalized_limit, visible_charts, force_network=force_network)
     else:
-        normalized_limit = min(normalized_limit, 5000)
+        normalized_limit = min(normalized_limit, 50000)
         candles = provider(symbol, timeframe, normalized_limit)
     if not candles:
         raise RuntimeError(f"{DATA_SOURCE_CONFIG['sources'][source]['label']} returned no price data for {symbol} {timeframe}")
@@ -192,7 +260,14 @@ def fetch_historical_candles(source: str, symbol: str, timeframe: str, period: s
     Broker adapters should still return plain OHLCV dictionaries. yfinance can
     honor period directly; exchange websocket-style sources use the latest limit.
     """
-    if source == "yfinance":
+    if custom_chart_base(source, timeframe):
+        effective_period = period
+        effective_limit = historical_limit_for_period(period, timeframe, limit)
+        payload = fetch_candles(source, symbol, timeframe, effective_limit, visible_charts=1)
+        candles = payload["candles"]
+        diagnostics = historical_diagnostics(period, timeframe, limit, effective_limit, effective_limit, effective_limit, candles)
+        diagnostics.update(payload.get("diagnostics", {}))
+    elif source == "yfinance":
         effective_period = yfinance_backtest_period(timeframe)
         candles = fetch_yfinance_candles_for_period(symbol, timeframe, effective_period)
         diagnostics = historical_diagnostics(period, timeframe, limit, len(candles), len(candles), len(candles), candles)
@@ -239,7 +314,9 @@ def fetch_bybit_instruments(category: str = "linear") -> list[dict]:
     rows = []
     cursor = None
     for _page in range(20):
-        params = {"category": category, "limit": 1000}
+        params = {"category": category}
+        if category != "spot":
+            params["limit"] = 1000
         if cursor:
             params["cursor"] = cursor
         response = None
@@ -936,9 +1013,9 @@ def log_bybit_diagnostics(diagnostics: dict) -> None:
     )
 
 
-def fetch_hyperliquid_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
+def fetch_hyperliquid_candles(symbol: str, timeframe: str, limit: int, end_ms: int | None = None) -> list[dict]:
     interval_ms = interval_to_ms(timeframe)
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    end_ms = end_ms if end_ms is not None else int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - (interval_ms * (limit + 5))
 
     response = requests.post(
@@ -946,7 +1023,7 @@ def fetch_hyperliquid_candles(symbol: str, timeframe: str, limit: int) -> list[d
         json={
             "type": "candleSnapshot",
             "req": {
-                "coin": symbol.upper(),
+                "coin": symbol,
                 "interval": timeframe,
                 "startTime": start_ms,
                 "endTime": end_ms,
@@ -1018,6 +1095,8 @@ def fetch_yfinance_candles_for_period(symbol: str, timeframe: str, period: str) 
 def interval_to_ms(interval: str) -> int:
     amount = int(interval[:-1])
     unit = interval[-1]
+    if unit == 's':
+        return amount * 1000
     if unit == "m":
         return amount * 60_000
     if unit == "h":
@@ -1065,8 +1144,71 @@ def yfinance_backtest_period(interval: str) -> str:
     return mapping.get(interval, "60d")
 
 
+def fetch_closed_candles(source, symbol, timeframe, as_of, limit=500):
+    base = custom_chart_base(source, timeframe)
+    if base:
+        ratio = interval_to_ms(timeframe) // interval_to_ms(base)
+        rows = fetch_closed_candles(source, symbol, base, as_of, (limit + 2) * ratio)
+        return [row for row in aggregate_chart_candles(rows, timeframe, base) if row["time"] + interval_to_ms(timeframe) // 1000 <= int(as_of)][-limit:]
+    if source not in DATA_SOURCE_CONFIG["sources"]:
+        raise ValueError("Unknown data source")
+    if timeframe not in DATA_SOURCE_CONFIG["sources"][source]["timeframes"]:
+        raise ValueError("Timeframe unavailable for this source")
+    end_ms = int(as_of) * 1000 - 1
+    if source == "bybit":
+        rows = request_bybit_kline_batch(symbol.upper(), bybit_interval(timeframe), end_ms)
+        candles = bybit_rows_to_candles(rows)
+    elif source == "binance":
+        candles = fetch_binance_candles(symbol, timeframe, limit + 1, end_ms=end_ms)
+    elif source in MARKETS:
+        candles = fetch_exchange_candles(source, symbol, timeframe, limit + 1, end_ms=end_ms)
+    elif source in FREE_MARKETS:
+        candles = fetch_free_candles(source, symbol, timeframe, limit + 1, end_ms=end_ms)
+    elif source == "hyperliquid":
+        candles = fetch_hyperliquid_candles(symbol, timeframe, limit + 1, end_ms=end_ms)
+    else:
+        candles = fetch_yfinance_candles(symbol, timeframe, 5000)
+    interval = interval_to_ms(timeframe) // 1000
+    return [row for row in candles if row["time"] + interval <= int(as_of)][-limit:]
+
+
+def fetch_older_candles(source, symbol, timeframe, before, limit=1000):
+    if timeframe == '1s' and source in ('bybit','bybit_spot','bybit_inverse'):
+        return {'source':source, 'symbol':symbol, 'timeframe':timeframe, 'candles':[], 'diagnostics':{'liveOnly':True}}
+    base = custom_chart_base(source, timeframe)
+    if base:
+        boundary = int(before) // (interval_to_ms(timeframe) // 1000) * (interval_to_ms(timeframe) // 1000)
+        ratio = interval_to_ms(timeframe) // interval_to_ms(base)
+        payload = fetch_older_candles(source, symbol, base, boundary, min(5000, (int(limit) + 2) * ratio))
+        return dict(payload, timeframe=timeframe, candles=aggregate_chart_candles(payload["candles"], timeframe, base)[-int(limit):])
+    if source not in DATA_SOURCE_CONFIG["sources"] or timeframe not in DATA_SOURCE_CONFIG["sources"][source]["timeframes"]:
+        raise ValueError("Invalid source or timeframe")
+    before = int(before)
+    if before <= 0 or before > int(time.time()):
+        raise ValueError("Invalid history boundary")
+    limit = max(1, min(5000, int(limit)))
+    end_ms = before * 1000 - 1
+    if source == "bybit":
+        rows = bybit_rows_to_candles(request_bybit_kline_batch(symbol, bybit_interval(timeframe), end_ms))
+    elif source == "binance":
+        rows = fetch_binance_candles(symbol, timeframe, limit, end_ms=end_ms)
+    elif source in MARKETS:
+        rows = fetch_exchange_candles(source, symbol, timeframe, limit, end_ms=end_ms)
+    elif source in FREE_MARKETS:
+        rows = fetch_free_candles(source, symbol, timeframe, limit, end_ms=end_ms)
+    elif source == "hyperliquid":
+        rows = fetch_hyperliquid_candles(symbol, timeframe, limit, end_ms=end_ms)
+    else:
+        rows = [row for row in fetch_yfinance_candles(symbol, timeframe, 5000) if row["time"] < before]
+    return {"source": source, "symbol": symbol, "timeframe": timeframe,
+            "candles": [row for row in rows if row["time"] < before][-limit:], "diagnostics": {}}
+
+
 PROVIDERS: dict[str, Callable[[str, str, int], list[dict]]] = {
+    "binance": fetch_binance_candles,
     "bybit": fetch_bybit_candles,
     "hyperliquid": fetch_hyperliquid_candles,
     "yfinance": fetch_yfinance_candles,
 }
+PROVIDERS.update(EXTRA_PROVIDERS)
+PROVIDERS.update(FREE_PROVIDERS)

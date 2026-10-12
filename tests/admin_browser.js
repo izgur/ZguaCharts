@@ -1,0 +1,22 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const {chromium}=require('playwright');
+(async()=>{const browser=await chromium.launch({channel:'msedge',headless:true});try{
+ const page=await browser.newPage({viewport:{width:1500,height:950}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('http://127.0.0.1:5000/charts');await page.waitForFunction(()=>panes[0]?.historyLoaded);
+ await page.evaluate(async()=>{const p=panes[0];restoreIndicators(p,['rsi','macd']);await renderIndicators(p,p.requestId);});await page.waitForTimeout(400);
+ const widths=await page.evaluate(()=>{const p=panes[0];return [p.chart,...p.indicatorCharts.map(i=>i.chart)].map(c=>c.priceScale('right').width());});
+ assert.ok(widths[0]<85,JSON.stringify(widths));assert.ok(Math.max(...widths)-Math.min(...widths)<2,JSON.stringify(widths));
+ await page.screenshot({path:'reports/compact-price-axis-20261011.png'});
+ await page.locator('#donate-button').click();await page.getByText('Donation options are not configured yet.').waitFor();await page.getByRole('button',{name:'Close',exact:true}).click();
+ const member=await browser.newPage();await member.route('**/api/account/session',r=>r.fulfill({json:{user:{id:99998,name:'Member test',role:'member'},csrf:'test'}}));await member.goto('http://127.0.0.1:5000/charts');await member.waitForFunction(()=>panes[0]?.historyLoaded);assert.equal(await member.locator('.preset-select').first().isVisible(),false);
+ const admin=await browser.newPage({viewport:{width:1500,height:950}});admin.on('pageerror',e=>errors.push(e.message));
+ await admin.route('**/api/account/admin',r=>r.fulfill({contentType:'text/html',body:fs.readFileSync('templates/admin.html','utf8')}));
+ await admin.route('**/api/account/session',r=>r.fulfill({json:{user:{id:99999,name:'Admin test',role:'admin'},csrf:'test'}}));
+ await admin.route('**/api/account/admin/users',r=>r.fulfill({json:{users:[{id:1,name:'owner',first_name:'Test',last_name:'Owner',email:'owner@example.test',email_verified:1,role:'admin',disabled:0,twoFactorEnabled:1},{id:2,name:'member',email:'member@example.test',email_verified:1,role:'member',disabled:0,twoFactorEnabled:0}],audit:[]}}));
+ await admin.route('**/api/account/donation',r=>r.fulfill({json:{settings:{}}}));
+ await admin.goto('http://127.0.0.1:5000/api/account/admin');await admin.locator('#users-body tr').nth(1).waitFor();
+ assert.equal(await admin.getByLabel('Role for member').inputValue(),'member');await admin.getByLabel('Role for member').selectOption('tactics');await admin.locator('#users-body tr').nth(1).getByRole('button',{name:'Save'}).click();await admin.locator('#admin-confirm').waitFor();await admin.getByRole('button',{name:'Cancel',exact:true}).click();
+ await admin.screenshot({path:'reports/admin-desktop-20261011.png'});await admin.setViewportSize({width:390,height:844});await admin.screenshot({path:'reports/admin-mobile-20261011.png'});assert.equal(await admin.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+ assert.deepEqual(errors,[]);console.log('Compact aligned axes, donation panel, Member restrictions and responsive admin controls passed.');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});

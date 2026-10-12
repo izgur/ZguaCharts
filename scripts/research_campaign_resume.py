@@ -217,7 +217,7 @@ def run_job(args, state: dict, path: Path, job: dict) -> int:
 
     creationflags = 0
     if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
 
     saved_report = None
     with log_file.open("a", encoding="utf-8") as handle:

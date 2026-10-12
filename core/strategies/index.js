@@ -1,4 +1,5 @@
 const registry = {};
+registerStrategy({name:"ZGUA", label:"ZGUA", params:{minStudies:1, accountEquity:10000, feePct:0.055, slippagePct:0.02}, requiresIndicators:false});
 
 function registerStrategy(strategy) {
   if (!strategy || !strategy.name) throw new Error("Strategy requires a name");
@@ -78,6 +79,7 @@ registerStrategy({
   "BreakoutRetestV2",
   "RangeExpansionV2",
   "RelativeStrengthV2",
+  "RelativeStrengthFreshV3",
   "SimpleAtrTrendV2",
   "FibPullbackContinuationV1",
   "MtfPullback15mV1",

@@ -1,0 +1,27 @@
+const assert=require('node:assert/strict');
+const {chromium}=require('playwright');
+(async()=>{const browser=await chromium.launch({channel:'msedge',headless:true});try{
+ const page=await browser.newPage({viewport:{width:1600,height:1000}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.route('**/api/market/instruments?*',route=>route.fulfill({json:{instruments:['CCCUSDT','AAAUSDT','BBBUSDT'].map(symbol=>({source:'bybit',symbol,displaySymbol:symbol+'.P'}))}}));
+ await page.goto('http://127.0.0.1:5000/charts');await page.waitForFunction(()=>panes[0]?.historyLoaded&&ChartWatchlists.rows().length===3);
+ assert.equal(await page.locator('.timeframe-overflow:visible').count(),0);
+ for(const timeframe of ['2m','30m','2h'])assert.equal(await page.locator('.timeframe-shortcuts [data-timeframe="'+timeframe+'"]').count(),1);
+ assert.ok(await page.evaluate(()=>{const host=panes[0].node.querySelector('.pane-right');return host.querySelector('.tactic-visibility-button').nextElementSibling===panes[0].backtestButton&&headerSignalStrip.parentElement===host;}));
+ await page.evaluate(async()=>{const pane=panes[0];pane.presetSelect.value=config.chart_signal_strategies.find(row=>row.strategy==='SimpleAtrTrendV2').id;await refreshHeaderSignalStrip();});
+ const signalTitle=await page.locator('.header-signal-pill').first().getAttribute('title');assert.match(signalTitle,/SimpleAtrTrendV2/);assert.match(signalTitle,/NOT win probability/);
+ await page.evaluate(()=>{const pane=panes[0];restoreIndicators(pane,['rsi','volume']);startPane(pane);});
+ await page.waitForFunction(()=>panes[0].indicatorCharts.length===2);await page.waitForTimeout(500);
+ const alignment=await page.evaluate(()=>{const pane=panes[0], n=pane.candles.length;pane.chart.timeScale().setVisibleLogicalRange({from:n-180,to:n+10});syncIndicatorTimeRanges(pane);return pane.candles.slice(n-150,n-10).filter((_,i)=>i%20===0).map(row=>{const points=[{chart:pane.chart,host:pane.chartEl},...pane.indicatorCharts.map(study=>({chart:study.chart,host:study.element.querySelector('.indicator-chart')}))];return points.map(({chart,host})=>host.getBoundingClientRect().left+chart.timeScale().timeToCoordinate(row.time));});});
+ assert.ok(alignment.length>=5);for(const points of alignment)assert.ok(Math.max(...points)-Math.min(...points)<2,JSON.stringify(points));
+ await page.evaluate(()=>{watchlistQuotes.set('bybit:AAAUSDT',{price:200});watchlistQuotes.set('bybit:BBBUSDT',{price:300});watchlistQuotes.set('bybit:CCCUSDT',{price:100});renderWatchlist();});
+ await page.locator('[data-watch-sort="last"]').click();assert.deepEqual(await page.locator('#watchlist-content tbody tr').evaluateAll(rows=>rows.map(row=>row.dataset.watchId)),['bybit:CCCUSDT','bybit:AAAUSDT','bybit:BBBUSDT']);
+ await page.locator('[data-watch-sort="last"]').click();assert.equal(await page.locator('#watchlist-content tbody tr').first().getAttribute('data-watch-id'),'bybit:BBBUSDT');
+ const widths=await page.locator('#watchlist-tabs button').evaluateAll(buttons=>buttons.map(button=>button.getBoundingClientRect().width));assert.ok(Math.max(...widths)-Math.min(...widths)<1);
+ await page.evaluate(()=>ChartWatchlists.create('Blue','#53b5df'));
+ const thirds=await page.locator('#watchlist-tabs button').evaluateAll(buttons=>buttons.map(button=>button.getBoundingClientRect().width));assert.equal(thirds.length,3);assert.ok(Math.max(...thirds)-Math.min(...thirds)<1);
+ await page.locator('#watchlist-tabs [role="tab"]').first().click();
+ await page.evaluate(()=>{const table=document.createElement('table');table.id='sort-test';table.innerHTML='<thead><tr><th>Value</th></tr></thead><tbody><tr><td>20%</td></tr><tr><td>3%</td></tr><tr><td>-5%</td></tr></tbody>';document.body.append(table);});
+ await page.locator('#sort-test .table-sort-button').click();assert.deepEqual(await page.locator('#sort-test tbody td').allTextContents(),['-5%','3%','20%']);await page.locator('#sort-test').evaluate(table=>table.remove());
+ await page.screenshot({path:'reports/chart-header-alignment-20261006.png'});
+ assert.deepEqual(errors,[]);console.log('Direct timeframes, header order and explanations, seven-point study alignment, numeric sorting and equal tabs passed');
+ }finally{await browser.close();}})().catch(error=>{console.error(error);process.exitCode=1;});

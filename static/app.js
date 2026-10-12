@@ -1,8 +1,8 @@
-const STORAGE_KEY = "tvk-dashboard-state";
-const UI_PREF_KEY = "zgua-ui-preferences";
-const MANUAL_BACKTEST_COMPARISON_KEY = "zgua-manual-backtest-comparisons";
-const GOOD_PEOPLE_PRESETS_KEY = "zgua-good-people-presets";
-const DEFAULT_CHART_LAYOUT_KEY = "zgua-default-chart-layout-v2";
+let STORAGE_KEY = "tvk-dashboard-state";
+let UI_PREF_KEY = "zgua-ui-preferences";
+let MANUAL_BACKTEST_COMPARISON_KEY = "zgua-manual-backtest-comparisons";
+let GOOD_PEOPLE_PRESETS_KEY = "zgua-good-people-presets";
+let DEFAULT_CHART_LAYOUT_KEY = "zgua-default-chart-layout-v2";
 // Frontend boundary:
 // This file owns UI state, chart rendering, marker rendering, websocket candle
 // display, and API calls only. Indicator formulas, signal scoring, strategy
@@ -33,6 +33,7 @@ function timeframeMinutes(timeframe) {
   const value = Number(text.slice(0, -1));
   if (!Number.isFinite(value)) return null;
   if (text.endsWith("m")) return value;
+  if (text.endsWith("s")) return value / 60;
   if (text.endsWith("h")) return value * 60;
   if (text.endsWith("d")) return value * 1440;
   return null;
@@ -56,8 +57,6 @@ const watchlistContent = document.querySelector("#watchlist-content");
 const currentStrategyContent = document.querySelector("#current-strategy-content");
 const currentStrategyTitle = document.querySelector("#current-strategy-title");
 const watchlistAddCurrent = document.querySelector("#watchlist-add-current");
-const watchlistAddAll = document.querySelector("#watchlist-add-all");
-const watchlistSignalToggle = document.querySelector("#watchlist-signal-toggle");
 const watchlistSection = document.querySelector("#watchlist-section");
 const activeSignalsSection = document.querySelector("#active-signals-section");
 const bottomPanel = document.querySelector(".bottom-panel");
@@ -141,22 +140,29 @@ function loadState() {
 }
 
 function saveState() {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify({
-      count: Number(countSelect.value),
-      panes: panes.map((pane) => ({
+  const savedPanes = panes.map((pane) => ({
         source: pane.sourceSelect.value,
         symbol: pane.symbolSelect.value,
+        marketInstrument: pane.marketInstrument,
         timeframe: pane.timeframeSelect.value,
         preset: pane.presetSelect.value,
         signalStrategy: pane.presetSelect.value,
         indicators: selectedIndicators(pane),
         signalMarkers: pane.signalMarkerToggle.checked,
         logarithmicScale: pane.logarithmicScale,
-      })),
-    }),
-  );
+        chartStyle: pane.chartStyle,
+        indicatorHeights: pane.indicatorHeights,
+        indicatorSettings: pane.indicatorSettings,
+        hiddenIndicators: Array.from(pane.hiddenIndicators || []),
+        studyViewportHeight: pane.studyViewportHeight,
+      }));
+  state = {
+    ...state,
+    count: Number(countSelect.value),
+    panes: [...savedPanes, ...(state.panes || []).slice(savedPanes.length)],
+  };
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  if (typeof window !== "undefined") window.ChartAccounts?.changed();
 }
 
 function loadUiPrefs() {
@@ -166,9 +172,24 @@ function loadUiPrefs() {
     const savedWatchlist = Array.isArray(parsed.watchlist) && parsed.watchlist.length ? parsed.watchlist : ["BTCUSDT"];
     return {
       watchlist: Array.from(new Set(savedWatchlist.map((symbol) => watchlistAliases[symbol] || symbol))),
+      watchLists: parsed.watchLists,
+      watchListTab: parsed.watchListTab,
+      watchAllSource: parsed.watchAllSource,
       watchlistOpen: parsed.watchlistOpen !== false,
       activeSignalsOpen: parsed.activeSignalsOpen !== false,
       syncIndicators: parsed.syncIndicators !== false,
+      watchColumns: Array.isArray(parsed.watchColumns) ? parsed.watchColumns : ["last", "signal1h"],
+      tradeColumns: Array.isArray(parsed.tradeColumns) ? parsed.tradeColumns.filter(id => ['entryTime','exitTime','returnPct','priceMovePct','money','entryPrice','exitPrice'].includes(id)) : null,
+      watchSort: parsed.watchSort && ['symbol',...watchlistColumns().map(([id])=>id)].includes(parsed.watchSort.column) && [1,-1].includes(parsed.watchSort.direction) ? parsed.watchSort : null,
+      sidebarWidth: Number(parsed.sidebarWidth) || 230,
+      compactWatchlist: parsed.compactWatchlist === true,
+      uiFontSize: Math.max(10, Math.min(16, Number(parsed.uiFontSize) || 12)),
+      chartFontSize: Math.max(10, Math.min(18, Number(parsed.chartFontSize) || 12)),
+      detailFontSize: Math.max(8, Math.min(14, Number(parsed.detailFontSize) || 9)),
+      headerFontSize: Math.max(9, Math.min(16, Number(parsed.headerFontSize) || 11)),
+      watchFontSize: Math.max(9, Math.min(18, Number(parsed.watchFontSize) || 12)),
+      panelFontSize: Math.max(10, Math.min(18, Number(parsed.panelFontSize) || 12)),
+      tableFontSize: Math.max(9, Math.min(18, Number(parsed.tableFontSize) || 11)),
       campaignForm: parsed.campaignForm && typeof parsed.campaignForm === "object" ? parsed.campaignForm : {},
     };
   } catch {
@@ -178,7 +199,28 @@ function loadUiPrefs() {
 
 function saveUiPrefs() {
   localStorage.setItem(UI_PREF_KEY, JSON.stringify(uiPrefs));
+  if (typeof window !== "undefined") window.ChartAccounts?.changed();
 }
+
+const fontSettingFields = [
+  { key: "uiFontSize", label: "Interface", min: 10, max: 16, value: 12 },
+  { key: "chartFontSize", label: "Chart axes", min: 10, max: 18, value: 12 },
+  { key: "detailFontSize", label: "Indicator labels and footer", min: 8, max: 14, value: 9 },
+  { key: "headerFontSize", label: "Header", min: 9, max: 16, value: 11 },
+  { key: "watchFontSize", label: "Watchlist", min: 9, max: 18, value: 12 },
+  { key: "panelFontSize", label: "Dialogs and panels", min: 10, max: 18, value: 12 },
+  { key: "tableFontSize", label: "Backtest and data tables", min: 9, max: 18, value: 11 },
+];
+window.ChartTypography = {
+  fields: fontSettingFields,
+  get: (key) => uiPrefs[key] || fontSettingFields.find((field) => field.key === key)?.value,
+  set: (key, value) => {
+    const field = fontSettingFields.find((item) => item.key === key);
+    if (!field || !Number.isFinite(value)) return;
+    uiPrefs[key] = Math.max(field.min, Math.min(field.max, value)); applyFontSettings(); saveUiPrefs();
+  },
+  reset: () => { for (const field of fontSettingFields) uiPrefs[field.key] = field.value; applyFontSettings(); saveUiPrefs(); },
+};
 
 function hasElement(...elements) {
   return elements.every(Boolean);
@@ -195,7 +237,7 @@ async function apiGet(url) {
 async function apiPost(url, body) {
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": window.ChartAccounts?.csrfToken() || "" },
     body: JSON.stringify(body),
   });
   const contentType = response.headers.get("content-type") || "";
@@ -231,10 +273,26 @@ async function cachedStrategyBacktest(key, request) {
 }
 
 async function boot() {
+  await window.ChartAccounts?.ready;
+  if (window.ChartAccounts) {
+    STORAGE_KEY = window.ChartAccounts.key(STORAGE_KEY); UI_PREF_KEY = window.ChartAccounts.key(UI_PREF_KEY);
+    DEFAULT_CHART_LAYOUT_KEY = window.ChartAccounts.key(DEFAULT_CHART_LAYOUT_KEY);
+    MANUAL_BACKTEST_COMPARISON_KEY = window.ChartAccounts.key(MANUAL_BACKTEST_COMPARISON_KEY);
+    GOOD_PEOPLE_PRESETS_KEY = window.ChartAccounts.key(GOOD_PEOPLE_PRESETS_KEY);
+    state = loadState(); uiPrefs = loadUiPrefs(); manualBacktestComparisons = loadManualBacktestComparisons(); goodPeoplePresets = loadGoodPeoplePresets();
+  }
   await loadChartLibrary();
+  applyFontSettings();
 
   const response = await fetch("/api/config");
   config = await response.json();
+  if (!window.ChartAccounts?.canUseTactics()) config.chart_signal_strategies = [];
+  window.ChartCustomIndicators.configure({ candles: () => panes[0]?.candles || [], changed: refreshCustomIndicatorMenus });
+  config.indicators.push(...window.ChartCustomIndicators.list());
+  window.ChartCustomTactics.configure({options: customTacticOptions, changed: refreshCustomTactics});
+  mergeCustomTactics();
+  window.ChartWatchlists.configure({prefs:uiPrefs,config,save:saveUiPrefs,render:renderWatchlist,refresh:scheduleWatchlistRefresh,
+    status:(message)=>{document.querySelector('#watchlist-catalog-status').textContent=message;}});
 
   if (!hasElement(grid, countSelect, template, backtestModal, backtestClose, backtestContent)) {
     throw new Error("Dashboard HTML is incomplete. Please restart Flask and hard-refresh the page.");
@@ -341,6 +399,8 @@ async function boot() {
 }
 
 function setupNavigation() {
+  const slot = document.querySelector("#active-chart-toolbar");
+  if (slot) new ResizeObserver(() => positionActiveChartToolbar()).observe(slot);
   navLinks.forEach((link) => {
     link.addEventListener("click", (event) => {
       const page = link.dataset.route;
@@ -349,8 +409,28 @@ function setupNavigation() {
       const path = page === "charts" ? "/charts" : `/${page}`;
       history.pushState({}, "", path);
       showPage(page);
+      document.querySelector(".page-menu").open = false;
     });
   });
+}
+
+function positionActiveChartToolbar() {
+  const slot = document.querySelector("#active-chart-toolbar");
+  if (!slot) return;
+  const rect = slot.getBoundingClientRect();
+  document.documentElement.style.setProperty("--active-toolbar-left", rect.left + "px");
+  document.documentElement.style.setProperty("--active-toolbar-width", rect.width + "px");
+}
+
+function activateChartToolbar(pane) {
+  if (pane.node.classList.contains("active-chart")) return;
+  const right = pane.node.querySelector(".pane-right");
+  right.querySelector('.tactic-visibility-button').after(pane.backtestButton);
+  right.append(headerSignalStrip);
+  document.querySelectorAll("#chart-grid > .pane").forEach((node) => node.classList.toggle("active-chart", node === pane.node));
+  positionActiveChartToolbar();
+  renderWatchlist();
+  refreshHeaderSignalStrip();
 }
 
 function pathToPage(pathname) {
@@ -368,6 +448,12 @@ function pathToPage(pathname) {
 }
 
 function showPage(page) {
+  if (!window.ChartAccounts?.canUseTactics() && page !== 'charts') {
+    page = 'charts'; history.replaceState(null,'','/charts');
+  }
+  document.body.dataset.page = page;
+  const label = document.querySelector("#current-page-label");
+  if (label) label.textContent = navLinks.find((link) => link.dataset.route === page && link.closest(".app-nav"))?.textContent || "Charts";
   routePages.forEach((section) => {
     section.hidden = section.dataset.page !== page;
   });
@@ -1831,6 +1917,8 @@ function initChartsPage() {
 }
 
 function setupSidebar() {
+  setupSidebarResize();
+  setupWatchlistColumns();
   if (watchlistSection) {
     watchlistSection.open = uiPrefs.watchlistOpen;
     watchlistSection.addEventListener("toggle", () => {
@@ -1845,27 +1933,14 @@ function setupSidebar() {
       saveUiPrefs();
     });
   }
-  watchlistAddCurrent?.addEventListener("click", () => {
+  watchlistAddCurrent?.addEventListener("click", (event) => {
+    event.preventDefault(); event.stopPropagation();
     const symbol = panes[0]?.symbolSelect?.value || globalSymbolSelect?.value || "BTCUSDT";
     addToWatchlist(symbol);
   });
-  watchlistAddAll?.addEventListener("click", () => {
-    const symbols = config?.sources?.bybit?.symbols || [];
-    uiPrefs.watchlist = Array.from(new Set([...uiPrefs.watchlist, ...symbols]));
-    saveUiPrefs();
-    renderWatchlist();
-    refreshWatchlistData(true);
-  });
-  watchlistSignalToggle?.addEventListener("click", () => {
-    const pane = panes[0];
-    if (!pane) return;
-    pane.signalMarkerToggle.checked = !pane.signalMarkerToggle.checked;
-    if (globalSignalToggle) globalSignalToggle.checked = pane.signalMarkerToggle.checked;
-    updateChartMarkers(pane);
-    updateWatchlistSignalToggle();
-    saveState();
-  });
   renderWatchlist();
+  window.ChartWatchlists.load();
+  watchlistContent?.addEventListener('scroll',scheduleWatchlistRefresh,{passive:true});
   refreshWatchlistData(true);
 }
 
@@ -1881,7 +1956,7 @@ function setupChartsToolbar() {
     event.stopPropagation();
     globalIndicatorMenu.hidden = !globalIndicatorMenu.hidden;
   });
-  globalIndicatorList?.addEventListener("change", applyGlobalIndicatorControls);
+  globalIndicatorList?.addEventListener("change", (event) => { if (event.target.type === "checkbox") applyGlobalIndicatorControls(); });
   globalSignalToggle?.addEventListener("change", applyGlobalSignalToggle);
 }
 
@@ -1908,10 +1983,11 @@ function populateGlobalIndicatorMenu() {
     .map((indicator) => `
       <label class="indicator-option">
         <input type="checkbox" value="${indicator.id}">
-        <span>${indicator.label}</span>
+        <span>${escapeHtml(indicator.label)}</span>
       </label>
     `)
     .join("");
+  addIndicatorSearch(globalIndicatorList);
   restoreGlobalIndicators(state.panes?.[0]?.indicators || []);
   if (globalSignalToggle) globalSignalToggle.checked = state.panes?.[0]?.signalMarkers !== false;
   updateGlobalIndicatorButton();
@@ -2211,11 +2287,14 @@ function renderReplacementSuggestion(payload) {
   `;
 }
 
+let sidebarPaperRequestId = 0;
 async function refreshSidebarPaperStatus() {
   if (!activeSignalsList) return;
+  const requestId = ++sidebarPaperRequestId;
   try {
-    const response = await fetch("/api/paper/status");
+    const response = await fetch("/api/paper/status?summaryOnly=true");
     const payload = await response.json();
+    if (requestId !== sidebarPaperRequestId) return;
     if (!response.ok) throw new Error(payload.error || "Paper status failed");
     const positions = payload.openPositions || [];
     const openTradeHtml = positions.length
@@ -2236,79 +2315,169 @@ async function refreshSidebarPaperStatus() {
         </div>
       `
       : `<div class="open-trade-row muted-row">No open simulated trades.</div>`;
+    activeSignalsList.querySelectorAll(".open-trade-row").forEach((row) => row.remove());
     activeSignalsList.insertAdjacentHTML("beforeend", openTradeHtml);
   } catch (error) {
+    if (requestId !== sidebarPaperRequestId) return;
+    activeSignalsList.querySelectorAll(".open-trade-row").forEach((row) => row.remove());
     activeSignalsList.insertAdjacentHTML("beforeend", `<div class="open-trade-row muted-row">Paper status unavailable: ${escapeHtml(error.message)}</div>`);
   }
 }
 
 function addToWatchlist(symbol) {
   if (!symbol) return;
-  uiPrefs.watchlist = Array.from(new Set([...(uiPrefs.watchlist || []), symbol]));
-  saveUiPrefs();
-  renderWatchlist();
-  refreshWatchlistData(true);
+  const pane=panes[0];
+  window.ChartWatchlists.add(pane?.marketInstrument?.symbol===symbol?pane.marketInstrument:window.ChartWatchlists.record(symbol,pane?.sourceSelect.value||'bybit'));
 }
 
-function removeFromWatchlist(symbol) {
-  uiPrefs.watchlist = (uiPrefs.watchlist || []).filter((item) => item !== symbol);
-  if (!uiPrefs.watchlist.length) uiPrefs.watchlist = ["BTCUSDT"];
-  saveUiPrefs();
-  renderWatchlist();
+function setupSidebarResize() {
+  const workspace = document.querySelector(".charts-workspace"), sidebar = workspace?.querySelector(".right-sidebar");
+  if (!sidebar) return;
+  if (!uiPrefs.compactWatchlist) {
+    uiPrefs.sidebarWidth = Math.min(uiPrefs.sidebarWidth || 230, 380);
+    uiPrefs.compactWatchlist = true;
+    saveUiPrefs();
+  }
+  const handle = document.createElement("div"); handle.className = "sidebar-resize-handle";
+  handle.tabIndex = 0; handle.setAttribute("role", "separator"); handle.setAttribute("aria-label", "Resize right sidebar");
+  handle.setAttribute("aria-orientation", "vertical"); handle.setAttribute("aria-valuemin", "200");
+  handle.title = "Resize sidebar"; workspace.insertBefore(handle, sidebar);
+  const apply = (value) => {
+    const width = window.ChartPresentation.sidebarWidth(value, workspace.clientWidth);
+    workspace.style.setProperty("--sidebar-width", width + "px");
+    handle.setAttribute("aria-valuenow", String(width)); handle.setAttribute("aria-valuemax", String(Math.max(200, Math.min(720, workspace.clientWidth - 320))));
+    return width;
+  };
+  apply(uiPrefs.sidebarWidth || 230);
+  let drag = null;
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0) return; e.preventDefault();
+    drag = { x: e.clientX, width: Number(handle.getAttribute("aria-valuenow")), pointer: e.pointerId };
+    handle.setPointerCapture(e.pointerId); document.body.classList.add("resizing-sidebar");
+  });
+  handle.addEventListener("pointermove", (e) => { if (drag) apply(drag.width + drag.x - e.clientX); });
+  const finish = (e) => {
+    if (!drag) return;
+    uiPrefs.sidebarWidth = Number(handle.getAttribute("aria-valuenow")); saveUiPrefs(); drag = null;
+    if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId);
+    document.body.classList.remove("resizing-sidebar");
+  };
+  handle.addEventListener("pointerup", finish); handle.addEventListener("pointercancel", finish);
+  handle.addEventListener("keydown", (e) => {
+    if (!["ArrowLeft", "ArrowRight", "Home"].includes(e.key)) return; e.preventDefault();
+    uiPrefs.sidebarWidth = apply(e.key === "Home" ? 230 : Number(handle.getAttribute("aria-valuenow")) + (e.key === "ArrowLeft" ? 20 : -20)); saveUiPrefs();
+  });
+  window.addEventListener("resize", () => apply(uiPrefs.sidebarWidth || 230));
+}
+
+function watchlistColumns() {
+  return [
+    ["last", "Last"], ["change24h", "Change 1d"], ["percent24h", "%1d"],
+    ["change1h", "Change 1h"], ["percent1h", "%1h"], ["volume", "Volume 1d"],
+    ["signal4h", "S4h"], ["signal1h", "S1h"], ["signal15m", "S15m"],
+  ];
+}
+
+function setupWatchlistColumns() {
+  const settings=document.querySelector('#watchlist-column-settings'); if(!settings)return;
+  const chosen=uiPrefs.watchColumns||['last','signal1h'];
+  settings.innerHTML=watchlistColumns().map(([id,label])=>`<label><input type="checkbox" value="${id}" ${chosen.includes(id)?'checked':''}><span>${label}</span></label>`).join('')+
+    '<hr><label>All exchange / market<select class="watch-all-source" aria-label="All watchlist exchange"></select></label><hr><button class="watch-new-list" type="button"><i data-lucide="plus"></i>Add new list</button><form class="watch-new-list-form" hidden><label>Name<input name="name" maxlength="24" required aria-label="List name"></label><div class="watch-colour-control"><span>Colour</span><input name="color" type="color" value="#53b5df" aria-label="List colour"></div><span role="status"></span><button type="submit">Create</button><button type="button" class="watch-list-cancel">Cancel</button></form>';
+  const source=settings.querySelector('select');
+  for(const [id,info]of Object.entries(config.sources)){const option=new Option(info.label,id);option.selected=id===window.ChartWatchlists.source;source.add(option);}
+  source.onchange=()=>{watchlistContent.scrollTop=0;window.ChartWatchlists.setSource(source.value);};
+  settings.querySelectorAll('input[type="checkbox"]').forEach(input=>input.onchange=()=>{uiPrefs.watchColumns=Array.from(settings.querySelectorAll('input[type="checkbox"]:checked'),input=>input.value);saveUiPrefs();renderWatchlist();refreshWatchlistData(true);});
+  const form=settings.querySelector('form'), add=settings.querySelector('.watch-new-list');
+  add.onclick=()=>{form.hidden=false;form.elements.name.focus();};
+  settings.querySelector('.watch-list-cancel').onclick=()=>{form.hidden=true;};
+  form.onsubmit=event=>{event.preventDefault();try{window.ChartWatchlists.create(form.elements.name.value,form.elements.color.value);form.reset();form.hidden=true;add.disabled=window.ChartWatchlists.lists().length>=5;}catch(error){form.querySelector('[role="status"]').textContent=error.message;}};
+  add.disabled=window.ChartWatchlists.lists().length>=5;
+  window.lucide?.createIcons({root:settings});
+}
+
+function compactWatchPrice(value) {
+  if(!Number.isFinite(value))return '-';
+  const text=Number(value.toPrecision(6)).toString();
+  return text.length<=7?text:value.toExponential(2).replace('e+','e');
+}
+
+function watchlistCell(quote, column) {
+  if (column.startsWith("signal")) {
+    const signal = quote?.signals?.[column.slice(6)];
+    return `<td class="watch-score ${escapeHtml(signal?.tone || "neutral")}" title="${escapeHtml(signal?.direction || "Awaiting signal")}">${escapeHtml(String(signal?.score ?? "-"))}</td>`;
+  }
+  if (column === "last") return `<td class="watch-last" title="${escapeHtml(String(quote?.price??'-'))}">${compactWatchPrice(quote?.price)}</td>`;
+  if (column === "volume") return `<td title="${escapeHtml(String(quote?.volume24h??'-'))}">${Number.isFinite(quote?.volume24h) ? new Intl.NumberFormat('en',{notation:'compact',maximumFractionDigits:1}).format(quote.volume24h) : '-'}</td>`;
+  const percent = column.startsWith("percent"), timeframe = column.endsWith("24h") ? "24h" : "1h";
+  const value = quote?.["change" + timeframe]?.[percent ? "percent" : "value"];
+  return `<td title="${escapeHtml(String(value??'-'))}" class="${Number.isFinite(value) ? value >= 0 ? "positive" : "negative" : ""}">${Number.isFinite(value) ? (percent?value.toFixed(Math.abs(value)>=100?0:2)+'%':compactWatchPrice(value)) : '-'}</td>`;
+}
+
+function sortedWatchlistRows() {
+  const rows=[...window.ChartWatchlists.rows()], sort=uiPrefs.watchSort;
+  if(!sort)return rows;
+  const value=row=>{const quote=watchlistQuotes.get(window.ChartWatchlists.id(row));if(sort.column==='symbol')return row.displaySymbol||row.symbol;if(sort.column==='last')return quote?.price??null;if(sort.column==='volume')return quote?.volume24h??null;if(sort.column.startsWith('signal'))return quote?.signals?.[sort.column.slice(6)]?.score??null;const period=sort.column.endsWith('24h')?'24h':'1h';return quote?.['change'+period]?.[sort.column.startsWith('percent')?'percent':'value']??null;};
+  return rows.sort((a,b)=>window.ChartTableSorting.compare(value(a),value(b),sort.direction===-1?-1:1));
+}
+
+function watchSortHeading(id,label) {
+  const active=uiPrefs.watchSort?.column===id, direction=uiPrefs.watchSort?.direction;
+  return `<th class="${id==='symbol'?'watch-symbol-heading':''}" data-column="${id}" ${active?'aria-sort="'+(direction===-1?'descending':'ascending')+'"':''}><button class="table-sort-button" type="button" data-watch-sort="${id}" title="Sort ${escapeHtml(label)} ascending / descending">${escapeHtml(label)}</button></th>`;
 }
 
 function renderWatchlist() {
-  if (!watchlistContent) return;
-  const symbols = uiPrefs.watchlist?.length ? uiPrefs.watchlist : ["BTCUSDT"];
-  const activeSymbol = panes[0]?.symbolSelect?.value || "";
-  watchlistContent.innerHTML = `
-    <table class="watchlist-table compact-table">
-      <thead><tr><th></th><th>Symbol</th><th>Price</th><th>Signal</th></tr></thead>
-      <tbody>${symbols.map((symbol) => {
-        const quote = watchlistQuotes.get(symbol);
-        const price = quote?.price ? formatPrice(Number(quote.price)) : "-";
-        const signalClass = quote?.tone || "neutral";
-        const signal = quote?.score ?? "-";
-        return `
-          <tr class="${symbol === activeSymbol ? "active-watch-symbol" : ""}">
-            <td><button class="star-button active" type="button" data-remove-watch="${escapeHtml(symbol)}" title="Remove from watchlist">★</button></td>
-            <td><button class="link-button watch-symbol-button" type="button" data-watch-symbol="${escapeHtml(symbol)}">${escapeHtml(symbol)}</button></td>
-            <td>${price}</td>
-            <td class="${signalClass} watch-score">${signal}</td>
-          </tr>
-        `;
-      }).join("")}</tbody>
-    </table>
-    <p class="sidebar-help">Use ★ Add current or Add all to fill this list.</p>
-  `;
-  watchlistContent.querySelectorAll("[data-remove-watch]").forEach((button) => {
-    button.addEventListener("click", () => removeFromWatchlist(button.dataset.removeWatch));
-  });
-  watchlistContent.querySelectorAll("[data-watch-symbol]").forEach((button) => {
-    button.addEventListener("click", () => setPrimaryChartSymbol(button.dataset.watchSymbol));
-  });
-  if (currentStrategyContent) {
-    currentStrategyContent.innerHTML = renderCurrentStrategySummary();
-    bindCurrentStrategyTrades();
-  }
+  if(!watchlistContent||!window.ChartWatchlists)return;
+  const sidebar=document.querySelector('.right-sidebar'), sidebarTop=sidebar?.scrollTop||0, top=watchlistContent.scrollTop,left=watchlistContent.scrollLeft;
+  const model=window.ChartWatchlists, rows=sortedWatchlistRows(), columns=watchlistColumns().filter(([id])=>(uiPrefs.watchColumns||['last','signal1h']).includes(id));
+  model.tabs(document.querySelector('#watchlist-tabs'));
+  const active=panes[0]?.sourceSelect.value+':'+panes[0]?.symbolSelect.value;
+  watchlistContent.innerHTML=`<table class="watchlist-table compact-table"><thead><tr><th class="watch-stars-heading"></th>${watchSortHeading('symbol','Symbol')}${columns.map(([id,label])=>watchSortHeading(id,label)).join('')}</tr></thead><tbody>${rows.map(row=>`<tr data-watch-id="${escapeHtml(model.id(row))}" class="${model.id(row)===active?'active-watch-symbol':''}"><td class="watch-stars">${model.lists().map(list=>`<button class="star-button" type="button" data-watch-list="${list.id}" aria-pressed="${list.members.some(member=>model.id(member)===model.id(row))}" style="--star-color:${list.color}" title="${escapeHtml(list.name)}" aria-label="${escapeHtml(list.name+': '+row.symbol)}">★</button>`).join('')}</td><td class="watch-symbol-cell"><button class="link-button watch-symbol-button" type="button" title="${escapeHtml((row.displaySymbol||row.symbol)+' · '+(config.sources[row.source]?.label||row.source))}" data-watch-symbol="${escapeHtml(row.symbol)}">${escapeHtml(row.displaySymbol||row.symbol)}</button></td>${columns.map(([id])=>watchlistCell(watchlistQuotes.get(model.id(row)),id)).join('')}</tr>`).join('')}</tbody></table>${!rows.length?'<p class="watchlist-empty">No symbols in this list</p>':''}`;
+  watchlistContent.onclick=event=>{const sort=event.target.closest('[data-watch-sort]');if(sort){const column=sort.dataset.watchSort;uiPrefs.watchSort={column,direction:uiPrefs.watchSort?.column===column&&uiPrefs.watchSort.direction===1?-1:1};saveUiPrefs();renderWatchlist();scheduleWatchlistRefresh();return;}const tr=event.target.closest('[data-watch-id]');if(!tr)return;const row=model.rows().find(row=>model.id(row)===tr.dataset.watchId);if(!row)return;const star=event.target.closest('[data-watch-list]');if(star){model.toggle(star.dataset.watchList,row);return;}if(event.target.closest('[data-watch-symbol]'))selectWatchMarket(row);};
+  if(currentStrategyContent&&window.ChartPresentation.replacePreservingScroll(currentStrategyContent,renderCurrentStrategySummary()))bindCurrentStrategyTrades();
+  watchlistContent.scrollTop=top;watchlistContent.scrollLeft=left;if(sidebar)sidebar.scrollTop=sidebarTop;
   updateWatchlistSignalToggle();
 }
 
+function selectWatchMarket(record) {
+  const pane=panes[0], source=config.sources[record.source];if(!pane||!source)return;
+  if(!source.symbols.includes(record.symbol))source.symbols.push(record.symbol);
+  const timeframe=pane.timeframeSelect.value;pane.sourceSelect.value=record.source;pane.marketInstrument=record;
+  populateSymbolAndTimeframe(pane,{symbol:record.symbol,timeframe});pane.historicalSignalRequest=(pane.historicalSignalRequest||0)+1;
+  pane.node.querySelector('.historical-signals')?.remove();syncChartsToolbarFromPane(pane);startPane(pane);saveState();renderWatchlist();
+}
+
+function watchVisibleRows() {
+  const rows=window.ChartWatchlists.rows(), bounds=watchlistContent.getBoundingClientRect();
+  const visible=new Set(Array.from(watchlistContent.querySelectorAll('tbody tr')).filter(tr=>{const box=tr.getBoundingClientRect();return box.bottom>=bounds.top-40&&box.top<=bounds.bottom+40;}).map(tr=>tr.dataset.watchId));
+  return rows.filter(row=>visible.has(window.ChartWatchlists.id(row))).slice(0,30);
+}
+
+function watchlistRequestKey() {return JSON.stringify([window.ChartWatchlists.source,window.ChartWatchlists.tab,uiPrefs.watchColumns||['last','signal1h'],watchVisibleRows().map(row=>window.ChartWatchlists.id(row))]);}
+
+function updateWatchQuoteRow(record) {
+  const tr=watchlistContent.querySelector('[data-watch-id="'+CSS.escape(window.ChartWatchlists.id(record))+'"]');if(!tr)return;
+  const columns=watchlistColumns().filter(([id])=>(uiPrefs.watchColumns||['last','signal1h']).includes(id));
+  while(tr.children.length>2)tr.lastElementChild.remove();
+  tr.insertAdjacentHTML('beforeend',columns.map(([id])=>watchlistCell(watchlistQuotes.get(window.ChartWatchlists.id(record)),id)).join(''));
+}
+
 function updateWatchlistSignalToggle() {
-  if (!watchlistSignalToggle) return;
-  const pane = panes[0];
-  const preset = (config.chart_signal_strategies || []).find((item) => item.id === pane?.presetSelect?.value);
-  const fullName = preset?.label || (pane?.presetSelect?.value === "none" ? "None" : "Signal");
-  const shortName = fullName.slice(0, 5);
-  const visible = pane?.signalMarkerToggle?.checked !== false;
-  watchlistSignalToggle.textContent = shortName;
-  watchlistSignalToggle.classList.toggle("is-off", !visible);
-  watchlistSignalToggle.setAttribute("aria-pressed", String(visible));
-  watchlistSignalToggle.title = `${visible ? "Hide" : "Show"} ${fullName} chart signals`;
+  for(const pane of panes){const button=pane.node.querySelector('.tactic-visibility-button');if(!button)continue;
+    const visible=pane.signalMarkerToggle?.checked!==false;
+    button.innerHTML='<i data-lucide="'+(visible?'eye':'eye-off')+'"></i>';
+    button.setAttribute('aria-pressed',String(visible));button.title=(visible?'Hide':'Show')+' tactic signals';button.setAttribute('aria-label',button.title);
+    window.lucide?.createIcons({root:button});
+  }
+}
+
+function compactTradeDate(value) {
+  const time=normalizeMarkerTime(value);if(time===null)return '-';
+  const date=new Date(time*1000);
+  return `<span class="trade-date">${escapeHtml(date.toLocaleDateString(undefined,{day:'2-digit',month:'2-digit'}))}</span><span class="trade-time">${escapeHtml(date.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit',hour12:false}))}</span>`;
 }
 
 function renderCurrentStrategySummary() {
-  const pane = panes[0];
+  const pane = panes.find((item) => item.node.classList.contains("active-chart")) || panes[0];
   const summary = pane?.strategySummary;
   if (currentStrategyTitle) {
     currentStrategyTitle.textContent = summary?.strategy || "Current Strategy";
@@ -2337,11 +2506,20 @@ function renderCurrentStrategySummary() {
     `;
   }
   const returnPct = Number(summary.totalReturnPct || 0);
+  let referenceReturn = 0;
+  const referenceBalances = (summary.trades || []).map(trade => {
+    referenceReturn += Number(trade.returnPct) || 0;
+    return 1000 * (1 + referenceReturn / 100);
+  });
   const tradeRows = (summary.trades || []).map((trade, index) => `
-    <tr class="strategy-trade-row" data-strategy-trade-index="${index}" tabindex="0" title="Zoom chart to this trade">
-      <td>${escapeHtml(formatCompactDateTime(trade.entryTime))}</td>
-      <td>${escapeHtml(formatCompactDateTime(trade.exitTime))}</td>
-      <td class="${Number(trade.returnPct) >= 0 ? "positive" : "negative"}" title="Risk-sized account return; underlying price move ${formatSigned(trade.priceMovePct)}%">${formatSigned(trade.returnPct)}%</td>
+    <tr class="strategy-trade-row ${Number(trade.returnPct) >= 0 ? 'trade-gain' : 'trade-loss'}" data-strategy-trade-index="${index}" tabindex="0" title="Zoom chart to this trade">
+      <td data-trade-column="entryTime" title="${escapeHtml(formatCompactDateTime(trade.entryTime))}">${compactTradeDate(trade.entryTime)}</td>
+      <td data-trade-column="exitTime" title="${escapeHtml(formatCompactDateTime(trade.exitTime))}">${compactTradeDate(trade.exitTime)}</td>
+      <td data-trade-column="returnPct" class="${Number(trade.returnPct) >= 0 ? "positive" : "negative"}" title="Risk-sized account return; underlying price move ${formatSigned(trade.priceMovePct)}%">${formatSigned(trade.returnPct)}%</td>
+      <td data-trade-column="priceMovePct" class="${Number(trade.priceMovePct) >= 0 ? "positive" : "negative"}" title="Underlying price change, without account sizing">${formatSigned(trade.priceMovePct)}%</td>
+      <td data-trade-column="money" title="Reference balance after this trade, initial EUR 1,000; not currency conversion">${formatNumber(referenceBalances[index], 2)}€</td>
+      <td data-trade-column="entryPrice" title="${escapeHtml(String(trade.entryPrice ?? 'Unavailable'))}">${Number.isFinite(trade.entryPrice) ? compactWatchPrice(trade.entryPrice) : '-'}</td>
+      <td data-trade-column="exitPrice" title="${escapeHtml(String(trade.exitPrice ?? 'Unavailable'))}">${Number.isFinite(trade.exitPrice) ? compactWatchPrice(trade.exitPrice) : '-'}</td>
     </tr>
   `).join("");
   return `
@@ -2353,15 +2531,17 @@ function renderCurrentStrategySummary() {
       <div class="watch-strategy-metrics">
         <span><small>TRADES</small><strong>${summary.completedTrades}</strong></span>
         <span><small>WIN</small><strong>${formatNumber(summary.winRate, 1)}%</strong></span>
-        <span title="Compounded, risk-sized account return"><small>ACCT RETURN</small><strong class="${returnPct >= 0 ? "positive" : "negative"}">${formatSigned(returnPct)}%</strong></span>
+        <span title="Realized net P&L / initial account equity; position size evolves with equity"><small>ACCT %</small><strong class="${returnPct >= 0 ? "positive" : "negative"}">${formatSigned(returnPct)}%</strong></span>
         <span><small>SPAN</small><strong>${summary.tradingDays}d</strong></span>
+        <span title="Ending reference balance ${formatNumber(1000*(1+returnPct/100), 2)} EUR from initial EUR 1,000; realized trades only, not currency conversion"><small>1000€</small><strong>${formatNumber(1000*(1+returnPct/100), 0)}€</strong></span>
       </div>
       <p class="strategy-history-range" title="${escapeHtml(summary.historyLabel)}">${escapeHtml(summary.historyLabel)}</p>
       <p class="strategy-watcher-status">${escapeHtml(summary.executionTimeframe)} watcher · checked ${escapeHtml(formatClockTime(summary.checkedAt))}</p>
+      <p class="strategy-cost-status" title="Costs per side; chart preview excludes open trades">Closed trades · fee ${formatNumber(summary.feePct || 0, 3)}% / slip ${formatNumber(summary.slippagePct || 0, 2)}%</p>
       <div class="watch-strategy-trades">
         <table class="compact-table">
-          <thead><tr><th>Buy</th><th>Exit</th><th title="Risk-sized account return">Acct.</th></tr></thead>
-          <tbody>${tradeRows || `<tr><td colspan="3">No completed trades.</td></tr>`}</tbody>
+          <thead><tr><th data-trade-column="entryTime">Buy</th><th data-trade-column="exitTime">Exit</th><th data-trade-column="returnPct" title="Net P&L divided by initial account equity">Acct. %</th><th data-trade-column="priceMovePct">Price %</th><th data-trade-column="money" title="Balance after trade, initial EUR 1,000">1000€</th><th data-trade-column="entryPrice">Entry px</th><th data-trade-column="exitPrice">Exit px</th></tr></thead>
+          <tbody>${tradeRows || `<tr><td colspan="7">No completed trades.</td></tr>`}</tbody>
         </table>
       </div>
     </section>
@@ -2381,7 +2561,7 @@ function bindCurrentStrategyTrades() {
 }
 
 function zoomToStrategyTrade(index, row) {
-  const pane = panes[0];
+  const pane = panes.find((item) => item.node.classList.contains("active-chart")) || panes[0];
   const trade = pane?.strategySummary?.trades?.[index];
   const entryTime = normalizeMarkerTime(trade?.entryTime);
   const exitTime = normalizeMarkerTime(trade?.exitTime);
@@ -2396,9 +2576,9 @@ function zoomToStrategyTrade(index, row) {
 }
 
 function timeframeSeconds(timeframe) {
-  const match = String(timeframe || "").toLowerCase().match(/^(\d+)(m|h|d|w)$/);
+  const match = String(timeframe || "").toLowerCase().match(/^(\d+)(s|m|h|d|w)$/);
   if (!match) return 3600;
-  return Number(match[1]) * ({ m: 60, h: 3600, d: 86400, w: 604800 }[match[2]] || 3600);
+  return Number(match[1]) * ({ s:1, m: 60, h: 3600, d: 86400, w: 604800 }[match[2]] || 3600);
 }
 
 function scheduleWatchlistRefresh() {
@@ -2407,41 +2587,24 @@ function scheduleWatchlistRefresh() {
 }
 
 async function refreshWatchlistData(force = false) {
-  if (!watchlistContent || watchlistRefreshInFlight) return;
-  const symbols = uiPrefs.watchlist?.length ? uiPrefs.watchlist : ["BTCUSDT"];
-  const activeSource = panes[0]?.sourceSelect?.value || "bybit";
-  const activeTimeframe = panes[0]?.timeframeSelect?.value || "1h";
-  const now = Date.now();
-  const staleSymbols = symbols.filter((symbol) => force || !watchlistQuotes.get(symbol) || now - watchlistQuotes.get(symbol).updatedAt > WATCHLIST_REFRESH_MS);
-  if (!staleSymbols.length) return;
-  watchlistRefreshInFlight = true;
-  try {
-    for (const symbol of staleSymbols) {
-      try {
-        const source = sourceForWatchSymbol(symbol, activeSource);
-        const timeframe = timeframeForWatchSymbol(source, activeTimeframe);
-        const [candlesPayload, signalPayload] = await Promise.all([
-          apiGet(`/api/candles?${new URLSearchParams({ source, symbol, timeframe, limit: "50", visible_charts: String(visibleChartCount()) })}`),
-          apiGet(`/api/signals?${new URLSearchParams({ source, symbol, timeframe, limit: "300", include_timeframes: "false" })}`),
-        ]);
-        const candle = candlesPayload.candles?.[candlesPayload.candles.length - 1];
-        watchlistQuotes.set(symbol, {
-          price: candle?.close,
-          score: signalPayload.score,
-          tone: signalPayload.tone || "neutral",
-          direction: signalPayload.signalDirection || "NEUTRAL",
-          updatedAt: Date.now(),
-        });
-        renderWatchlist();
-      } catch (error) {
-        const prior = watchlistQuotes.get(symbol) || {};
-        watchlistQuotes.set(symbol, { ...prior, score: "ERR", tone: "neutral", updatedAt: Date.now() });
+  if(!watchlistContent||watchlistRefreshInFlight||!window.ChartWatchlists||!watchlistSection?.open)return;
+  const rows=watchVisibleRows(), chosen=[...(uiPrefs.watchColumns||['last','signal1h'])], requestKey=watchlistRequestKey(), now=Date.now();
+  const dataKey=JSON.stringify(chosen);
+  const stale=rows.filter(row=>force||watchlistQuotes.get(window.ChartWatchlists.id(row))?.requestKey!==dataKey||now-(watchlistQuotes.get(window.ChartWatchlists.id(row))?.researchUpdatedAt||0)>WATCHLIST_REFRESH_MS);
+  if(!stale.length)return;watchlistRefreshInFlight=true;
+  try {for(const record of stale){if(requestKey!==watchlistRequestKey())break;const {source,symbol}=record,key=window.ChartWatchlists.id(record);
+    try {const timeframe=timeframeForWatchSymbol(source,'1h');
+      const payload=await apiGet('/api/candles?'+new URLSearchParams({source,symbol,timeframe,limit:'60',visible_charts:String(visibleChartCount())}));
+      const signals={};
+      for(const interval of ['4h','1h','15m'].filter(value=>chosen.includes('signal'+value))){if(requestKey!==watchlistRequestKey())break;if(!config.sources[source]?.timeframes.includes(interval))continue;
+        try{const signal=await apiGet('/api/signals?'+new URLSearchParams({source,symbol,timeframe:interval,limit:'300',include_timeframes:'false'}));signals[interval]={score:signal.score,tone:signal.tone||'neutral',direction:signal.signalDirection||'NEUTRAL'};}catch{signals[interval]={score:'ERR',tone:'neutral',direction:'Signal unavailable'};}
       }
-    }
-  } finally {
-    watchlistRefreshInFlight = false;
-    renderWatchlist();
-  }
+      if(requestKey!==watchlistRequestKey())break;
+      const candles=payload.candles||[],metrics=window.ChartPresentation.changes(candles),last=candles.at(-1),volume=candles.filter(row=>row.time>(last?.time||0)-86400);
+      watchlistQuotes.set(key,{...watchlistQuotes.get(key),...metrics,signals,volume24h:metrics.change24h&&volume.every(row=>Number.isFinite(row.volume))?volume.reduce((sum,row)=>sum+row.volume,0):null,requestKey:dataKey,researchUpdatedAt:Date.now(),updatedAt:Date.now()});
+      updateWatchQuoteRow(record);
+    }catch(error){watchlistQuotes.set(key,{...watchlistQuotes.get(key),signals:Object.fromEntries(chosen.filter(id=>id.startsWith('signal')).map(id=>[id.slice(6),{score:'ERR',tone:'neutral',direction:'Signal unavailable'}])),requestKey:dataKey,researchUpdatedAt:Date.now()});updateWatchQuoteRow(record);}
+  }}finally{watchlistRefreshInFlight=false;if(requestKey!==watchlistRequestKey())scheduleWatchlistRefresh();}
 }
 
 function sourceForWatchSymbol(symbol, preferredSource) {
@@ -2506,6 +2669,7 @@ function loadScriptWithTimeout(src, timeoutMs) {
 }
 
 function renderPanes(count) {
+  document.querySelector(".topbar").append(headerSignalStrip);
   cleanupPanes();
   grid.className = `chart-grid layout-${count}`;
   grid.innerHTML = "";
@@ -2523,11 +2687,22 @@ function renderPanes(count) {
 
 function cleanupPanes() {
   panes.forEach((pane) => {
+    pane.disposed = true;
+    if (pane.indicatorList?.indicatorFavouriteListener) window.removeEventListener("indicator-favourites-changed", pane.indicatorList.indicatorFavouriteListener);
+    pane.requestId += 1;
+    pane.indicatorRequestId += 1;
+    pane.strategyRequestId += 1;
     if (pane.ws) pane.ws.close();
     if (pane.pollTimer) clearInterval(pane.pollTimer);
     if (pane.strategyPollTimer) clearTimeout(pane.strategyPollTimer);
     if (pane.resizeObserver) pane.resizeObserver.disconnect();
+    pane.drawingTools?.destroy();
+    pane.cleanupWorkspace?.();
+    pane.cleanupPresentation?.();
     cancelPaneRangeSync(pane);
+  });
+  // Stop all callbacks before disposing charts; drawings sync across panes.
+  panes.forEach((pane) => {
     clearIndicatorSeries(pane);
     if (pane.chart) pane.chart.remove();
   });
@@ -2537,6 +2712,7 @@ function createPane(node, index) {
   const pane = {
     node,
     index,
+    disposed: false,
     sourceSelect: node.querySelector(".source-select"),
     symbolSelect: node.querySelector(".symbol-select"),
     timeframeSelect: node.querySelector(".timeframe-select"),
@@ -2589,7 +2765,12 @@ function createPane(node, index) {
   };
   pane.dataDiagnosticsEl = document.createElement("div");
   pane.dataDiagnosticsEl.className = "data-diagnostics";
-  pane.status.after(pane.dataDiagnosticsEl);
+  pane.status.replaceWith(pane.dataDiagnosticsEl);
+  pane.dataDiagnosticsEl.append(pane.status);
+  pane.status.classList.add("chart-feed-status");
+  node.addEventListener("pointerdown", () => activateChartToolbar(pane));
+  node.querySelector(".chart-context").addEventListener("click", () => activateChartToolbar(pane));
+  if (index === 0) activateChartToolbar(pane);
 
   setupChart(pane);
   populateSourceSelect(pane);
@@ -2597,24 +2778,73 @@ function createPane(node, index) {
   populateIndicatorMenu(pane);
 
   const saved = state.panes?.[index] || {};
+  pane.indicatorHeights = saved.indicatorHeights || {};
+  pane.indicatorSettings = saved.indicatorSettings || {};
+  pane.hiddenIndicators = new Set(saved.hiddenIndicators || []);
+  pane.marketInstrument = saved.marketInstrument;
+  pane.studyViewportHeight = Number(saved.studyViewportHeight) || null;
   pane.sourceSelect.value = config.sources[saved.source] ? saved.source : "bybit";
   pane.presetSelect.value = config.chart_signal_strategies?.some((preset) => preset.id === saved.signalStrategy)
     ? saved.signalStrategy
     : "none";
   populateSymbolAndTimeframe(pane, saved);
+  setupSymbolSearch(pane);
   restoreIndicators(pane, saved.indicators || []);
   pane.signalMarkerToggle.checked = saved.signalMarkers !== false;
   pane.logarithmicScale = saved.logarithmicScale === true;
+  pane.chartStyle = window.ChartPresentation.styles.some(([id]) => id === saved.chartStyle) ? saved.chartStyle : "candles";
+  setupChartPresentation(pane);
+  pane.cleanupWorkspace = window.ChartWorkspace.attach(pane, {
+    pause: () => {
+      pane.replayTimeline = pane.candles.map(({ time }) => ({ time }));
+      pane.replayNeedsReset = true;
+      pane.replayTimeOptions = pane.chart.timeScale().options();
+      pane.chart.timeScale().applyOptions({ shiftVisibleRangeOnNewBar: false, allowShiftVisibleRangeOnWhitespaceReplacement: false });
+      const priceScale = pane.chart.priceScale("right");
+      pane.replayPriceRange = priceScale.getVisibleRange();
+      pane.replayAutoScale = priceScale.options().autoScale;
+      if (pane.replayPriceRange) priceScale.setVisibleRange(pane.replayPriceRange);
+      for (const item of pane.indicatorCharts) {
+        const scale = item.chart.priceScale("right"), range = scale.getVisibleRange();
+        if (range) scale.setVisibleRange(range);
+        item.replayPriceRange = range;
+      }
+      pane.requestId++; pane.indicatorRequestId++; pane.strategyRequestId++;
+      pane.ws?.close(); pane.ws = null;
+      clearInterval(pane.pollTimer); clearTimeout(pane.strategyPollTimer);
+      clearBacktestOverlaySeries(pane); hideMarkerDetails(pane);
+      pane.backtestDiagnostics = {};
+      document.querySelector(`.historical-signals[data-pane="${pane.index}"]`)?.remove();
+      pane.signalBadge.textContent = "REPLAY";
+      window.ChartEntryReadiness.invalidate('Replay: select candle');
+      pane.status.textContent = "Replay paused - select a starting candle";
+      updateChartMarkers(pane);
+    },
+    slice: (rows, fullRows) => applyReplaySlice(pane, rows, fullRows),
+    resume: (rows, restore) => {
+      pane.chart.priceScale("right").applyOptions({ autoScale: pane.replayAutoScale });
+      pane.chart.timeScale().applyOptions({ shiftVisibleRangeOnNewBar: pane.replayTimeOptions.shiftVisibleRangeOnNewBar, allowShiftVisibleRangeOnWhitespaceReplacement: pane.replayTimeOptions.allowShiftVisibleRangeOnWhitespaceReplacement });
+      pane.replayTimeline = null;
+      pane.indicatorRequestId++;
+      pane.candles = rows;
+      refreshHeaderSignalStrip();
+      if (restore && !pane.disposed) { startPane(pane); startStrategyWatcher(pane); }
+    },
+  });
   applyPanePriceScale(pane);
 
   [pane.sourceSelect, pane.symbolSelect, pane.timeframeSelect].forEach((select) => {
     select.addEventListener("change", () => {
+      pane.historicalSignalRequest = (pane.historicalSignalRequest || 0) + 1;
+      document.querySelector(`.historical-signals[data-pane="${pane.index}"]`)?.remove();
       if (select === pane.sourceSelect) {
         populateSymbolAndTimeframe(pane, {
           symbol: pane.symbolSelect.value,
           timeframe: pane.timeframeSelect.value,
         });
       }
+      updateSymbolPickerButton(pane);
+      window.ChartWorkspace.timeframeControls(pane, config.sources[pane.sourceSelect.value].timeframes);
       startPane(pane);
       saveState();
       renderWatchlist();
@@ -2623,17 +2853,36 @@ function createPane(node, index) {
   });
 
   pane.presetSelect.addEventListener("change", () => {
+    pane.historicalSignalRequest = (pane.historicalSignalRequest || 0) + 1;
+    pane.node.querySelector('.historical-signals')?.remove();
+    refreshHeaderSignalStrip();
+    if (pane.presetSelect.value === "__new_tactic") { pane.presetSelect.value = "none"; renderSelectedStrategy(pane, pane.requestId); saveState(); window.ChartCustomTactics.openEditor(null, pane); return; }
     renderSelectedStrategy(pane, pane.requestId);
     updateWatchlistSignalToggle();
     saveState();
   });
 
+  pane.node.querySelector('.tactic-source-button').onclick = () => window.ChartCustomTactics.openEditor(
+    config.chart_signal_strategies.find((item) => item.id === pane.presetSelect.value), pane);
+
+  pane.node.querySelector('.tactic-visibility-button').onclick = () => {
+    pane.signalMarkerToggle.checked=!pane.signalMarkerToggle.checked;
+    if(pane===panes[0]&&globalSignalToggle)globalSignalToggle.checked=pane.signalMarkerToggle.checked;
+    updateChartMarkers(pane); updateWatchlistSignalToggle(); saveState();
+  };
   pane.indicatorButton.addEventListener("click", (event) => {
     event.stopPropagation();
+    const focusStack = pane.node.querySelector(".chart-stack.chart-focus");
+    (focusStack || pane.node.querySelector(".indicator-control")).append(pane.indicatorMenu);
+    pane.indicatorMenu.style.position = "fixed";
+    pane.indicatorMenu.style.left = Math.max(12, Math.min(pane.indicatorButton.getBoundingClientRect().left, window.innerWidth - Math.min(510, window.innerWidth - 24) - 12)) + "px";
+    pane.indicatorMenu.style.top = focusStack ? "34px" : document.querySelector(".topbar").getBoundingClientRect().bottom + "px";
     pane.indicatorMenu.hidden = !pane.indicatorMenu.hidden;
   });
 
-  pane.indicatorList.addEventListener("change", () => {
+  pane.indicatorList.addEventListener("change", (event) => {
+    if (event.target.type !== "checkbox") return;
+    if (event.target.checked) { pane.hiddenIndicators.delete(event.target.value); pane.drawingTools?.showIndicators(); }
     startPane(pane);
     saveState();
   });
@@ -2644,6 +2893,11 @@ function createPane(node, index) {
     saveState();
   });
   pane.signalBadge.addEventListener("click", () => openSignalDetails(pane));
+  pane.signalBadge.setAttribute("role", "button");
+  pane.signalBadge.tabIndex = 0;
+  pane.signalBadge.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openSignalDetails(pane); }
+  });
 
   pane.backtestButton.addEventListener("click", () => openBacktestControls(pane));
   pane.scaleToggle.addEventListener("click", () => {
@@ -2667,6 +2921,54 @@ function applyPanePriceScale(pane) {
   pane.scaleToggle.title = `${pane.logarithmicScale ? "Disable" : "Enable"} logarithmic price scale`;
 }
 
+function setupChartPresentation(pane) {
+  const control = pane.node.querySelector(".chart-style-control"), menu = control.querySelector(".chart-style-menu");
+  menu.innerHTML = window.ChartPresentation.styles.map(([id, label]) => `<button type="button" role="menuitemradio" aria-checked="${pane.chartStyle === id}" data-chart-style="${id}">${label}</button>`).join("");
+  const select = (style) => {
+    const range = pane.chart.timeScale().getVisibleLogicalRange();
+    if (pane.signalMarkerPrimitive) { pane.signalMarkerPrimitive.detach(); pane.signalMarkerPrimitive = null; }
+    pane.chart.removeSeries(pane.series); pane.chartStyle = style;
+    const definition = window.ChartPresentation.styles.find(([id]) => id === style);
+    const colors = { upColor: "#12b886", downColor: "#ff5c7a", borderUpColor: "#12b886", borderDownColor: "#ff5c7a", wickUpColor: "#12b886", wickDownColor: "#ff5c7a" };
+    const options = definition[2] === "CandlestickSeries" ? { ...colors, ...(style === "hollow" ? { upColor: "#11161d" } : {}) }
+      : definition[2] === "BarSeries" ? { upColor: colors.upColor, downColor: colors.downColor }
+      : { color: "#58c4dc", lineColor: "#58c4dc", topColor: "#58c4dc40", bottomColor: "#58c4dc05", pointMarkersVisible: style === "markers", lineType: style === "step" ? LightweightCharts.LineType.WithSteps : LightweightCharts.LineType.Simple };
+    if (style === "baseline") options.baseValue = { type: "price", price: pane.candles[0]?.close || 0 };
+    pane.series = pane.chart.addSeries(LightweightCharts[definition[2]], options);
+    pane.series.setData(window.ChartPresentation.seriesData(pane.candles, style));
+    applyPanePriceScale(pane); updateChartMarkers(pane);
+    if (range) pane.chart.timeScale().setVisibleLogicalRange(range);
+    menu.querySelectorAll("[data-chart-style]").forEach((button) => button.setAttribute("aria-checked", String(button.dataset.chartStyle === style)));
+    control.querySelector("summary").title = "Chart style: " + definition[1];
+    control.open = false; saveState();
+  };
+  menu.addEventListener("click", (e) => { const button = e.target.closest("[data-chart-style]"); if (button) select(button.dataset.chartStyle); });
+  if (pane.chartStyle !== "candles") select(pane.chartStyle);
+  pane.node.querySelector(".chart-auto-button").addEventListener("click", () => {
+    pane.chart.priceScale("right").applyOptions({ autoScale: true }); pane.chart.timeScale().fitContent();
+    for (const { chart } of pane.indicatorCharts) { chart.priceScale("right").applyOptions({ autoScale: true }); chart.timeScale().fitContent(); }
+    syncIndicatorTimeRanges(pane);
+  });
+  const stack = pane.node.querySelector(".chart-stack"), fullscreen = pane.node.querySelector(".chart-fullscreen-button");
+  const exitFocus = () => { stack.classList.remove("chart-focus"); fullscreen.setAttribute("aria-pressed", "false"); };
+  fullscreen.addEventListener("click", async () => {
+    if (stack.classList.contains("chart-focus")) { if (document.fullscreenElement === stack) await document.exitFullscreen(); exitFocus(); return; }
+    stack.classList.add("chart-focus"); fullscreen.setAttribute("aria-pressed", "true");
+    try { if (stack.requestFullscreen) await stack.requestFullscreen(); } catch { /* Embedded browsers retain in-page focus mode. */ }
+  });
+  const onFullscreen = () => { if (document.fullscreenElement !== stack) exitFocus(); };
+  const onKey = (e) => { if (e.key === "Escape") { if (document.fullscreenElement === stack) document.exitFullscreen().catch(() => {}); exitFocus(); } };
+  document.addEventListener("fullscreenchange", onFullscreen); document.addEventListener("keydown", onKey);
+  pane.cleanupPresentation = () => { document.removeEventListener("fullscreenchange", onFullscreen); document.removeEventListener("keydown", onKey); exitFocus(); };
+}
+
+function updatePresentationSeries(pane, candle) {
+  if (pane.chartStyle === "baseline" && pane.candles.length) pane.series.applyOptions({ baseValue: { type: "price", price: pane.candles[0].close } });
+  const data = window.ChartPresentation.seriesData(pane.candles, pane.chartStyle);
+  if (pane.chartStyle === "heikin" || !candle) pane.series.setData(data);
+  else if (data.length) pane.series.update(data.at(-1));
+}
+
 function jumpPaneToNow(pane) {
   const candleCount = pane.candles?.length || 0;
   const visibleCount = Math.min(candleCount, 180);
@@ -2684,12 +2986,14 @@ function jumpPaneToNow(pane) {
 }
 
 function startStrategyWatcher(pane) {
+  if (pane.disposed || pane.replayActive) return;
   if (pane.strategyPollTimer) clearTimeout(pane.strategyPollTimer);
   const intervalMs = 5 * 60 * 1000;
   const closeGraceMs = 5000;
   const now = Date.now();
   const nextCheckAt = (Math.floor(now / intervalMs) + 1) * intervalMs + closeGraceMs;
   pane.strategyPollTimer = setTimeout(async () => {
+    if (pane.disposed) return;
     if (pane.presetSelect.value && pane.presetSelect.value !== "none" && !pane.strategyWatcherRunning) {
       pane.strategyWatcherRunning = true;
       try {
@@ -2742,19 +3046,157 @@ function setupChart(pane) {
   };
 
   pane.series = addSeries(pane.chart, "candlestick", candleOptions);
+  pane.drawingTools = window.ChartDrawingTools.attach(pane, {
+    onIndicators: () => {
+      const rect = pane.chartEl.getBoundingClientRect();
+      pane.node.querySelector(".chart-stack").append(pane.indicatorMenu);
+      pane.indicatorMenu.style.position = "fixed";
+      pane.indicatorMenu.style.left = Math.max(12, Math.min(rect.left + 44, window.innerWidth - Math.min(510, window.innerWidth - 24) - 12)) + "px";
+      pane.indicatorMenu.style.top = Math.min(rect.top + 24, window.innerHeight - 200) + "px";
+      pane.indicatorMenu.hidden = !pane.indicatorMenu.hidden;
+    },
+    getIndicators: () => selectedIndicators(pane),
+    setIndicators: (ids) => { restoreIndicators(pane, ids); updateIndicatorButton(pane); saveState(); startPane(pane); },
+    onVisibilityChange: () => updateChartMarkers(pane),
+  });
 
   pane.resizeObserver = new ResizeObserver(() => {
+    applyIndicatorHeights(pane);
     schedulePaneRangeSync(pane, pane.chart);
   });
   pane.resizeObserver.observe(pane.chartEl);
+  pane.resizeObserver.observe(pane.node.querySelector(".chart-stack"));
   if (pane.chart.timeScale().subscribeVisibleLogicalRangeChange) {
-    pane.chart.timeScale().subscribeVisibleLogicalRangeChange(() => schedulePaneRangeSync(pane, pane.chart));
+    pane.chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      schedulePaneRangeSync(pane, pane.chart);
+      if (range && range.from < 20) loadOlderChartHistory(pane);
+    });
   } else if (pane.chart.timeScale().subscribeVisibleTimeRangeChange) {
     pane.chart.timeScale().subscribeVisibleTimeRangeChange(() => schedulePaneRangeSync(pane, pane.chart));
   }
   if (pane.chart.subscribeCrosshairMove) {
-    pane.chart.subscribeCrosshairMove((param) => showMarkerDetailsForCrosshair(pane, param));
+    pane.chart.subscribeCrosshairMove((param) => { showMarkerDetailsForCrosshair(pane, param); syncPaneCrosshair(pane, pane.chart, param); });
   }
+  pane.chart.subscribeClick((param) => {
+    if (String(param.hoveredObjectId || '').startsWith('zgua:')) { inspectZguaDivergence(pane, param.hoveredObjectId); return; }
+    showHistoricalSignalStrength(pane, param);
+  });
+}
+
+function syncPaneCrosshair(pane, sourceChart, param) {
+  const targets = panes.flatMap((item) => [{ chart: item.chart, host: item.chartEl },
+    ...item.indicatorCharts.map((study) => ({ chart: study.chart, host: study.element.querySelector('.indicator-chart') }))]);
+  for (const target of targets) {
+    if (!target.host || !target.chart) continue;
+    let line = target.host.querySelector('.synced-time-crosshair');
+    if (!line) { line = document.createElement('div'); line.className = 'synced-time-crosshair'; target.host.append(line); }
+    const x = param.point && param.time !== undefined ? target.chart.timeScale().timeToCoordinate(param.time) : null;
+    line.hidden = x === null || x < 0 || x > target.host.clientWidth;
+    if (!line.hidden) line.style.left = x + 'px';
+  }
+}
+
+function isCandleBodyClick(pane, param) {
+  if (!param.point || !["candles", "hollow", "heikin"].includes(pane.chartStyle)) return false;
+  const time = normalizeMarkerTime(param.time);
+  const candle = pane.chartStyle === "heikin"
+    ? window.ChartPresentation.seriesData(pane.candles, "heikin").find((row) => row.time === time)
+    : pane.candles.find((row) => row.time === time);
+  if (!candle) return false;
+  const x = pane.chart.timeScale().timeToCoordinate(time);
+  const open = pane.series.priceToCoordinate(candle.open), close = pane.series.priceToCoordinate(candle.close);
+  if (x === null || open === null || close === null) return false;
+  const halfWidth = Math.max(0.5, pane.chart.timeScale().options().barSpacing * 0.7 / 2);
+  const minY = Math.min(open, close), maxY = Math.max(open, close);
+  return Math.abs(param.point.x - x) <= halfWidth && param.point.y >= minY - (maxY - minY < 1 ? 0.5 : 0) && param.point.y <= maxY + (maxY - minY < 1 ? 0.5 : 0);
+}
+
+async function showHistoricalSignalStrength(pane, param) {
+  if (!window.ChartAccounts?.canUseTactics() || !pane.presetSelect.value || pane.presetSelect.value === 'none' || pane.presetSelect.value === '__new_tactic') return;
+  if (pane.replayActive) return;
+  if (!param.time || pane.disposed || pane.drawingTools?.isInteracting()) return;
+  if (!isCandleBodyClick(pane, param)) return;
+  const time = normalizeMarkerTime(param.time);
+  const source = pane.sourceSelect.value, symbol = pane.symbolSelect.value, requestId = pane.requestId;
+  const asOf = Math.min(Math.floor(Date.now() / 1000), time + timeframeSeconds(pane.timeframeSelect.value));
+  const id = (pane.historicalSignalRequest || 0) + 1; pane.historicalSignalRequest = id;
+  pane.node.querySelector(".historical-signals")?.remove();
+  const panel = document.createElement("div"); panel.className = "historical-signals"; panel.setAttribute("aria-live", "polite");
+  panel.dataset.pane = String(pane.index);
+  pane.node.querySelector(".chart-stack").append(panel);
+  panel.innerHTML = `<button type="button" class="historical-signals-close" aria-label="Close historical signals" title="Close"><i data-lucide="x"></i></button><strong>${escapeHtml(symbol)} · ${escapeHtml(formatCompactDateTime(asOf))}</strong><small>${escapeHtml(config.sources[source].label)} · Closed bars as of candle close</small><div class="historical-signals-body">Loading 4h / 1h / 15m...</div>`;
+  window.lucide.createIcons();
+  panel.querySelector("button").onclick = () => { pane.historicalSignalRequest++; panel.remove(); };
+  const handle = panel.querySelector("strong");
+  handle.tabIndex = 0; handle.title = "Move signal details";
+  handle.setAttribute("aria-label", "Move signal details");
+  let drag;
+  const move = (x, y) => {
+    const parent = panel.parentElement;
+    panel.style.right = "auto";
+    panel.style.left = Math.max(42, Math.min(Math.max(42, parent.clientWidth - panel.offsetWidth), x)) + "px";
+    panel.style.top = Math.max(0, Math.min(Math.max(0, parent.clientHeight - panel.offsetHeight), y)) + "px";
+  };
+  handle.onpointerdown = (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault(); event.stopPropagation();
+    const box = panel.getBoundingClientRect(); drag = { x: event.clientX - box.left, y: event.clientY - box.top };
+    handle.setPointerCapture(event.pointerId);
+  };
+  handle.onpointermove = (event) => {
+    if (!drag) return;
+    const box = panel.parentElement.getBoundingClientRect(); move(event.clientX - box.left - drag.x, event.clientY - box.top - drag.y);
+  };
+  handle.onpointerup = handle.onpointercancel = () => { drag = null; };
+  handle.onkeydown = (event) => {
+    const delta = { ArrowLeft: [-10, 0], ArrowRight: [10, 0], ArrowUp: [0, -10], ArrowDown: [0, 10] }[event.key];
+    if (delta) { event.preventDefault(); move(panel.offsetLeft + delta[0], panel.offsetTop + delta[1]); }
+  };
+  try {
+    const preset = config.chart_signal_strategies.find(item=>item.id===pane.presetSelect.value);
+    if (preset) {
+      const rows = await window.ChartEntryReadiness.evaluate(pane,preset,asOf);
+      if (!panel.isConnected || pane.disposed || requestId !== pane.requestId || id !== pane.historicalSignalRequest) return;
+      panel.querySelector('small').textContent = preset.label + ' · Direction / entry quality';
+      panel.querySelector('.historical-signals-body').innerHTML = rows.map(row=>`<div class="historical-signal-row ${row.score>=60?'positive':row.score!==null&&row.score<=40?'negative':'neutral'}" title="${escapeHtml(window.ChartEntryReadiness.title(row,preset,source,symbol))}"><b>${row.timeframe}</b><span>${escapeHtml(row.direction||'Unavailable')} ${row.score ?? ''} · ${escapeHtml(row.status)}</span></div>`).join('');
+      return;
+    }
+    const payload = await apiGet(`/api/signals/at?${new URLSearchParams({ source, symbol, as_of: String(asOf) })}`);
+    if (!panel.isConnected || pane.disposed || requestId !== pane.requestId || id !== pane.historicalSignalRequest || source !== pane.sourceSelect.value || symbol !== pane.symbolSelect.value) return;
+    panel.querySelector(".historical-signals-body").innerHTML = payload.timeframes.map((row) => `<div class="historical-signal-row ${escapeHtml(row.tone || "neutral")}" title="${escapeHtml(row.error || 'Closed bars only; last bar ' + formatCompactDateTime(row.lastClosedTime))}"><b>${row.timeframe}</b>${row.error ? `<span>Unavailable: ${escapeHtml(row.error)}</span>` : `<span>${escapeHtml(row.direction)} ${row.score}</span><span>L ${row.longPct}% / S ${row.shortPct}%</span>`}</div>`).join("");
+  } catch (error) { if (panel.isConnected && !pane.disposed && id === pane.historicalSignalRequest) panel.querySelector(".historical-signals-body").textContent = error.message; }
+}
+
+function updateSymbolPickerButton(pane) {
+  const button = pane.node.querySelector(".symbol-picker-button");
+  if (!button) return;
+  const market = config.sources[pane.sourceSelect.value];
+  const display = pane.marketInstrument?.symbol === pane.symbolSelect.value ? pane.marketInstrument.displaySymbol : pane.symbolSelect.value + (market.marketType === "Perpetual" ? ".P" : "");
+  button.querySelector(".selected-symbol").textContent = display;
+  button.querySelector(".selected-market").textContent = config.sources[pane.sourceSelect.value].label;
+  button.title = pane.symbolSelect.value + " · " + config.sources[pane.sourceSelect.value].label;
+  const context = pane.node.querySelector(".chart-context");
+  if (context) context.textContent = display + " · " + pane.timeframeSelect.value + " · " + market.exchange;
+}
+
+function setupSymbolSearch(pane) {
+  const button = pane.node.querySelector(".symbol-picker-button");
+  updateSymbolPickerButton(pane);
+  button.addEventListener("click", () => window.SymbolPicker.open({
+    sources: config.sources, source: pane.sourceSelect.value, symbol: button.querySelector(".selected-symbol").textContent,
+    onSelect: (record) => {
+      if (pane.disposed) return;
+      const timeframe = pane.timeframeSelect.value;
+      const sourceConfig = config.sources[record.source];
+      if (!sourceConfig.symbols.includes(record.symbol)) sourceConfig.symbols.push(record.symbol);
+      pane.sourceSelect.value = record.source;
+      pane.marketInstrument = record;
+      populateSymbolAndTimeframe(pane, { symbol: record.symbol, timeframe });
+      pane.historicalSignalRequest = (pane.historicalSignalRequest || 0) + 1;
+      pane.node.querySelector(".historical-signals")?.remove();
+      startPane(pane); saveState(); renderWatchlist(); refreshWatchlistData(true);
+    },
+  }));
 }
 
 function createBaseChart(element, overrides = {}) {
@@ -2764,12 +3206,13 @@ function createBaseChart(element, overrides = {}) {
       background: { color: "#11161d" },
       textColor: "#9ca8b7",
       fontFamily: getComputedStyle(document.body).fontFamily,
+      fontSize: Number(uiPrefs.chartFontSize) || 12,
     },
     grid: {
       vertLines: { color: "rgba(255, 255, 255, 0.05)" },
       horzLines: { color: "rgba(255, 255, 255, 0.05)" },
     },
-    rightPriceScale: { borderColor: "#26313d" },
+    rightPriceScale: { borderColor: "#26313d", minimumWidth: 0 },
     timeScale: { borderColor: "#26313d", timeVisible: true, secondsVisible: false },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     ...overrides,
@@ -2801,14 +3244,59 @@ function populateSourceSelect(pane) {
 function populatePresetSelect(pane) {
   pane.presetSelect.innerHTML = [
     `<option value="none">None (signals off)</option>`,
-    ...(config.chart_signal_strategies || []).map((preset) => `<option value="${preset.id}">${preset.label}</option>`),
+    ...(config.chart_signal_strategies || []).filter((preset) => !preset.custom).map((preset) => `<option value="${preset.id}">${escapeHtml(preset.label)}</option>`),
+    '<optgroup label="My tactics">' + (config.chart_signal_strategies || []).filter((preset) => preset.custom).map((preset) => `<option value="${preset.id}">${escapeHtml(preset.label)}</option>`).join('') + '</optgroup>',
+    '<option value="__new_tactic">+ New tactic</option>',
   ].join("");
+}
+
+function mergeCustomTactics() {
+  if (!window.ChartAccounts?.canUseTactics()) return;
+  config.chart_signal_strategies = (config.chart_signal_strategies || []).filter((item) => !item.custom).concat(
+    window.ChartCustomTactics.list().map((item) => ({id:item.id, label:item.name, strategy:item.baseStrategy, params:{}, custom:true})));
+}
+
+function refreshCustomTactics() {
+  mergeCustomTactics();
+  for (const pane of panes) {
+    const previous = pane.presetSelect.value; populatePresetSelect(pane);
+    pane.presetSelect.value = config.chart_signal_strategies.some(item => item.id === previous) ? previous : 'none';
+    renderSelectedStrategy(pane, pane.requestId).catch(console.error);
+  }
+  saveState();
+}
+
+async function customTacticOptions(pane, record) {
+  if (record?.baseStrategy === 'ZGUA' || /BASE_STRATEGY\s*=\s*['"]ZGUA['"]/.test(record?.code || '')) {
+    const candles = pane.candles.slice(-5000);
+    const response = await fetch('/api/zgua/events', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({candles, params:pane.indicatorSettings.zgua || {}})});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || 'Divergence detection failed');
+    return {candles, divergenceEvents:payload.events, interval:pane.timeframeSelect.value, symbol:pane.symbolSelect.value, source:pane.sourceSelect.value};
+  }
+  if (pane.timeframeSelect.value.endsWith('s')) throw new Error('Use a minute-or-higher chart for tactic backtests; 1s is inspection-only.');
+  if (!pane?.candles?.length) throw new Error('Wait for chart candles before backtesting.');
+  const response = await fetch('/api/candles?source=bybit&symbol=BTCUSDT&timeframe=4h&limit=2500');
+  const payload = await response.json();
+  if (!response.ok || !payload.candles?.length) throw new Error(payload.error || 'BTC benchmark candles unavailable.');
+  const options = {candles:pane.candles.slice(-5000), regimeCandles:payload.candles, benchmarkCandles:payload.candles,
+    interval:pane.timeframeSelect.value, benchmarkInterval:'4h', symbol:pane.symbolSelect.value, source:pane.sourceSelect.value};
+  if (record?.code?.includes('researchExitMode')) {
+    const asOf=pane.replayActive?pane.candles.at(-1).time+timeframeSeconds(options.interval):Math.floor(Date.now()/1000);
+    options.candles=options.candles.filter(bar=>bar.time+timeframeSeconds(options.interval)<=asOf);
+    const limit=Math.min(50000,Math.max(300,Math.ceil(options.candles.length*timeframeSeconds(options.interval)/300)));
+    const execution=await apiGet('/api/candles?'+new URLSearchParams({source:options.source,symbol:options.symbol,timeframe:'5m',limit:String(limit),before:String(asOf)}));
+    options.executionCandles=(execution.candles||[]).filter(bar=>bar.time+300<=asOf);
+    options.executionInterval='5m';
+  }
+  return options;
 }
 
 function populateSymbolAndTimeframe(pane, saved) {
   const sourceConfig = config.sources[pane.sourceSelect.value];
+  if (/^[A-Za-z0-9.:@/^=_-]{1,96}$/.test(saved.symbol || "") && !sourceConfig.symbols.includes(saved.symbol)) sourceConfig.symbols.push(saved.symbol);
   pane.symbolSelect.innerHTML = sourceConfig.symbols
-    .map((symbol) => `<option value="${symbol}">${symbol}</option>`)
+    .map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`)
     .join("");
   pane.timeframeSelect.innerHTML = sourceConfig.timeframes
     .map((timeframe) => `<option value="${timeframe}">${timeframe}</option>`)
@@ -2816,6 +3304,8 @@ function populateSymbolAndTimeframe(pane, saved) {
 
   pane.symbolSelect.value = sourceConfig.symbols.includes(saved.symbol) ? saved.symbol : sourceConfig.symbols.includes("BTCUSDT") ? "BTCUSDT" : sourceConfig.symbols[0];
   pane.timeframeSelect.value = sourceConfig.timeframes.includes(saved.timeframe) ? saved.timeframe : sourceConfig.timeframes.includes("1h") ? "1h" : sourceConfig.timeframes[0];
+  window.ChartWorkspace.timeframeControls(pane, sourceConfig.timeframes);
+  updateSymbolPickerButton(pane);
 }
 
 function populateIndicatorMenu(pane) {
@@ -2823,10 +3313,106 @@ function populateIndicatorMenu(pane) {
     .map((indicator) => `
       <label class="indicator-option">
         <input type="checkbox" value="${indicator.id}">
-        <span>${indicator.label}</span>
+        <span>${escapeHtml(indicator.label)}</span>
       </label>
     `)
     .join("");
+  addIndicatorSearch(pane.indicatorList);
+}
+
+function addIndicatorSearch(host) {
+  host.classList.add("indicator-picker");
+  const nav = document.createElement("nav"); nav.className = "indicator-categories";
+  nav.setAttribute("aria-label", "Indicator categories");
+  const content = document.createElement("div"); content.className = "indicator-picker-content";
+  while (host.firstChild) content.append(host.firstChild);
+  host.append(nav, content);
+  let category = "all";
+  for (const [id, title, icon] of [["all", "All", "list"], ["favourites", "Favourites", "star"], ["top", "Top", "trending-up"], ["my", "Personal", "user-round"]]) {
+    const button = document.createElement("button"); button.type = "button"; button.dataset.category = id;
+    button.innerHTML = `<i data-lucide="${icon}"></i><span>${title}</span>`;
+    if (id === "top") button.title = "Curated popular studies; not a live TradingView ranking";
+    button.onclick = () => { category = id; update(); };
+    nav.append(button);
+  }
+  const create = document.createElement("button"); create.type = "button";
+  create.innerHTML = '<i data-lucide="plus"></i><span>New indicator</span>';
+  create.onclick = () => window.ChartCustomIndicators.openEditor(null); nav.append(create);
+  for (const label of content.querySelectorAll(".indicator-option")) {
+    const row = document.createElement("div"); row.className = "indicator-picker-row";
+    label.replaceWith(row); row.append(label);
+    const star = document.createElement("button"); star.type = "button"; star.className = "indicator-favourite";
+    star.innerHTML = '<i data-lucide="star"></i>';
+    star.onclick = (event) => {
+      event.stopPropagation();
+      const favourites = indicatorFavourites(), id = label.querySelector("input").value;
+      if (favourites.has(id)) favourites.delete(id); else favourites.add(id);
+      localStorage.setItem(indicatorFavouriteKey(), JSON.stringify([...favourites]));
+      window.ChartAccounts?.changed();
+      window.dispatchEvent(new Event("indicator-favourites-changed"));
+    };
+    const source = document.createElement("button"); source.type = "button"; source.className = "indicator-source-button";
+    source.title = "View Python source"; source.setAttribute("aria-label", "View Python source: " + label.textContent.trim());
+    source.innerHTML = '<i data-lucide="code-2"></i>';
+    source.onclick = (event) => { event.stopPropagation(); showIndicatorSource(label.querySelector("input").value); };
+    row.append(star, source);
+  }
+  const search = document.createElement("input"); search.type = "search";
+  search.className = "indicator-search"; search.placeholder = "Search indicators"; search.setAttribute("aria-label", "Search indicators");
+  const empty = document.createElement("p"); empty.className = "indicator-search-empty"; empty.textContent = "No matching indicators"; empty.hidden = true;
+  content.prepend(search); content.append(empty);
+  const update = () => {
+    const favourites = indicatorFavourites(); let matches = 0;
+    for (const button of nav.querySelectorAll("[data-category]")) button.setAttribute("aria-pressed", String(button.dataset.category === category));
+    for (const row of content.querySelectorAll(".indicator-picker-row")) {
+      const label = row.querySelector("label"), id = label.querySelector("input").value, star = row.querySelector(".indicator-favourite");
+      star.setAttribute("aria-pressed", String(favourites.has(id)));
+      star.title = (favourites.has(id) ? "Remove from" : "Add to") + " favourites";
+      star.setAttribute("aria-label", star.title + ": " + label.textContent.trim());
+      row.hidden = !indicatorPickerMatches(id, label.textContent, search.value, category, favourites);
+      if (!row.hidden) matches++;
+    }
+    empty.textContent = category === "favourites" && !search.value.trim() ? "No favourite indicators yet" : "No matching indicators";
+    empty.hidden = matches > 0;
+  };
+  search.oninput = update;
+  if (host.indicatorFavouriteListener) window.removeEventListener("indicator-favourites-changed", host.indicatorFavouriteListener);
+  host.indicatorFavouriteListener = update;
+  window.addEventListener("indicator-favourites-changed", update);
+  update();
+  window.lucide?.createIcons({ root: host });
+}
+
+function indicatorFavouriteKey() {
+  return window.ChartAccounts?.key("zgua-indicator-favourites-v1") || "zgua-indicator-favourites-v1";
+}
+
+function showIndicatorSource(id) { return window.ChartCustomIndicators.openEditor(id); }
+
+function refreshCustomIndicatorMenus() {
+  config.indicators = config.indicators.filter((item) => !item.custom).concat(window.ChartCustomIndicators.list());
+  for (const pane of panes) {
+    const selected = selectedIndicators(pane);
+    populateIndicatorMenu(pane); restoreIndicators(pane, selected);
+    renderIndicators(pane, pane.requestId).catch((error) => { console.error(error); });
+  }
+  populateGlobalIndicatorMenu();
+  saveState();
+}
+
+function indicatorFavourites() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(indicatorFavouriteKey()));
+    return new Set(Array.isArray(stored) ? stored.filter((id) => typeof id === "string") : []);
+  } catch { return new Set(); }
+}
+
+function indicatorPickerMatches(id, label, query, category, favourites) {
+  const top = ["rsi", "macd", "ema", "sma", "bbands", "volume", "vwap", "atr", "supertrend", "stochrsi", "adx", "squeeze", "wavetrend", "cipherb", "utbot", "squeeze_lb", "wavetrend_lb", "vixfix", "supertrend_kivanc"];
+  return (label + " " + id).toLowerCase().includes(query.trim().toLowerCase())
+    && (category !== "favourites" || favourites.has(id))
+    && (category !== "top" || top.includes(id))
+    && (category !== "my" || id.startsWith("custom_"));
 }
 
 function restoreIndicators(pane, ids) {
@@ -2841,6 +3427,9 @@ function selectedIndicators(pane) {
 }
 
 async function startPane(pane) {
+  if (pane.disposed) return;
+  if (pane.replayActive) pane.exitReplay(false);
+  updateSymbolPickerButton(pane);
   const loadStartedAt = performance.now();
   const requestId = pane.requestId + 1;
   pane.requestId = requestId;
@@ -2850,7 +3439,11 @@ async function startPane(pane) {
   pane.pollTimer = null;
   pane.lastPrice = null;
   pane.historyLoaded = false;
+  refreshHeaderSignalStrip();
   pane.historyError = null;
+  pane.olderHistoryExhausted = false;
+  pane.olderHistoryLoading = false;
+  pane.olderHistoryRetryAt = 0;
   clearIndicatorSeries(pane);
   clearSignalMarkers(pane);
   clearBacktestMarkers(pane);
@@ -2865,18 +3458,30 @@ async function startPane(pane) {
     if (!candles.length) throw new Error("No historical candles returned");
     pane.candleDiagnostics = candlePayload.diagnostics || {};
     pane.candles = candles;
+    pane.chart.timeScale().applyOptions({secondsVisible:pane.timeframeSelect.value.endsWith('s')});
+    if (candlePayload.diagnostics?.liveOnly) pane.olderHistoryExhausted=true;
     pane.historyLoaded = true;
+    refreshHeaderSignalStrip();
     const chartStartedAt = performance.now();
-    pane.series.setData(candles);
+    if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane);
+    else pane.series.setData(candles);
     pane.performanceTimings.chartSetDataMs = Math.round((performance.now() - chartStartedAt) * 10) / 10;
     jumpPaneToNow(pane);
     if (candles.length) updateTicker(pane, candles[candles.length - 1].close);
     const strategySelected = pane.presetSelect.value && pane.presetSelect.value !== "none";
     await Promise.allSettled([
-      renderIndicators(pane, requestId),
+      renderIndicators(pane, requestId).catch((error) => {
+        if (pane.disposed || requestId !== pane.requestId) return;
+        const failure = document.createElement("div"); failure.className = "indicator-load-error";
+        failure.setAttribute("role", "alert"); failure.textContent = "Indicators unavailable: " + error.message;
+        pane.indicatorPanesEl.replaceChildren(failure);
+        pane.indicatorPanesEl.style.gridTemplateRows = "64px";
+        console.error("Indicator rendering failed", error);
+      }),
       renderSelectedStrategy(pane, requestId),
       renderSignals(pane, requestId, { sidebarOnly: strategySelected }),
     ]);
+    if (pane.disposed || requestId !== pane.requestId) return;
     pane.status.textContent = candleStatusText(candlePayload);
     pane.performanceTimings.totalLoadMs = Math.round((performance.now() - loadStartedAt) * 10) / 10;
     console.debug("ZguaCharts render timing", pane.symbolSelect.value, pane.timeframeSelect.value, pane.performanceTimings);
@@ -2887,18 +3492,57 @@ async function startPane(pane) {
     pane.status.textContent = `Historical candles unavailable: ${error.message}`;
   }
 
-  if (pane.sourceSelect.value === "bybit") {
+  if (pane.disposed || requestId !== pane.requestId) return;
+  const aggregatedTimeframe = ["2m", "6m", "12m"].includes(pane.timeframeSelect.value);
+  if (pane.sourceSelect.value.startsWith('bybit') && pane.timeframeSelect.value === '1s') {
+    window.ChartSecondCandles.connect(pane,requestId);
+  } else if (pane.sourceSelect.value === "bybit" && !aggregatedTimeframe) {
     connectBybit(pane, requestId);
-  } else if (pane.sourceSelect.value === "hyperliquid") {
+  } else if (pane.sourceSelect.value === "hyperliquid" && !aggregatedTimeframe) {
     connectHyperliquid(pane, requestId);
   }
 
   if (pane.sourceSelect.value === "yfinance") {
     startYfinancePolling(pane);
   }
+  if (!(pane.sourceSelect.value.startsWith('bybit')&&pane.timeframeSelect.value==='1s') && pane.sourceSelect.value !== "yfinance" && (aggregatedTimeframe || config.sources[pane.sourceSelect.value].live === "polling")) startBinancePolling(pane);
+}
+
+function startBinancePolling(pane) {
+  const requestId = pane.requestId;
+  const refresh = async () => {
+    if (pane.disposed || pane.requestId !== requestId || pane.replayActive) return;
+    try {
+      const payload = await loadCandles(pane, { limit: 50, liveTail: true });
+      if (pane.disposed || pane.requestId !== requestId || pane.replayActive) return;
+      if (payload.diagnostics?.degraded_to_stale_cache) throw new Error('Latest candles unavailable; cached data is stale.');
+      const merged = new Map(pane.candles.map((row) => [row.time, row]));
+      const changed = payload.candles.some(row => {
+        const old = merged.get(row.time);
+        return !old || ['open','high','low','close','volume'].some(key => old[key] !== row[key]);
+      });
+      for (const row of payload.candles) merged.set(row.time, row);
+      pane.candles = [...merged.values()].sort((a, b) => a.time - b.time);
+      if(pane.timeframeSelect.value==='1s')pane.candles=pane.candles.slice(-5000);
+      const range = pane.chart.timeScale().getVisibleLogicalRange();
+      if (changed) {
+        if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane); else pane.series.setData(pane.candles);
+        if (range) pane.chart.timeScale().setVisibleLogicalRange(range);
+      }
+      if (pane.candles.length) updateTicker(pane, pane.candles.at(-1).close);
+      if (changed && (pane.timeframeSelect.value !== '1s' || Date.now()-(pane.secondStudyRefreshAt||0)>2000)) {
+        pane.secondStudyRefreshAt=Date.now();
+        await renderIndicators(pane,requestId);
+      }
+    } catch (error) { if (!pane.disposed && pane.requestId === requestId) pane.status.textContent = "Market feed: " + error.message; }
+    if (!pane.disposed && pane.requestId === requestId && !pane.replayActive) pane.pollTimer = setTimeout(refresh, pane.timeframeSelect.value==='1s'?1000:10000);
+  };
+  pane.pollTimer = setTimeout(refresh, pane.timeframeSelect.value==='1s'?1000:10000);
 }
 
 async function renderSignals(pane, requestId, options = {}) {
+  if (!window.ChartAccounts?.canUseTactics()) { clearSignalMarkers(pane); return; }
+  if (pane.timeframeSelect.value.endsWith('s')) return;
   // Signals are scored by /api/signals. The browser only renders the returned
   // badge, details, and optional chart markers.
   if (!options.sidebarOnly) {
@@ -2919,8 +3563,8 @@ async function renderSignals(pane, requestId, options = {}) {
   if (!response.ok) throw new Error(payload.error || "Signal request failed");
 
   pane.lastSignalPayload = payload;
-  watchlistQuotes.set(pane.symbolSelect.value, {
-    ...(watchlistQuotes.get(pane.symbolSelect.value) || {}),
+  watchlistQuotes.set(pane.sourceSelect.value+':'+pane.symbolSelect.value, {
+    ...(watchlistQuotes.get(pane.sourceSelect.value+':'+pane.symbolSelect.value) || {}),
     score: payload.score,
     tone: payload.tone || "neutral",
     direction: payload.signalDirection || "NEUTRAL",
@@ -2935,8 +3579,17 @@ async function renderSignals(pane, requestId, options = {}) {
 }
 
 async function renderSelectedStrategy(pane, requestId, options = {}) {
+  updateTacticVisibility();
+  if (!window.ChartAccounts?.canUseTactics()) {
+    pane.strategyPayload=null;pane.strategySummary={status:'off'};
+    clearSignalMarkers(pane);clearBacktestMarkers(pane);return;
+  }
+  if (pane.timeframeSelect.value.endsWith('s')) {pane.strategyPayload=null;pane.strategySummary={status:'off'};pane.signalBadge.textContent='1s VIEW';pane.signalBadge.title='Sub-minute chart inspection only; tactic backtests and paper configuration unchanged.';return;}
+  if (pane.replayActive) return;
+  if (!pane.historyLoaded || !pane.candles.length) return;
   const strategyRequestId = ++pane.strategyRequestId;
   if (!options.silent) {
+    pane.strategyPayload = null;
     clearSignalMarkers(pane);
     clearBacktestMarkers(pane);
     resetSignalBadge(pane);
@@ -2944,6 +3597,7 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
 
   const presetId = pane.presetSelect.value;
   if (!presetId || presetId === "none") {
+    pane.strategyPayload = null;
     pane.strategySummary = { status: "off" };
     pane.signalBadge.textContent = "SIGNALS OFF";
     pane.signalBadge.title = "Choose a tested strategy to show entries and exits.";
@@ -2965,18 +3619,22 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
       source: pane.sourceSelect.value,
       symbol: pane.symbolSelect.value,
       timeframe: pane.timeframeSelect.value,
-      executionTimeframe: defaultExecutionTimeframe(pane.timeframeSelect.value),
+      executionTimeframe: preset.strategy === 'ZGUA' ? pane.timeframeSelect.value : defaultExecutionTimeframe(pane.timeframeSelect.value),
       period: periodForChartCandles(pane.timeframeSelect.value, strategyCandleLimit),
       strategy: preset.strategy,
-      params: preset.params || {},
+      params: preset.strategy === 'ZGUA' ? {...preset.params, ...pane.indicatorSettings.zgua} : preset.params || {},
       paramsSource: preset.label,
       limit: String(strategyCandleLimit),
-      feePct: 0,
-      slippagePct: 0,
+      feePct: preset.strategy === 'ZGUA' || preset.params?.researchExitMode ? 0.055 : 0,
+      slippagePct: preset.strategy === 'ZGUA' || preset.params?.researchExitMode ? 0.02 : 0,
       allowShorts: false,
       includeFullTrades: true,
+      saveHistory: false,
+      mode: "chart-preview",
     };
-    const cachedResult = await cachedStrategyBacktest(strategyCacheKey(pane, preset, strategyCandleLimit), request);
+    const cachedResult = preset.custom
+      ? {payload: await window.ChartCustomTactics.backtest(window.ChartCustomTactics.get(preset.id), pane), cached: false}
+      : await cachedStrategyBacktest(strategyCacheKey(pane, {...preset, params:request.params}, strategyCandleLimit), request);
     const payload = cachedResult.payload;
     pane.performanceTimings.strategyMs = Math.round((performance.now() - strategyStartedAt) * 10) / 10;
     pane.performanceTimings.strategyCached = cachedResult.cached;
@@ -2992,6 +3650,7 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
     pane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
     updateChartMarkers(pane);
     renderDataDiagnostics(pane);
+    pane.strategyPayload = payload;
     updateStrategyBadge(pane, payload, preset);
     const trades = normalizedTrades(payload);
     const completedTrades = trades.filter((trade) => !/end of data/i.test(String(trade.exit_reason ?? trade.exitReason ?? "")));
@@ -3013,10 +3672,12 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
       strategy: preset.label,
       symbol: pane.symbolSelect.value,
       timeframe: pane.timeframeSelect.value,
-      executionTimeframe: payload.executionTimeframe || defaultExecutionTimeframe(pane.timeframeSelect.value),
+      executionTimeframe: payload.executionTimeframe || payload.executionInterval || defaultExecutionTimeframe(pane.timeframeSelect.value),
       completedTrades: completedTrades.length,
       winRate: completedTrades.length ? (winningTrades / completedTrades.length) * 100 : 0,
       totalReturnPct: completedReturnPct,
+      feePct: preset.custom ? 0.055 : request.feePct,
+      slippagePct: preset.custom ? 0.02 : request.slippagePct,
       candlesEvaluated: strategyCandleLimit,
       historyLabel: `${strategyCandleLimit} candles · ${formatCompactDate(historyStart)} to ${formatCompactDate(historyEnd)}`,
       checkedAt: Date.now(),
@@ -3024,12 +3685,15 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
       trades: completedTrades.map((trade) => ({
         entryTime: trade.entry_time ?? trade.entryTime,
         exitTime: trade.exit_time ?? trade.exitTime,
+        entryPrice: Number(trade.entry_price ?? trade.entryPrice ?? trade.entry_fill_price ?? trade.entryFillPrice),
+        exitPrice: Number(trade.exit_price ?? trade.exitPrice ?? trade.exit_fill_price ?? trade.exitFillPrice),
         returnPct: Number(trade.return_pct ?? trade.returnPct ?? 0),
         priceMovePct: (() => {
           const entry = Number(trade.entry_price ?? trade.entryPrice ?? trade.entry_fill_price ?? trade.entryFillPrice);
           const exit = Number(trade.exit_price ?? trade.exitPrice ?? trade.exit_fill_price ?? trade.exitFillPrice);
           return entry > 0 && Number.isFinite(exit) ? ((exit - entry) / entry) * 100 : 0;
         })(),
+        entryReason: trade.entry_reason ?? trade.entryReason ?? "-",
         exitReason: trade.exit_reason ?? trade.exitReason ?? "-",
       })),
     };
@@ -3070,7 +3734,7 @@ function updateStrategyBadge(pane, payload, preset) {
   pane.signalBadge.textContent = direction;
   pane.signalBadge.classList.remove("buy", "sell", "neutral");
   pane.signalBadge.classList.add(direction === "LONG" ? "buy" : direction === "SHORT" ? "sell" : "neutral");
-  pane.signalBadge.title = `${preset?.label || pane.presetSelect.value}: ${direction}. ${trades.length} completed or current trade(s).`;
+  pane.signalBadge.title = `${preset?.label || pane.presetSelect.value}: ${direction}. ${direction === 'FLAT' ? 'No simulated position remains open at the last loaded candle.' : 'A simulated position remains open at the last loaded candle.'}\n${trades.length} completed or current trade(s). Click for tactic preview results and trades.\nPreview runs are not saved to History; use Backtest for a saved run. This is not a live account position.`;
 }
 
 async function loadCandles(pane, options = {}) {
@@ -3081,15 +3745,47 @@ async function loadCandles(pane, options = {}) {
     limit: String(options.limit || 240),
     visible_charts: String(visibleChartCount()),
   });
+  if (options.before) params.set("before", String(options.before));
+  if (options.liveTail) params.set("live_tail", "true");
   const response = await fetch(`/api/candles?${params}`);
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Candle request failed");
   return payload;
 }
 
+async function loadOlderChartHistory(pane) {
+  if (pane.replayActive) return;
+  if (pane.disposed || !pane.historyLoaded || pane.olderHistoryLoading || pane.olderHistoryExhausted || Date.now() < (pane.olderHistoryRetryAt || 0) || !pane.candles?.length || pane.candles.length >= 50000) return;
+  const id = pane.requestId, before = pane.candles[0].time;
+  pane.olderHistoryLoading = true;
+  try {
+    const payload = await loadCandles(pane, { before, limit: Math.min(1000, 50000 - pane.candles.length) });
+    if (pane.disposed || pane.requestId !== id) return;
+    const older = payload.candles.filter((row) => row.time < before);
+    if (!older.length) { pane.olderHistoryExhausted = true; return; }
+    const range = pane.chart.timeScale().getVisibleLogicalRange();
+    const merged = new Map([...older, ...pane.candles].map((row) => [row.time, row]));
+    const added = merged.size - pane.candles.length;
+    pane.candles = [...merged.values()].sort((a, b) => a.time - b.time);
+    if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane); else pane.series.setData(pane.candles);
+    if (range) pane.chart.timeScale().setVisibleLogicalRange({ from: range.from + added, to: range.to + added });
+    pane.status.textContent = `${pane.candles.length} candles loaded`;
+    await renderIndicators(pane, id);
+    if (!pane.disposed && pane.requestId === id) syncIndicatorTimeRanges(pane);
+  } catch (error) {
+    if (!pane.disposed && pane.requestId === id) {
+      pane.olderHistoryRetryAt = Date.now() + 30000;
+      pane.status.textContent = "Older history: " + error.message;
+    }
+  } finally {
+    if (pane.requestId === id) pane.olderHistoryLoading = false;
+  }
+}
+
 function candleStatusText(payload) {
   const count = payload.candles?.length || 0;
   const warnings = payload.diagnostics?.warnings || [];
+  if (payload.diagnostics?.liveOnly) return `${count} trade-built 1s bars · Limited recent/live history; seed may be partial`;
   if (payload.diagnostics?.degraded_to_stale_cache) {
     return `${count} cached candles loaded; ${warnings[0] || "data may be stale"}`;
   }
@@ -3108,8 +3804,11 @@ async function renderIndicators(pane, requestId) {
   // Indicators are calculated by /api/indicators. Keep formula changes in the
   // backend/core modules and render the returned time-aligned series here.
   const indicators = selectedIndicators(pane);
+  const nativeIds = indicators.filter((id) => !id.startsWith("custom_"));
+  const customIds = indicators.filter((id) => id.startsWith("custom_"));
   const indicatorRequestId = ++pane.indicatorRequestId;
   updateIndicatorButton(pane);
+  renderIndicatorLabels(pane);
   if (!indicators.length) {
     clearIndicatorSeries(pane);
     pane.indicatorDiagnostics = {};
@@ -3121,16 +3820,60 @@ async function renderIndicators(pane, requestId) {
     source: pane.sourceSelect.value,
     symbol: pane.symbolSelect.value,
     timeframe: pane.timeframeSelect.value,
-    indicators: indicators.join(","),
+    indicators: nativeIds.join(","),
     limit: String(Math.max(pane.candles.length, 1)),
     chart_candles_count: String(pane.candles.length),
     first_chart_candle_time: String(pane.candles[0]?.time || ""),
     last_chart_candle_time: String(pane.candles[pane.candles.length - 1]?.time || ""),
   });
-  const response = await fetch(`/api/indicators?${params}`);
-  const payload = await response.json();
+  let payload = { overlays: [], panes: [], diagnostics: {} };
+  if (nativeIds.length) {
+    const settings = Object.fromEntries(Object.entries(pane.indicatorSettings || {}).filter(([id]) => !id.startsWith("custom_")));
+    const response = await fetch(`/api/indicators?${params}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candles: pane.candles, settings }),
+    });
+    payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Indicator request failed");
+  }
+  if (customIds.length) {
+    const custom = await window.ChartCustomIndicators.calculate(customIds, pane.candles, pane.indicatorSettings,
+      () => requestId === pane.requestId && indicatorRequestId === pane.indicatorRequestId);
+    payload.overlays.push(...custom.overlays); payload.panes.push(...custom.panes);
+  }
   if (requestId !== pane.requestId || indicatorRequestId !== pane.indicatorRequestId) return;
-  if (!response.ok) throw new Error(payload.error || "Indicator request failed");
+
+  const inspection = pane.divergenceInspection;
+  if (inspection && inspection.context === [pane.sourceSelect.value,pane.symbolSelect.value,pane.timeframeSelect.value].join(':') && indicators.includes('zgua') && pane.candles.some(bar=>bar.time===inspection.event.confirmedAt)) {
+    const study = inspection.studies[inspection.selected || 0];
+    payload.panes.push({id:'zgua-inspection', title:`${inspection.event.kind} ${inspection.event.bullish ? 'bullish' : 'bearish'}: ${study.name} ${study.firstValue.toPrecision(4)} → ${study.pivotValue.toPrecision(4)}`, series:study.series, markers:study.markers});
+  }
+  const timeline = pane.replayActive && pane.replayTimeline ? pane.replayTimeline : pane.candles;
+  const forward = Math.max(0, ...[...payload.overlays, ...payload.panes.flatMap(study => study.series)].map(series => series.offset || 0));
+  pane.indicatorTimeline = timeline.map(({time}) => ({time}));
+  const step = Math.max(1, timeline.at(-1)?.time - timeline.at(-2)?.time || 60);
+  for (let index = 0; index < forward; index++) pane.indicatorTimeline.push({time: timeline.at(-1).time + (index + 1) * step});
+
+  // Replay changes data in place: chart containers, resize handles and scales stay stable.
+  if (pane.replayActive && pane.replayIndicatorSignature === indicators.join(",") && pane.overlaySeries.length === payload.overlays.length && pane.indicatorCharts.length === payload.panes.length) {
+    pane.overlayPayload = payload.overlays;
+    payload.overlays.forEach((overlay, index) => {
+      pane.overlaySeries[index].setData(indicatorSeriesData(pane, overlay.data, overlay.offset));
+      if (overlay.markers) setSeriesMarkers(pane.overlaySeries[index], normalizeMarkers(overlay.markers));
+      updateIndicatorSegments(pane, pane.overlaySeries[index], overlay);
+    });
+    payload.panes.forEach((study, index) => {
+      const item = pane.indicatorCharts[index];
+      pane.indicatorInfoById?.set(study.id || study.title, study);
+      study.series.forEach((data, seriesIndex) => {
+        item.series[seriesIndex].setData(indicatorSeriesData(pane, data.data, data.offset));
+        if (data.markers) setSeriesMarkers(item.series[seriesIndex], normalizeMarkers(data.markers));
+      });
+      if (item.markerSeries) setSeriesMarkers(item.markerSeries, normalizeMarkers(study.markers || []));
+    });
+    groupDivergenceMarkers(pane, payload.overlays, pane.overlaySeries);
+    applyIndividualIndicatorVisibility(pane);
+    syncIndicatorTimeRanges(pane); return;
+  }
 
   const oldOverlaySeries = pane.overlaySeries;
   const oldIndicatorCharts = pane.indicatorCharts;
@@ -3138,30 +3881,54 @@ async function renderIndicators(pane, requestId) {
   const nextIndicatorCharts = [];
   const nextPaneElements = [];
   pane.indicatorInfoById = new Map();
+  pane.overlayPayload = payload.overlays;
 
   payload.overlays.forEach((overlay) => {
     const series = addSeries(pane.chart, overlay.type, seriesOptions(overlay));
-    series.setData(normalizeSeriesData(overlay.data));
+    series.indicatorName = overlay.name;
+    series.indicatorId = overlay.indicatorId;
+    series.setData(indicatorSeriesData(pane, overlay.data, overlay.offset));
+    if (overlay.markers) setSeriesMarkers(series, normalizeMarkers(overlay.markers));
+    updateIndicatorSegments(pane, series, overlay);
     nextOverlaySeries.push(series);
   });
+  groupDivergenceMarkers(pane, payload.overlays, nextOverlaySeries);
+  window.ChartStudyClouds.attach(payload.overlays, nextOverlaySeries);
 
   payload.panes.forEach((indicatorPane) => {
     const indicatorId = indicatorPane.id || indicatorPane.title || `indicator-${nextPaneElements.length}`;
     pane.indicatorInfoById.set(indicatorId, indicatorPane);
     const paneEl = document.createElement("div");
     paneEl.className = "indicator-pane";
+    paneEl.dataset.indicatorId = indicatorId;
     paneEl.innerHTML = `
       <div class="indicator-title">
         <button class="indicator-info-button" type="button" data-indicator-id="${escapeHtml(indicatorId)}">${escapeHtml(indicatorPane.title)}</button>
         <button class="indicator-sync-button" type="button">${pane.syncIndicators ? "Sync on" : "Sync off"}</button>
+        <button class="indicator-help-button" type="button" title="Indicator guide" aria-label="Indicator guide"><i data-lucide="info"></i></button>
       </div>
       <div class="indicator-chart"></div>
     `;
     nextPaneElements.push({ element: paneEl, pane: indicatorPane });
+    if (indicatorId === 'zgua-inspection') {
+      const header = paneEl.querySelector('.indicator-title');
+      const select = document.createElement('select'); select.className = 'zgua-study-select'; select.setAttribute('aria-label','Divergence oscillator');
+      pane.divergenceInspection.studies.forEach((study,index)=>select.add(new Option(study.name,String(index))));
+      select.value = String(pane.divergenceInspection.selected || 0);
+      select.onchange=()=>{pane.divergenceInspection.selected=Number(select.value);renderIndicators(pane,pane.requestId);};
+      const close=document.createElement('button'); close.type='button'; close.textContent='×'; close.title='Close divergence inspection'; close.setAttribute('aria-label',close.title);
+      close.onclick=()=>{pane.divergenceInspection=null;renderIndicators(pane,pane.requestId);};
+      header.append(select,close);
+      header.title=`Price swings: ${new Date(pane.divergenceInspection.event.firstTime*1000).toLocaleString()} / ${new Date(pane.divergenceInspection.event.pivotTime*1000).toLocaleString()}. Confirmed: ${new Date(pane.divergenceInspection.event.confirmedAt*1000).toLocaleString()}. Coloured straight line connects the actual oscillator values at those price swings; it is not a separate signal.`;
+    }
+    const helpInfo=config.indicators.find(item=>item.id===indicatorId);
+    if(helpInfo)window.ChartIndicatorHelp.attach(paneEl.querySelector('.indicator-help-button'),helpInfo,()=>indicatorPane.series);
+    setupIndicatorResize(pane, paneEl, indicatorId);
   });
 
   oldOverlaySeries.forEach((series) => {
     try {
+      for (const child of series.indicatorSegments || []) pane.chart.removeSeries(child);
       pane.chart.removeSeries(series);
     } catch {
       // A pane can be destroyed while an async indicator request is still returning.
@@ -3170,18 +3937,29 @@ async function renderIndicators(pane, requestId) {
   cancelPaneRangeSync(pane);
   oldIndicatorCharts.forEach((item) => item.chart.remove());
   pane.indicatorPanesEl.innerHTML = "";
+  nextPaneElements.forEach((item) => pane.indicatorPanesEl.appendChild(item.element));
+  applyIndicatorHeights(pane);
   nextPaneElements.forEach((item) => {
-    pane.indicatorPanesEl.appendChild(item.element);
     const chart = createBaseChart(item.element.querySelector(".indicator-chart"));
+    chart.subscribeCrosshairMove((param) => syncPaneCrosshair(pane, chart, param));
+    if (pane.replayActive) chart.timeScale().applyOptions({ shiftVisibleRangeOnNewBar: false, allowShiftVisibleRangeOnWhitespaceReplacement: false });
     let markerSeries = null;
+    const studySeries = [];
     item.pane.series.forEach((seriesConfig) => {
       const series = addSeries(chart, seriesConfig.type, seriesOptions(seriesConfig));
-      series.setData(normalizeSeriesData(seriesConfig.data));
+      series.setData(indicatorSeriesData(pane, seriesConfig.data, seriesConfig.offset));
+      if (seriesConfig.markers) setSeriesMarkers(series, normalizeMarkers(seriesConfig.markers));
+      studySeries.push(series);
       if (!markerSeries && !seriesConfig.guide) markerSeries = series;
     });
     const paneMarkers = normalizeMarkers(item.pane.markers || []);
     if (markerSeries && paneMarkers.length) setSeriesMarkers(markerSeries, paneMarkers);
-    nextIndicatorCharts.push({ chart, element: item.element });
+    nextIndicatorCharts.push({ chart, element: item.element, series: studySeries, markerSeries });
+    if (pane.replayActive) {
+      const previous = oldIndicatorCharts.find((study) => study.element.dataset.indicatorId === item.pane.id);
+      if (previous?.replayPriceRange) chart.priceScale("right").setVisibleRange(previous.replayPriceRange);
+      restoreVisibleLogicalRange(chart, currentVisibleLogicalRange(pane.chart));
+    } else chart.timeScale().fitContent();
     if (chart.timeScale().subscribeVisibleLogicalRangeChange) {
       chart.timeScale().subscribeVisibleLogicalRangeChange(() => schedulePaneRangeSync(pane, chart));
     } else if (chart.timeScale().subscribeVisibleTimeRangeChange) {
@@ -3190,9 +3968,194 @@ async function renderIndicators(pane, requestId) {
   });
   pane.overlaySeries = nextOverlaySeries;
   pane.indicatorCharts = nextIndicatorCharts;
+  for (const study of pane.indicatorCharts) study.chart.timeScale().applyOptions({secondsVisible:pane.timeframeSelect.value.endsWith('s')});
+  pane.replayIndicatorSignature = indicators.join(",");
+  applyIndicatorHeights(pane);
+  pane.drawingTools?.refreshVisibility();
+  applyIndividualIndicatorVisibility(pane);
   syncIndicatorTimeRanges(pane);
   pane.indicatorDiagnostics = payload.diagnostics || {};
+  window.lucide?.createIcons({root:pane.indicatorPanesEl});
   renderDataDiagnostics(pane);
+}
+
+async function applyReplaySlice(pane, rows, fullRows) {
+  if (pane.disposed || !pane.replayActive) return;
+  // Read the user's latest view, not the viewport saved when Replay was opened.
+  const view = currentVisibleLogicalRange(pane.chart);
+  const priceRange = pane.chart.priceScale("right").getVisibleRange();
+  pane.replayTimeline = fullRows.map(({ time }) => ({ time }));
+  pane.candles = rows;
+  refreshHeaderSignalStrip();
+  cancelPaneRangeSync(pane);
+  if (pane.replayNeedsReset) {
+    for (const series of pane.overlaySeries) {
+      series.setData(pane.replayTimeline);
+      setSeriesMarkers(series, []);
+      for (const child of series.indicatorSegments || []) pane.chart.removeSeries(child);
+      series.indicatorSegments = [];
+    }
+    for (const item of pane.indicatorCharts) {
+      for (const series of item.series) series.setData(pane.replayTimeline);
+      if (item.markerSeries) setSeriesMarkers(item.markerSeries, []);
+    }
+    pane.replayNeedsReset = false;
+  }
+  pane.series.setData([...window.ChartPresentation.seriesData(rows, pane.chartStyle), ...fullRows.slice(rows.length).map(({ time }) => ({ time }))]);
+  restoreVisibleLogicalRange(pane.chart, view);
+  if (priceRange) pane.chart.priceScale("right").setVisibleRange(priceRange);
+  pane.status.textContent = "Replay - " + rows.length + " visible candles";
+  await renderIndicators(pane, pane.requestId);
+  if (!pane.disposed && pane.replayActive) renderDataDiagnostics(pane);
+}
+
+function indicatorSeriesData(pane, data, offset = 0) {
+  const normalized = normalizeSeriesData(data);
+  const timeline = pane.indicatorTimeline || (pane.replayActive && pane.replayTimeline ? pane.replayTimeline : pane.candles);
+  if (!timeline?.length) return normalized;
+  if (offset) {
+    const indexes = new Map(timeline.map((row, index) => [row.time, index]));
+    const shifted = new Map();
+    for (const point of normalized) {
+      if (pane.replayActive && point.time > (pane.candles.at(-1)?.time || 0)) continue;
+      const index = indexes.get(point.time);
+      const target = index === undefined ? null : timeline[index + offset];
+      if (target) shifted.set(target.time, {...point, time: target.time});
+    }
+    return timeline.map(row => shifted.get(row.time) || {time: row.time});
+  }
+  const points = new Map(normalized.map(point => [point.time, point]));
+  const lastTime = pane.candles.at(-1)?.time || 0;
+  // Every series gets the identical timestamp spine, including warmup whitespace.
+  return timeline.map(row => pane.replayActive && row.time > lastTime ? {time:row.time} : points.get(row.time) || {time:row.time});
+}
+
+function renderIndicatorLabels(pane) {
+  let host = pane.node.querySelector(".chart-indicator-labels");
+  if (!host) { host = document.createElement("div"); host.className = "chart-indicator-labels"; pane.node.querySelector(".main-chart-wrap").append(host); }
+  host.replaceChildren();
+  for (const id of selectedIndicators(pane)) {
+    const info = config.indicators.find((item) => item.id === id);
+    if (!info) continue;
+    const row = document.createElement("div"); row.className = "chart-indicator-label"; row.tabIndex = 0;
+    row.classList.toggle("study-hidden", pane.hiddenIndicators?.has(id));
+    const label = document.createElement("span");
+    const basis = { ema: "close", sma: "close", rsi: "close", macd: "close", bbands: "close; population variance", atr: "true range", supertrend: "HL2", stochrsi: "close", volume: "volume", cipherb: "HLC3; scale 0.015; levels 60, 53, 0, -53, -60" };
+    const values = (info.schema || []).map((field) => `${field.label.trim()} ${pane.indicatorSettings[id]?.[field.name] ?? field.default}`).join("; ");
+    label.textContent = `${info.label.replace(/ (?:\d.*|\+ MA\d+)$/, "")} (${values ? (basis[id] || info.parameters) + "; " + values : info.parameters || "default"})`;
+    label.setAttribute("role", "button"); label.tabIndex = 0;
+    label.onclick = () => editIndicatorParameters(pane, info);
+    label.onkeydown = (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); editIndicatorParameters(pane, info); } };
+    row.append(label);
+    for (const [action, icon, title] of [["visibility", "eye", "Show or hide indicator"], ["settings", "settings-2", "Indicator parameters"], ["source", "code-2", "View Python source"], ["remove", "trash-2", "Remove indicator"], ["info", "info", "Indicator guide"]]) {
+      const button = document.createElement("button"); button.type = "button"; button.title = title; button.setAttribute("aria-label", `${title}: ${info.label}`); button.innerHTML = `<i data-lucide="${icon}"></i>`;
+      if(action==='info'){button.classList.add('indicator-help-button');window.ChartIndicatorHelp.attach(button,info,()=>pane.indicatorInfoById?.get(id)?.series||(pane.overlayPayload||[]).filter(item=>item.indicatorId===id||({ema:/^EMA /,sma:/^SMA /,vwap:/^VWAP/,bbands:/^BB /,supertrend:/^Supertrend/}[id])?.test(item.name)));row.append(button);continue;}
+      button.onclick = async () => {
+        if (action === "source") { showIndicatorSource(id); return; }
+        if (action === "remove") { pane.indicatorList.querySelector(`input[value="${id}"]`).checked = false; saveState(); await renderIndicators(pane, pane.requestId); }
+        else if (action === "visibility") {
+          pane.hiddenIndicators ||= new Set();
+          const hidden = !pane.hiddenIndicators.has(id);
+          hidden ? pane.hiddenIndicators.add(id) : pane.hiddenIndicators.delete(id);
+          row.classList.toggle("study-hidden", hidden); button.setAttribute("aria-pressed", String(hidden));
+          applyIndividualIndicatorVisibility(pane); saveState();
+        } else {
+          editIndicatorParameters(pane, info);
+        }
+      }; row.append(button);
+    }
+    host.append(row);
+  }
+  window.lucide?.createIcons();
+}
+
+function applyIndividualIndicatorVisibility(pane) {
+  for (const study of pane.indicatorCharts) study.element.style.visibility = pane.hiddenIndicators?.has(study.element.dataset.indicatorId) ? "hidden" : "";
+  const names = { ema: /^EMA /, sma: /^SMA /, vwap: /^VWAP/, bbands: /^BB /, supertrend: /^Supertrend/ };
+  for (const series of pane.overlaySeries) {
+    const id = series.indicatorId || Object.keys(names).find((name) => names[name].test(series.indicatorName || ""));
+    const visible = !pane.node.classList.contains("drawing-hide-indicators") && !pane.hiddenIndicators?.has(id);
+    series.applyOptions({ visible });
+    for (const child of series.indicatorSegments || []) child.applyOptions({ visible });
+  }
+}
+
+function applyIndicatorHeights(pane) {
+  const items = Array.from(pane.indicatorPanesEl.children);
+  const heights = items.map((item) => Math.max(64, Math.min(600, Number(pane.indicatorHeights?.[item.dataset.indicatorId]) || 128)));
+  const total = heights.reduce((sum, height) => sum + height, 0);
+  const stack = pane.node.querySelector(".chart-stack");
+  const requested = Math.min(Number(pane.studyViewportHeight) || total, total);
+  const stackHeight = stack.getBoundingClientRect?.().height || stack.clientHeight || total + 142;
+  const available = Math.min(requested, Math.max(64, stackHeight - 142));
+  // Compact layouts share the available study space before resorting to scrolling.
+  const fitted = total > available && available >= items.length * 64
+    ? heights.map((height) => 64 + (height - 64) * (available - items.length * 64) / (total - items.length * 64)) : heights;
+  pane.indicatorPanesEl.style.gridTemplateRows = fitted.map((height) => height + "px").join(" ");
+  pane.node.style.setProperty("--study-viewport-height", available + "px");
+  stack.classList.toggle("has-lower-studies", items.some((item) => item.classList.contains("indicator-pane")));
+}
+
+function editIndicatorParameters(pane, info) {
+  pane.node.querySelector(".indicator-parameter-popover")?.remove();
+  const panel = document.createElement("form"); panel.className = "indicator-parameter-popover";
+  const heading = document.createElement("strong"); heading.textContent = info.label.replace(/ (?:\d.*|\+ MA\d+)$/, "");
+  panel.append(heading);
+  for (const field of info.schema || []) {
+    const label = document.createElement("label"); label.textContent = field.label;
+    const input = document.createElement("input"); input.type = field.type === "boolean" ? "checkbox" : "number"; input.name = field.name;
+    input.min = field.min; input.max = field.max; input.step = field.step; input.required = field.type !== "boolean";
+    const value = pane.indicatorSettings[info.id]?.[field.name] ?? field.default;
+    if (field.type === "boolean") { input.checked = Boolean(value); label.className = "indicator-boolean-field"; }
+    else input.value = value;
+    label.append(input); panel.append(label);
+  }
+  if (!info.schema?.length) { const description = document.createElement("p"); description.textContent = info.parameters; panel.append(description); }
+  const error = document.createElement("p"); error.className = "account-error"; error.setAttribute("role", "status");
+  const footer = document.createElement("footer");
+  for (const title of ["Reset", "Cancel", "Apply"]) {
+    const button = document.createElement("button"); button.textContent = title; button.type = title === "Apply" ? "submit" : "button";
+    if (title === "Cancel") button.onclick = () => panel.remove();
+    if (title === "Reset") button.onclick = () => {
+      for (const field of info.schema || []) {
+        const input = panel.elements.namedItem(field.name);
+        if (field.type === "boolean") input.checked = Boolean(field.default); else input.value = field.default;
+      }
+    };
+    footer.append(button);
+  }
+  panel.append(error, footer); pane.node.querySelector(".chart-stack").append(panel);
+  panel.onsubmit = async (event) => {
+    event.preventDefault(); const previous = pane.indicatorSettings[info.id];
+    pane.indicatorSettings[info.id] = Object.fromEntries((info.schema || []).map((field) => {
+      const input = panel.elements.namedItem(field.name);
+      return [field.name, field.type === "boolean" ? Number(input.checked) : Number(input.value)];
+    }));
+    const submit = footer.lastElementChild; submit.disabled = true;
+    try { await renderIndicators(pane, pane.requestId); pane.hiddenIndicators.delete(info.id); pane.drawingTools?.showIndicators(); applyIndividualIndicatorVisibility(pane); renderIndicatorLabels(pane); saveState(); panel.remove(); }
+    catch (failure) { if (previous) pane.indicatorSettings[info.id] = previous; else delete pane.indicatorSettings[info.id]; renderIndicatorLabels(pane); error.textContent = failure.message; submit.disabled = false; }
+  };
+  panel.querySelector("input,button")?.focus();
+}
+
+function setupIndicatorResize(pane, element, id) {
+  const handle = document.createElement("div"); handle.className = "indicator-resize-handle";
+  handle.setAttribute("role", "separator"); handle.setAttribute("aria-orientation", "horizontal");
+  handle.setAttribute("aria-label", "Resize " + id + " height"); handle.tabIndex = 0; handle.title = "Drag to resize indicator height";
+  element.prepend(handle);
+  const apply = (height, viewport) => {
+    pane.indicatorHeights[id] = Math.max(64, Math.min(600, Math.round(height)));
+    pane.studyViewportHeight = Math.max(64, Math.min(600, Math.round(viewport)));
+    handle.setAttribute("aria-valuenow", String(pane.indicatorHeights[id])); applyIndicatorHeights(pane);
+  };
+  handle.setAttribute("aria-valuemin", "64"); handle.setAttribute("aria-valuemax", "600");
+  handle.setAttribute("aria-valuenow", String(pane.indicatorHeights[id] || 128));
+  let drag;
+  handle.addEventListener("pointerdown", (e) => { if (e.button !== 0) return; e.preventDefault(); e.stopPropagation(); drag = { y: e.clientY, height: element.getBoundingClientRect().height, viewport: pane.indicatorPanesEl.clientHeight }; handle.setPointerCapture(e.pointerId); });
+  handle.addEventListener("pointermove", (e) => { if (drag) { const delta = drag.y - e.clientY; apply(drag.height + delta, drag.viewport + delta); } });
+  const finish = (e) => { if (!drag) return; drag = null; if (handle.hasPointerCapture(e.pointerId)) handle.releasePointerCapture(e.pointerId); saveState(); };
+  handle.addEventListener("pointerup", finish); handle.addEventListener("pointercancel", finish);
+  handle.addEventListener("keydown", (e) => { if (!["ArrowUp", "ArrowDown"].includes(e.key)) return; e.preventDefault(); const delta = e.key === "ArrowUp" ? 16 : -16; apply(element.getBoundingClientRect().height + delta, pane.indicatorPanesEl.clientHeight + delta); saveState(); });
 }
 
 function normalizeSeriesData(data) {
@@ -3217,15 +4180,73 @@ function seriesOptions(series) {
   return {
     color: series.color || "#ced4da",
     lineWidth: series.guide ? 1 : 2,
+    lineVisible: !series.pointOnly,
+    pointMarkersVisible: series.pointOnly === true && !series.markerGroup,
+    pointMarkersRadius: 2,
     lineStyle: series.guide && LightweightCharts.LineStyle ? LightweightCharts.LineStyle.Dashed : undefined,
     priceLineVisible: false,
-    lastValueVisible: !series.guide,
+    lastValueVisible: !series.guide && !series.markerGroup,
   };
 }
 
+function groupDivergenceMarkers(pane, overlays, series) {
+  const groups = new Map();
+  overlays.forEach((config, index) => {
+    if (config.indicatorId !== 'zgua' && !config.markerGroup) return;
+    const id = config.indicatorId || 'zgua';
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(index);
+  });
+  for (const indices of groups.values()) {
+    const markers = indices.flatMap(index => {
+      setSeriesMarkers(series[index], []);
+      return (overlays[index].markers || []).map(marker => {
+        const match = /^([A-Z]{2})\s+(.+)$/.exec(marker.text);
+        return {...marker, text: match ? match[1]+' ('+match[2].replace(/ \+ break$/, '').split('/').length+')'+(marker.text.endsWith('+ break')?' +':'') : marker.text};
+      });
+    });
+    if (!markers.length) continue;
+    const host = addSeries(pane.chart, 'line', {lineVisible:false,pointMarkersVisible:false,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false,autoscaleInfoProvider:()=>null});
+    host.setData(pane.candles.map(({time,close})=>({time,value:close})));
+    setSeriesMarkers(host, normalizeMarkers(markers).sort((a,b)=>a.time-b.time));
+    series[indices[0]].indicatorSegments ||= [];
+    series[indices[0]].indicatorSegments.push(host);
+  }
+}
+
+async function inspectZguaDivergence(pane, markerId) {
+  const parts = markerId.split(':');
+  if (parts.length !== 6) return;
+  const event = {kind:parts[1], bullish:parts[2]==='1', firstTime:Number(parts[3]), pivotTime:Number(parts[4]), confirmedAt:Number(parts[5])};
+  const requestId = pane.requestId, inspectionId = (pane.inspectionRequestId || 0)+1;
+  pane.inspectionRequestId = inspectionId;
+  try {
+    const response = await fetch('/api/zgua/inspect', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({candles:pane.candles, params:pane.indicatorSettings.zgua || {}, event})});
+    const payload = await response.json();
+    if (requestId !== pane.requestId || inspectionId !== pane.inspectionRequestId) return;
+    if (!response.ok) throw new Error(payload.error || 'Divergence inspection failed');
+    pane.divergenceInspection = {...payload, selected:0, context:[pane.sourceSelect.value,pane.symbolSelect.value,pane.timeframeSelect.value].join(':')};
+    await renderIndicators(pane,requestId);
+  } catch (error) { console.error('Zgua inspection:',error); }
+}
+
+function updateIndicatorSegments(pane, series, config) {
+  for (const child of series.indicatorSegments || []) pane.chart.removeSeries(child);
+  series.indicatorSegments = [];
+  const times = new Set(pane.candles.map(row => row.time));
+  for (const segment of (config.segments || []).slice(-200)) {
+    if (!times.has(segment.confirmedAt) || !Array.isArray(segment.data) || segment.data.length !== 2 || !segment.data.every(point => times.has(point.time) && Number.isFinite(point.value)) || segment.data[0].time >= segment.data[1].time || segment.data[1].time >= segment.confirmedAt) continue;
+    const child = addSeries(pane.chart, 'line', {color: config.color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null});
+    child.setData(segment.data);
+    series.indicatorSegments.push(child);
+  }
+}
+
 function clearIndicatorSeries(pane) {
+  pane.indicatorTimeline = null;
   pane.overlaySeries.forEach((series) => {
     try {
+      for (const child of series.indicatorSegments || []) pane.chart.removeSeries(child);
       pane.chart.removeSeries(series);
     } catch {
       // A pane can be destroyed while an async indicator request is still returning.
@@ -3235,6 +4256,8 @@ function clearIndicatorSeries(pane) {
   pane.indicatorCharts.forEach((item) => item.chart.remove());
   pane.indicatorCharts = [];
   pane.indicatorPanesEl.innerHTML = "";
+  pane.indicatorPanesEl.style.gridTemplateRows = "";
+  pane.node.querySelector(".chart-stack").classList.remove("has-lower-studies");
 }
 
 function clearBacktestOverlaySeries(pane) {
@@ -3271,7 +4294,7 @@ function resetSignalBadge(pane) {
 }
 
 function updateChartMarkers(pane) {
-  const visibleMarkers = pane.signalMarkerToggle.checked
+  const visibleMarkers = pane.signalMarkerToggle.checked && !pane.drawingPositionsHidden && !pane.replayActive
     ? [...pane.signalMarkers, ...pane.backtestMarkers].sort((a, b) => a.time - b.time)
     : [];
   pane.markerDetailsByTime = buildMarkerDetailsMap(visibleMarkers);
@@ -3299,7 +4322,10 @@ function setSeriesMarkers(series, markers) {
     series.setMarkers(markers);
     return;
   }
-  if (LightweightCharts.createSeriesMarkers) LightweightCharts.createSeriesMarkers(series, markers);
+  if (LightweightCharts.createSeriesMarkers) {
+    if (!series.markerPlugin) series.markerPlugin = LightweightCharts.createSeriesMarkers(series, markers);
+    else series.markerPlugin.setMarkers(markers);
+  }
 }
 
 function clearSignalMarkers(pane) {
@@ -3336,10 +4362,10 @@ function currentVisibleLogicalRange(chart) {
 }
 
 function currentVisibleSyncRange(chart) {
-  const logical = currentVisibleLogicalRange(chart);
-  if (logical) return { type: "logical", range: logical };
   const time = currentVisibleRange(chart);
   if (time) return { type: "time", range: time };
+  const logical = currentVisibleLogicalRange(chart);
+  if (logical) return { type: "logical", range: logical };
   return null;
 }
 
@@ -3371,22 +4397,36 @@ function restoreVisibleLogicalRange(chart, range) {
 }
 
 function syncIndicatorTimeRanges(pane) {
+  const charts = [pane.chart, ...pane.indicatorCharts.map((item) => item.chart)];
+  const font = Number(uiPrefs.chartFontSize) || 12;
+  const canvas = document.createElement('canvas'), context = canvas.getContext('2d');
+  context.font = `${font}px ${getComputedStyle(document.body).fontFamily}`;
+  const labels = charts.flatMap((chart) => {
+    const range = chart.priceScale('right').getVisibleRange();
+    return range ? [range.from, range.to].map((value) => Number(value).toFixed(2)) : [];
+  });
+  const axisWidth = Math.ceil(Math.max(32, ...labels.map((label) => context.measureText(label).width)) + 24);
+  charts.forEach((chart) => chart.priceScale('right').applyOptions({ minimumWidth: axisWidth }));
+  pane.node?.style.setProperty('--chart-axis-width',(pane.chart.priceScale('right').width()||96)+'px');
   if (!pane.syncIndicators) return;
   if (pane.rangeSyncing) return;
-  const syncRange = currentVisibleSyncRange(pane.chart);
-  if (!syncRange) return;
+  const logical = currentVisibleLogicalRange(pane.chart);
+  const syncRange = logical ? { type: "logical", range: logical } : currentVisibleSyncRange(pane.chart);
+  if (!syncRange?.range) return;
   syncPaneTimeRange(pane, syncRange, pane.chart);
 }
 
 function schedulePaneRangeSync(pane, sourceChart) {
-  if (!pane.syncIndicators || pane.rangeSyncing) return;
+  if (pane.disposed || !pane.syncIndicators || pane.rangeSyncing) return;
+  if (pane.replayActive && sourceChart !== pane.chart) return;
   pane.pendingRangeSyncSource = sourceChart;
   if (pane.rangeSyncFrame !== null) return;
   pane.rangeSyncFrame = requestAnimationFrame(() => {
     pane.rangeSyncFrame = null;
     const latestSource = pane.pendingRangeSyncSource;
     pane.pendingRangeSyncSource = null;
-    if (!latestSource) return;
+    if (pane.disposed || !latestSource) return;
+    if (latestSource !== pane.chart && !pane.indicatorCharts.some((item) => item.chart === latestSource)) return;
     if (latestSource === pane.chart) {
       syncIndicatorTimeRanges(pane);
     } else {
@@ -3402,9 +4442,11 @@ function cancelPaneRangeSync(pane) {
 }
 
 function syncPaneTimeRangeFromChart(pane, sourceChart) {
+  if (pane.replayActive) return;
   if (!pane.syncIndicators) return;
   if (pane.rangeSyncing) return;
-  const syncRange = currentVisibleSyncRange(sourceChart);
+  const logical = currentVisibleLogicalRange(sourceChart);
+  const syncRange = logical ? { type: "logical", range: logical } : currentVisibleSyncRange(sourceChart);
   if (!syncRange) return;
   syncPaneTimeRange(pane, syncRange, sourceChart);
 }
@@ -3432,13 +4474,16 @@ function backtestLimitOptions(selected = "auto") {
 }
 
 function openBacktestControls(pane) {
-  const options = (config.strategy_presets || [])
-    .map((preset) => `<option value="${preset.id}" ${preset.id === pane.presetSelect.value ? "selected" : ""}>${preset.label}</option>`)
+  const controlsRequestId = pane.requestId;
+  if (pane.timeframeSelect.value.endsWith('s')) {openBacktestModal('<p class="modal-note">1s is for chart inspection. Use a minute-or-higher timeframe for the existing tactic backtests; limited trade-built history must not be treated as a complete test.</p>','Sub-minute chart');return;}
+  const options = (config.chart_signal_strategies || [])
+    .map((preset) => `<option value="${escapeHtml(preset.id)}" ${preset.id === pane.presetSelect.value ? "selected" : ""}>${escapeHtml(preset.label)}</option>`)
     .join("");
   openBacktestModal(`
     <div class="backtest-controls">
+      <p class="modal-note">${escapeHtml(pane.sourceSelect.value)} / ${escapeHtml(pane.symbolSelect.value)} / ${escapeHtml(pane.timeframeSelect.value)} / ${escapeHtml(defaultExecutionTimeframe(pane.timeframeSelect.value))} execution</p>
       <label>
-        <span>Preset</span>
+        <span>Tactic</span>
         <select id="modal-preset-select">${options}</select>
       </label>
       <label>
@@ -3447,11 +4492,11 @@ function openBacktestControls(pane) {
       </label>
       <label>
         <span>Fee % / side</span>
-        <input id="modal-fee-input" type="number" min="0" step="0.01" value="0">
+        <input id="modal-fee-input" type="number" min="0" step="0.005" value="0.055">
       </label>
       <label>
         <span>Slippage % / side</span>
-        <input id="modal-slippage-input" type="number" min="0" step="0.01" value="0">
+        <input id="modal-slippage-input" type="number" min="0" step="0.01" value="0.02">
       </label>
       <label class="allow-short-toggle">
         <input id="modal-allow-shorts" type="checkbox">
@@ -3460,8 +4505,6 @@ function openBacktestControls(pane) {
       <p class="modal-note">Short mode enables explicit short-side strategy rules where implemented; long-only presets remain long-only.</p>
       <div class="backtest-actions">
         <button id="modal-run-backtest" type="button">Run Backtest</button>
-        <button id="modal-test-presets" type="button">Test presets</button>
-        <button id="modal-optimize-strategy" type="button">Optimize</button>
       </div>
       <p id="modal-preset-note" class="modal-note"></p>
     </div>
@@ -3471,15 +4514,24 @@ function openBacktestControls(pane) {
   const presetSelect = document.querySelector("#modal-preset-select");
   const note = document.querySelector("#modal-preset-note");
   const syncNote = () => {
-    const preset = (config.strategy_presets || []).find((item) => item.id === presetSelect.value);
-    note.textContent = preset?.intended_timeframes ? `Recommended timeframe: ${preset.intended_timeframes}` : "";
+    const preset = (config.chart_signal_strategies || []).find((item) => item.id === presetSelect.value);
+    note.textContent = preset?.custom ? 'Personal tactic: isolated local backtest; worker cost and 1x limits apply.' : 'Historical simulation, not evidence that this tactic is profitable. Modeled costs are included.';
+    for (const id of ['modal-limit-input','modal-fee-input','modal-slippage-input','modal-allow-shorts']) {
+      const input = document.getElementById(id);
+      input.disabled = Boolean(preset?.custom);
+      input.title = preset?.custom ? 'Personal tactics use loaded candles and fixed isolated-worker costs/settings.' : '';
+    }
   };
   presetSelect.addEventListener("change", syncNote);
   syncNote();
 
-  document.querySelector("#modal-run-backtest").addEventListener("click", () => runBacktest(pane, presetSelect.value));
-  document.querySelector("#modal-test-presets").addEventListener("click", () => testPresets(pane));
-  document.querySelector("#modal-optimize-strategy").addEventListener("click", () => optimizeStrategy(pane, presetSelect.value));
+  document.querySelector("#modal-run-backtest").addEventListener("click", () => {
+    if (pane.disposed || pane.requestId !== controlsRequestId) {
+      document.querySelector('#modal-results').textContent = 'The chart changed. Reopen Backtest for the current chart.';
+      return;
+    }
+    runBacktest(pane, presetSelect.value);
+  });
 }
 
 function backtestSettings(presetId) {
@@ -3505,6 +4557,7 @@ function buildMarkerDetailsMap(markers) {
 
 function showMarkerDetailsForCrosshair(pane, param) {
   if (!pane.markerDetailEl) return;
+  if (pane.drawingTools?.isInteracting()) { pane.markerDetailEl.hidden = true; return; }
   const time = normalizeMarkerTime(param?.time);
   if (time === null) {
     hideMarkerDetails(pane);
@@ -5302,24 +6355,34 @@ async function runBacktest(pane, presetId) {
   // by /api/backtest. The UI renders the payload without duplicating strategy
   // or metric formulas.
   pane.backtestButton.disabled = true;
-  pane.backtestButton.textContent = "Testing...";
+  pane.backtestButton.setAttribute('aria-busy', 'true');
   const resultsEl = document.querySelector("#modal-results") || backtestContent;
+  const requestId = pane.requestId;
   resultsEl.innerHTML = `<p class="pane-status">Running backtest for ${pane.symbolSelect.value}...</p>`;
 
   try {
     const settings = backtestSettings(presetId);
-    const params = new URLSearchParams({
+    const preset = (config.chart_signal_strategies || []).find(item => item.id === presetId);
+    if (!preset) throw new Error('Choose an available chart tactic.');
+    const limit = settings.limit === 'auto' ? Math.min(5000, Math.max(300, pane.candles.length)) : Number(settings.limit);
+    const payload = preset.custom
+      ? await window.ChartCustomTactics.backtest(window.ChartCustomTactics.get(preset.id), pane)
+      : await apiPost('/api/backtest/run-custom', {
       source: pane.sourceSelect.value,
       symbol: pane.symbolSelect.value,
       timeframe: pane.timeframeSelect.value,
-      period: "60d",
-      chart_candles_count: String(pane.candles.length),
-      first_chart_candle_time: String(pane.candles[0]?.time || ""),
-      last_chart_candle_time: String(pane.candles[pane.candles.length - 1]?.time || ""),
-      ...settings,
+      executionTimeframe: defaultExecutionTimeframe(pane.timeframeSelect.value),
+      period: periodForChartCandles(pane.timeframeSelect.value, limit),
+      strategy: preset.strategy, params: preset.params || {}, paramsSource: preset.label,
+      limit, feePct: Number(settings.fee_pct), slippagePct: Number(settings.slippage_pct),
+      allowShorts: settings.allowShorts === 'true', includeFullTrades: true,
+      saveHistory: true, mode: 'manual',
     });
-    const payload = await apiGet(`/api/backtest?${params}`);
 
+    if (pane.disposed || pane.requestId !== requestId) {
+      resultsEl.innerHTML = '<p>The chart changed during the backtest. Reopen Backtest for the current chart.</p>';
+      return;
+    }
     pane.backtestMarkers = markersFromBacktestPayload(payload);
     renderBacktestOverlays(pane, payload);
     pane.backtestDiagnostics = payload.diagnostics?.overlay_rendering || payload.overlayDiagnostics || {};
@@ -5330,7 +6393,7 @@ async function runBacktest(pane, presetId) {
     resultsEl.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
   } finally {
     pane.backtestButton.disabled = false;
-    pane.backtestButton.textContent = "Backtest";
+    pane.backtestButton.removeAttribute('aria-busy');
   }
 }
 
@@ -5352,9 +6415,10 @@ function renderBacktestOverlays(pane, payload) {
   clearBacktestOverlaySeries(pane);
   (payload.overlays || []).forEach((overlay) => {
     const series = addSeries(pane.chart, overlay.type || "line", seriesOptions(overlay));
-    series.setData(normalizeSeriesData(overlay.data));
+    series.setData(indicatorSeriesData(pane, overlay.data));
     pane.backtestOverlaySeries.push(series);
   });
+  pane.drawingTools?.refreshVisibility();
 }
 
 function markersFromBacktestPayload(payload, options = {}) {
@@ -5394,7 +6458,13 @@ function markersFromBacktestPayload(payload, options = {}) {
       });
     }
   });
-  return markers;
+  for (const trade of trades) for (const fill of trade.partialExits || []) {
+    const time=normalizeMarkerTime(fill.time);
+    if (time!==null) markers.push({time,position:String(trade.side||'long').toLowerCase()==='short'?'belowBar':'aboveBar',
+      color:'#69d7bb',shape:'circle',text:prefix+'25% @ '+fill.targetR+'R',reason:'Research partial profit target; modeled costs applied.',
+      trade,strategyName:options.strategyName,strategyParams:options.strategyParams});
+  }
+  return markers.sort((a,b)=>a.time-b.time);
 }
 
 function normalizedTrades(payload) {
@@ -5402,6 +6472,7 @@ function normalizedTrades(payload) {
   if (Array.isArray(payload.trade_list)) return payload.trade_list;
   if (Array.isArray(payload.tradeList)) {
     return payload.tradeList.map((trade) => ({
+      ...trade,
       entry_time: trade.entryTime,
       exit_time: trade.exitTime,
       entry_price: trade.entryPrice,
@@ -5504,44 +6575,28 @@ async function openBacktestHistory() {
 }
 
 function renderBacktestHistory(payload) {
-  const summaries = payload.strategySummary || [];
   const runs = payload.runs || [];
-  const summaryRows = summaries.map((row) => `
-    <tr>
-      <td>${escapeHtml(row.strategy)}</td>
-      <td>${row.tests}</td>
-      <td>${row.totalTrades}</td>
-      <td class="${row.sumReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.sumReturnPct)}%</td>
-      <td class="${row.avgReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(row.avgReturnPct)}%</td>
-      <td>${row.avgWinRate}%</td>
-      <td>${row.avgProfitFactor}</td>
-      <td>${row.worstDrawdown}%</td>
-    </tr>
-  `).join("");
   const runRows = runs.map((run) => `
     <tr>
       <td>${escapeHtml(new Date(run.createdAt).toLocaleString())}</td>
-      <td>${escapeHtml(run.strategy)}</td>
-      <td>${escapeHtml(run.symbol)} ${escapeHtml(run.timeframe)}</td>
-      <td>${escapeHtml(run.period || "-")}</td>
+      <td title="${escapeHtml(JSON.stringify(run.params || {}))}">${escapeHtml(run.strategy)}</td>
+      <td>${escapeHtml(run.source || "Unknown")} · ${escapeHtml(run.symbol)} ${escapeHtml(run.timeframe)}</td>
+      <td title="${escapeHtml(run.firstCandleTime ? formatDateTime(run.firstCandleTime) + ' to ' + formatDateTime(run.lastCandleTime) : 'Legacy run: actual candle coverage was not saved')}">${escapeHtml(run.period || "-")}${run.candlesLoaded ? ' / ' + run.candlesLoaded + ' bars' : ''}</td>
+      <td>${escapeHtml(run.executionTimeframe || "Not saved")}</td>
+      <td>${run.params?.feePct == null ? '?' : formatNumber(run.params.feePct, 3)} / ${run.params?.slippagePct == null ? '?' : formatNumber(run.params.slippagePct, 3)}%</td>
       <td class="${run.totalReturnPct >= 0 ? "positive" : "negative"}">${formatSigned(run.totalReturnPct)}%</td>
-      <td>${run.trades}</td>
-      <td>${run.winRate}%</td>
-      <td>${run.profitFactor}</td>
-      <td>${run.maxDrawdown}%</td>
+      <td title="${run.includesEndOfData ? 'Includes a forced End of data exit; sidebar excludes it' : 'Legacy runs may include End of data exits'}">${run.trades}${run.closedTrades != null ? ' / ' + run.closedTrades : ''}</td>
+      <td>${formatNumber(run.winRate, 1)}%</td>
+      <td>${formatNumber(run.profitFactor, 2)}</td>
+      <td>${formatNumber(run.maxDrawdown, 2)}%</td>
     </tr>
   `).join("");
   return `
-    <h3 class="modal-section-title">Strategy Totals</h3>
-    <p class="modal-note">Stored locally from completed <code>/api/backtest</code> runs. Summary values are backend-calculated.</p>
+    <h3 class="modal-section-title">Saved Backtests (${payload.totalRuns || runs.length})</h3>
+    <p class="modal-note">Overlapping runs are not independent returns. Legacy runs can lack execution/coverage metadata. Chart previews exclude open trades and are not saved automatically.</p>
     <table class="trade-table">
-      <thead><tr><th>Strategy</th><th>Tests</th><th>Trades</th><th>Sum return</th><th>Avg return</th><th>Avg win</th><th>Avg PF</th><th>Worst DD</th></tr></thead>
-      <tbody>${summaryRows || `<tr><td colspan="8">No backtests recorded yet.</td></tr>`}</tbody>
-    </table>
-    <h3 class="modal-section-title">Recent Backtests</h3>
-    <table class="trade-table">
-      <thead><tr><th>Time</th><th>Strategy</th><th>Market</th><th>Period</th><th>Return</th><th>Trades</th><th>Win</th><th>PF</th><th>DD</th></tr></thead>
-      <tbody>${runRows || `<tr><td colspan="9">Run a backtest to create history.</td></tr>`}</tbody>
+      <thead><tr><th>Time</th><th>Strategy</th><th>Source / Market</th><th>Window</th><th>Exit TF</th><th>Fee / Slip</th><th>Account return</th><th>Total / Closed</th><th>Win</th><th>PF</th><th>DD</th></tr></thead>
+      <tbody>${runRows || `<tr><td colspan="11">No saved backtests.</td></tr>`}</tbody>
     </table>
   `;
 }
@@ -5606,8 +6661,12 @@ function openIndicatorInfo(indicatorPane) {
 }
 
 function openSignalDetails(pane) {
+  if (pane.strategyPayload && pane.presetSelect.value !== 'none') {
+    openBacktestModal('<p class="modal-note">Chart preview, not a saved backtest. History lists completed saved runs only.</p>' + renderBacktestResults(pane.strategyPayload), (pane.strategySummary?.strategy || pane.presetSelect.value) + ' · Preview');
+    return;
+  }
   const payload = pane.lastSignalPayload;
-  if (!payload) return;
+  if (!payload) { openBacktestModal('<p class="modal-note">Select a tactic and wait for its chart preview to finish.</p>', 'Tactic details'); return; }
   if (bottomPanelContent && !document.querySelector("#charts-page")?.hidden) {
     bottomPanelContent.innerHTML = renderSignalDetails(pane, payload);
   }
@@ -5652,39 +6711,18 @@ function renderSignalDetails(pane, payload) {
 }
 
 async function refreshHeaderSignalStrip() {
-  if (!headerSignalStrip) return;
-  const symbol = "BTCUSDT";
-  const source = "bybit";
-  const timeframes = ["4h", "1h", "15m"];
-  const rows = await Promise.all(timeframes.map(async (timeframe) => {
-    try {
-      const payload = await apiGet(`/api/signals?${new URLSearchParams({
-        source,
-        symbol,
-        timeframe,
-        limit: "500",
-        include_timeframes: "false",
-      })}`);
-      return {
-        timeframe,
-        direction: payload.signalDirection || "NEUTRAL",
-        longPct: payload.longSignalPct ?? payload.buySuggestionPct ?? 0,
-        shortPct: payload.shortSignalPct ?? 0,
-        score: payload.score ?? 0,
-        tone: payload.tone || "neutral",
-      };
-    } catch (error) {
-      return { timeframe, direction: "ERR", longPct: 0, shortPct: 0, score: "-", tone: "neutral", error: error.message };
-    }
-  }));
-  headerSignalStrip.innerHTML = rows.map((row) => {
-    const pct = row.direction === "SHORT" ? row.shortPct : row.longPct;
-    const label = row.direction === "SHORT" ? "S" : row.direction === "LONG" ? "L" : row.direction === "ERR" ? "ERR" : "N";
-    const title = row.error
-      ? `BTC ${row.timeframe}: ${row.error}`
-      : `BTC ${row.timeframe}: ${row.direction}, long ${row.longPct}%, short ${row.shortPct}%, score ${row.score}`;
-    return `<span class="header-signal-pill ${escapeHtml(row.tone)}" title="${escapeHtml(title)}">BTC ${escapeHtml(row.timeframe)} ${escapeHtml(label)}${escapeHtml(String(pct))}%</span>`;
-  }).join("");
+  updateTacticVisibility();
+  const active = panes.find(pane=>pane.node.classList.contains('active-chart')) || panes[0];
+  if (!window.ChartAccounts?.canUseTactics() || !active?.presetSelect.value || active.presetSelect.value==='none' || active.presetSelect.value==='__new_tactic') return;
+  return window.ChartEntryReadiness.refresh();
+}
+
+function updateTacticVisibility() {
+  const signedIn=!!window.ChartAccounts?.canUseTactics();
+  for (const pane of panes) pane.node.classList.toggle('no-tactic',!signedIn || !pane.presetSelect.value || pane.presetSelect.value==='none' || pane.presetSelect.value==='__new_tactic');
+  const active=panes.find(pane=>pane.node.classList.contains('active-chart')) || panes[0];
+  headerSignalStrip.hidden=!signedIn || !active || active.node.classList.contains('no-tactic');
+  if (headerSignalStrip.hidden) headerSignalStrip.replaceChildren();
 }
 
 function renderTimeframeSignalMatrix(payload) {
@@ -6132,7 +7170,8 @@ function renderBacktestResults(payload) {
       <td>${formatPrice(trade.exit_price)}</td>
       <td class="${trade.return_pct >= 0 ? "positive" : "negative"}">${formatSigned(trade.return_pct)}%</td>
       <td>${trade.bars_held}</td>
-      <td>${escapeHtml(trade.exit_reason)}</td>
+      <td>${escapeHtml(trade.entry_reason ?? trade.entryReason ?? '-')}</td>
+      <td>${escapeHtml(trade.exit_reason ?? trade.exitReason ?? '-')}</td>
     </tr>
   `).join("");
 
@@ -6170,7 +7209,7 @@ function renderBacktestResults(payload) {
           <th>Exit Price</th>
           <th>Return</th>
           <th>Bars</th>
-          <th>Reason</th>
+          <th>Entry reason</th><th>Exit reason</th>
         </tr>
       </thead>
       <tbody>${rows || `<tr><td colspan="7">No trades for this period.</td></tr>`}</tbody>
@@ -11809,6 +12848,10 @@ function renderSettingsPage() {
     </div>
   `;
   settingsContent.innerHTML = `
+    <section class="settings-panel font-settings">
+      <h3>Typography</h3>
+      ${fontSettingFields.map((field) => `<label>${escapeHtml(field.label)} <input type="number" data-font-setting="${field.key}" aria-label="${escapeHtml(field.label)} font size" min="${field.min}" max="${field.max}" value="${uiPrefs[field.key] || field.value}"> px</label>`).join("")}
+    </section>
     <div class="metric"><span>Default source</span><strong>Bybit</strong></div>
     <div class="metric"><span>Default chart count</span><strong>1</strong></div>
     <div class="metric"><span>Default preset</span><strong>${escapeHtml(config.default_strategy_preset || "-")}</strong></div>
@@ -11840,6 +12883,25 @@ function renderSettingsPage() {
       saveState();
     });
   });
+  settingsContent.querySelectorAll("[data-font-setting]").forEach((input) => {
+    const update = () => {
+      if (!input.value || !input.checkValidity()) return;
+      uiPrefs[input.dataset.fontSetting] = Number(input.value); applyFontSettings(); saveUiPrefs();
+    };
+    input.addEventListener("input", update); input.addEventListener("change", update);
+  });
+}
+
+function applyFontSettings() {
+  document.documentElement.style.setProperty("--ui-font-scale", (Number(uiPrefs.uiFontSize) || 12) / 12);
+  document.documentElement.style.setProperty("--detail-font-size", (Number(uiPrefs.detailFontSize) || 9) + "px");
+  document.documentElement.style.setProperty("--header-font-size", (Number(uiPrefs.headerFontSize) || 11) + "px");
+  document.documentElement.style.setProperty("--watch-font-size", (Number(uiPrefs.watchFontSize) || 12) + "px");
+  document.documentElement.style.setProperty("--panel-font-size", (Number(uiPrefs.panelFontSize) || 12) + "px");
+  document.documentElement.style.setProperty("--table-font-size", (Number(uiPrefs.tableFontSize) || 11) + "px");
+  for (const pane of [...panes, ...(backtestPane ? [backtestPane] : [])]) {
+    for (const chart of [pane.chart, ...(pane.indicatorCharts || []).map((item) => item.chart)]) chart?.applyOptions({ layout: { fontSize: Number(uiPrefs.chartFontSize) || 12 } });
+  }
 }
 
 function formatIsoDate(value) {
@@ -11866,13 +12928,15 @@ function renderDataDiagnostics(pane) {
   const overlayPoints = backtest.overlayPoints || indicator.overlayPoints || {};
   const indicatorCount = overlayPoints["EMA 200"] || overlayPoints["EMA 50"] || Object.values(overlayPoints)[0] || 0;
   pane.dataDiagnosticsEl.innerHTML = `
-    <span>Candles ${pane.candles.length || 0}</span>
+    <span class="feed-status-slot"></span>
     <span>Indicators ${indicatorCount || 0}</span>
     <span>First ${formatDateTime(pane.candles[0]?.time)}</span>
     <span>EMA200 ${formatDateTime(firstEma200)}</span>
     <span>Last ${formatDateTime(pane.candles[pane.candles.length - 1]?.time)}</span>
     <span>Overlay last ${formatDateTime(lastOverlay)}</span>
+    <span class="chart-disclaimer">Signals are technical-analysis hints, not financial advice.</span>
   `;
+  pane.dataDiagnosticsEl.querySelector(".feed-status-slot").replaceWith(pane.status);
 }
 
 function formatCompact(value) {
@@ -11968,16 +13032,21 @@ function escapeHtml(value) {
 
 function updateIndicatorButton(pane) {
   const count = selectedIndicators(pane).length;
-  pane.indicatorButton.textContent = count ? `Indicators ${count}` : "Indicators";
+  const badge = pane.indicatorButton.querySelector(".indicator-count");
+  badge.textContent = count;
+  badge.hidden = !count;
+  pane.indicatorButton.setAttribute("aria-label", count ? `Indicators ${count}` : "Indicators");
 }
 
 function connectBybit(pane, requestId) {
+  if (pane.disposed || requestId !== pane.requestId) return;
   const symbol = pane.symbolSelect.value;
   const timeframe = bybitInterval(pane.timeframeSelect.value);
   const ws = new WebSocket(BYBIT_WS);
   pane.ws = ws;
 
   ws.addEventListener("open", () => {
+    if (pane.disposed || requestId !== pane.requestId || pane.ws !== ws) { ws.close(); return; }
     ws.send(JSON.stringify({
       op: "subscribe",
       args: [`kline.${timeframe}.${symbol}`],
@@ -11990,7 +13059,10 @@ function connectBybit(pane, requestId) {
   });
 
   ws.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
+    if (pane.disposed || requestId !== pane.requestId || pane.ws !== ws) return;
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (!message || typeof message !== "object") return;
     const row = message.data?.[0];
     if (!row || !message.topic?.startsWith("kline.")) return;
     const candle = {
@@ -11999,9 +13071,11 @@ function connectBybit(pane, requestId) {
       high: Number(row.high),
       low: Number(row.low),
       close: Number(row.close),
+      volume: Number(row.volume),
     };
-    mergeLiveCandle(pane, candle);
-    pane.series.update(candle);
+    if (!mergeLiveCandle(pane, candle)) return;
+    if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane, candle);
+    else pane.series.update(candle);
     updateTicker(pane, candle.close);
   });
 
@@ -12010,24 +13084,31 @@ function connectBybit(pane, requestId) {
   });
 
   ws.addEventListener("error", () => {
-    if (requestId === pane.requestId) pane.status.textContent = "Bybit websocket error";
+    if (!pane.disposed && pane.ws === ws && requestId === pane.requestId) pane.status.textContent = "Bybit websocket error";
   });
 }
 
 function mergeLiveCandle(pane, candle) {
+  if (![candle.time, candle.open, candle.high, candle.low, candle.close].every(Number.isFinite)) return false;
   if (!Array.isArray(pane.candles)) pane.candles = [];
   const last = pane.candles[pane.candles.length - 1];
+  if (last && candle.time < last.time) return false;
+  if (candle.volume === undefined && last?.time === candle.time) candle.volume = last.volume;
+  if (!Number.isFinite(candle.volume) || candle.volume < 0) return false;
   if (!last || candle.time > last.time) pane.candles.push(candle);
   else if (candle.time === last.time) pane.candles[pane.candles.length - 1] = candle;
+  return true;
 }
 
 function connectHyperliquid(pane, requestId) {
+  if (pane.disposed || requestId !== pane.requestId) return;
   const symbol = pane.symbolSelect.value;
   const timeframe = pane.timeframeSelect.value;
   const ws = new WebSocket(HYPERLIQUID_WS);
   pane.ws = ws;
 
   ws.addEventListener("open", () => {
+    if (pane.disposed || requestId !== pane.requestId || pane.ws !== ws) { ws.close(); return; }
     ws.send(JSON.stringify({
       method: "subscribe",
       subscription: { type: "candle", coin: symbol, interval: timeframe },
@@ -12040,7 +13121,10 @@ function connectHyperliquid(pane, requestId) {
   });
 
   ws.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
+    if (pane.disposed || requestId !== pane.requestId || pane.ws !== ws) return;
+    let message;
+    try { message = JSON.parse(event.data); } catch { return; }
+    if (!message || typeof message !== "object") return;
     if (message.channel !== "candle" || !message.data) return;
     const row = message.data;
     const candle = {
@@ -12049,9 +13133,11 @@ function connectHyperliquid(pane, requestId) {
       high: Number(row.h),
       low: Number(row.l),
       close: Number(row.c),
+      volume: Number(row.v),
     };
-    mergeLiveCandle(pane, candle);
-    pane.series.update(candle);
+    if (!mergeLiveCandle(pane, candle)) return;
+    if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane, candle);
+    else pane.series.update(candle);
     updateTicker(pane, candle.close);
   });
 
@@ -12060,7 +13146,7 @@ function connectHyperliquid(pane, requestId) {
   });
 
   ws.addEventListener("error", () => {
-    if (requestId === pane.requestId) pane.status.textContent = "Hyperliquid websocket error";
+    if (!pane.disposed && pane.ws === ws && requestId === pane.requestId) pane.status.textContent = "Hyperliquid websocket error";
   });
 }
 
@@ -12073,14 +13159,13 @@ function bybitInterval(timeframe) {
 }
 
 function startYfinancePolling(pane) {
+  if (pane.disposed) return;
+  const requestId = pane.requestId;
   const refresh = async () => {
-    if (pane.sourceSelect.value !== "yfinance") {
-      clearInterval(pane.pollTimer);
-      pane.pollTimer = null;
-      return;
-    }
+    if (pane.disposed || requestId !== pane.requestId || pane.sourceSelect.value !== "yfinance") return;
     try {
       const candles = await loadCandles(pane);
+      if (pane.disposed || requestId !== pane.requestId) return;
       pane.candleDiagnostics = candles.diagnostics || {};
       pane.candles = candles.candles || [];
       if (!pane.candles.length) {
@@ -12088,13 +13173,17 @@ function startYfinancePolling(pane) {
         return;
       }
       pane.pollFailures = 0;
-      pane.series.setData(pane.candles);
+      if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane);
+      else pane.series.setData(pane.candles);
       updateTicker(pane, pane.candles[pane.candles.length - 1].close);
-      await renderIndicators(pane, pane.requestId);
-      await renderSelectedStrategy(pane, pane.requestId);
+      await renderIndicators(pane, requestId);
+      if (pane.disposed || requestId !== pane.requestId) return;
+      await renderSelectedStrategy(pane, requestId);
+      if (pane.disposed || requestId !== pane.requestId) return;
       renderDataDiagnostics(pane);
       pane.status.textContent = `yfinance refreshed ${new Date().toLocaleTimeString()}`;
     } catch (error) {
+      if (pane.disposed || requestId !== pane.requestId) return;
       pane.status.textContent = error.message;
       pane.pollFailures = (pane.pollFailures || 0) + 1;
       if (pane.pollFailures >= 3) {
@@ -12112,16 +13201,21 @@ function startYfinancePolling(pane) {
 function updateTicker(pane, price) {
   const direction = pane.lastPrice === null ? "neutral" : price >= pane.lastPrice ? "up" : "down";
   pane.lastPrice = price;
+  pane.lastQuoteAt = Date.now();
+  window.ChartEntryReadiness?.refreshQuote(pane);
   pane.tickerSymbol.textContent = pane.symbolSelect.value;
   pane.tickerPrice.textContent = formatPrice(price);
   pane.ticker.classList.remove("up", "down", "neutral");
   pane.ticker.classList.add(direction);
-  watchlistQuotes.set(pane.symbolSelect.value, {
-    ...(watchlistQuotes.get(pane.symbolSelect.value) || {}),
-    price,
-    updatedAt: Date.now(),
-  });
-  renderWatchlist();
+  const watchSource = sourceForWatchSymbol(pane.symbolSelect.value, panes[0]?.sourceSelect?.value);
+  if (pane.sourceSelect.value === watchSource) {
+    watchlistQuotes.set(pane.sourceSelect.value+':'+pane.symbolSelect.value, {
+      ...(watchlistQuotes.get(pane.sourceSelect.value+':'+pane.symbolSelect.value) || {}),
+      price,
+      updatedAt: Date.now(),
+    });
+    renderWatchlist();
+  }
 
   window.clearTimeout(pane.flashTimer);
   pane.flashTimer = window.setTimeout(() => {

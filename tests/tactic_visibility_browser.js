@@ -1,0 +1,21 @@
+const assert=require('node:assert/strict');
+const {chromium}=require('playwright');
+(async()=>{const browser=await chromium.launch({channel:'msedge',headless:true});try{
+ const guest=await browser.newPage({viewport:{width:1600,height:1000}}),errors=[];guest.on('pageerror',e=>errors.push(e.message));
+ await guest.goto('http://127.0.0.1:5000/charts');await guest.waitForFunction(()=>panes[0]?.historyLoaded);
+ for(const selector of ['.preset-select','.tactic-source-button','.tactic-visibility-button','.backtest-button','.page-menu','#header-signal-strip','#current-strategy-section','#active-signals-section']) assert.equal(await guest.locator(selector).first().isVisible(),false,selector);
+ for(const selector of ['.symbol-picker-button','.indicator-button','.replay-button','.alert-button','#account-button']) assert.equal(await guest.locator(selector).first().isVisible(),true,selector);
+ await guest.screenshot({path:'reports/tactic-visibility-guest-20261011.png'});
+ await guest.goto('http://127.0.0.1:5000/research');await guest.waitForFunction(()=>panes[0]?.historyLoaded&&document.body.dataset.page==='charts'&&location.pathname==='/charts');assert.ok(guest.url().endsWith('/charts'));
+ const signed=await browser.newPage({viewport:{width:1600,height:1000}});signed.on('pageerror',e=>errors.push(e.message));
+ await signed.route('**/api/account/session',route=>route.fulfill({json:{user:{id:99999,name:'UI test',role:'tactics'},csrf:'test',registrationEnabled:true}}));
+ await signed.route('**/api/config',async route=>{const response=await route.fetch();const data=await response.json();data.chart_signal_strategies=[{id:'ZGUA',label:'ZGUA',strategy:'ZGUA',params:{}}];await route.fulfill({json:data});});
+ await signed.goto('http://127.0.0.1:5000/charts');await signed.waitForFunction(()=>panes[0]?.historyLoaded);
+ assert.equal(await signed.locator('.preset-select').first().isVisible(),true);assert.equal(await signed.locator('.page-menu').isVisible(),true);
+ await signed.evaluate(()=>{panes[0].presetSelect.value='none';updateTacticVisibility();});
+ for(const selector of ['.tactic-source-button','.tactic-visibility-button','.backtest-button','#header-signal-strip'])assert.equal(await signed.locator(selector).first().isVisible(),false,selector);
+ await signed.evaluate(()=>{panes[0].presetSelect.value='ZGUA';updateTacticVisibility();});
+ for(const selector of ['.tactic-source-button','.tactic-visibility-button','.backtest-button'])assert.equal(await signed.locator(selector).first().isVisible(),true,selector);
+ assert.equal(await signed.locator('#header-signal-strip').evaluate(node=>node.hidden),false);
+ await signed.screenshot({path:'reports/tactic-visibility-signed-20261011.png'});assert.deepEqual(errors,[]);console.log('Guest chart-only UI and signed-in none/selected tactic visibility passed');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});

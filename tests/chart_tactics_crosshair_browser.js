@@ -1,0 +1,70 @@
+const assert=require('node:assert/strict');
+const {chromium}=require('playwright');
+(async()=>{
+ const browser=await chromium.launch({channel:'msedge',headless:true});
+ try {
+  const page=await browser.newPage({viewport:{width:1440,height:900}}), errors=[];
+  page.on('pageerror',e=>errors.push(e.message));
+  await page.goto('http://127.0.0.1:5000/charts');
+  await page.waitForFunction(()=>panes[0]?.candles?.length>50);
+  const picker=page.locator('.indicator-menu:visible').first();
+  await page.locator('.indicator-button:visible').first().click();
+  await picker.locator('.indicator-search').fill('rsi');
+  await picker.locator('.indicator-picker-row:visible input[value="rsi"]').check();
+  await page.mouse.click(700,550);
+  await page.locator('.indicator-pane[data-indicator-id="rsi"]').waitFor();
+  const main=await page.locator('.chart').first().boundingBox();
+  await page.mouse.move(main.x+main.width*.65,main.y+main.height*.5);
+  await page.waitForFunction(()=>document.querySelectorAll('.synced-time-crosshair:not([hidden])').length>=2);
+  const positions=await page.locator('.synced-time-crosshair:not([hidden])').evaluateAll(lines=>lines.map(line=>line.getBoundingClientRect().x));
+  assert.ok(Math.max(...positions)-Math.min(...positions)<3);
+  const lower=await page.locator('.indicator-chart').first().boundingBox();
+  await page.mouse.move(lower.x+lower.width*.6,lower.y+lower.height*.5);
+  await page.waitForFunction(()=>document.querySelectorAll('.synced-time-crosshair:not([hidden])').length>=2);
+  await page.locator('.preset-select:visible').first().selectOption('research_SimpleAtrTrendV2');
+  await page.locator('.tactic-source-button:visible').first().click();
+  const dialog=page.locator('.tactic-editor');
+  await dialog.locator('.tactic-test:not([disabled])').waitFor();
+  assert.match(await dialog.locator('textarea').inputValue(),/function simpleAtrTrendV2Entry/);
+  assert.doesNotMatch(await dialog.locator('textarea').inputValue(),/function relativeStrengthV2Entry/);
+  await dialog.locator('input').fill('My test tactic');
+  await dialog.locator('.tactic-test').click();
+  await page.waitForFunction(()=>document.querySelector('.tactic-editor .source-status')?.textContent==='Backtest complete',{timeout:30000});
+  assert.match(await dialog.locator('output').innerText(),/Fees.*Slippage.*1x cap/);
+  assert.match(await dialog.locator('output').innerText(),/accountEquity 10000.00.*Ending equity.*Win.*PF/);
+  await page.screenshot({path:'reports/tactic-editor-crosshair-20261006.png'});
+  await dialog.locator('.tactic-save-copy').click();
+  await dialog.waitFor({state:'detached',timeout:30000});
+  const id=await page.evaluate(()=>ChartCustomTactics.list()[0].id);
+  await page.locator('.preset-select:visible').first().selectOption(id);
+  await page.waitForFunction(()=>panes[0]?.strategySummary?.status==='ready',{timeout:30000});
+  await page.locator('.signal-badge:visible').first().click();
+  await page.waitForFunction(()=>document.querySelector('#backtest-content')?.textContent.includes('Chart preview, not a saved backtest'));
+  assert.match(await page.locator('.signal-badge:visible').first().getAttribute('title'),/Preview runs are not saved to History/);
+  await page.locator('#backtest-close').click();
+  await page.reload();
+  await page.waitForFunction(()=>ChartCustomTactics.list().length===1);
+  await page.locator('.preset-select:visible optgroup[label="My tactics"] option').waitFor({state:'attached'});
+  assert.equal(await page.locator('.preset-select:visible optgroup[label="My tactics"] option').count(),1);
+  await page.locator('.tactic-source-button:visible').first().click();
+  await dialog.locator('.tactic-test:not([disabled])').waitFor();
+  await dialog.locator('input').fill('Renamed tactic');await dialog.locator('.tactic-save').click();
+  await dialog.waitFor({state:'detached',timeout:30000});
+  assert.equal(await page.evaluate(()=>ChartCustomTactics.list()[0].name),'Renamed tactic');
+  await page.setViewportSize({width:390,height:844});
+  await page.evaluate(()=>ChartCustomTactics.openEditor(null,panes[0]));
+  await page.waitForFunction(()=>document.querySelector('.tactic-editor .source-status')?.textContent!=='Loading...');
+  assert.equal(await dialog.locator('.tactic-test').isDisabled(),false,await dialog.locator('.source-status').innerText());
+  await dialog.locator('.tactic-test:not([disabled])').waitFor();
+  const box=await dialog.boundingBox();assert.ok(box.x>=0&&box.x+box.width<=390&&box.height<=844);
+  await page.screenshot({path:'reports/tactic-editor-mobile-20261006.png'});
+  await dialog.locator('.source-close').click();
+  const blocked=await page.evaluate(async()=>{
+    const rows=panes[0].candles.slice(-100);
+    try{await ChartCustomTactics.execute("const x=new XMLHttpRequest();x.open('GET','/api/account/session',false);x.send();",{candles:rows,interval:'1h'});return false;}
+    catch(error){return /NetworkError|Failed to execute.*send|network/.test(error.message);}
+  });assert.equal(blocked,true);
+  assert.deepEqual(errors,[]);
+  console.log('Crosshair from chart and RSI, isolated tactic backtest, save, chart selection, persistence and rename passed');
+ }finally{await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});

@@ -1,6 +1,7 @@
 const data = require("../data");
 const indicators = require("../indicators");
 const regime = require("../regime");
+const marketAssessment = require('./marketAssessment');
 
 const MTF_CONTEXT_CACHE = new Map();
 const MTF_CONTEXT_CACHE_LIMIT = 12;
@@ -48,10 +49,18 @@ const BLOCKERS = [
 function run(options) {
   var strategyName = options.strategy || "RegimeFilteredTrendStrategy";
   var params = Object.assign({}, defaultParams(strategyName), options.params || {});
+  if (options.assessmentOnly) delete params.researchExitMode;
   params = normalizeExecutionParams(params);
   params.strategyName = strategyName;
   params.executionTimeframe = options.executionInterval || options.executionTimeframe || options.execution_timeframe || options.interval || options.timeframe;
+  if (typeof options.customEntry === "function") params.customEntry = options.customEntry;
   var candles = data.normalizeCandles(options.candles || []);
+  if (params.researchExitMode) {
+    var researchAsOf = Number(options.asOf || Math.floor(Date.now()/1000));
+    var researchStep = executionIntervalSeconds(options.interval||options.timeframe);
+    candles = candles.filter(bar=>bar.time+researchStep<=researchAsOf);
+    options = Object.assign({},options,{executionCandles:(options.executionCandles||[]).filter(bar=>bar.time+300<=researchAsOf)});
+  }
   var regimeCandles = data.normalizeCandles(options.regimeCandles || []);
   var benchmarkCandles = data.normalizeCandles(options.benchmarkCandles || []);
   var mapped = regime.mapRegimeToCandles(candles, regimeCandles, benchmarkCandles, {
@@ -81,6 +90,17 @@ function run(options) {
     }
   }
   var execution = buildExecutionContext(options, frame);
+  if (params.researchExitMode && !['staged','adaptive','momentum'].includes(params.researchExitMode)) throw new Error('Unknown research exit mode');
+  if (params.researchExitMode && (!execution.active || execution.interval !== '5m')) throw new Error('Research exits require real 5m execution candles');
+  if (params.researchExitMode && frame.length > 200) {
+    var requiredStart = frame[200].time;
+    var requiredEnd = frame[frame.length-1].time + executionIntervalSeconds(options.interval||options.timeframe);
+    var bars = execution.candles.filter(bar=>bar.time>=requiredStart && bar.time<requiredEnd);
+    if (bars.length !== Math.round((requiredEnd-requiredStart)/300) || bars[0].time!==requiredStart || bars.some((bar,index)=>index && bar.time-bars[index-1].time!==300)) {
+      throw new Error('Research exits need complete 5m coverage after warmup; shorten the period or collect missing history.');
+    }
+  }
+  var decisionOptions = Object.assign({}, options, {executionCandles: execution.candles});
   var state = {
     cash: Number(params.accountEquity),
     peak: Number(params.accountEquity),
@@ -124,6 +144,8 @@ function run(options) {
     startIndex = anchorIndex + 1;
   }
   var processedSignalCandles = 0;
+  var readinessRows = [];
+  var readinessTrigger = null;
 
   for (var i = startIndex; i < frame.length; i += 1) {
     processedSignalCandles += 1;
@@ -144,6 +166,7 @@ function run(options) {
         // Lower-timeframe stop/take-profit already closed the position before the signal close.
       }
       if (!state.position) {
+        if (options.collectReadiness) readinessRows.push({time:row.time, closedAt:signalCloseTime, status:'EXIT', score:null, blockers:[], executionTimeframe:execution.interval, positionContext:'hypothetical tactic position; not your account'});
         var flatEquity = currentEquity(state, row);
         state.peak = Math.max(state.peak, flatEquity);
         state.equityCurve.push({
@@ -178,7 +201,14 @@ function run(options) {
       if (state.position) updateTrailing(state.position, row, params);
     }
 
-    var entry = applyResearchEntryFilter(entrySignal(frame, i, state, params), frame, i, state, params, options);
+    var entry = applyResearchEntryFilter(entrySignal(frame, i, state, params), frame, i, state, params, decisionOptions);
+    if (options.collectReadiness) {
+      var flatState = Object.assign({}, state, {position: null, pendingEntry: null, cooldown: 0});
+      var setup = applyResearchEntryFilter(entrySignal(frame, i, flatState, params), frame, i, flatState, params, decisionOptions);
+      if (!setup.passed) readinessTrigger = null;
+      else if (!readinessTrigger || readinessTrigger.side !== setup.side) readinessTrigger = {index: i, price: row.close, side: setup.side, time: row.time};
+      readinessRows.push(entryReadiness(frame, i, state, params, execution, entry, setup, readinessTrigger));
+    }
     collectDiagnostics(state.diagnostics, frame, i, entry, state);
     if (!state.position && !state.pendingEntry && entry.passed && dailyLossAllowsEntry(state, row, params)) {
       if (shouldDeferEntry(params, i, frame.length)) {
@@ -240,7 +270,19 @@ function run(options) {
     });
   }
 
+  if (params.researchExitMode && state.equityCurve.length) {
+    var finalPoint = state.equityCurve[state.equityCurve.length-1];
+    finalPoint.equity = round(state.cash,4);
+    finalPoint.equityPct = round((state.cash/params.accountEquity-1)*100,4);
+  }
   var result = formatResult(options, params, frame, state);
+  if (options.collectReadiness) {
+    var reviewState = {cash:Number(params.accountEquity),position:null,pendingEntry:null,pendingExit:null,cooldown:0,dailyRealizedPnl:{}};
+    var review = frame.length ? entrySignal(frame,frame.length-1,reviewState,params) : null;
+    result.marketAssessment = marketAssessment.assess(indicators.buildIndicatorFrame(candles,{}),execution,params,{signalSeconds:executionIntervalSeconds(options.interval||options.timeframe),asOf:options.assessmentAsOf,
+      tacticSetup:review && {passed:review.passed,side:review.side,blockers:review.blockers}});
+  }
+  if (options.collectReadiness) result.entryReadiness = {version: 'entry-readiness-v1', validation: 'experimental; not calibrated', rows: readinessRows};
   if (checkpoint) {
     result.checkpoint = checkpoint;
     result.processedSignalCandles = processedSignalCandles;
@@ -250,6 +292,15 @@ function run(options) {
 
 function applyResearchEntryFilter(entry, frame, index, state, params, options) {
   if (!entry || !entry.passed) return entry;
+  if (params.strategyName === 'RelativeStrengthFreshV3') {
+    var closeTime = frame[index].time + executionIntervalSeconds(options.interval || options.timeframe);
+    var step = executionIntervalSeconds(options.executionInterval || options.executionTimeframe);
+    var lower = closedExecutionBars(options.executionCandles || [], frame[index].time, closeTime, step);
+    var expected = Math.round((closeTime - frame[index].time) / step);
+    var covered = step === 300 && lower.length === expected;
+    for (var k = 1; k < lower.length; k++) if (lower[k].time - lower[k-1].time !== step) covered = false;
+    if (!covered || !(lower[lower.length-1].close > lower[lower.length-1].open)) return {passed:false, side:'long', blockers:[covered ? 'executionTimingBlocked' : 'executionCoverageMissing']};
+  }
   if (typeof options.entryFilter === "function") {
     var decision = options.entryFilter({
       frame: frame,
@@ -383,6 +434,10 @@ function causalMomentumLabel(frame, index) {
 }
 
 function defaultParams(strategyName) {
+  if (strategyName === 'RelativeStrengthFreshV3') return Object.assign({}, defaultParams('RelativeStrengthV2'), {
+    freshnessMaxBars: 0, freshnessMaxDriftAtr: 0.5, readinessCostMultiple: 3,
+    takerFeePct: 0.055, slippagePct: 0.02, slippageBps: 2, maxPositionPct: 100, maxNotional: 10000
+  });
   var base = {
     accountEquity: 10000,
     riskPct: 0.005,
@@ -693,6 +748,7 @@ function dailyLossAllowsEntry(state, row, params) {
 }
 
 function entrySignal(frame, index, state, params) {
+  if (typeof params.customEntry === "function") return params.customEntry(frame.slice(0, index + 1), index, state, params);
   if (params.strategyName === "RegimeDonchian20") return donchian20Entry(frame, index, state, params);
   if (params.strategyName === "RegimeDonchianCloseConfirm") return closeConfirmEntry(frame, index, state, params);
   if (params.strategyName === "RegimePullbackTrend") return pullbackTrendEntry(frame, index, state, params);
@@ -706,6 +762,7 @@ function entrySignal(frame, index, state, params) {
   if (params.strategyName === "BreakoutRetestV2") return breakoutRetestV2Entry(frame, index, state, params);
   if (params.strategyName === "RangeExpansionV2") return rangeExpansionV2Entry(frame, index, state, params);
   if (params.strategyName === "RelativeStrengthV2") return relativeStrengthV2Entry(frame, index, state, params);
+  if (params.strategyName === 'RelativeStrengthFreshV3') return relativeStrengthFreshV3Entry(frame, index, state, params);
   if (params.strategyName === "SimpleAtrTrendV2") return simpleAtrTrendV2Entry(frame, index, state, params);
   if (params.strategyName === "FibPullbackContinuationV1") return fibPullbackContinuationEntry(frame, index, state, params);
   if (params.strategyName === "MtfPullback15mV1") return mtfPullback15mEntry(frame, index, state, params);
@@ -998,6 +1055,70 @@ function simpleAtrTrendV2Entry(frame, index, state, params) {
   if (!(row.ema20 > row.ema50 && row.close > row.ema50)) blockers.push("emaTrendFailed");
   if (params.useRsiFilter && !(row.rsi14 >= params.rsiMin && row.rsi14 <= params.rsiMax)) blockers.push("pullbackReclaimFailed");
   return signalFromBlockers(blockers);
+}
+
+function relativeStrengthFreshV3Entry(frame, index, state, params) {
+  var entry = relativeStrengthV2Entry(frame, index, state, params);
+  if (!entry.passed) return entry;
+  var flat = Object.assign({}, state, {position: null, cooldown: 0});
+  var first = index;
+  while (first > 0 && relativeStrengthV2Entry(frame, first - 1, flat, params).passed) first--;
+  var row = frame[index], drift = (row.close - frame[first].close) / row.atr14;
+  var costs = readinessCosts(params), stopPct = row.atr14 * params.atrMultiplier / row.close * 100;
+  var blockers = [];
+  if (index - first > Number(params.freshnessMaxBars ?? 0)) blockers.push('setupExpired');
+  if (drift > Number(params.freshnessMaxDriftAtr ?? 0.5)) blockers.push('entryOverextended');
+  if (!(stopPct > costs * Number(params.readinessCostMultiple ?? 3))) blockers.push('costsTooHigh');
+  return {passed: blockers.length === 0, side: 'long', blockers: blockers};
+}
+
+function readinessCosts(params) {
+  var slippage = params.slippageBps === null || params.slippageBps === undefined ? Number(params.slippagePct || 0) : Number(params.slippageBps) / 100;
+  return 2 * (Number(params.takerFeePct || 0) + slippage);
+}
+
+function closedExecutionBars(candles, start, end, step) {
+  // Normalized execution history is sorted. Avoid scanning it for every signal bar.
+  function bound(time) {
+    var low = 0, high = candles.length;
+    while (low < high) {var mid = (low + high) >>> 1;if (candles[mid].time < time) low = mid + 1;else high = mid;}
+    return low;
+  }
+  return candles.slice(bound(start), bound(end - step + 1));
+}
+
+// Display-only diagnostic; the original entry, execution and paper state are unchanged.
+function entryReadiness(frame, index, state, params, execution, entry, setup, trigger) {
+  var row = frame[index], interval = executionIntervalSeconds(execution.signalInterval || params.signalTimeframe || execution.interval);
+  var end = row.time + interval;
+  var lower = closedExecutionBars(execution.candles, row.time, end, executionIntervalSeconds(execution.interval));
+  var covered = execution.active && lower.length === Math.round(interval / executionIntervalSeconds(execution.interval));
+  for (var j = 1; j < lower.length; j++) if (lower[j].time - lower[j-1].time !== executionIntervalSeconds(execution.interval)) covered = false;
+  var costs = readinessCosts(params), stopPct = row.atr14 * params.atrMultiplier / row.close * 100;
+  var age = trigger ? index - trigger.index : null;
+  var drift = trigger && row.atr14 > 0 ? Math.abs(row.close - trigger.price) / row.atr14 : null;
+  var blockers = [...new Set(entry.blockers || [])];
+  if (!dailyLossAllowsEntry(state, row, params)) blockers.push('dailyLossLimitReached');
+  if (index < 199 || !Number.isFinite(row.atr14) || !(row.atr14 > 0) || !(row.ema200 > 0)) blockers.push('warmupMissing');
+  if (!covered) blockers.push('executionCoverageMissing');
+  if (!(costs > 0 && stopPct > costs * Number(params.readinessCostMultiple ?? 3))) blockers.push('costsUnavailableOrTooHigh');
+  if (trigger && (age > Number(params.freshnessMaxBars ?? 0) || drift > Number(params.freshnessMaxDriftAtr ?? 0.5))) blockers.push('setupExpired');
+  var status = 'WAIT';
+  if (blockers.includes('warmupMissing') || blockers.includes('executionCoverageMissing')) status = 'UNAVAILABLE';
+  else if (state.pendingExit) status = 'EXIT';
+  else if (state.position || state.pendingEntry) status = 'HOLD';
+  else if (blockers.includes('setupExpired')) status = 'LATE';
+  else if (setup.passed && !blockers.length) status = String(entry.side || 'long').toUpperCase();
+  var score = status === 'LONG' || status === 'SHORT' ? Math.round(100 - Math.min(10, costs / stopPct * 20 + (drift || 0) * 5)) : null;
+  return {time: row.time, closedAt: end, status: status, score: score, side: entry.side || 'long',
+    eligible: entry.passed, setupPassed: setup.passed, blockers: blockers, setupAgeBars: age,
+    triggerTime: trigger && trigger.time, triggerPrice: trigger && trigger.price, driftAtr: drift,
+    stopDistancePct: Number.isFinite(stopPct) ? stopPct : null, roundTripCostPct: costs,
+    executionTimeframe: execution.interval, executionCovered: covered,
+    checks: {close:row.close,ema20:row.ema20,ema50:row.ema50,ema200:row.ema200,rsi:row.rsi14,
+      rsiMin:params.rsiMin,rsiMax:params.rsiMax,adx:row.adx14,benchmarkClosedTime:row.rsBenchmarkTime,
+      mandatoryTacticRulesPassed:entry.passed,costToStopRatio:stopPct>0?costs/stopPct:null},
+    positionContext: state.position || state.pendingEntry ? 'hypothetical tactic position; not your account' : 'flat simulation'};
 }
 
 function fibPullbackContinuationEntry(frame, index, state, params) {
@@ -1400,7 +1521,7 @@ function exitSignal(position, frame, index, params, execution) {
       var meanTarget = row.bbMiddle || row.vwap || row.ema20;
       if (meanTarget && row.high >= meanTarget) return { price: meanTarget, reason: "BTC 4h mean reversion exit", kind: "close-signal" };
     }
-    if (canRuleExit && ["RegimePullbackTrend", "EmaPullbackContinuation", "MeanReversionInBullRegime", "MomentumContinuation", "PullbackReclaimV2", "RangeExpansionV2", "RelativeStrengthV2", "SimpleAtrTrendV2", "FibPullbackContinuationV1", "MtfPullback15mV1", "BtcRegimeController4hV1"].includes(params.strategyName) && row.close < row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
+    if (canRuleExit && ["RegimePullbackTrend", "EmaPullbackContinuation", "MeanReversionInBullRegime", "MomentumContinuation", "PullbackReclaimV2", "RangeExpansionV2", "RelativeStrengthV2", "RelativeStrengthFreshV3", "SimpleAtrTrendV2", "FibPullbackContinuationV1", "MtfPullback15mV1", "BtcRegimeController4hV1"].includes(params.strategyName) && row.close < row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
     if (params.strategyName === "EmaBounceV2" && row.close < row.ema100) return { price: row.close, reason: "EMA100 exit", kind: "close-signal" };
     if (crossesBelowDonchian(row, previous, params.donchianExit)) return { price: row.close, reason: "Donchian exit", kind: "close-signal" };
   } else {
@@ -1552,6 +1673,7 @@ function executionIntervalSeconds(interval) {
   var text = String(interval || "").trim().toLowerCase();
   var value = Number(text.slice(0, -1));
   if (!Number.isFinite(value) || value <= 0) return 300;
+  if (text.endsWith('s')) return value;
   if (text.endsWith("m")) return value * 60;
   if (text.endsWith("h")) return value * 3600;
   if (text.endsWith("d")) return value * 86400;
@@ -1588,6 +1710,21 @@ function closeOnExecutionCandle(state, frame, signalIndex, params, execution, si
         executionTimeframe: execution.interval
       });
       return true;
+    }
+    if (params.researchExitMode) {
+      var reference = frame[referenceIndex];
+      researchPartialProfits(state, position, row, params);
+      if (params.researchExitMode === 'momentum') {
+        var direction = position.side === 'long' ? 1 : -1;
+        var failed = direction * (row.close - reference.ema20) < 0;
+        position.researchMomentumFailures = failed ? Number(position.researchMomentumFailures || 0) + 1 : 0;
+        if (position.researchMomentumFailures >= 2 && direction * (row.close-position.entryPrice) > position.initialStopDistance) {
+          closePositionAtFillRow(state,frame,row,row.close,'Research momentum profit exit',params,{signalIndex:signalIndex,signalTime:row.time,signalPrice:row.close,kind:'soft-execution-exit'});
+          execution.diagnostics.exitsOnExecutionCandles += 1;
+          return true;
+        }
+      }
+      researchUpdateTrail(position,row,reference,params);
     }
     position.lastExecutionCheckTime = row.time;
   }
@@ -1681,6 +1818,57 @@ function openPosition(state, frame, signalIndex, fillIndex, side, params, execut
     entrySlippage: slippagePaid
   };
   if (executionFill && state.diagnostics.execution) state.diagnostics.execution.fillsOnExecutionCandles += 1;
+  if (params.researchExitMode) {
+    state.position.originalSize = size;
+    state.position.bestClose = rawEntry;
+    state.position.researchRealized = {net:0,gross:0,fees:0,slippage:0,weightedExit:0,fills:[]};
+  }
+}
+
+function researchPartialProfits(state, position, row, params) {
+  if (params.researchExitMode !== 'staged') return;
+  var sign = position.side === 'long' ? 1 : -1;
+  for (var level of [1,2]) {
+    var key = 'researchTarget' + level;
+    var target = position.entryPrice + sign * position.initialStopDistance * level;
+    if (position[key] || (sign === 1 ? row.high < target : row.low > target)) continue;
+    var size = Math.min(position.size,position.originalSize*.25);
+    var ratio = size/position.size;
+    var base = sign === 1 ? Math.max(row.open,target) : Math.min(row.open,target);
+    var fill = applySlippage(base,position.side,'exit',params);
+    var entryFee = position.entryFee * ratio, entrySlippage = position.entrySlippage * ratio;
+    var exitFee = fill*size*params.takerFeePct/100, exitSlippage = Math.abs(fill-base)*size;
+    var gross = sign*(fill-position.entryPrice)*size, grossBase = sign*(base-position.entryBasePrice)*size;
+    var net = gross-exitFee-entryFee;
+    state.cash += gross-exitFee;
+    state.grossPnl += grossBase;
+    state.totalFees += exitFee;
+    state.totalSlippage += exitSlippage;
+    var day = new Date(row.time*1000).toISOString().slice(0,10);
+    state.dailyRealizedPnl[day] = Number(state.dailyRealizedPnl[day]||0)+net;
+    var realized = position.researchRealized;
+    realized.net += net; realized.gross += grossBase;
+    realized.fees += entryFee+exitFee; realized.slippage += entrySlippage+exitSlippage;
+    realized.weightedExit += fill*size;
+    realized.fills.push({time:row.time,price:fill,size:size,targetR:level,netPnl:net});
+    position.entryFee -= entryFee; position.entrySlippage -= entrySlippage;
+    position.size -= size; position.notional = position.size*position.entryPrice;
+    position[key] = true;
+  }
+}
+
+function researchUpdateTrail(position,row,reference,params) {
+  var sign = position.side === 'long' ? 1 : -1;
+  position.bestClose = sign===1 ? Math.max(position.bestClose,row.close) : Math.min(position.bestClose,row.close);
+  var gainR = sign*(position.bestClose-position.entryPrice)/position.initialStopDistance;
+  if (gainR < 1) return;
+  var fee = params.takerFeePct/100, slip = params.slippagePct/100;
+  var breakEven = sign===1 ? position.entryPrice*(1+fee)/(1-fee)/(1-slip) : position.entryPrice*(1-fee)/(1+fee)/(1+slip);
+  var multiplier = params.researchExitMode==='adaptive' && gainR>=2 ? .75 : 1.5;
+  var candidate = sign===1 ? Math.max(breakEven,position.bestClose-reference.atr14*multiplier) : Math.min(breakEven,position.bestClose+reference.atr14*multiplier);
+  // New stop is available only on the next execution candle, never retroactively.
+  position.trailingStop = sign===1 ? Math.max(position.trailingStop,candidate) : Math.min(position.trailingStop,candidate);
+  position.breakEvenActive = true;
 }
 
 function closePosition(state, frame, fillIndex, exitPrice, reason, params, signal) {
@@ -1710,6 +1898,11 @@ function closePositionAtFillRow(state, frame, fillRow, exitPrice, reason, params
   state.totalSlippage += exitSlippage;
   var dayKey = new Date(Number(fillRow.time) * 1000).toISOString().slice(0, 10);
   state.dailyRealizedPnl[dayKey] = Number(state.dailyRealizedPnl[dayKey] || 0) + net;
+  var realized = position.researchRealized;
+  if (realized) {
+    net += realized.net; grossBeforeCosts += realized.gross;
+    feePaid += realized.fees; slippagePaid += realized.slippage;
+  }
   state.trades.push({
     side: position.side,
     entrySignalTime: position.entrySignalTime,
@@ -1747,6 +1940,21 @@ function closePositionAtFillRow(state, frame, fillRow, exitPrice, reason, params
     barsHeld: signal.signalIndex !== undefined && signal.signalIndex !== null ? signal.signalIndex - position.entrySignalIndex : fillRow.__index - position.entryIndex,
     exitReason: reason
   });
+  if (realized) {
+    var trade = state.trades[state.trades.length-1];
+    var sign = position.side==='long'?1:-1;
+    var size = position.originalSize;
+    var weightedExit = (realized.weightedExit+adjustedExit*position.size)/size;
+    var excursion = Math.max(0,sign*(position.bestClose-position.entryPrice));
+    trade.size = round(size,8);
+    trade.notional = round(size*position.entryPrice,4);
+    trade.partialExits = realized.fills;
+    trade.weightedExitPrice = round(weightedExit,8);
+    trade.maxFavorableCloseR = round(excursion/position.initialStopDistance,4);
+    trade.profitCapturePct = excursion>0 ? round(sign*(weightedExit-position.entryPrice)/excursion*100,4) : null;
+    trade.givebackR = round(Math.max(0,excursion-sign*(weightedExit-position.entryPrice))/position.initialStopDistance,4);
+    trade.researchExitMode = params.researchExitMode;
+  }
   state.position = null;
   state.cooldown = Number(params.cooldownBars || 0);
 }
@@ -1791,6 +1999,7 @@ function applySlippage(price, side, action, params) {
 }
 
 function updateTrailing(position, row, params) {
+  if (params.researchExitMode) return;
   var riskUnit = Number(position.initialStopDistance || position.stopDistance || 0);
   var favorableMove;
   if (position.side === "long") {
@@ -2121,8 +2330,9 @@ function markersFromTrades(trades) {
     var buy = trade.side === "long";
     markers.push({ time: trade.entryTime, position: buy ? "belowBar" : "aboveBar", color: buy ? "#12b886" : "#ff5c7a", shape: buy ? "arrowUp" : "arrowDown", text: buy ? "BUY" : "SHORT" });
     markers.push({ time: trade.exitTime, position: buy ? "aboveBar" : "belowBar", color: buy ? "#ff5c7a" : "#12b886", shape: buy ? "arrowDown" : "arrowUp", text: buy ? "SELL" : "COVER" });
+    (trade.partialExits || []).forEach(fill=>markers.push({time:fill.time,position:buy?'aboveBar':'belowBar',color:'#69d7bb',shape:'circle',text:'25% @ '+fill.targetR+'R'}));
   });
-  return markers;
+  return markers.sort((a,b)=>a.time-b.time);
 }
 
 function maxDrawdown(curve) {
@@ -2169,6 +2379,12 @@ module.exports = {
   defaultParams: defaultParams,
   BLOCKERS: BLOCKERS,
   testHooks: {
+    closeOnExecutionCandle: closeOnExecutionCandle,
+    researchPartialProfits: researchPartialProfits,
+    researchUpdateTrail: researchUpdateTrail,
+    closePositionAtFillRow: closePositionAtFillRow,
+    entryReadiness: entryReadiness,
+    relativeStrengthFreshV3Entry: relativeStrengthFreshV3Entry,
     exitBasePrice: exitBasePrice,
     softExecutionExitSignal: softExecutionExitSignal,
     shouldDeferEntry: shouldDeferEntry,

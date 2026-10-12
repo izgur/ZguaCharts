@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import math
+import mimetypes
 import os
 import re
 import shutil
@@ -11,11 +12,15 @@ import sys
 import traceback
 import uuid
 import ctypes
+from copy import deepcopy
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import wraps, lru_cache
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, g, has_request_context, jsonify, render_template, request
+
+mimetypes.add_type("application/wasm", ".wasm")
 
 from data_source import (
     BYBIT_MAX_CACHE_CANDLES,
@@ -23,6 +28,8 @@ from data_source import (
     bybit_disk_cache_path,
     bybit_symbol_validation_payload,
     fetch_candles,
+    fetch_closed_candles,
+    fetch_older_candles,
     fetch_historical_candles,
     inspect_all_bybit_cache,
     inspect_bybit_cache,
@@ -34,6 +41,7 @@ from data_source import (
 )
 from indicators import available_indicators, build_indicator_payload
 from signals import build_signal_payload
+from binance_data import symbol_catalog
 from services.operational_freshness import (
     freshness_check_message,
     freshness_check_status,
@@ -45,6 +53,22 @@ from strategy import DEFAULT_PRESET_ID, preset_options
 
 
 app = Flask(__name__)
+from services.indicator_sources import blueprint as indicator_sources_blueprint
+app.register_blueprint(indicator_sources_blueprint)
+from services.tactic_sources import blueprint as tactic_sources_blueprint
+app.register_blueprint(tactic_sources_blueprint)
+from services.zgua import blueprint as zgua_blueprint, detection as zgua_detection
+app.register_blueprint(zgua_blueprint)
+from services.chart_alerts import blueprint as chart_alerts_blueprint
+app.register_blueprint(chart_alerts_blueprint)
+from services.chart_accounts import blueprint as chart_accounts_blueprint
+from services import account_security
+app.register_blueprint(chart_accounts_blueprint)
+
+@app.before_request
+def tactic_access_guard():
+    if request.path.startswith(('/api/backtest', '/api/strategy-ranking', '/api/strategy-optimize')):
+        return account_security.protect_tactic_request()
 
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
 CONFIG_DIR = Path(app.root_path) / "config"
@@ -134,6 +158,13 @@ def index():
     return render_template("index.html")
 
 
+@app.get("/community/library/<section>")
+def community_library(section):
+    if section not in ("indicators", "patterns"):
+        return jsonify({"error": "Unknown library section"}), 404
+    return render_template("library.html", section=section, indicators=available_indicators())
+
+
 @app.get("/healthz")
 def healthz():
     return jsonify({"ok": True, "app": "ZguaCharts"})
@@ -152,7 +183,10 @@ def system_health_quick():
 
 @app.get("/api/config")
 def config():
-    payload = dict(DATA_SOURCE_CONFIG)
+    payload = deepcopy(DATA_SOURCE_CONFIG)
+    for source in payload["sources"].values():
+        if "3m" in source["timeframes"] or "1m" in source["timeframes"]:
+            source["timeframes"] = sorted(set(source["timeframes"] + ["6m", "12m"] + (["2m"] if "1m" in source["timeframes"] else [])), key=lambda value: interval_to_chart_seconds(value))
     payload["indicators"] = available_indicators()
     payload["strategy_presets"] = preset_options() + [
         {
@@ -164,7 +198,15 @@ def config():
     payload["optimizer_strategy_presets"] = LEARNING_OPTIMIZER_STRATEGY_OPTIONS
     payload["chart_signal_strategies"] = chart_signal_strategy_options()
     payload["default_strategy_preset"] = DEFAULT_PRESET_ID
+    if account_security.request_role() not in ('tactics', 'admin'):
+        for field in ('strategy_presets','optimizer_strategy_presets','chart_signal_strategies'):
+            payload[field] = []
+        payload['default_strategy_preset'] = None
     return jsonify(payload)
+
+
+def interval_to_chart_seconds(value):
+    return int(value[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(value[-1], 60)
 
 
 def chart_signal_strategy_options() -> list[dict]:
@@ -182,7 +224,7 @@ def chart_signal_strategy_options() -> list[dict]:
     four_hour_rows = (champion_board.get("championsByTimeframe") or {}).get("4h") or []
     four_hour = four_hour_rows[0] if four_hour_rows else {}
 
-    options = []
+    options = [{"id": "ZGUA", "label": "ZGUA", "strategy": "ZGUA", "params": {"feePct": 0.055, "slippagePct": 0.02}, "source": "Exploratory divergence-only long tactic; not promoted"}]
     if candidate.get("strategy"):
         options.append({
             "id": "best_1h",
@@ -201,6 +243,15 @@ def chart_signal_strategy_options() -> list[dict]:
             "params": four_hour.get("params") or {},
             "source": champion_path.name,
         })
+    for name in ("SimpleAtrTrendV2", "PullbackReclaimV2", "BreakoutRetestV2", "RelativeStrengthFreshV3"):
+        options.append({"id": "research_" + name, "label": name + " (research)",
+                        "strategy": name, "timeframe": "1h", "params": {},
+                        "source": "built-in exploratory baseline; not a promoted candidate"})
+    for mode, label in (("staged", "Staged profits"), ("adaptive", "Adaptive trail"), ("momentum", "Momentum exit")):
+        options.append({"id": "research_exit_" + mode, "label": "RSV2 - " + label + " (research)",
+                        "strategy": "RelativeStrengthV2", "timeframe": "1h",
+                        "params": {"researchExitMode": mode, "takerFeePct": 0.055, "slippageBps": 2},
+                        "source": "experimental exits; requires complete 5m history; not promoted"})
     return options
 
 
@@ -236,11 +287,14 @@ def candles():
     source = request.args.get("source", "bybit")
     symbol = request.args.get("symbol", "BTCUSDT")
     timeframe = request.args.get("timeframe", "1m")
-    limit = int(request.args.get("limit", "240"))
-    visible_charts = int(request.args.get("visible_charts", "1"))
-
     try:
-        payload = fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=visible_charts)
+        limit = int(request.args.get("limit", "240"))
+        visible_charts = int(request.args.get("visible_charts", "1"))
+        before = request.args.get("before")
+        live_tail = request.args.get("live_tail") == "true" and not before
+        if live_tail:
+            limit = max(1, min(limit, 50))
+        payload = fetch_older_candles(source, symbol, timeframe, before, limit) if before else fetch_candles(source, symbol, timeframe, limit=limit, visible_charts=visible_charts, force_network=live_tail)
         source_diagnostics = payload.get("diagnostics", {})
         payload["diagnostics"] = {
             **source_diagnostics,
@@ -254,21 +308,42 @@ def candles():
     return jsonify(payload)
 
 
-@app.get("/api/indicators")
+@app.route("/api/indicators", methods=["GET", "POST"])
 def indicators():
     source = request.args.get("source", "bybit")
     symbol = request.args.get("symbol", "BTCUSDT")
     timeframe = request.args.get("timeframe", "1m")
     names = request.args.get("indicators", "")
-    sma_period = int(request.args.get("sma_period", "20"))
-    limit = int(request.args.get("limit", "300"))
     chart_candles_count = request.args.get("chart_candles_count")
     first_chart_candle_time = request.args.get("first_chart_candle_time")
     last_chart_candle_time = request.args.get("last_chart_candle_time")
 
     try:
-        candles_payload = fetch_candles(source, symbol, timeframe, limit=limit)
-        candles = candles_payload["candles"]
+        sma_period = int(request.args.get("sma_period", "20"))
+        limit = int(request.args.get("limit", "300"))
+        body = {}
+        if request.method == "POST":
+            if (request.content_length or 0) > 12000000:
+                raise ValueError("Indicator candle payload is too large")
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict):
+                raise ValueError("Provide an indicator request object")
+            rows = body.get("candles")
+            if not isinstance(rows, list) or not 1 <= len(rows) <= 50000:
+                raise ValueError("Provide 1 to 50000 chart candles")
+            candles = []
+            for row in rows:
+                if not isinstance(row, dict) or any(key not in row for key in ("time", "open", "high", "low", "close", "volume")):
+                    raise ValueError("Incomplete chart candle: time, OHLC and volume are required. Reload the chart to refresh its data.")
+                values = {key: float(row[key]) for key in ("open", "high", "low", "close", "volume")}
+                timestamp = int(row["time"])
+                if not all(math.isfinite(value) for value in values.values()) or min(values[key] for key in ("open", "high", "low", "close")) <= 0 or values["volume"] < 0 or timestamp <= 0 or candles and timestamp <= candles[-1]["time"]:
+                    raise ValueError("Invalid or unsorted chart candles")
+                candles.append(dict(values, time=timestamp))
+            candles_payload = {"diagnostics": {"input": "displayed-chart-candles"}}
+        else:
+            candles_payload = fetch_candles(source, symbol, timeframe, limit=limit)
+            candles = candles_payload["candles"]
         first_time = int(first_chart_candle_time or 0)
         last_time = int(last_chart_candle_time or 0)
         if first_time and last_time:
@@ -280,6 +355,7 @@ def indicators():
             candles,
             names.split(","),
             sma_period=sma_period,
+            settings=body.get("settings"),
         )
         payload.setdefault("diagnostics", {})
         payload["diagnostics"].update(candles_payload.get("diagnostics", {}))
@@ -315,6 +391,73 @@ def signals():
         return jsonify({"error": f"Could not load signals: {exc}"}), 502
 
     return jsonify(payload)
+
+
+@app.get("/api/market/binance/symbols")
+def market_binance_symbols():
+    try:
+        payload = symbol_catalog()
+        DATA_SOURCE_CONFIG["sources"]["binance"]["symbols"] = payload["symbols"]
+        return jsonify(payload)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.get("/api/market/instruments")
+def market_instruments():
+    from market_symbols import search_catalog
+    try:
+        return jsonify(search_catalog(request.args.get("source", "bybit")))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.get("/api/market/search")
+def market_symbol_search():
+    from market_symbols import search_finance
+    query = request.args.get("q", "").strip()[:64]
+    if len(query) < 2:
+        return jsonify({"instruments": []})
+    try:
+        return jsonify({"instruments": search_finance(query, int(datetime.now(timezone.utc).timestamp() // 600))})
+    except Exception as exc:
+        return jsonify({"instruments": [], "warning": "Yahoo Finance search unavailable: " + str(exc)})
+
+
+@lru_cache(maxsize=128)
+def historical_signal_snapshot(source, symbol, as_of):
+    rows = []
+    for label in ("4h", "1h", "15m"):
+        timeframe = "60m" if source == "yfinance" and label == "1h" else label
+        try:
+            candles = fetch_closed_candles(source, symbol, timeframe, as_of)
+            if len(candles) < 200:
+                raise ValueError("Insufficient closed-bar history (200 bars required)")
+            signal = build_signal_payload(candles)
+            rows.append({"timeframe": label, "score": signal["score"], "direction": signal["signalDirection"], "longPct": signal["longSignalPct"], "shortPct": signal["shortSignalPct"], "tone": signal["tone"], "lastClosedTime": candles[-1]["time"]})
+        except Exception as exc:
+            rows.append({"timeframe": label, "error": str(exc)})
+    return {"source": source, "symbol": symbol, "asOf": as_of, "timeframes": rows}
+
+
+@app.get("/api/signals/at")
+def signals_at():
+    try:
+        source = request.args.get("source", "bybit")
+        symbol = request.args.get("symbol", "BTCUSDT")
+        as_of = int(request.args.get("as_of", "0"))
+        if source not in DATA_SOURCE_CONFIG["sources"] or not re.fullmatch(r"[A-Za-z0-9_:@./^=-]{1,96}", symbol):
+            raise ValueError("Invalid source or symbol")
+        if not 0 < as_of <= int(datetime.now(timezone.utc).timestamp()):
+            raise ValueError("Select a historical time, not a future candle")
+        snapshot = historical_signal_snapshot(source, symbol, as_of)
+        if any("error" in row for row in snapshot["timeframes"]):
+            historical_signal_snapshot.cache_clear()
+        return jsonify(snapshot)
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": str(exc)}), 400
 
 
 @app.get("/api/backtest")
@@ -402,6 +545,8 @@ def backtest_run_custom():
         execution_timeframe = normalize_execution_timeframe(payload.get("executionTimeframe") or payload.get("executionInterval"), timeframe)
         period = str(payload.get("period") or "365d")
         strategy = str(payload.get("strategy") or payload.get("preset") or "SimpleAtrTrendV2")
+        if strategy == "ZGUA":
+            execution_timeframe = timeframe
         limit_arg = payload.get("limit", "auto")
         limit = research_limit_for(source, timeframe, period, limit_arg)
         params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
@@ -443,6 +588,7 @@ def backtest_run_custom():
         params_used = (result_payload.get("diagnostics") or {}).get("params") or params
         params_used = {**(params_used or {}), "feePct": fee_pct, "slippagePct": slippage_pct}
         result_payload["mode"] = "manual"
+        result_payload["executionTimeframe"] = execution_timeframe
         result_payload["params"] = params_used
         result_payload["paramsSource"] = str(payload.get("paramsSource") or payload.get("presetName") or payload.get("preset") or "custom")
         result_payload.setdefault("diagnostics", {})["params"] = params_used
@@ -488,6 +634,7 @@ def backtest_run_custom():
         warnings = dedupe_list(list(result_payload.get("warnings") or []) + list((result_payload.get("diagnostics") or {}).get("warnings") or []))
         warnings = dedupe_list(warnings + context_warnings + active_comparison.get("warnings", []))
         return jsonify({
+            **result_payload,
             "ok": True,
             "readOnly": True,
             "paperEnabled": canonical_paper_enabled(),
@@ -3509,6 +3656,20 @@ def research_snapshot_export():
         return jsonify({"error": f"Could not build research snapshot export: {exc}"}), 502
 
 
+def paper_status_report(builder):
+    @wraps(builder)
+    def cached(args):
+        if not has_request_context() or request.method != "GET" or request.path != "/api/paper/status":
+            return builder(args)
+        # Nested status reports must not rerun the same checks or share mutable results.
+        cache = g.setdefault("paper_status_reports", {})
+        key = (builder.__name__, json.dumps(dict(args), sort_keys=True, default=str))
+        if key not in cache:
+            cache[key] = builder(args)
+        return deepcopy(cache[key])
+    return cached
+
+
 def paper_trade_pnl(trade: dict) -> float:
     return safe_float(trade.get("pnl", trade.get("netPnl", 0)), 0)
 
@@ -3523,7 +3684,7 @@ def paper_loss_streak(trades: list[dict]) -> int:
     return streak
 
 
-def paper_profit_factor(trades: list[dict]) -> float:
+def paper_recovery_profit_factor(trades: list[dict]) -> float:
     wins = sum(max(0, paper_trade_pnl(trade)) for trade in trades or [])
     losses = abs(sum(min(0, paper_trade_pnl(trade)) for trade in trades or []))
     if losses <= 0:
@@ -3574,7 +3735,7 @@ def paper_handbrake_snapshot(state: dict, candidate: dict, real_enabled: bool, p
     drawdown = paper_equity_drawdown_pct(state.get("equityCurve") if isinstance(state.get("equityCurve"), list) else [])
     recent_average = sum(paper_trade_pnl(trade) for trade in recent) / max(1, len(recent))
     recovery_average = sum(paper_trade_pnl(trade) for trade in recovery) / max(1, len(recovery))
-    recovery_pf = paper_profit_factor(recovery)
+    recovery_pf = paper_recovery_profit_factor(recovery)
     recovery_drawdown = paper_trade_window_drawdown_pct(recovery)
     already_active = existing.get("state") in {"PAPER_RECOVERY", "READY_FOR_MANUAL_RESUME"}
     triggers = []
@@ -3637,6 +3798,17 @@ def paper_status():
         state = read_json_file(state_path, {})
         candidate = load_paper_candidate_config()
         paper_enabled = canonical_paper_enabled(candidate)
+        if request.args.get("summaryOnly") == "true":
+            real_enabled, _ = paper_real_trading_enabled()
+            return jsonify({
+                "ok": True,
+                "paperEnabled": paper_enabled,
+                "realTradingEnabled": real_enabled,
+                "handbrake": paper_handbrake_snapshot(state, candidate, real_enabled, paper_enabled),
+                "openPositions": state.get("openPositions", []),
+                "equity": state.get("accountEquity"),
+                "lastUpdated": state.get("updatedAt"),
+            })
         events = read_jsonl_tail(journal_path, 30)
         health_payload = build_candidate_health(candidate_health_rules(request.args))
         readiness = build_paper_readiness_report(request.args)
@@ -7526,6 +7698,7 @@ def candidate_observation_baseline(candidate: dict) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_observation_quality(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -7738,6 +7911,7 @@ def primary_active_market(candidate: dict) -> dict:
     return active[0] if active else {}
 
 
+@paper_status_report
 def build_paper_observation_targets(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -8082,6 +8256,7 @@ def compact_observation_counters(counters: dict) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_observation_counters(args) -> dict:
     candidate = load_paper_candidate_config()
     state_path = Path(app.root_path) / "data" / "paper-state.json"
@@ -8178,6 +8353,7 @@ def compact_runner_summary(summary: dict) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_runner_summary(args) -> dict:
     selection, entries, _limit = runner_log_entries({**dict(args), "limit": args.get("limit", 200)})
     log_path = selection["path"]
@@ -8615,6 +8791,7 @@ def compact_session_events_summary(summary: dict) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_session_events_summary(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -8762,6 +8939,7 @@ def paper_session_event_records(candidate: dict, state: dict | None = None) -> t
     return records, session, active_keys, watch_keys
 
 
+@paper_status_report
 def build_paper_session_events(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -8848,6 +9026,7 @@ def trade_state_item(item: dict, default_status: str) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_session_trades(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -8919,6 +9098,7 @@ def compact_active_observation(payload: dict) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_active_observation(args) -> dict:
     candidate = load_paper_candidate_config()
     paper_enabled = canonical_paper_enabled(candidate)
@@ -19066,6 +19246,7 @@ def fast_candidate_recommendation(best: dict | None, rows: list[dict]) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_observation_report(args) -> dict:
     report_args = {**dict(args), "activeOnly": "true"}
     if args.get("counterLimit") and not report_args.get("limit"):
@@ -19341,6 +19522,7 @@ def paper_next_useful_tick(active: dict, useful_now: bool = False) -> tuple[str 
     return epoch_to_iso(target), max(0, int(target - now_epoch)), target
 
 
+@paper_status_report
 def build_paper_tick_readiness(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -19719,6 +19901,7 @@ def run_paper_once_controlled(args, payload: dict) -> tuple[dict, int]:
     return result, 200 if result["ok"] else refresh_status
 
 
+@paper_status_report
 def build_paper_session_summary(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -19816,6 +19999,7 @@ def build_paper_recent_events(args) -> dict:
     }
 
 
+@paper_status_report
 def build_paper_runtime_status(args) -> dict:
     state_path = Path(app.root_path) / "data" / "paper-state.json"
     journal_path = Path(app.root_path) / "reports" / "paper-journal.jsonl"
@@ -20039,6 +20223,7 @@ def paper_stop_rule(rules: list[dict], name: str, passed: bool, severity: str, d
     })
 
 
+@paper_status_report
 def build_paper_stop_rules(args) -> dict:
     candidate = load_paper_candidate_config()
     state = read_json_file(os.path.join(app.root_path, "data", "paper-state.json"), {})
@@ -20285,6 +20470,7 @@ def run_paper_tick_once(args) -> tuple[dict, int]:
     return payload, 200
 
 
+@paper_status_report
 def build_paper_readiness_report(args) -> dict:
     checks = []
     warnings = []
@@ -21038,7 +21224,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     (yfinance, Bybit cache, Hyperliquid). Simulation rules live in /core so
     the UI, CLI optimizer, and future workers all share one backtest engine.
     """
-    execution_timeframe = normalize_execution_timeframe(execution_timeframe, timeframe)
+    execution_timeframe = timeframe if preset == "ZGUA" else normalize_execution_timeframe(execution_timeframe, timeframe)
     candles_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
     execution_payload = None
     regime_payload = None
@@ -21050,7 +21236,7 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         if source != "bybit":
             execution_limit = min(5000, execution_limit)
         execution_payload = fetch_historical_candles(source, symbol, execution_timeframe, period=period, limit=execution_limit)
-    if source != "bybit":
+    if source != "bybit" and preset != "ZGUA":
         signal_minutes = backtest_timeframe_minutes(timeframe) or 60
         signal_candle_count = limit or len(candles_payload["candles"]) or 1000
         regime_limit = min(5000, max(300, int(math.ceil(signal_candle_count * signal_minutes / 240)) + 250))
@@ -21078,6 +21264,8 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         "debug": debug,
         "candles": candles_payload["candles"],
     }
+    if preset == "ZGUA":
+        engine_input["divergenceEvents"] = zgua_detection(candles_payload["candles"], params)[2]
     if regime_payload:
         engine_input["regimeCandles"] = regime_payload["candles"]
     if execution_payload:
@@ -21844,6 +22032,12 @@ def record_backtest_history(payload: dict) -> None:
         "strategy": payload.get("preset") or payload.get("strategy") or "unknown",
         "params": params if isinstance(params, dict) else {},
         "paramsSource": payload.get("paramsSource") or diagnostics.get("paramsSource") or payload.get("preset_id"),
+        "executionTimeframe": payload.get("executionTimeframe") or diagnostics.get("executionTimeframe"),
+        "candlesLoaded": payload.get("candlesLoaded") or diagnostics.get("candlesLoaded") or diagnostics.get("actual_returned_candles"),
+        "firstCandleTime": payload.get("firstCandleTime") or diagnostics.get("first_candle_time"),
+        "lastCandleTime": payload.get("lastCandleTime") or diagnostics.get("last_candle_time"),
+        "closedTrades": sum(1 for trade in (payload.get("trade_list") or payload.get("tradeList") or []) if "end of data" not in str(trade.get("exit_reason", trade.get("exitReason", ""))).lower()),
+        "includesEndOfData": any("end of data" in str(trade.get("exit_reason", trade.get("exitReason", ""))).lower() for trade in (payload.get("trade_list") or payload.get("tradeList") or [])),
         "totalReturnPct": safe_float(payload.get("totalReturnPct", payload.get("total_return_pct", payload.get("totalReturn", 0)))),
         "trades": int(safe_float(payload.get("trades", payload.get("number_of_trades", 0)))),
         "winRate": safe_float(payload.get("winRate", payload.get("win_rate", 0))),

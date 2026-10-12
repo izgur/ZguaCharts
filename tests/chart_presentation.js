@@ -1,0 +1,53 @@
+const assert = require("node:assert/strict");
+const fs = require("node:fs"), vm = require("node:vm");
+const { styles, seriesData, changes, sidebarWidth, replacePreservingScroll } = require("../static/chart-presentation.js");
+const candles = Array.from({ length: 26 }, (_, i) => ({ time: i * 3600, open: 99 + i, high: 103 + i, low: 97 + i, close: 100 + i, volume: 10 }));
+const original = JSON.stringify(candles);
+for (const [id] of styles) {
+  const data = seriesData(candles, id);
+  assert.equal(data.length, candles.length);
+  assert.ok(data.every((c, i) => c.time === candles[i].time));
+  assert.ok(data.every((c) => Number.isFinite(c.value ?? c.close)));
+}
+assert.equal(JSON.stringify(candles), original, "Display transforms must not alter strategy candles");
+assert.equal(seriesData(candles, "heikin")[0].close, 99.75);
+assert.equal(seriesData(candles, "heikin")[1].open, (99.5 + 99.75) / 2);
+assert.equal(seriesData(candles, "columns")[0].color, "#12b886");
+const result = changes(candles);
+assert.equal(result.change1h.value, 1);
+assert.equal(result.change24h.value, 24);
+assert.equal(result.change24h.percent, 24 / 101 * 100);
+assert.equal(changes(candles.slice(-10)).change24h, null, "Do not fabricate missing 24h history");
+assert.equal(changes([]).change1h, null);
+assert.equal(changes([{ time: 0, close: 10 }, { time: 86400, close: 11 }]).change1h, null, "Daily candles cannot supply a 1h change");
+const revised = candles.map((c) => ({ ...c })); revised.at(-1).close = 200;
+const before = seriesData(candles, "heikin"), after = seriesData(revised, "heikin");
+assert.deepEqual(before.slice(0, -1), after.slice(0, -1));
+assert.notEqual(before.at(-1).close, after.at(-1).close);
+const source = fs.readFileSync(require.resolve("../static/app.js"), "utf8");
+const start = source.indexOf("function updatePresentationSeries(pane, candle) {");
+const end = source.indexOf("\nfunction ", start + 1);
+const context = { window: { ChartPresentation: { seriesData } } };
+vm.createContext(context); vm.runInContext(source.slice(start, end), context);
+for (const [chartStyle] of styles) {
+  let updated, loaded;
+  const pane = { candles: revised, chartStyle, series: { applyOptions() {}, update: (data) => { updated = data; }, setData: (data) => { loaded = data; } } };
+  context.updatePresentationSeries(pane, revised.at(-1));
+  if (chartStyle === "heikin") assert.equal(loaded.length, revised.length);
+  else assert.deepEqual(updated, seriesData(revised, chartStyle).at(-1));
+}
+assert.equal(sidebarWidth(440, 1280), 440);
+assert.equal(sidebarWidth(9999, 1280), 720);
+assert.equal(sidebarWidth(9999, 1000), 680);
+assert.equal(sidebarWidth(10, 1280), 200);
+assert.equal(sidebarWidth(undefined, 1280), 230);
+let writes = 0;
+let scroller = { scrollTop: 250, scrollLeft: 30 };
+const element = { scrollTop: 20, scrollLeft: 12, querySelector: (selector) => selector === ".watch-strategy-trades" ? scroller : null };
+Object.defineProperty(element, "innerHTML", { set() { writes++; scroller = { scrollTop: 0, scrollLeft: 0 }; element.scrollTop = element.scrollLeft = 0; } });
+assert.equal(replacePreservingScroll(element, "same"), true);
+assert.equal(scroller.scrollTop, 250); assert.equal(scroller.scrollLeft, 30);
+assert.equal(element.scrollTop, 20); assert.equal(element.scrollLeft, 12);
+assert.equal(replacePreservingScroll(element, "same"), false); assert.equal(writes, 1);
+assert.equal(replacePreservingScroll(element, "updated"), true); assert.equal(scroller.scrollTop, 250);
+console.log("Chart presentation passed: price transforms, changes, resize bounds and scroll-preserving updates.");

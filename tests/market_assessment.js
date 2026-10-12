@@ -1,0 +1,36 @@
+const assert = require('node:assert/strict');
+const {assess,align} = require('../core/backtest/marketAssessment');
+const engine = require('../core/backtest/regimeTrend');
+const start = 1700000100, step = 900, end = start+220*step;
+const frame = Array.from({length:220},(_,i)=>({time:start+i*step,open:104.5,high:112,low:104,close:105,volume:100,
+  atr14:2,ema20:104+(i-219)*.1,ema50:102,ema200:100,rsi14:60,macdHistogram:.4,cmf20:.1,adx14:25}));
+const lower = Array.from({length:60},(_,i)=>({time:end-(60-i)*300,open:103+i*.03,high:103.05+i*.03,low:102.95+i*.03,close:103.02+i*.03,volume:10}));
+lower.at(-1).close=105; lower.at(-1).high=105.1;
+const execution={interval:'5m',candles:lower};
+const params={takerFeePct:.055,slippageBps:2};
+const options={signalSeconds:step,asOf:end};
+const original=JSON.stringify({frame,execution});
+const long=assess(frame,execution,params,options);
+assert.ok(long.score>=60&&long.score<=100);assert.equal(long.direction,'BULLISH');
+assert.equal(long.status,'ENTER');assert.equal(long.side,'long');assert.ok(long.rewardRisk>=1.5);
+assert.equal(long.closedAt,end);assert.equal(long.timingClosedAt,end);
+assert.equal(JSON.stringify({frame,execution}),original);
+const late=assess(frame.map(bar=>({...bar,ema20:bar.ema20-4,ema50:98,ema200:95})),execution,params,options);
+assert.equal(late.status,'LATE');assert.equal(late.direction,'BULLISH');
+assert.equal(assess(frame,{...execution,candles:lower.slice(0,-3)},params,options).status,'UNAVAILABLE');
+assert.equal(assess(frame.slice(-100),execution,params,options).score,null);
+const gap=frame.map((bar,i)=>i===218?{...bar,time:bar.time-300}:bar);
+assert.equal(assess(gap,execution,params,options).score,null);
+const reflected=frame.map(bar=>({...bar,open:210-bar.open,high:210-bar.low,low:210-bar.high,close:210-bar.close,
+  ema20:210-bar.ema20,ema50:210-bar.ema50,ema200:210-bar.ema200,rsi14:100-bar.rsi14,macdHistogram:-bar.macdHistogram,cmf20:-bar.cmf20}));
+const reflectedLower=lower.map(bar=>({...bar,open:210-bar.open,high:210-bar.low,low:210-bar.high,close:210-bar.close}));
+const short=assess(reflected,{interval:'5m',candles:reflectedLower},params,options);
+assert.ok(Math.abs(short.score-(100-long.score))<=1);assert.equal(short.status,'ENTER');assert.equal(short.side,'short');
+const aligned=align([{...long,timeframe:'15m'},{...short,timeframe:'4h'},{...long,timeframe:'1h'}]);
+assert.equal(aligned[0].status,'WAIT');assert.match(aligned[0].blockers.join(','),/4h/);
+const future={time:end+300,open:1000,high:1001,low:999,close:1000,volume:10};
+assert.deepEqual(assess(frame,{...execution,candles:[...lower,future]},params,options),long);
+const input={strategy:'SimpleAtrTrendV2',interval:'15m',executionInterval:'5m',params:{...params,regimeMode:'noRegime',volumeFilter:false},candles:frame,executionCandles:lower,assessmentAsOf:end};
+const baseline=engine.run(input),observed=engine.run({...input,collectReadiness:true});
+assert.deepEqual(baseline.tradeList,observed.tradeList);assert.equal(baseline.netReturn,observed.netReturn);
+console.log('Market assessment: direction symmetry, entry/late, costs, coverage, warmup, HTF agreement, no lookahead, native equivalence passed');

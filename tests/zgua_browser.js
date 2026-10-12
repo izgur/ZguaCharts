@@ -1,0 +1,27 @@
+const assert=require('node:assert/strict');
+const {chromium}=require('playwright');
+const {PNG}=require('pngjs');
+(async()=>{const browser=await chromium.launch({channel:'msedge',headless:true});try{
+ const page=await browser.newPage({viewport:{width:1600,height:1000}}),errors=[];page.on('pageerror',error=>errors.push(error.message));
+ await page.goto('http://127.0.0.1:5000/charts');await page.waitForFunction(()=>panes[0]?.historyLoaded);
+ assert.ok(await page.evaluate(()=>config.indicators.some(item=>item.id==='zgua'&&item.placement==='overlay')));
+ await page.evaluate(async()=>{const pane=panes[0];pane.ws?.close();clearTimeout(pane.pollTimer);clearTimeout(pane.strategyPollTimer);pane.requestId++;pane.strategyRequestId++;
+  pane.candles=Array.from({length:600},(_,i)=>{const value=100+8*Math.sin(i/5)+4*Math.sin(i/32);return {time:1700000000+i*3600,open:value-.3,high:value+2,low:value-2,close:value+Math.cos(i/14),volume:100+i%17};});
+  pane.series.setData(pane.candles);restoreIndicators(pane,['zgua','rsi']);await renderIndicators(pane,pane.requestId);pane.chart.timeScale().setVisibleLogicalRange({from:420,to:610});syncIndicatorTimeRanges(pane);
+ });
+ const stats=await page.evaluate(()=>{const pane=panes[0];return {types:pane.overlayPayload.filter(s=>s.indicatorId==='zgua').map(s=>s.name),events:pane.overlayPayload.flatMap(s=>s.events||[]),segments:pane.overlaySeries.reduce((n,s)=>n+(s.indicatorSegments?.length||0),0),markers:pane.overlaySeries.flatMap(s=>s.indicatorSegments||[]).filter(s=>s.data().length===pane.candles.length).flatMap(s=>s.markerPlugin?.markers()||[])};});
+ assert.equal(stats.types.length,8);assert.ok(stats.events.length>0);assert.ok(stats.segments>0);for(const event of stats.events)assert.ok(event.confirmedAt>event.pivotTime);
+ assert.equal(stats.markers.length,stats.events.length);assert.ok(stats.markers.every((marker,i)=>i===0||marker.time>=stats.markers[i-1].time));
+ const canvas=PNG.sync.read(await page.locator('.chart canvas').first().screenshot());let changed=0;for(let i=0;i<canvas.data.length;i+=4)if(canvas.data[i]+canvas.data[i+1]+canvas.data[i+2]>120)changed++;assert.ok(changed>200);
+ await page.screenshot({path:'reports/zgua-divergences-desktop-20261009.png'});
+ await page.evaluate(()=>{const pane=panes[0];pane.hiddenIndicators=new Set(['zgua']);applyIndividualIndicatorVisibility(pane);});
+ assert.ok(await page.evaluate(()=>panes[0].overlaySeries.every(series=>(series.indicatorSegments||[]).every(child=>child.options().visible===false))));
+ await page.evaluate(async()=>{const pane=panes[0];pane.hiddenIndicators.clear();applyIndividualIndicatorVisibility(pane);pane.indicatorSettings.zgua={...pane.indicatorSettings.zgua,regular_bullish:0};await renderIndicators(pane,pane.requestId);});
+ assert.ok(await page.evaluate(()=>panes[0].overlayPayload.every(series=>(series.markers||[]).every(marker=>!marker.text.startsWith('RB ')))));
+ await page.evaluate(async()=>{const pane=panes[0];pane.replayActive=true;pane.replayTimeline=pane.candles.map(({time})=>({time}));pane.candles=pane.candles.slice(0,400);pane.series.setData([...pane.candles,...pane.replayTimeline.slice(400)]);await renderIndicators(pane,pane.requestId);});
+ assert.ok(await page.evaluate(()=>panes[0].overlayPayload.flatMap(s=>s.events||[]).every(event=>event.confirmedAt<=panes[0].candles.at(-1).time)));
+ await page.evaluate(()=>{const pane=panes[0];clearIndicatorSeries(pane);});assert.equal(await page.evaluate(()=>panes[0].overlaySeries.length),0);
+ await page.goto('http://127.0.0.1:5000/community/library/indicators#zgua');assert.match(await page.locator('h1').innerText(),/Zgua/);assert.match(await page.locator('#library-content').innerText(),/Hidden|HB/);
+ await page.setViewportSize({width:390,height:844});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));await page.screenshot({path:'reports/zgua-library-mobile-20261009.png'});
+ assert.deepEqual(errors,[]);console.log('Zgua: eight separate categories, confirmed events, connecting lines, rendered pixels, hide/remove, individual toggles, replay cutoff and mobile library passed.');
+}finally{await browser.close();}})().catch(error=>{console.error(error);process.exitCode=1;});

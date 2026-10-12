@@ -4,14 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>ZguaCharts</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260909-header-signal-strip-v1">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20261008-library-refresh-1">
   </head>
-  <body>
+  <body data-page="charts">
     <header class="topbar">
       <a class="brand" href="/charts" data-route="charts">
-        <span class="brand-mark"></span>
-        <h1>ZguaCharts</h1>
+        <span class="brand-z" aria-label="ZguaCharts">Z</span>
       </a>
+      <div id="active-chart-toolbar" class="active-chart-toolbar" aria-label="Active chart controls"></div>
+      <details class="page-menu"><summary><span id="current-page-label">Charts</span><i data-lucide="chevron-down"></i></summary>
       <nav class="app-nav" aria-label="Main navigation">
         <a href="/charts" data-route="charts">Charts</a>
         <a href="/dashboard" data-route="dashboard">Dashboard</a>
@@ -21,9 +22,24 @@
         <a href="/ops" data-route="ops">Ops</a>
         <a href="/settings" data-route="settings">Settings</a>
       </nav>
+      </details>
+      <details class="community-menu"><summary title="Community" aria-label="Community"><i data-lucide="users-round"></i></summary><nav aria-label="Community library"><strong>Library</strong><a href="/community/library/indicators">Indicators</a><a href="/community/library/patterns">Patterns</a></nav></details>
+      <button id="account-button" class="account-button" type="button" aria-label="Account" title="Sign in or register"><i data-lucide="circle-user-round"></i></button>
+      <button id="donate-button" type="button" title="Support ZguaCharts"><i data-lucide="heart"></i><span>Donate</span></button>
+      <details id="layout-menu" class="layout-menu"><summary title="Layouts"><i data-lucide="save"></i><span id="layout-name">Layout</span><i data-lucide="chevron-down"></i></summary>
+        <div class="layout-actions">
+          <button id="layout-save" type="button"><i data-lucide="save"></i>Save layout</button>
+          <label><input id="layout-autosave" type="checkbox" checked>Autosave layout</label>
+          <button type="button" disabled title="Sharing is not available yet"><i data-lucide="share-2"></i>Share layout</button>
+          <button id="layout-copy" type="button"><i data-lucide="copy"></i>Copy chart image</button>
+          <button id="layout-rename" type="button"><i data-lucide="pencil"></i>Rename</button>
+          <button id="layout-new" type="button"><i data-lucide="file-plus-2"></i>Create new layout</button>
+          <div id="saved-layouts"></div><small id="layout-save-status" role="status">Local layout storage</small>
+        </div>
+      </details>
       <label class="count-control header-count-control">
-        <span>Charts</span>
-        <select id="chart-count">
+        <i data-lucide="panels-top-left"></i>
+        <select id="chart-count" aria-label="Chart layout" title="Number of charts">
           <option value="1">1</option>
           <option value="2">2</option>
           <option value="4">4</option>
@@ -36,11 +52,10 @@
         <span class="header-signal-pill neutral">BTC 1h --</span>
         <span class="header-signal-pill neutral">BTC 15m --</span>
       </div>
-      <p class="signal-warning">Signals are technical-analysis hints, not financial advice.</p>
     </header>
 
     <main class="app-shell">
-      <section id="dashboard-page" class="route-page workflow-page" data-page="dashboard">
+      <section id="dashboard-page" class="route-page workflow-page" data-page="dashboard" hidden>
         <section class="status-card strategy-finder-card">
           <div class="status-card-header">
             <div>
@@ -178,12 +193,12 @@
           <main id="chart-grid" class="chart-grid layout-4" aria-live="polite"></main>
           <aside class="right-sidebar">
             <details id="watchlist-section" class="sidebar-section" open>
-              <summary><span class="sidebar-title"><span class="star-icon">★</span> Watchlist</span></summary>
+              <summary><span class="sidebar-title"><span class="star-icon">★</span> Watchlist</span><button id="watchlist-add-current" type="button" title="Add current symbol to list" aria-label="Add current symbol to list"><i data-lucide="plus"></i></button></summary>
               <div class="watchlist-actions">
-                <button id="watchlist-add-current" type="button" title="Add current symbol">★ Add</button>
-                <button id="watchlist-add-all" type="button" title="Add all symbols">All</button>
-                <button id="watchlist-signal-toggle" class="watchlist-signal-toggle" type="button" aria-pressed="true" title="Hide strategy signals">None</button>
+                <div id="watchlist-tabs" role="tablist" aria-label="Watchlists"></div>
+                <details class="watchlist-settings"><summary title="Watchlist columns" aria-label="Watchlist columns"><i data-lucide="sliders-horizontal"></i></summary><div id="watchlist-column-settings"></div></details>
               </div>
+              <div id="watchlist-catalog-status" role="status"></div>
               <div id="watchlist-content" class="sidebar-placeholder">Loading watchlist...</div>
             </details>
             <details id="current-strategy-section" class="sidebar-section" open>
@@ -197,8 +212,7 @@
           </aside>
         </div>
 
-        <details class="bottom-panel">
-          <summary>Indicators and Signal Details</summary>
+        <details class="bottom-panel" hidden>
           <div id="bottom-panel-content" class="bottom-panel-content">
             Select indicators or click a signal badge to inspect backend-returned details.
           </div>
@@ -1315,12 +1329,16 @@
       <section class="pane">
         <div class="pane-toolbar">
           <div class="selectors">
-            <select class="source-select" aria-label="Data source"></select>
-            <select class="symbol-select" aria-label="Symbol"></select>
-            <select class="timeframe-select" aria-label="Timeframe"></select>
-            <button class="backtest-button" type="button">Backtest</button>
+            <select class="source-select" aria-label="Data source" hidden></select>
+            <select class="symbol-select" aria-label="Symbol" hidden></select>
+            <button class="symbol-picker-button" type="button" aria-label="Symbol search" aria-haspopup="dialog"><span class="selected-symbol"></span><small class="selected-market"></small><i data-lucide="search"></i></button>
+            <div class="timeframe-shortcuts" role="group" aria-label="Timeframe shortcuts"></div>
+            <select class="timeframe-select" aria-label="Timeframe" hidden></select>
+            <details class="timeframe-overflow"><summary title="All timeframes" aria-label="All timeframes"><i data-lucide="chevron-down"></i></summary><div class="timeframe-menu" role="menu"></div></details>
+            <button class="backtest-button" type="button" title="Backtest selected tactic" aria-label="Backtest selected tactic"><i data-lucide="flask-conical"></i></button>
+            <details class="chart-style-control"><summary title="Chart style" aria-label="Chart style"><i data-lucide="chart-no-axes-column"></i></summary><div class="chart-style-menu" role="menu" aria-label="Chart styles"></div></details>
             <div class="indicator-control">
-              <button class="indicator-button" type="button">Indicators</button>
+              <button class="indicator-button" type="button" title="Indicators"><i data-lucide="chart-no-axes-combined"></i><span>Indicators</span><b class="indicator-count" hidden></b></button>
               <div class="indicator-menu" hidden>
                 <label class="indicator-option signal-marker-setting">
                   <input class="signal-marker-toggle" type="checkbox">
@@ -1329,10 +1347,14 @@
                 <div class="indicator-list"></div>
               </div>
             </div>
+            <button class="alert-button header-tool" type="button" title="Create alert" aria-label="Create alert"><i data-lucide="bell-plus"></i><span>Alert</span></button>
+            <button class="replay-button header-tool" type="button" title="Bar replay" aria-label="Bar replay"><i data-lucide="rewind"></i><span>Replay</span></button>
           </div>
           <div class="pane-right">
+            <div class="signal-badge neutral" hidden aria-hidden="true">NEUTRAL</div>
             <select class="preset-select" aria-label="Chart signal strategy"></select>
-            <div class="signal-badge neutral">NEUTRAL</div>
+            <button class="tactic-source-button header-tool" type="button" title="Tactic source / My tactics" aria-label="Tactic source / My tactics"><i data-lucide="code-2"></i></button>
+            <button class="tactic-visibility-button header-tool" type="button" aria-label="Hide tactic signals" aria-pressed="true" title="Hide tactic signals"><i data-lucide="eye"></i></button>
             <div class="ticker neutral">
               <span class="ticker-symbol">--</span>
               <strong class="ticker-price">Loading</strong>
@@ -1341,10 +1363,13 @@
         </div>
         <div class="chart-stack">
           <div class="main-chart-wrap">
+            <button class="chart-context" type="button" title="Select chart"></button>
             <div class="chart"></div>
             <div class="chart-corner-controls">
-              <button class="chart-scale-toggle" type="button" aria-pressed="false" title="Toggle logarithmic price scale">Log</button>
-              <button class="chart-now-button" type="button" title="Jump to latest candle">Now</button>
+              <button class="chart-scale-toggle" type="button" aria-label="Logarithmic scale" aria-pressed="false" title="Toggle logarithmic price scale">L</button>
+              <button class="chart-now-button" type="button" aria-label="Latest candle" title="Jump to latest candle">N</button>
+              <button class="chart-auto-button" type="button" aria-label="Fit data" title="Fit data to screen">A</button>
+              <button class="chart-fullscreen-button" type="button" aria-label="Focus chart" aria-pressed="false" title="Fullscreen chart and indicators">F</button>
             </div>
           </div>
           <div class="indicator-panes"></div>
@@ -1391,6 +1416,22 @@
       };
       var api = window.api;
     </script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20261001-execution-safety-v1" defer></script>
+    <script src="{{ url_for('static', filename='lucide.min.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='chart-drawings.js') }}?v=20261009-zgua-1" defer></script>
+    <script src="{{ url_for('static', filename='chart-presentation.js') }}?v=20261004" defer></script>
+    <script src="{{ url_for('static', filename='symbol-picker.js') }}?v=20261004-exchanges-3" defer></script>
+    <script src="{{ url_for('static', filename='chart-workspace.js') }}?v=20261008-seconds-order-1" defer></script>
+    <script src="{{ url_for('static', filename='chart-accounts.js') }}?v=20261006-account-settings-5" defer></script>
+    <script src="{{ url_for('static', filename='donations.js') }}?v=20261011" defer></script>
+    <script src="{{ url_for('static', filename='custom-indicators.js') }}?v=20261009-zgua-1" defer></script>
+    <script src="{{ url_for('static', filename='custom-tactics.js') }}?v=20261008-exit-research-1" defer></script>
+    <script src="{{ url_for('static', filename='watchlist-lists.js') }}?v=20261006-1" defer></script>
+    <script src="{{ url_for('static', filename='indicator-help.js') }}?v=20261009-zgua-1" defer></script>
+    <script src="{{ url_for('static', filename='table-sorting.js') }}?v=20261006-1" defer></script>
+    <script src="{{ url_for('static', filename='study-clouds.js') }}?v=20261007-1" defer></script>
+    <script src="{{ url_for('static', filename='second-candles.js') }}?v=20261008-1" defer></script>
+    <script src="{{ url_for('static', filename='entry-readiness.js') }}?v=20261008-market-bias-1" defer></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20261009-zgua-1" defer></script>
+    <script src="{{ url_for('static', filename='sidebar-settings.js') }}?v=20261008-library-1" defer></script>
   </body>
 </html>

@@ -22,6 +22,7 @@ function runBacktest(options) {
 }
 
 function runBacktestOnCandles(options) {
+  if (options.strategy === "ZGUA") return require("./zgua").run(options, formatResult);
   var strategy = strategies.getStrategy(options.strategy || "ConservativeTrend");
   if (usesRegimeRunner(strategy.name)) {
     return regimeTrend.run(options);
@@ -108,6 +109,7 @@ function usesRegimeRunner(name) {
     "BreakoutRetestV2",
     "RangeExpansionV2",
     "RelativeStrengthV2",
+    "RelativeStrengthFreshV3",
     "SimpleAtrTrendV2",
     "FibPullbackContinuationV1",
     "MtfPullback15mV1",
@@ -251,6 +253,7 @@ function formatResult(payload) {
       exit_price: trade.exitPrice,
       return_pct: trade.returnPct,
       bars_held: trade.barsHeld,
+      entry_reason: trade.entryReason,
       exit_reason: trade.exitReason
     };
   });

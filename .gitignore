@@ -25,3 +25,4 @@ config/backups/
 config/local/
 zguacharts-*.patch
 zguacharts-local-commits.txt
+/static/pyodide/
