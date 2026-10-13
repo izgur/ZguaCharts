@@ -58,6 +58,14 @@ def main():
         for name, value in values.items():
             if value is not None:
                 set_key(str(target), name, str(value), quote_mode='always')
+        web_target = ROOT / '.env.render'
+        fd = os.open(str(web_target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)
+        web_values = {name: value for name, value in values.items()
+                      if value and name != 'DATABASE_URL_UNPOOLED'}
+        web_values.update(PYTHON_VERSION='3.12.14', NODE_VERSION='24', ZGUA_QUIET='1')
+        for name, value in web_values.items():
+            set_key(str(web_target), name, str(value), quote_mode='always')
         print('PASS production config prepared; credentials were not displayed.')
         return 0
     except Exception:
