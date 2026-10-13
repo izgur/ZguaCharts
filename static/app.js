@@ -2500,7 +2500,7 @@ function updateWatchlistSignalToggle() {
   for(const pane of panes){const button=pane.node.querySelector('.tactic-visibility-button');if(!button)continue;
     const visible=pane.signalMarkerToggle?.checked!==false;
     button.innerHTML='<i data-lucide="'+(visible?'eye':'eye-off')+'"></i>';
-    button.setAttribute('aria-pressed',String(visible));button.title=(visible?'Hide':'Show')+' tactic signals';button.setAttribute('aria-label',button.title);
+    button.setAttribute('aria-pressed',String(visible));button.title=(visible?'Hide':'Show')+' tactic signals and overlays';button.setAttribute('aria-label',button.title);
     window.lucide?.createIcons({root:button});
   }
 }
@@ -4124,6 +4124,8 @@ function renderIndicatorLabels(pane) {
     const info = config.indicators.find((item) => item.id === id);
     if (!info) continue;
     const row = document.createElement("div"); row.className = "chart-indicator-label"; row.tabIndex = 0;
+    row.dataset.indicatorId = id;
+    row.hidden = !!pane.hiddenIndicators?.has(id);
     row.classList.toggle("study-hidden", pane.hiddenIndicators?.has(id));
     const label = document.createElement("span");
     const basis = { ema: "close", sma: "close", rsi: "close", macd: "close", bbands: "close; population variance", atr: "true range", supertrend: "HL2", stochrsi: "close", volume: "volume", cipherb: "HLC3; scale 0.015; levels 60, 53, 0, -53, -60" };
@@ -4156,6 +4158,9 @@ function renderIndicatorLabels(pane) {
 }
 
 function applyIndividualIndicatorVisibility(pane) {
+  for (const label of pane.node.querySelectorAll('.chart-indicator-label')) {
+    label.hidden = !!pane.hiddenIndicators?.has(label.dataset.indicatorId);
+  }
   for (const study of pane.indicatorCharts) {
     study.element.hidden = !!pane.hiddenIndicators?.has(study.element.dataset.indicatorId);
     study.element.style.visibility = '';
@@ -4385,6 +4390,8 @@ function resetSignalBadge(pane) {
 }
 
 function updateChartMarkers(pane) {
+  const overlaysVisible = pane.signalMarkerToggle.checked && !pane.drawingPositionsHidden && !pane.replayActive && Boolean(pane.presetSelect?.value) && pane.presetSelect.value !== 'none';
+  for (const series of pane.backtestOverlaySeries || []) series.applyOptions({visible: overlaysVisible});
   const visibleMarkers = pane.signalMarkerToggle.checked && !pane.drawingPositionsHidden && !pane.replayActive
     ? [...pane.signalMarkers, ...pane.backtestMarkers].sort((a, b) => a.time - b.time)
     : [];
@@ -6542,6 +6549,7 @@ function renderBacktestOverlays(pane, payload) {
     pane.backtestOverlaySeries.push(series);
   });
   pane.drawingTools?.refreshVisibility();
+  updateChartMarkers(pane);
 }
 
 function markersFromBacktestPayload(payload, options = {}) {

@@ -663,7 +663,7 @@
         series.applyOptions({ visible });
         for (const child of series.indicatorSegments || []) child.applyOptions({ visible });
       }
-      for (const series of pane.backtestOverlaySeries || []) series.applyOptions({ visible: !settings.hidePositions });
+      for (const series of pane.backtestOverlaySeries || []) series.applyOptions({ visible: !settings.hidePositions && pane.signalMarkerToggle?.checked !== false && !pane.replayActive && Boolean(pane.presetSelect?.value) && pane.presetSelect.value !== 'none' });
       pane.drawingPositionsHidden = settings.hidePositions;
       if (settings.hidePositions && pane.markerDetailEl) pane.markerDetailEl.hidden = true;
       options.onVisibilityChange?.();
