@@ -1,0 +1,13 @@
+# Supported production runtime; legacy requirements.txt remains for local Python 3.7.
+Flask>=3.1,<4
+gunicorn>=23,<26
+yfinance>=0.2.66,<0.3
+requests>=2.32.4,<3
+urllib3>=2.5,<3
+multitasking<0.0.12
+pandas>=2.2,<3
+numpy>=1.26,<3
+pyotp>=2.9,<3
+cryptography>=46,<51
+psycopg2-binary>=2.9.11,<3
+python-dotenv>=1.1,<2

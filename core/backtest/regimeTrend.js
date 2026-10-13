@@ -43,7 +43,7 @@ const BLOCKERS = [
   "mtfTrendBlocked",
   "mtfTimingBlocked",
   "rangeRegimeBlocked",
-  "vwapReversionFailed"
+  "vwapReversionFailed", "setupExpired", "entryOverextended", "costsTooHigh", "executionTimingBlocked", "executionCoverageMissing"
 ];
 
 function run(options) {
@@ -55,6 +55,12 @@ function run(options) {
   params.executionTimeframe = options.executionInterval || options.executionTimeframe || options.execution_timeframe || options.interval || options.timeframe;
   if (typeof options.customEntry === "function") params.customEntry = options.customEntry;
   var candles = data.normalizeCandles(options.candles || []);
+  if (strategyName === 'RelativeStrengthFreshV3') {
+    var freshAsOf = Number(options.assessmentAsOf || options.asOf || Math.floor(Date.now()/1000));
+    var freshStep = executionIntervalSeconds(options.interval || options.timeframe);
+    candles = candles.filter(bar => bar.time + freshStep <= freshAsOf);
+    options = Object.assign({},options,{executionCandles:(options.executionCandles||[]).filter(bar=>bar.time+300<=freshAsOf)});
+  }
   if (params.researchExitMode) {
     var researchAsOf = Number(options.asOf || Math.floor(Date.now()/1000));
     var researchStep = executionIntervalSeconds(options.interval||options.timeframe);
@@ -63,6 +69,13 @@ function run(options) {
   }
   var regimeCandles = data.normalizeCandles(options.regimeCandles || []);
   var benchmarkCandles = data.normalizeCandles(options.benchmarkCandles || []);
+  if (strategyName === 'RelativeStrengthFreshV3') {
+    var signalStep = executionIntervalSeconds(options.interval || options.timeframe);
+    var timingStep = executionIntervalSeconds(params.executionTimeframe);
+    if (signalStep <= 300 || signalStep % 300 !== 0 || timingStep !== 300) throw new Error('FreshV3 requires a signal timeframe above 5m, divisible by 5m, with real 5m execution candles.');
+    if (!regimeCandles.length) throw new Error('FreshV3 is missing BTC regime/benchmark history; entries cannot be evaluated.');
+    if (!(options.executionCandles || []).length) throw new Error('FreshV3 is missing real 5m execution history.');
+  }
   var mapped = regime.mapRegimeToCandles(candles, regimeCandles, benchmarkCandles, {
     interval: options.interval || options.timeframe, benchmarkInterval: options.benchmarkInterval
   });
@@ -276,6 +289,13 @@ function run(options) {
     finalPoint.equityPct = round((state.cash/params.accountEquity-1)*100,4);
   }
   var result = formatResult(options, params, frame, state);
+  if (strategyName === 'RelativeStrengthFreshV3') result.diagnostics.freshV3 = {
+    benchmarkCandles:regimeCandles.length,executionCandles:execution.candles.length,
+    signalTimeframe:options.interval||options.timeframe,executionTimeframe:execution.interval,
+    freshnessMaxBars:params.freshnessMaxBars,freshnessMaxDriftAtr:params.freshnessMaxDriftAtr,
+    roundTripCostPct:params.roundTripCostPct,costMultiple:params.readinessCostMultiple,
+    rule:'Closed signal bar, newly qualifying relative strength, affordable ATR stop and complete green-close 5m confirmation; next-open fill.'
+  };
   if (options.collectReadiness) {
     var reviewState = {cash:Number(params.accountEquity),position:null,pendingEntry:null,pendingExit:null,cooldown:0,dailyRealizedPnl:{}};
     var review = frame.length ? entrySignal(frame,frame.length-1,reviewState,params) : null;
@@ -2060,7 +2080,7 @@ function createDiagnostics(candleCount, params) {
   var counts = {};
   BLOCKERS.forEach(function (key) { counts[key] = 0; });
   return {
-    strategyName: "RegimeFilteredTrendStrategy",
+    strategyName: params.strategyName || "RegimeFilteredTrendStrategy",
     paramsUsed: params,
     candlesEvaluated: 0,
     candlesLoaded: candleCount,

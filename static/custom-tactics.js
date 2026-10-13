@@ -3,7 +3,7 @@
   const STORE='zgua-custom-tactics-v1';
   const key=()=>root.ChartAccounts?.key(STORE)||STORE;
   let hooks={};
-  function list() { try { const rows=JSON.parse(localStorage.getItem(key())); return Array.isArray(rows)?rows.filter(row=>/^tactic_[a-z0-9-]{1,64}$/.test(row.id)&&typeof row.code==='string'&&row.code.length<=100000&&typeof row.name==='string').slice(0,10):[]; } catch {return [];} }
+  function list() { if (!root.ChartAccounts?.canManageTactics()) return []; try { const rows=JSON.parse(localStorage.getItem(key())); return Array.isArray(rows)?rows.filter(row=>/^tactic_[a-z0-9-]{1,64}$/.test(row.id)&&typeof row.code==='string'&&row.code.length<=100000&&typeof row.name==='string').slice(0,10):[]; } catch {return [];} }
   const get=id=>list().find(row=>row.id===id);
   function suggestions(name) {const base=name.slice(0,55)+' - Custom', names=new Set(list().map(row=>row.name.toLowerCase()));let title=base,n=2;while(names.has(title.toLowerCase()))title=base+' '+n++;return title;}
   function execute(code, options, signal) {
@@ -31,6 +31,8 @@
   }
   async function backtest(record,pane){return (await execute(record.code,await hooks.options(pane,record))).result;}
   async function openEditor(preset,pane) {
+    const readOnly = !root.ChartAccounts?.canManageTactics();
+    if (readOnly && preset?.strategy !== 'RelativeStrengthV2') return;
     const existing=get(preset?.id), dialog=document.createElement('dialog');dialog.className='indicator-source-dialog indicator-editor tactic-editor';
     dialog.innerHTML='<header><h2>Tactic source</h2><button type="button" class="source-close" aria-label="Close tactic source"><i data-lucide="x"></i></button></header><label class="indicator-editor-name">Name<input maxlength="80" aria-label="Tactic name"></label><p class="source-origin">JavaScript entry + shared exits. Local backtest model: taker 0.055%/side, slippage 2 bps/side, 1x cap.</p><textarea class="indicator-code-editor" aria-label="Tactic source code" spellcheck="false"></textarea><output class="tactic-test-result"></output><footer><span class="source-status" role="status">Loading...</span><button type="button" class="tactic-test"><i data-lucide="flask-conical"></i>Backtest</button><button type="button" class="tactic-copy" title="Copy source" aria-label="Copy tactic source"><i data-lucide="copy"></i></button><button type="button" class="tactic-new"><i data-lucide="plus"></i>New</button><button type="button" class="tactic-save-copy">Save as new</button><button type="button" class="tactic-save">Save</button><button type="button" class="tactic-delete" title="Delete tactic"><i data-lucide="trash-2"></i></button></footer>';
     (document.fullscreenElement||document.body).append(dialog);dialog.showModal();root.lucide?.createIcons({root:dialog});
@@ -53,11 +55,16 @@
       }
       if (existing?.baseStrategy === 'ZGUA' || preset?.strategy === 'ZGUA') dialog.querySelector('.source-origin').textContent='JavaScript divergence entry and exit. Python detection uses chart Zgua settings. Costs: 0.055% fees and 0.02% slippage per side; long-only, 1x.';
       buttons.forEach(button=>button.disabled=false);status.textContent='';
+      if (readOnly) {
+        editor.readOnly = name.readOnly = true; name.value = 'RelativeStrengthV2';
+        for (const selector of ['.tactic-new','.tactic-save-copy','.tactic-save','.tactic-delete']) dialog.querySelector(selector).hidden = true;
+        status.textContent = 'Read-only RelativeStrengthV2 demo';
+      }
     }catch(error){status.textContent=error.message;return;}
-    async function action(task){if(busy)return;busy=true;editor.readOnly=name.readOnly=true;buttons.forEach(button=>button.disabled=true);try{await task();}catch(error){status.textContent=error.message;}finally{busy=false;editor.readOnly=name.readOnly=false;buttons.forEach(button=>button.disabled=false);}}
+    async function action(task){if(busy)return;busy=true;editor.readOnly=name.readOnly=true;buttons.forEach(button=>button.disabled=true);try{await task();}catch(error){status.textContent=error.message;}finally{busy=false;editor.readOnly=name.readOnly=readOnly;buttons.forEach(button=>button.disabled=false);}}
     async function run(saving){status.textContent=saving?'Saving...':'Backtesting...';const options=await hooks.options(pane,{code:editor.value});const result=await execute(editor.value,options);output.textContent=options.candles.length+' candles · '+options.interval+' signals / '+(options.executionInterval||options.interval)+' execution · '+result.result.numberOfTrades+' trades · Net '+result.result.netReturn.toFixed(2)+'% · DD '+result.result.maxDrawdown.toFixed(2)+'% · Fees '+result.result.totalFees.toFixed(2)+' · Slippage '+result.result.totalSlippageCost.toFixed(2)+' · 1x cap · accountEquity '+result.params.accountEquity.toFixed(2)+' · Ending equity '+(result.params.accountEquity*(1+result.result.netReturn/100)).toFixed(2)+' · Win '+result.result.winRate.toFixed(1)+'% · PF '+result.result.profitFactor.toFixed(2);return result;}
     dialog.querySelector('.tactic-test').onclick=()=>action(async()=>{await run(false);status.textContent='Backtest complete';});
-    async function save(copy){await action(async()=>{
+    async function save(copy){if(readOnly)return;await action(async()=>{
       let title=name.value.trim();if(title.length<2||title.length>80)throw new Error('Name must be 2–80 characters.');
       if(copy&&existing&&title===existing.name)title=suggestions(title);
       const rows=list();if(rows.some(row=>row.name.toLowerCase()===title.toLowerCase()&&(copy||row.id!==existing?.id)))throw new Error('Tactic name already used');

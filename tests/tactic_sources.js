@@ -8,6 +8,7 @@ for(const name of ['RelativeStrengthV2','RelativeStrengthFreshV3','EmaBounceV2',
   const exported=source(name), scope={module:{exports:{}}};
   vm.createContext(scope);vm.runInContext(exported.code,scope);
   const options={strategy:name,params:exported.params,candles:rows,regimeCandles:rows,benchmarkCandles:rows,interval:'1h'};
+  if(name==='RelativeStrengthFreshV3'){options.executionInterval='5m';options.executionCandles=rows.flatMap(row=>Array.from({length:12},(_,i)=>({...row,time:row.time+i*300})));}
   const expected=engine.run(options), custom=context.self.TacticEngine.run({...options,customEntry:scope.module.exports.entry});
   assert.deepEqual(JSON.parse(JSON.stringify(custom.tradeList)),expected.tradeList);
   assert.equal(custom.netReturn,expected.netReturn);

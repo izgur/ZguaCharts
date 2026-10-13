@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from collections import OrderedDict
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -40,13 +42,23 @@ VISIBLE_CHART_LIMITS = {
     8: 3000,
 }
 
-_bybit_cache = {}
+_bybit_cache = OrderedDict()
+BYBIT_CACHE_CANDLE_BUDGET = max(50000, int(os.environ.get(
+    "ZGUA_CACHE_CANDLE_BUDGET", "60000" if os.environ.get("RENDER") else "500000")))
 _bybit_cache_lock = threading.Lock()
 _bybit_instruments_cache = {}
 _bybit_instruments_cache_time = 0.0
 BYBIT_SYMBOL_ALIASES = {
     "PEPEUSDT": "1000PEPEUSDT",
 }
+
+
+def store_bybit_memory_cache(key, candles):
+    # Call while holding _bybit_cache_lock; disk history is not evicted.
+    _bybit_cache.pop(key, None)
+    _bybit_cache[key] = candles[-BYBIT_MAX_CACHE_CANDLES:]
+    while sum(len(rows) for rows in _bybit_cache.values()) > BYBIT_CACHE_CANDLE_BUDGET:
+        _bybit_cache.popitem(last=False)
 
 
 class BybitRateLimiter:
@@ -179,9 +191,41 @@ for _source, _info in FREE_MARKETS.items():
 for _source in ('bybit', 'bybit_spot', 'bybit_inverse', 'binance'):
     DATA_SOURCE_CONFIG['sources'][_source]['timeframes'].insert(0, '1s')
 for _source, _info in DATA_SOURCE_CONFIG["sources"].items():
+    if '1d' in _info['timeframes']:
+        _info['timeframes'] = list(dict.fromkeys(_info['timeframes'] + ['1M','1y']))
     if "exchange" not in _info:
         _info["exchange"] = "Binance" if _source.startswith("binance") else "Bybit" if _source.startswith("bybit") else "Hyperliquid" if _source == "hyperliquid" else "Yahoo Finance"
         _info["marketType"] = "Stock" if _source == "yfinance" else "Spot" if _source in ("binance", "bybit_spot") else "Perpetual"
+
+
+def calendar_bounds(timestamp, timeframe):
+    date = datetime.fromtimestamp(timestamp, timezone.utc)
+    if timeframe == '1M':
+        start = datetime(date.year,date.month,1,tzinfo=timezone.utc)
+        end = datetime(date.year + (date.month == 12),1 if date.month == 12 else date.month + 1,1,tzinfo=timezone.utc)
+    elif timeframe == '1y':
+        start = datetime(date.year,1,1,tzinfo=timezone.utc)
+        end = datetime(date.year+1,1,1,tzinfo=timezone.utc)
+    else:
+        raise ValueError('Invalid calendar timeframe')
+    return int(start.timestamp()),int(end.timestamp())
+
+
+def aggregate_calendar_candles(rows, timeframe):
+    groups = {}
+    for row in rows:
+        start, end = calendar_bounds(row['time'],timeframe)
+        groups.setdefault(start, {'end':end,'rows':{}})['rows'][row['time']] = row
+    output = []
+    now = int(time.time())
+    for start, group in sorted(groups.items()):
+        points = [group['rows'][key] for key in sorted(group['rows'])]
+        expected = (min(group['end'], now // 86400 * 86400 + 86400) - start) // 86400
+        if not points or points[0]['time'] != start or len(points) != expected or any(b['time']-a['time']!=86400 for a,b in zip(points,points[1:])):
+            continue
+        output.append({'time':start,'open':points[0]['open'],'high':max(p['high'] for p in points),
+                       'low':min(p['low'] for p in points),'close':points[-1]['close'],'volume':sum(p.get('volume',0) for p in points)})
+    return output
 
 
 def aggregate_chart_candles(rows, timeframe, base):
@@ -218,6 +262,18 @@ def fetch_candles(source: str, symbol: str, timeframe: str, limit: int = 240, vi
     To add a broker later, implement a fetch function with this signature and
     register it in PROVIDERS plus DATA_SOURCE_CONFIG.
     """
+    if timeframe in ('1M','1y'):
+        if timeframe not in DATA_SOURCE_CONFIG['sources'].get(source,{}).get('timeframes',[]):
+            raise ValueError('Calendar timeframe unavailable for this source')
+        requested = max(1,int(limit))
+        daily_limit = min(12000,(requested+1)*(31 if timeframe=='1M' else 366))
+        # The current calendar bar needs today's forming daily candle, not a
+        # daily cache tail that is considered fresh for several days.
+        payload = fetch_candles(source,symbol,'1d',daily_limit,visible_charts,True)
+        candles = aggregate_calendar_candles(payload['candles'],timeframe)[-requested:]
+        if not candles: raise RuntimeError('Not enough continuous daily history for a complete calendar period.')
+        return dict(payload,timeframe=timeframe,requested_limit=requested,candles=candles,
+                    diagnostics=dict(payload.get('diagnostics',{}),aggregatedFrom='1d',calendarAggregation=True,returned_candles=len(candles)))
     if timeframe == '1s' and source in ('bybit','bybit_spot','bybit_inverse'):
         from services.second_candles import fetch_recent_seconds
         return fetch_recent_seconds(source, symbol, limit)
@@ -713,6 +769,15 @@ def fetch_bybit_candles(symbol: str, timeframe: str, limit: int) -> list[dict]:
     return candles
 
 
+def contiguous_bybit_tail(candles, timeframe):
+    """Never splice disconnected cache periods into a recent chart window."""
+    step = max(1, interval_to_ms(timeframe) // 1000)
+    for index in range(len(candles) - 1, 0, -1):
+        if candles[index]['time'] - candles[index - 1]['time'] > step * 3:
+            return candles[index:]
+    return candles
+
+
 def fetch_bybit_candles_with_diagnostics(
     symbol: str,
     timeframe: str,
@@ -748,13 +813,19 @@ def fetch_bybit_candles_with_diagnostics(
 
     with _bybit_cache_lock:
         cached = list(_bybit_cache.get(cache_key, []))
+        if cache_key in _bybit_cache:
+            _bybit_cache.move_to_end(cache_key)
     if not cached:
         cached = load_bybit_disk_cache(symbol, timeframe)
         if cached:
             diagnostics["disk_cache_hits"] = 1
             with _bybit_cache_lock:
-                _bybit_cache[cache_key] = cached[-BYBIT_MAX_CACHE_CANDLES:]
+                store_bybit_memory_cache(cache_key, cached)
 
+    cached_tail = contiguous_bybit_tail(cached, timeframe)
+    if len(cached_tail) < len(cached):
+        diagnostics['warnings'].append('Disconnected historical cache periods excluded; fetching continuous recent history.')
+    cached = cached_tail
     cache_fresh = not bybit_cache_is_stale(cached, timeframe, diagnostics)
     if not force_network and diagnostics["disk_cache_hits"] and len(cached) >= requested:
         diagnostics["cache_hits"] = 1
@@ -785,6 +856,7 @@ def fetch_bybit_candles_with_diagnostics(
             latest_batch = request_bybit_kline_batch(symbol, interval)
             diagnostics["bybit_requests"] += 1
             rows.extend(latest_batch)
+            rows = [bybit_candle_to_row(candle) for candle in contiguous_bybit_tail(bybit_rows_to_candles(rows), timeframe)]
         except Exception as exc:
             if not rows:
                 raise
@@ -796,6 +868,7 @@ def fetch_bybit_candles_with_diagnostics(
 
     while len(rows) < requested:
         try:
+            diagnostics['network_fetch_attempted'] = True
             batch = request_bybit_kline_batch(symbol, interval, end_time)
             diagnostics["bybit_requests"] += 1
         except Exception as exc:
@@ -812,6 +885,7 @@ def fetch_bybit_candles_with_diagnostics(
         seen_oldest.add(oldest_time)
 
         rows.extend(batch)
+        rows = [bybit_candle_to_row(candle) for candle in bybit_rows_to_candles(rows)]
         new_end_time = oldest_time - 1
         if end_time is not None and new_end_time >= end_time:
             break
@@ -822,7 +896,7 @@ def fetch_bybit_candles_with_diagnostics(
 
     candles = bybit_rows_to_candles(rows)
     with _bybit_cache_lock:
-        _bybit_cache[cache_key] = candles[-BYBIT_MAX_CACHE_CANDLES:]
+        store_bybit_memory_cache(cache_key, candles)
     save_bybit_disk_cache(symbol, timeframe, candles[-BYBIT_MAX_CACHE_CANDLES:])
 
     candles = candles[-requested:]
@@ -1093,6 +1167,9 @@ def fetch_yfinance_candles_for_period(symbol: str, timeframe: str, period: str) 
 
 
 def interval_to_ms(interval: str) -> int:
+    # Capacity estimates only; actual calendar boundaries use calendar_bounds.
+    if interval == '1M': return 31 * 86400000
+    if interval == '1y': return 366 * 86400000
     amount = int(interval[:-1])
     unit = interval[-1]
     if unit == 's':
@@ -1145,6 +1222,8 @@ def yfinance_backtest_period(interval: str) -> str:
 
 
 def fetch_closed_candles(source, symbol, timeframe, as_of, limit=500):
+    if timeframe in ('1M','1y'):
+        return fetch_older_candles(source,symbol,timeframe,int(as_of),limit)['candles']
     base = custom_chart_base(source, timeframe)
     if base:
         ratio = interval_to_ms(timeframe) // interval_to_ms(base)
@@ -1173,6 +1252,25 @@ def fetch_closed_candles(source, symbol, timeframe, as_of, limit=500):
 
 
 def fetch_older_candles(source, symbol, timeframe, before, limit=1000):
+    if timeframe in ('1M','1y'):
+        if timeframe not in DATA_SOURCE_CONFIG['sources'].get(source,{}).get('timeframes',[]) or not 0 < int(before) <= int(time.time()):
+            raise ValueError('Invalid source or calendar history boundary')
+        cursor = calendar_bounds(int(before),timeframe)[0]
+        target = min(12000,(max(1,int(limit))+1)*(31 if timeframe=='1M' else 366))
+        daily = {}
+        while len(daily) < target:
+            page_size = min(1000,target-len(daily))
+            payload = fetch_older_candles(source,symbol,'1d',cursor,page_size)
+            rows = payload['candles']
+            if not rows: break
+            oldest = min(row['time'] for row in rows)
+            if oldest >= cursor: break
+            daily.update((row['time'],row) for row in rows)
+            cursor = oldest
+            if len(rows) < page_size: break
+        return {'source':source,'symbol':symbol,'timeframe':timeframe,
+                'candles':aggregate_calendar_candles(list(daily.values()),timeframe)[-int(limit):],
+                'diagnostics':{'aggregatedFrom':'1d','calendarAggregation':True}}
     if timeframe == '1s' and source in ('bybit','bybit_spot','bybit_inverse'):
         return {'source':source, 'symbol':symbol, 'timeframe':timeframe, 'candles':[], 'diagnostics':{'liveOnly':True}}
     base = custom_chart_base(source, timeframe)

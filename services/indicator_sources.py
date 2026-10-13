@@ -89,8 +89,9 @@ def download_source(key):
 @blueprint.get("/worker.js")
 def indicator_worker():
     from flask import request
+    from services.chart_accounts import account_origin
     response = send_file(ROOT / "static" / "custom-indicator-worker.js", mimetype="application/javascript", max_age=0)
-    asset_root = request.host_url.rstrip("/") + "/static/pyodide/"
+    asset_root = account_origin() + "/static/pyodide/"
     response.headers["Content-Security-Policy"] = "default-src 'none'; script-src " + asset_root + " 'wasm-unsafe-eval'; connect-src " + asset_root + "; worker-src 'none'; object-src 'none'"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Cross-Origin-Resource-Policy"] = "same-origin"

@@ -10,6 +10,12 @@ from data_source import aggregate_chart_candles
 
 
 class ChartAlertTests(unittest.TestCase):
+    def setUp(self):
+        for target in (alerts, alerts.account_mail.mail_store):
+            mode = patch.object(target, "postgres_enabled", return_value=False)
+            mode.start()
+            self.addCleanup(mode.stop)
+
     def alert(self, operator="crossing", once=True):
         return {"enabled": True, "expiresAt": time.time() + 1000, "once": once, "match": "all",
                 "conditions": [{"field": "price", "operator": operator, "value": 100}]}

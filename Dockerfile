@@ -1,21 +1,26 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    ZGUA_QUIET=1
+    ZGUA_QUIET=1 \
+    ZGUA_ENV=production \
+    ZGUA_CACHE_CANDLE_BUDGET=60000 \
+    NODE_OPTIONS=--max-old-space-size=128
 
 WORKDIR /app
 
+COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends nodejs npm \
+    && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt package.json ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && npm install --omit=dev
+COPY requirements-production.lock ./
+RUN pip install --no-cache-dir -r requirements-production.lock
 
 COPY . .
+RUN python scripts/install_indicator_runtime.py
 
 EXPOSE 10000
 
-CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-10000} --workers 2 --threads 4 --timeout 180"]
+CMD ["python", "scripts/start_web.py"]

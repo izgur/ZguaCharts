@@ -5,6 +5,9 @@
   const operators = [["crossing", "Crossing"], ["crossing-up", "Crossing up"], ["crossing-down", "Crossing down"], ["above", "Greater than"], ["below", "Less than"]];
   let polling, lastEventTime = Date.now() / 1000;
   async function api(url, options) {
+    if (options?.method && options.method !== "GET") {
+      options = { ...options, headers: { ...options.headers, "X-CSRF-Token": root.ChartAccounts?.csrfToken() || "" } };
+    }
     const response = await fetch(url, options), body = await response.json();
     if (!response.ok) throw new Error(body.error || "Request failed");
     return body;
@@ -13,7 +16,8 @@
   function timeframeControls(pane, frames) {
     frames = frames.includes('1s') ? ['1s', ...frames.filter(value => value !== '1s')] : frames;
     const select = pane.timeframeSelect, host = pane.node.querySelector(".timeframe-shortcuts"), menu = pane.node.querySelector(".timeframe-menu");
-    host.innerHTML = frames.map((value) => `<button type="button" data-timeframe="${value}" title="${value}">${label(value)}</button>`).join("");
+    const visible = root.ChartHeaderTimeframes?.visible(frames) || frames;
+    host.innerHTML = visible.map((value) => `<button type="button" data-timeframe="${value}" title="${value}">${label(value)}</button>`).join("");
     menu.innerHTML = frames.map((value) => `<button type="button" role="menuitemradio" data-timeframe="${value}">${label(value)}</button>`).join("");
     const sync = () => {
       for (const button of [...host.children, ...menu.children]) {

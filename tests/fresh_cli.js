@@ -1,0 +1,13 @@
+const assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const {createRequire}=require('node:module'),path=require('node:path');
+const cliRequire=createRequire(path.resolve('cli/backtest.js'));
+const start=1700000400,candles=Array.from({length:800},(_,i)=>{const close=100+i*.03+Math.sin(i/3);return {time:start+i*3600,open:close-.08,high:close+2,low:close-2,close,volume:100};});
+const regime=Array.from({length:600},(_,i)=>{const close=200+i*.04;return {time:start-1000*3600+i*14400,open:close-.1,high:close+1,low:close-1,close,volume:100};});
+const execution=candles.flatMap(row=>Array.from({length:12},(_,i)=>({...row,time:row.time+i*300,open:row.close-.01})));
+(async()=>{let output='',errors='',finish;const done=new Promise(resolve=>{finish=resolve;}),requests=[];
+ const runtime={readStdinIfPresent:async()=>JSON.stringify({strategy:'RelativeStrengthFreshV3',source:'bybit',symbol:'ETHUSDT',interval:'1h',executionInterval:'5m',limit:800,candles,executionCandles:execution}),finishCli:finish};
+ const data={...cliRequire('../core/data'),fetchCandles:async options=>{requests.push(options);return options.candles||regime;}};
+ vm.runInNewContext(fs.readFileSync('cli/backtest.js','utf8'),{require:name=>name==='./runtime'?runtime:name==='../core/data'?data:cliRequire(name),process:{argv:['node','cli/backtest.js','--stdin-json'],stdout:{write:value=>{output+=value;}},stderr:{write:value=>{errors+=value;}}},console});
+ const result=await done;assert.equal(result.exitCode,0,errors);const payload=JSON.parse(output);assert.ok(payload.numberOfTrades>0,output.slice(0,500));assert.ok(requests.some(o=>o.symbol==='BTCUSDT'&&o.interval==='4h'&&o.limit===450));assert.equal(payload.diagnostics.strategyName,'RelativeStrengthFreshV3');assert.ok(payload.totalFees>0);
+ console.log('Real CLI pipeline automatically loads correctly sized BTC benchmark and produces FreshV3 trades with fees.');
+})().catch(error=>{console.error(error);process.exitCode=1;});

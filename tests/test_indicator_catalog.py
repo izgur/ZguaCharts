@@ -21,7 +21,8 @@ class CatalogTests(unittest.TestCase):
                 self.assertTrue(series)
                 for item in series:
                     self.assertEqual(len(item["data"]), len(self.rows))
-                    if key not in ("supertrend_kivanc", "zigzag"):
+                    # Divergence classes may legitimately have no matching event.
+                    if key not in ("supertrend_kivanc", "zigzag", "zgua"):
                         self.assertTrue(any(row["value"] is not None for row in item["data"]))
                     self.assertTrue(all(row["value"] is None or np.isfinite(row["value"]) for row in item["data"]))
                     self.assertEqual(item["indicatorId"], key)
@@ -55,6 +56,7 @@ class CatalogTests(unittest.TestCase):
             if name == "fast": custom = {name: value + 1}
             if key == "psar": custom = {"start": 0.04}
             if key == "anchoredvwap": custom = {"length": 8}
+            if key == "zgua": custom = {"max_events": 1}
             with self.subTest(indicator=key):
                 old = build_indicator_payload(self.rows, [key])
                 new = build_indicator_payload(self.rows, [key], settings={key: custom})

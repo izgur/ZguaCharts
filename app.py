@@ -16,7 +16,12 @@ from copy import deepcopy
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps, lru_cache
+from threading import BoundedSemaphore
 from pathlib import Path
+
+from dotenv import load_dotenv
+if not os.environ.get("RENDER") and os.environ.get("ZGUA_ENV") != "production" and os.environ.get('ZGUA_LOAD_DOTENV','1') != '0':
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 from flask import Flask, g, has_request_context, jsonify, render_template, request
 
@@ -53,6 +58,14 @@ from strategy import DEFAULT_PRESET_ID, preset_options
 
 
 app = Flask(__name__)
+from services.storage import postgres_enabled, StorageUnavailable, setting
+from services.deployment import production_mode, validate_environment, database_errors
+if os.environ.get('RENDER') and not production_mode():
+    raise RuntimeError('Hosted deployments require ZGUA_ENV=production and explicit production settings')
+if production_mode():
+    deployment_errors = validate_environment()
+    if deployment_errors:
+        raise RuntimeError('Invalid production configuration: ' + ', '.join(deployment_errors))
 from services.indicator_sources import blueprint as indicator_sources_blueprint
 app.register_blueprint(indicator_sources_blueprint)
 from services.tactic_sources import blueprint as tactic_sources_blueprint
@@ -65,10 +78,84 @@ from services.chart_accounts import blueprint as chart_accounts_blueprint
 from services import account_security
 app.register_blueprint(chart_accounts_blueprint)
 
+_hosted_backtest_slot = BoundedSemaphore(1)
+
+
+def hosted_mode():
+    return bool(os.environ.get("RENDER") or os.environ.get("ZGUA_ENV") == "production"
+                or app.config.get("ZGUA_PUBLIC_ACCOUNTS", os.environ.get("ZGUA_PUBLIC_ACCOUNTS")) == "1")
+
+
+if hosted_mode():
+    app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
+
+
+@app.after_request
+def production_headers(response):
+    if getattr(g, "hosted_backtest_slot", False):
+        _hosted_backtest_slot.release()
+        g.hosted_backtest_slot = False
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store'
+    if hosted_mode():
+        response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; object-src 'none'")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if str(setting('PUBLIC_APP_URL','')).startswith('https://'):
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
+
+
+@app.teardown_request
+def release_hosted_backtest_slot(error):
+    if getattr(g, "hosted_backtest_slot", False):
+        _hosted_backtest_slot.release()
+        g.hosted_backtest_slot = False
+
+
+@app.errorhandler(413)
+def payload_too_large(error):
+    return jsonify(error='Request is too large. Use a smaller chart history or profile.'),413
+
+
+@app.errorhandler(StorageUnavailable)
+def database_temporarily_unavailable(error):
+    response = jsonify(error='Account storage is temporarily unavailable. Please retry shortly.')
+    response.headers['Retry-After'] = '5'
+    return response,503
+
 @app.before_request
 def tactic_access_guard():
+    if hosted_mode():
+        if request.path.startswith('/api/zgua/') and request.method == 'POST':
+            body = request.get_json(silent=True)
+            if isinstance(body,dict) and isinstance(body.get('candles'),list) and len(body['candles']) > 5000:
+                return jsonify(error='Hosted divergence inspection supports at most 5000 candles.'),400
+        if request.path.startswith('/api/chart-alerts') and not postgres_enabled():
+            return jsonify(error='Hosted alerts require persistent account storage.'),503
+        public_api = ('/api/account/', '/api/chart-alerts', '/api/indicator-source', '/api/tactic-source', '/api/zgua/')
+        public_paths = {'/api/config','/api/candles','/api/indicators','/api/signals','/api/signals/at',
+                        '/api/backtest/run-custom','/api/backtest/strategy-metadata','/api/backtest-history'}
+        if request.path.startswith('/api/') and request.path not in public_paths and not request.path.startswith(public_api + ('/api/market/instruments','/api/market/search','/api/market/binance/symbols','/api/market/bybit/symbols')):
+            return jsonify(error='Local research and operator endpoints are not exposed on the hosted service.'),403
+        if request.path in ('/research','/research/paper-review','/research/paper-operator','/paper','/candidate','/learning','/ops','/settings','/analysis','/dashboard','/good-people'):
+            return jsonify(error='This workspace is available only in local development.'),403
     if request.path.startswith(('/api/backtest', '/api/strategy-ranking', '/api/strategy-optimize')):
-        return account_security.protect_tactic_request()
+        if request.path == '/api/backtest/run-custom' and request.method == 'POST' and account_security.request_role() not in ('admin','tactics'):
+            denied = account_security.protect_public_demo()
+            if denied: return denied
+            g.demo_tactic = True
+        else:
+            denied = account_security.protect_tactic_request()
+            if denied: return denied
+    if hosted_mode() and request.path == '/api/backtest/run-custom':
+        if not _hosted_backtest_slot.acquire(blocking=False):
+            response = jsonify(error='A backtest is already running. Please retry shortly.')
+            response.headers['Retry-After'] = '3'
+            return response,503
+        g.hosted_backtest_slot = True
 
 BACKTEST_HISTORY_PATH = Path(app.root_path) / "data" / "backtest-history.json"
 CONFIG_DIR = Path(app.root_path) / "config"
@@ -170,6 +257,12 @@ def healthz():
     return jsonify({"ok": True, "app": "ZguaCharts"})
 
 
+@app.get("/readyz")
+def readyz():
+    errors = database_errors() if postgres_enabled() else (['DATABASE_URL'] if hosted_mode() else [])
+    return jsonify(ok=not errors, checks=errors),503 if errors else 200
+
+
 @app.get("/api/system/health")
 def system_health():
     include_optimizer = request.args.get("optimizer", "").lower() in {"1", "true", "yes"}
@@ -201,11 +294,14 @@ def config():
     if account_security.request_role() not in ('tactics', 'admin'):
         for field in ('strategy_presets','optimizer_strategy_presets','chart_signal_strategies'):
             payload[field] = []
+        payload['chart_signal_strategies'] = [{'id':'demo_relativestrengthv2','label':'RelativeStrengthV2','strategy':'RelativeStrengthV2','params':{},'demo':True}]
         payload['default_strategy_preset'] = None
     return jsonify(payload)
 
 
 def interval_to_chart_seconds(value):
+    if value == '1M': return 31 * 86400
+    if value == '1y': return 366 * 86400
     return int(value[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}.get(value[-1], 60)
 
 
@@ -289,6 +385,7 @@ def candles():
     timeframe = request.args.get("timeframe", "1m")
     try:
         limit = int(request.args.get("limit", "240"))
+        if hosted_mode(): limit = max(1,min(5000,limit))
         visible_charts = int(request.args.get("visible_charts", "1"))
         before = request.args.get("before")
         live_tail = request.args.get("live_tail") == "true" and not before
@@ -314,6 +411,8 @@ def indicators():
     symbol = request.args.get("symbol", "BTCUSDT")
     timeframe = request.args.get("timeframe", "1m")
     names = request.args.get("indicators", "")
+    if hosted_mode() and len({name for name in names.split(',') if name.strip()}) > 12:
+        return jsonify(error='Hosted charts support at most 12 simultaneous indicators. Local research remains unrestricted.'),400
     chart_candles_count = request.args.get("chart_candles_count")
     first_chart_candle_time = request.args.get("first_chart_candle_time")
     last_chart_candle_time = request.args.get("last_chart_candle_time")
@@ -321,6 +420,7 @@ def indicators():
     try:
         sma_period = int(request.args.get("sma_period", "20"))
         limit = int(request.args.get("limit", "300"))
+        if hosted_mode(): limit = max(1,min(5000,limit))
         body = {}
         if request.method == "POST":
             if (request.content_length or 0) > 12000000:
@@ -329,8 +429,9 @@ def indicators():
             if not isinstance(body, dict):
                 raise ValueError("Provide an indicator request object")
             rows = body.get("candles")
-            if not isinstance(rows, list) or not 1 <= len(rows) <= 50000:
-                raise ValueError("Provide 1 to 50000 chart candles")
+            maximum = 5000 if hosted_mode() else 50000
+            if not isinstance(rows, list) or not 1 <= len(rows) <= maximum:
+                raise ValueError("Provide 1 to {} chart candles".format(maximum))
             candles = []
             for row in rows:
                 if not isinstance(row, dict) or any(key not in row for key in ("time", "open", "high", "low", "close", "volume")):
@@ -377,6 +478,7 @@ def signals():
     symbol = request.args.get("symbol", "BTCUSDT")
     timeframe = request.args.get("timeframe", "1m")
     limit = int(request.args.get("limit", "300"))
+    if hosted_mode(): limit = max(1,min(5000,limit))
     include_timeframes = request.args.get("include_timeframes", "true").lower() != "false"
 
     try:
@@ -535,6 +637,24 @@ def backtest_strategy_metadata():
 
 @app.post("/api/backtest/run-custom")
 def backtest_run_custom():
+    if getattr(g,'demo_tactic',False):
+        body = request.get_json(silent=True)
+        source, symbol, timeframe = body.get('source','bybit'),body.get('symbol','BTCUSDT'),body.get('timeframe','1h')
+        if not isinstance(source,str) or source not in DATA_SOURCE_CONFIG['sources'] or not isinstance(symbol,str) or not re.fullmatch(r'[A-Za-z0-9.:@/^=_-]{1,96}',symbol):
+            return jsonify(error='Invalid demo market.'),400
+        frames = DATA_SOURCE_CONFIG['sources'][source]['timeframes'] + ['2m','6m','12m']
+        if not isinstance(timeframe,str) or timeframe not in frames or timeframe in ('1M','1y') or timeframe.endswith('s'):
+            return jsonify(error='Choose a minute, hour, day or week timeframe for the demo.'),400
+        try:
+            limit = 2000 if body.get('limit') in (None,'auto') else max(300,min(2500,int(body['limit'])))
+            period = str(max(1,math.ceil(limit*interval_to_chart_seconds(timeframe)/86400)))+'d'
+            result = run_shared_backtest_engine(source,symbol,timeframe,period,'RelativeStrengthV2',0.055,0.02,limit,strategy_params={'accountEquity':10000,'maxPositionPct':100,'maxNotional':10000},execution_timeframe=normalize_execution_timeframe(None,timeframe),max_signal_candles=limit)
+            result.pop('presets',None)
+            metrics = manual_backtest_result_summary(result,period)
+            result.update(ok=True,guestDemo=True,historySaved=False,trades=metrics['trades'],totalReturnPct=metrics['totalReturnPct'],winRate=metrics['winRate'])
+            return jsonify(result)
+        except (ValueError,TypeError) as exc: return jsonify(error=str(exc)),400
+        except Exception as exc: return jsonify(error='Demo backtest could not finish: '+str(exc)),502
     stage = "argument parsing"
     context = {}
     try:
@@ -21217,15 +21337,25 @@ def node_executable() -> str:
     return fallback or "node"
 
 
-def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None, include_candles: bool = False, execution_timeframe: str | None = None) -> dict:
+def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period: str, preset: str, fee_pct: float, slippage_pct: float, limit: int | None, debug: bool = False, allow_shorts: bool = False, strategy_params: dict | None = None, include_candles: bool = False, execution_timeframe: str | None = None, max_signal_candles: int | None = None) -> dict:
     """Bridge Flask to the reusable Node research engine.
 
     Python keeps responsibility for broker adapters that already work here
     (yfinance, Bybit cache, Hyperliquid). Simulation rules live in /core so
     the UI, CLI optimizer, and future workers all share one backtest engine.
     """
+    hosted_request = hosted_mode() and has_request_context()
+    original_period = period
+    if hosted_request:
+        limit = max(1,min(2500,limit or 2500))
+        max_signal_candles = min(max_signal_candles or limit,limit)
+        capacity_days = max(1,math.ceil(limit * interval_to_chart_seconds(timeframe) / 86400))
+        requested_days = parse_period_to_days(period)
+        period = str(min(requested_days,capacity_days) if requested_days and math.isfinite(requested_days) and requested_days > 0 else capacity_days) + 'd'
     execution_timeframe = timeframe if preset == "ZGUA" else normalize_execution_timeframe(execution_timeframe, timeframe)
     candles_payload = fetch_historical_candles(source, symbol, timeframe, period=period, limit=limit)
+    if max_signal_candles:
+        candles_payload = dict(candles_payload,candles=candles_payload['candles'][-max_signal_candles:],limit=min(max_signal_candles,len(candles_payload['candles'])))
     execution_payload = None
     regime_payload = None
     if execution_timeframe and execution_timeframe != timeframe:
@@ -21233,9 +21363,16 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
         execution_minutes = backtest_timeframe_minutes(execution_timeframe) or signal_minutes
         signal_candle_count = limit or len(candles_payload["candles"]) or 1000
         execution_limit = min(50000, max(300, int(math.ceil(signal_candle_count * signal_minutes / execution_minutes)) + 250))
+        if hosted_request: execution_limit = min(30000,execution_limit)
         if source != "bybit":
             execution_limit = min(5000, execution_limit)
-        execution_payload = fetch_historical_candles(source, symbol, execution_timeframe, period=period, limit=execution_limit)
+        execution_period = period
+        if hosted_request:
+            capacity_days = max(1,math.ceil(execution_limit * execution_minutes / 1440))
+            execution_period = str(min(parse_period_to_days(period) or capacity_days,capacity_days)) + 'd'
+        execution_payload = fetch_historical_candles(source, symbol, execution_timeframe, period=execution_period, limit=execution_limit)
+        if hosted_request:
+            execution_payload = dict(execution_payload,candles=execution_payload['candles'][-execution_limit:])
     if source != "bybit" and preset != "ZGUA":
         signal_minutes = backtest_timeframe_minutes(timeframe) or 60
         signal_candle_count = limit or len(candles_payload["candles"]) or 1000
@@ -21304,6 +21441,9 @@ def run_shared_backtest_engine(source: str, symbol: str, timeframe: str, period:
     payload["diagnostics"]["period_capped"] = historical_diag.get("period_capped", False)
     payload["diagnostics"].setdefault("warnings", [])
     payload["diagnostics"]["warnings"].extend(historical_diag.get("warnings", []))
+    if hosted_request:
+        payload['diagnostics']['hostedHistoryLimits'] = {'requestedPeriod':original_period,'effectivePeriod':period,'maxSignalCandles':2500,'maxExecutionCandles':30000}
+        payload['diagnostics']['warnings'].append('Hosted backtests use bounded history (2500 signal / 30000 execution candles). Check coverage; use local research for full-period validation.')
     payload["diagnostics"]["execution_timeframe"] = execution_timeframe
     payload["diagnostics"]["executionTimeframe"] = execution_timeframe
     if execution_payload:
@@ -22002,6 +22142,9 @@ def build_signal_timeframe_matrix(source: str, symbol: str, selected_timeframe: 
 
 
 def load_backtest_history() -> list[dict]:
+    if postgres_enabled() and has_request_context():
+        from services.backtest_store import history
+        return history()
     if not BACKTEST_HISTORY_PATH.exists():
         return []
     try:
@@ -22045,9 +22188,13 @@ def record_backtest_history(payload: dict) -> None:
         "profitFactor": safe_float(payload.get("profit_factor", payload.get("profitFactor", 0))),
         "averageBarsHeld": safe_float(payload.get("average_bars_held", payload.get("avgBarsHeld", 0))),
     }
-    records = load_backtest_history()
-    records.append(record)
-    save_backtest_history(records)
+    if postgres_enabled() and has_request_context():
+        from services.backtest_store import record as persist_record
+        persist_record(record, payload)
+    else:
+        records = load_backtest_history()
+        records.append(record)
+        save_backtest_history(records)
 
 
 def backtest_lab_history_row(record: dict) -> dict:

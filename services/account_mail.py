@@ -11,6 +11,7 @@ from datetime import datetime
 from email.utils import parseaddr
 from email.message import EmailMessage
 import requests
+from services import mail_store
 
 ROOT = Path(__file__).resolve().parents[1]
 USAGE = ROOT / "config" / "local" / "mail-usage.json"
@@ -67,7 +68,7 @@ def _reserve_send(config):
     temporary.replace(USAGE)
 
 
-def _send_resend(config, recipient, subject, message, html, idempotency_key):
+def _send_resend(config, recipient, subject, message, html, idempotency_key, persisted=False):
     global _last_send
     sender = parseaddr(config["from"])[1].lower()
     if sender.endswith("@resend.dev"):
@@ -81,10 +82,13 @@ def _send_resend(config, recipient, subject, message, html, idempotency_key):
     headers = {"Authorization": "Bearer " + config["api_key"], "Idempotency-Key": idempotency_key,
                "Content-Type": "application/json"}
     with SEND_LOCK:
-        _reserve_send(config)
+        if not persisted:
+            _reserve_send(config)
         for attempt in range(3):
             time.sleep(max(0, 1.0 - (time.monotonic() - _last_send)))
             _last_send = time.monotonic()
+            if persisted:
+                mail_store.record_attempt(idempotency_key)
             try:
                 response = requests.post("https://api.resend.com/emails", headers=headers, json=payload,
                                          timeout=(5, 15), allow_redirects=False)
@@ -110,14 +114,14 @@ def _send_resend(config, recipient, subject, message, html, idempotency_key):
             return {"provider": "resend", "id": email_id, "status": "accepted"}
 
 
-def send(recipient, subject, message, html=None, idempotency_key=None, config=None):
+def _send(recipient, subject, message, html=None, idempotency_key=None, config=None, persisted=False):
     config = configuration() if config is None else config
     if not configured(config):
         raise MailDeliveryError("Email delivery is not configured")
     if any(char in recipient + subject for char in "\r\n") or parseaddr(recipient)[1] != recipient or "@" not in recipient:
         raise MailDeliveryError("Invalid email recipient or subject")
     if config.get("provider") == "resend":
-        return _send_resend(config, recipient, subject, message, html, idempotency_key or "zgua/" + uuid.uuid4().hex)
+        return _send_resend(config, recipient, subject, message, html, idempotency_key or "zgua/" + uuid.uuid4().hex, persisted)
     mail = EmailMessage()
     mail["From"], mail["To"], mail["Subject"] = config["from"], recipient, subject
     mail.set_content(message)
@@ -126,6 +130,8 @@ def send(recipient, subject, message, html=None, idempotency_key=None, config=No
     security = config.get("security", "starttls")
     context = ssl.create_default_context()
     port = int(config.get("port", 465 if security == "ssl" else 587))
+    if persisted:
+        mail_store.record_attempt(idempotency_key)
     if security == "ssl":
         connection = smtplib.SMTP_SSL(config["host"], port, timeout=15, context=context)
     else:
@@ -137,3 +143,42 @@ def send(recipient, subject, message, html=None, idempotency_key=None, config=No
             smtp.login(config["username"], config.get("password", ""))
         smtp.send_message(mail)
     return {"provider": "smtp", "status": "accepted"}
+
+
+def send(recipient, subject, message, html=None, idempotency_key=None, config=None):
+    """Deliver synchronously; PostgreSQL claims are durable before provider I/O."""
+    config = configuration() if config is None else config
+    if not configured(config):
+        raise MailDeliveryError("Email delivery is not configured")
+    if any(char in recipient + subject for char in "\r\n") or parseaddr(recipient)[1] != recipient or "@" not in recipient:
+        raise MailDeliveryError("Invalid email recipient or subject")
+    try:
+        persisted = mail_store.postgres_enabled()
+    except Exception:
+        raise MailDeliveryError("Email persistence is unavailable") from None
+    if not persisted:
+        return _send(recipient, subject, message, html, idempotency_key, config)
+    delivery_id = idempotency_key or "zgua/" + uuid.uuid4().hex
+    try:
+        prior = mail_store.claim(delivery_id, recipient, subject, config)
+    except mail_store.MailStoreError as exc:
+        raise MailDeliveryError(str(exc)) from None
+    except Exception:
+        raise MailDeliveryError("Email persistence is unavailable") from None
+    if prior:
+        return prior
+    try:
+        result = _send(recipient, subject, message, html, delivery_id, config, persisted=True)
+    except Exception as exc:
+        # Never persist arbitrary exception text, SMTP replies or message data.
+        safe_error = str(exc) if isinstance(exc, MailDeliveryError) else "Email delivery failed; reconcile its outcome before resending"
+        try:
+            mail_store.finish(delivery_id, error=safe_error)
+        except Exception:
+            pass  # The committed claim still prevents an ambiguous resend.
+        raise MailDeliveryError(safe_error) from None
+    try:
+        mail_store.finish(delivery_id, result=result)
+    except Exception:
+        raise MailDeliveryError("Email was accepted but its receipt could not be saved; reconcile before resending") from None
+    return result

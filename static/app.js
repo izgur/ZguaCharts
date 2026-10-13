@@ -190,6 +190,7 @@ function loadUiPrefs() {
       watchFontSize: Math.max(9, Math.min(18, Number(parsed.watchFontSize) || 12)),
       panelFontSize: Math.max(10, Math.min(18, Number(parsed.panelFontSize) || 12)),
       tableFontSize: Math.max(9, Math.min(18, Number(parsed.tableFontSize) || 11)),
+      headerTimeframes: Array.isArray(parsed.headerTimeframes) ? parsed.headerTimeframes.filter(value => typeof value === 'string') : null,
       campaignForm: parsed.campaignForm && typeof parsed.campaignForm === "object" ? parsed.campaignForm : {},
     };
   } catch {
@@ -220,6 +221,22 @@ window.ChartTypography = {
     uiPrefs[key] = Math.max(field.min, Math.min(field.max, value)); applyFontSettings(); saveUiPrefs();
   },
   reset: () => { for (const field of fontSettingFields) uiPrefs[field.key] = field.value; applyFontSettings(); saveUiPrefs(); },
+};
+window.ChartHeaderTimeframes = {
+  visible: (frames) => {
+    if (!Array.isArray(uiPrefs.headerTimeframes)) { uiPrefs.headerTimeframes = frames.filter(value => !['1M','1y'].includes(value)); saveUiPrefs(); }
+    return frames.filter(value => uiPrefs.headerTimeframes.includes(value));
+  },
+  options: () => [...new Set(Object.values(config?.sources || {}).flatMap(source => source.timeframes))].sort((a,b) => {
+    const seconds = value => value === '1M' ? 2592000 : value === '1y' ? 31536000 : timeframeSeconds(value);
+    return seconds(a) - seconds(b);
+  }),
+  get: () => [...(uiPrefs.headerTimeframes || [])],
+  set: (frames) => {
+    const allowed = window.ChartHeaderTimeframes.options();
+    uiPrefs.headerTimeframes = [...new Set(frames)].filter(value => allowed.includes(value)); saveUiPrefs();
+    for (const pane of panes) window.ChartWorkspace.timeframeControls(pane, config.sources[pane.sourceSelect.value].timeframes);
+  },
 };
 
 function hasElement(...elements) {
@@ -448,7 +465,7 @@ function pathToPage(pathname) {
 }
 
 function showPage(page) {
-  if (!window.ChartAccounts?.canUseTactics() && page !== 'charts') {
+  if (!window.ChartAccounts?.canManageTactics() && page !== 'charts') {
     page = 'charts'; history.replaceState(null,'','/charts');
   }
   document.body.dataset.page = page;
@@ -2576,9 +2593,17 @@ function zoomToStrategyTrade(index, row) {
 }
 
 function timeframeSeconds(timeframe) {
+  if (timeframe === '1M') return 31 * 86400;
+  if (timeframe === '1y') return 366 * 86400;
   const match = String(timeframe || "").toLowerCase().match(/^(\d+)(s|m|h|d|w)$/);
   if (!match) return 3600;
   return Number(match[1]) * ({ s:1, m: 60, h: 3600, d: 86400, w: 604800 }[match[2]] || 3600);
+}
+function candleCloseTime(time, timeframe) {
+  const date = new Date(time * 1000);
+  if (timeframe === '1M') return Date.UTC(date.getUTCFullYear(),date.getUTCMonth()+1,1)/1000;
+  if (timeframe === '1y') return Date.UTC(date.getUTCFullYear()+1,0,1)/1000;
+  return time + timeframeSeconds(timeframe);
 }
 
 function scheduleWatchlistRefresh() {
@@ -2787,6 +2812,7 @@ function createPane(node, index) {
   pane.presetSelect.value = config.chart_signal_strategies?.some((preset) => preset.id === saved.signalStrategy)
     ? saved.signalStrategy
     : "none";
+  if (!window.ChartAccounts?.canManageTactics()) pane.presetSelect.value = 'demo_relativestrengthv2';
   populateSymbolAndTimeframe(pane, saved);
   setupSymbolSearch(pane);
   restoreIndicators(pane, saved.indicators || []);
@@ -2945,9 +2971,13 @@ function setupChartPresentation(pane) {
   menu.addEventListener("click", (e) => { const button = e.target.closest("[data-chart-style]"); if (button) select(button.dataset.chartStyle); });
   if (pane.chartStyle !== "candles") select(pane.chartStyle);
   pane.node.querySelector(".chart-auto-button").addEventListener("click", () => {
+    pane.viewRevision = (pane.viewRevision || 0) + 1;
+    pane.liveLogicalRange = null;
+    pane.autoFitPending = true;
     pane.chart.priceScale("right").applyOptions({ autoScale: true }); pane.chart.timeScale().fitContent();
     for (const { chart } of pane.indicatorCharts) { chart.priceScale("right").applyOptions({ autoScale: true }); chart.timeScale().fitContent(); }
     syncIndicatorTimeRanges(pane);
+    requestAnimationFrame(() => requestAnimationFrame(() => { pane.autoFitPending = false; }));
   });
   const stack = pane.node.querySelector(".chart-stack"), fullscreen = pane.node.querySelector(".chart-fullscreen-button");
   const exitFocus = () => { stack.classList.remove("chart-focus"); fullscreen.setAttribute("aria-pressed", "false"); };
@@ -3118,7 +3148,7 @@ async function showHistoricalSignalStrength(pane, param) {
   if (!isCandleBodyClick(pane, param)) return;
   const time = normalizeMarkerTime(param.time);
   const source = pane.sourceSelect.value, symbol = pane.symbolSelect.value, requestId = pane.requestId;
-  const asOf = Math.min(Math.floor(Date.now() / 1000), time + timeframeSeconds(pane.timeframeSelect.value));
+  const asOf = Math.min(Math.floor(Date.now() / 1000), candleCloseTime(time,pane.timeframeSelect.value));
   const id = (pane.historicalSignalRequest || 0) + 1; pane.historicalSignalRequest = id;
   pane.node.querySelector(".historical-signals")?.remove();
   const panel = document.createElement("div"); panel.className = "historical-signals"; panel.setAttribute("aria-live", "polite");
@@ -3213,7 +3243,7 @@ function createBaseChart(element, overrides = {}) {
       horzLines: { color: "rgba(255, 255, 255, 0.05)" },
     },
     rightPriceScale: { borderColor: "#26313d", minimumWidth: 0 },
-    timeScale: { borderColor: "#26313d", timeVisible: true, secondsVisible: false },
+    timeScale: { borderColor: "#26313d", timeVisible: true, secondsVisible: false, shiftVisibleRangeOnNewBar: false, allowShiftVisibleRangeOnWhitespaceReplacement: false },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
     ...overrides,
   });
@@ -3242,6 +3272,11 @@ function populateSourceSelect(pane) {
 }
 
 function populatePresetSelect(pane) {
+  if (!window.ChartAccounts?.canManageTactics()) {
+    pane.presetSelect.innerHTML = '<option value="demo_relativestrengthv2">RelativeStrengthV2</option>';
+    pane.presetSelect.disabled = true; pane.presetSelect.title = 'Guest demo: RelativeStrengthV2 only';return;
+  }
+  pane.presetSelect.disabled = false;
   pane.presetSelect.innerHTML = [
     `<option value="none">None (signals off)</option>`,
     ...(config.chart_signal_strategies || []).filter((preset) => !preset.custom).map((preset) => `<option value="${preset.id}">${escapeHtml(preset.label)}</option>`),
@@ -3251,7 +3286,7 @@ function populatePresetSelect(pane) {
 }
 
 function mergeCustomTactics() {
-  if (!window.ChartAccounts?.canUseTactics()) return;
+  if (!window.ChartAccounts?.canManageTactics()) return;
   config.chart_signal_strategies = (config.chart_signal_strategies || []).filter((item) => !item.custom).concat(
     window.ChartCustomTactics.list().map((item) => ({id:item.id, label:item.name, strategy:item.baseStrategy, params:{}, custom:true})));
 }
@@ -3267,6 +3302,7 @@ function refreshCustomTactics() {
 }
 
 async function customTacticOptions(pane, record) {
+  if (['1M','1y'].includes(pane.timeframeSelect.value)) throw new Error('Monthly and yearly are chart-inspection timeframes; calendar tactic execution is not validated yet.');
   if (record?.baseStrategy === 'ZGUA' || /BASE_STRATEGY\s*=\s*['"]ZGUA['"]/.test(record?.code || '')) {
     const candles = pane.candles.slice(-5000);
     const response = await fetch('/api/zgua/events', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({candles, params:pane.indicatorSettings.zgua || {}})});
@@ -3281,8 +3317,9 @@ async function customTacticOptions(pane, record) {
   if (!response.ok || !payload.candles?.length) throw new Error(payload.error || 'BTC benchmark candles unavailable.');
   const options = {candles:pane.candles.slice(-5000), regimeCandles:payload.candles, benchmarkCandles:payload.candles,
     interval:pane.timeframeSelect.value, benchmarkInterval:'4h', symbol:pane.symbolSelect.value, source:pane.sourceSelect.value};
-  if (record?.code?.includes('researchExitMode')) {
+  if (record?.baseStrategy === 'RelativeStrengthFreshV3' || /BASE_STRATEGY\s*=\s*['"]RelativeStrengthFreshV3['"]/.test(record?.code || '') || record?.code?.includes('researchExitMode')) {
     const asOf=pane.replayActive?pane.candles.at(-1).time+timeframeSeconds(options.interval):Math.floor(Date.now()/1000);
+    options.asOf = asOf;
     options.candles=options.candles.filter(bar=>bar.time+timeframeSeconds(options.interval)<=asOf);
     const limit=Math.min(50000,Math.max(300,Math.ceil(options.candles.length*timeframeSeconds(options.interval)/300)));
     const execution=await apiGet('/api/candles?'+new URLSearchParams({source:options.source,symbol:options.symbol,timeframe:'5m',limit:String(limit),before:String(asOf)}));
@@ -3493,7 +3530,7 @@ async function startPane(pane) {
   }
 
   if (pane.disposed || requestId !== pane.requestId) return;
-  const aggregatedTimeframe = ["2m", "6m", "12m"].includes(pane.timeframeSelect.value);
+  const aggregatedTimeframe = ["2m", "6m", "12m", "1M", "1y"].includes(pane.timeframeSelect.value);
   if (pane.sourceSelect.value.startsWith('bybit') && pane.timeframeSelect.value === '1s') {
     window.ChartSecondCandles.connect(pane,requestId);
   } else if (pane.sourceSelect.value === "bybit" && !aggregatedTimeframe) {
@@ -3513,7 +3550,7 @@ function startBinancePolling(pane) {
   const refresh = async () => {
     if (pane.disposed || pane.requestId !== requestId || pane.replayActive) return;
     try {
-      const payload = await loadCandles(pane, { limit: 50, liveTail: true });
+      const payload = await loadCandles(pane, { limit: ['1M','1y'].includes(pane.timeframeSelect.value) ? 2 : 50, liveTail: true });
       if (pane.disposed || pane.requestId !== requestId || pane.replayActive) return;
       if (payload.diagnostics?.degraded_to_stale_cache) throw new Error('Latest candles unavailable; cached data is stale.');
       const merged = new Map(pane.candles.map((row) => [row.time, row]));
@@ -3526,7 +3563,10 @@ function startBinancePolling(pane) {
       if(pane.timeframeSelect.value==='1s')pane.candles=pane.candles.slice(-5000);
       const range = pane.chart.timeScale().getVisibleLogicalRange();
       if (changed) {
+        freezeLivePriceScale(pane);
+        const priceRange = pane.autoFitPending ? null : pane.chart.priceScale('right').getVisibleRange();
         if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane); else pane.series.setData(pane.candles);
+        if (priceRange) pane.chart.priceScale('right').setVisibleRange(priceRange);
         if (range) pane.chart.timeScale().setVisibleLogicalRange(range);
       }
       if (pane.candles.length) updateTicker(pane, pane.candles.at(-1).close);
@@ -3541,6 +3581,7 @@ function startBinancePolling(pane) {
 }
 
 async function renderSignals(pane, requestId, options = {}) {
+  if (['1M','1y'].includes(pane.timeframeSelect.value)) { clearSignalMarkers(pane); return; }
   if (!window.ChartAccounts?.canUseTactics()) { clearSignalMarkers(pane); return; }
   if (pane.timeframeSelect.value.endsWith('s')) return;
   // Signals are scored by /api/signals. The browser only renders the returned
@@ -3585,6 +3626,7 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
     clearSignalMarkers(pane);clearBacktestMarkers(pane);return;
   }
   if (pane.timeframeSelect.value.endsWith('s')) {pane.strategyPayload=null;pane.strategySummary={status:'off'};pane.signalBadge.textContent='1s VIEW';pane.signalBadge.title='Sub-minute chart inspection only; tactic backtests and paper configuration unchanged.';return;}
+  if (['1M','1y'].includes(pane.timeframeSelect.value)) { pane.strategyPayload=null;pane.strategySummary={status:'off'};clearSignalMarkers(pane);clearBacktestMarkers(pane);pane.signalBadge.textContent='CALENDAR VIEW';pane.signalBadge.title='Monthly/yearly charts and indicators; calendar tactic execution is not validated yet.';return; }
   if (pane.replayActive) return;
   if (!pane.historyLoaded || !pane.candles.length) return;
   const strategyRequestId = ++pane.strategyRequestId;
@@ -3614,7 +3656,7 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
   }
   try {
     const strategyStartedAt = performance.now();
-    const strategyCandleLimit = Math.min(Math.max(pane.candles.length, 300), 5000);
+    const strategyCandleLimit = Math.min(Math.max(pane.candles.length, 300), preset.demo ? 2500 : 5000);
     const request = {
       source: pane.sourceSelect.value,
       symbol: pane.symbolSelect.value,
@@ -3625,8 +3667,8 @@ async function renderSelectedStrategy(pane, requestId, options = {}) {
       params: preset.strategy === 'ZGUA' ? {...preset.params, ...pane.indicatorSettings.zgua} : preset.params || {},
       paramsSource: preset.label,
       limit: String(strategyCandleLimit),
-      feePct: preset.strategy === 'ZGUA' || preset.params?.researchExitMode ? 0.055 : 0,
-      slippagePct: preset.strategy === 'ZGUA' || preset.params?.researchExitMode ? 0.02 : 0,
+      feePct: ['ZGUA','RelativeStrengthFreshV3'].includes(preset.strategy) || preset.params?.researchExitMode || preset.demo ? 0.055 : 0,
+      slippagePct: ['ZGUA','RelativeStrengthFreshV3'].includes(preset.strategy) || preset.params?.researchExitMode || preset.demo ? 0.02 : 0,
       allowShorts: false,
       includeFullTrades: true,
       saveHistory: false,
@@ -3841,6 +3883,9 @@ async function renderIndicators(pane, requestId) {
     payload.overlays.push(...custom.overlays); payload.panes.push(...custom.panes);
   }
   if (requestId !== pane.requestId || indicatorRequestId !== pane.indicatorRequestId) return;
+  const viewRevision = pane.viewRevision || 0;
+  const mainPriceRange = pane.historyLoaded && !pane.autoFitPending ? pane.chart.priceScale('right').getVisibleRange() : null;
+  const mainLogicalRange = pane.historyLoaded && !pane.autoFitPending ? (pane.liveLogicalRange?.requestId === requestId ? pane.liveLogicalRange.range : currentVisibleLogicalRange(pane.chart)) : null;
 
   const inspection = pane.divergenceInspection;
   if (inspection && inspection.context === [pane.sourceSelect.value,pane.symbolSelect.value,pane.timeframeSelect.value].join(':') && indicators.includes('zgua') && pane.candles.some(bar=>bar.time===inspection.event.confirmedAt)) {
@@ -3851,7 +3896,7 @@ async function renderIndicators(pane, requestId) {
   const forward = Math.max(0, ...[...payload.overlays, ...payload.panes.flatMap(study => study.series)].map(series => series.offset || 0));
   pane.indicatorTimeline = timeline.map(({time}) => ({time}));
   const step = Math.max(1, timeline.at(-1)?.time - timeline.at(-2)?.time || 60);
-  for (let index = 0; index < forward; index++) pane.indicatorTimeline.push({time: timeline.at(-1).time + (index + 1) * step});
+  for (let index = 0; index < forward; index++) pane.indicatorTimeline.push({time: ['1M','1y'].includes(pane.timeframeSelect.value) ? candleCloseTime(pane.indicatorTimeline.at(-1).time,pane.timeframeSelect.value) : timeline.at(-1).time + (index + 1) * step});
 
   // Replay changes data in place: chart containers, resize handles and scales stay stable.
   if (pane.replayActive && pane.replayIndicatorSignature === indicators.join(",") && pane.overlaySeries.length === payload.overlays.length && pane.indicatorCharts.length === payload.panes.length) {
@@ -3877,6 +3922,9 @@ async function renderIndicators(pane, requestId) {
 
   const oldOverlaySeries = pane.overlaySeries;
   const oldIndicatorCharts = pane.indicatorCharts;
+  const savedStudyViews = new Map(oldIndicatorCharts.map(item => [item.element.dataset.indicatorId, {
+    key: item.viewKey, price: item.chart.priceScale('right').getVisibleRange(), logical: currentVisibleLogicalRange(item.chart),
+  }]));
   const nextOverlaySeries = [];
   const nextIndicatorCharts = [];
   const nextPaneElements = [];
@@ -3901,10 +3949,12 @@ async function renderIndicators(pane, requestId) {
     const paneEl = document.createElement("div");
     paneEl.className = "indicator-pane";
     paneEl.dataset.indicatorId = indicatorId;
+    paneEl.hidden = !!pane.hiddenIndicators?.has(indicatorId);
     paneEl.innerHTML = `
       <div class="indicator-title">
         <button class="indicator-info-button" type="button" data-indicator-id="${escapeHtml(indicatorId)}">${escapeHtml(indicatorPane.title)}</button>
         <button class="indicator-sync-button" type="button">${pane.syncIndicators ? "Sync on" : "Sync off"}</button>
+        <button class="indicator-fit-button" type="button" title="Fit visible indicator values vertically" aria-label="Fit visible indicator values vertically"><i data-lucide="arrow-up-down"></i></button>
         <button class="indicator-help-button" type="button" title="Indicator guide" aria-label="Indicator guide"><i data-lucide="info"></i></button>
       </div>
       <div class="indicator-chart"></div>
@@ -3940,7 +3990,10 @@ async function renderIndicators(pane, requestId) {
   nextPaneElements.forEach((item) => pane.indicatorPanesEl.appendChild(item.element));
   applyIndicatorHeights(pane);
   nextPaneElements.forEach((item) => {
-    const chart = createBaseChart(item.element.querySelector(".indicator-chart"));
+    const chart = createBaseChart(item.element.querySelector(".indicator-chart"), {
+      rightPriceScale: { borderColor: '#26313d', minimumWidth: 0, scaleMargins: { top: 0.18, bottom: 0.08 } },
+    });
+    item.element.querySelector('.indicator-fit-button').onclick = () => chart.priceScale('right').applyOptions({ autoScale: true });
     chart.subscribeCrosshairMove((param) => syncPaneCrosshair(pane, chart, param));
     if (pane.replayActive) chart.timeScale().applyOptions({ shiftVisibleRangeOnNewBar: false, allowShiftVisibleRangeOnWhitespaceReplacement: false });
     let markerSeries = null;
@@ -3954,12 +4007,21 @@ async function renderIndicators(pane, requestId) {
     });
     const paneMarkers = normalizeMarkers(item.pane.markers || []);
     if (markerSeries && paneMarkers.length) setSeriesMarkers(markerSeries, paneMarkers);
-    nextIndicatorCharts.push({ chart, element: item.element, series: studySeries, markerSeries });
+    const id = item.element.dataset.indicatorId;
+    const viewKey = JSON.stringify([pane.requestId, id, pane.indicatorSettings?.[id] || {}]);
+    const savedView = savedStudyViews.get(id);
+    nextIndicatorCharts.push({ chart, element: item.element, series: studySeries, markerSeries, viewKey });
     if (pane.replayActive) {
       const previous = oldIndicatorCharts.find((study) => study.element.dataset.indicatorId === item.pane.id);
       if (previous?.replayPriceRange) chart.priceScale("right").setVisibleRange(previous.replayPriceRange);
       restoreVisibleLogicalRange(chart, currentVisibleLogicalRange(pane.chart));
-    } else chart.timeScale().fitContent();
+    } else {
+      restoreVisibleLogicalRange(chart, currentVisibleLogicalRange(pane.chart));
+      if (savedView?.key === viewKey && !pane.autoFitPending) {
+        if (savedView.price) chart.priceScale('right').setVisibleRange(savedView.price);
+        if (!pane.syncIndicators && savedView.logical) restoreVisibleLogicalRange(chart, savedView.logical);
+      }
+    }
     if (chart.timeScale().subscribeVisibleLogicalRangeChange) {
       chart.timeScale().subscribeVisibleLogicalRangeChange(() => schedulePaneRangeSync(pane, chart));
     } else if (chart.timeScale().subscribeVisibleTimeRangeChange) {
@@ -3974,6 +4036,12 @@ async function renderIndicators(pane, requestId) {
   pane.drawingTools?.refreshVisibility();
   applyIndividualIndicatorVisibility(pane);
   syncIndicatorTimeRanges(pane);
+  if (mainPriceRange) pane.chart.priceScale('right').setVisibleRange(mainPriceRange);
+  if (mainLogicalRange) requestAnimationFrame(() => {
+    if (pane.disposed || requestId !== pane.requestId || indicatorRequestId !== pane.indicatorRequestId || viewRevision !== (pane.viewRevision || 0)) return;
+    restoreVisibleLogicalRange(pane.chart, mainLogicalRange);
+    if (pane.syncIndicators) syncPaneTimeRange(pane, { type: 'logical', range: mainLogicalRange }, pane.chart);
+  });
   pane.indicatorDiagnostics = payload.diagnostics || {};
   window.lucide?.createIcons({root:pane.indicatorPanesEl});
   renderDataDiagnostics(pane);
@@ -4070,7 +4138,11 @@ function renderIndicatorLabels(pane) {
 }
 
 function applyIndividualIndicatorVisibility(pane) {
-  for (const study of pane.indicatorCharts) study.element.style.visibility = pane.hiddenIndicators?.has(study.element.dataset.indicatorId) ? "hidden" : "";
+  for (const study of pane.indicatorCharts) {
+    study.element.hidden = !!pane.hiddenIndicators?.has(study.element.dataset.indicatorId);
+    study.element.style.visibility = '';
+  }
+  applyIndicatorHeights(pane);
   const names = { ema: /^EMA /, sma: /^SMA /, vwap: /^VWAP/, bbands: /^BB /, supertrend: /^Supertrend/ };
   for (const series of pane.overlaySeries) {
     const id = series.indicatorId || Object.keys(names).find((name) => names[name].test(series.indicatorName || ""));
@@ -4081,7 +4153,7 @@ function applyIndividualIndicatorVisibility(pane) {
 }
 
 function applyIndicatorHeights(pane) {
-  const items = Array.from(pane.indicatorPanesEl.children);
+  const items = Array.from(pane.indicatorPanesEl.children).filter(item => !item.hidden);
   const heights = items.map((item) => Math.max(64, Math.min(600, Number(pane.indicatorHeights?.[item.dataset.indicatorId]) || 128)));
   const total = heights.reduce((sum, height) => sum + height, 0);
   const stack = pane.node.querySelector(".chart-stack");
@@ -4186,6 +4258,7 @@ function seriesOptions(series) {
     lineStyle: series.guide && LightweightCharts.LineStyle ? LightweightCharts.LineStyle.Dashed : undefined,
     priceLineVisible: false,
     lastValueVisible: !series.guide && !series.markerGroup,
+    autoscaleInfoProvider: series.guide || series.markerGroup ? () => null : undefined,
   };
 }
 
@@ -4474,6 +4547,7 @@ function backtestLimitOptions(selected = "auto") {
 }
 
 function openBacktestControls(pane) {
+  if (['1M','1y'].includes(pane.timeframeSelect.value)) { openBacktestModal('<p class="modal-note">Monthly and yearly are calendar chart views. Tactic execution on these periods is not validated yet; use a minute, hour, day or week chart for backtests.</p>','Calendar chart');return; }
   const controlsRequestId = pane.requestId;
   if (pane.timeframeSelect.value.endsWith('s')) {openBacktestModal('<p class="modal-note">1s is for chart inspection. Use a minute-or-higher timeframe for the existing tactic backtests; limited trade-built history must not be treated as a complete test.</p>','Sub-minute chart');return;}
   const options = (config.chart_signal_strategies || [])
@@ -4512,13 +4586,14 @@ function openBacktestControls(pane) {
   `);
 
   const presetSelect = document.querySelector("#modal-preset-select");
+  if (!window.ChartAccounts?.canManageTactics()) presetSelect.disabled = true;
   const note = document.querySelector("#modal-preset-note");
   const syncNote = () => {
     const preset = (config.chart_signal_strategies || []).find((item) => item.id === presetSelect.value);
     note.textContent = preset?.custom ? 'Personal tactic: isolated local backtest; worker cost and 1x limits apply.' : 'Historical simulation, not evidence that this tactic is profitable. Modeled costs are included.';
     for (const id of ['modal-limit-input','modal-fee-input','modal-slippage-input','modal-allow-shorts']) {
       const input = document.getElementById(id);
-      input.disabled = Boolean(preset?.custom);
+      input.disabled = Boolean(preset?.custom || preset?.demo);
       input.title = preset?.custom ? 'Personal tactics use loaded candles and fixed isolated-worker costs/settings.' : '';
     }
   };
@@ -6376,7 +6451,7 @@ async function runBacktest(pane, presetId) {
       strategy: preset.strategy, params: preset.params || {}, paramsSource: preset.label,
       limit, feePct: Number(settings.fee_pct), slippagePct: Number(settings.slippage_pct),
       allowShorts: settings.allowShorts === 'true', includeFullTrades: true,
-      saveHistory: true, mode: 'manual',
+      saveHistory: !preset.demo, mode: preset.demo ? 'guest-demo' : 'manual',
     });
 
     if (pane.disposed || pane.requestId !== requestId) {
@@ -7237,7 +7312,7 @@ function renderZeroTradePanel(payload) {
       <h3 class="modal-section-title">Why no trades?</h3>
       <p class="modal-note">Backend-owned trade-generation diagnostics. Strategy formulas are not calculated in the browser.</p>
       ${tradeDiag ? renderTradeGenerationDiagnostics(tradeDiag) : `<p class="pane-status">No detailed diagnosis is attached yet.</p>`}
-      <button type="button" class="small-action-button" data-diagnose-backtest="${escapeHtml(params.toString())}">Diagnose Backtest</button>
+      ${payload.guestDemo ? '' : `<button type="button" class="small-action-button" data-diagnose-backtest="${escapeHtml(params.toString())}">Diagnose Backtest</button>`}
       <div class="zero-trade-diagnostics"></div>
     </section>
   `;
@@ -13074,6 +13149,7 @@ function connectBybit(pane, requestId) {
       volume: Number(row.volume),
     };
     if (!mergeLiveCandle(pane, candle)) return;
+    freezeLivePriceScale(pane);
     if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane, candle);
     else pane.series.update(candle);
     updateTicker(pane, candle.close);
@@ -13086,6 +13162,19 @@ function connectBybit(pane, requestId) {
   ws.addEventListener("error", () => {
     if (!pane.disposed && pane.ws === ws && requestId === pane.requestId) pane.status.textContent = "Bybit websocket error";
   });
+}
+
+function freezeLivePriceScale(pane) {
+  if (pane.autoFitPending) return;
+  const scale = pane.chart.priceScale('right'), range = scale.getVisibleRange();
+  const view = { range: currentVisibleLogicalRange(pane.chart), requestId: pane.requestId, revision: pane.viewRevision || 0 };
+  pane.liveLogicalRange = view;
+  if (range) scale.setVisibleRange(range);
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (pane.disposed || pane.requestId !== view.requestId || pane.liveLogicalRange !== view || view.revision !== (pane.viewRevision || 0)) return;
+    if (view.range) restoreVisibleLogicalRange(pane.chart, view.range);
+    pane.liveLogicalRange = null;
+  }));
 }
 
 function mergeLiveCandle(pane, candle) {
@@ -13136,6 +13225,7 @@ function connectHyperliquid(pane, requestId) {
       volume: Number(row.v),
     };
     if (!mergeLiveCandle(pane, candle)) return;
+    freezeLivePriceScale(pane);
     if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane, candle);
     else pane.series.update(candle);
     updateTicker(pane, candle.close);
@@ -13173,8 +13263,13 @@ function startYfinancePolling(pane) {
         return;
       }
       pane.pollFailures = 0;
+      freezeLivePriceScale(pane);
+      const priceRange = pane.autoFitPending ? null : pane.chart.priceScale('right').getVisibleRange();
+      const logicalRange = currentVisibleLogicalRange(pane.chart);
       if (pane.chartStyle && pane.chartStyle !== "candles") updatePresentationSeries(pane);
       else pane.series.setData(pane.candles);
+      if (priceRange) pane.chart.priceScale('right').setVisibleRange(priceRange);
+      if (logicalRange) restoreVisibleLogicalRange(pane.chart, logicalRange);
       updateTicker(pane, pane.candles[pane.candles.length - 1].close);
       await renderIndicators(pane, requestId);
       if (pane.disposed || requestId !== pane.requestId) return;

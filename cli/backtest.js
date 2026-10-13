@@ -23,6 +23,7 @@ function usesRegimeRunner(strategy) {
     "BreakoutRetestV2",
     "RangeExpansionV2",
     "RelativeStrengthV2",
+    "RelativeStrengthFreshV3",
     "SimpleAtrTrendV2",
     "FibPullbackContinuationV1",
     "RobustTrendFollowerV1",
@@ -52,6 +53,7 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
     limit: Number(args.limit || input.limit || 5000),
     candles: input.candles,
     divergenceEvents: input.divergenceEvents,
+    asOf: input.asOf,
     debug: args.debug === true || input.debug === true
   };
   return data.fetchCandles(options).then(function (candles) {
@@ -69,7 +71,7 @@ runtime.readStdinIfPresent({ waitForEnd: cliArgs["stdin-json"] === true }).then(
         interval: "4h",
         from: options.from,
         to: options.to,
-        limit: Math.ceil(options.limit / 4) + 250
+        limit: Math.min(50000, Math.ceil(options.limit * (intervalMinutes(options.interval) || 60) / 240) + 250)
       }).then(function (regimeCandles) {
         return { candles: candles, regimeCandles: regimeCandles };
       });

@@ -9,7 +9,7 @@ const {chromium}=require('playwright');
  assert.ok(widths[0]<85,JSON.stringify(widths));assert.ok(Math.max(...widths)-Math.min(...widths)<2,JSON.stringify(widths));
  await page.screenshot({path:'reports/compact-price-axis-20261011.png'});
  await page.locator('#donate-button').click();await page.getByText('Donation options are not configured yet.').waitFor();await page.getByRole('button',{name:'Close',exact:true}).click();
- const member=await browser.newPage();await member.route('**/api/account/session',r=>r.fulfill({json:{user:{id:99998,name:'Member test',role:'member'},csrf:'test'}}));await member.goto('http://127.0.0.1:5000/charts');await member.waitForFunction(()=>panes[0]?.historyLoaded);assert.equal(await member.locator('.preset-select').first().isVisible(),false);
+ const member=await browser.newPage();await member.route('**/api/account/session',r=>r.fulfill({json:{user:{id:99998,name:'Member test',role:'member'},csrf:'test'}}));await member.goto('http://127.0.0.1:5000/charts');await member.waitForFunction(()=>panes[0]?.historyLoaded);assert.equal(await member.locator('.preset-select').first().isVisible(),true);assert.equal(await member.locator('.preset-select').first().isDisabled(),true);
  const admin=await browser.newPage({viewport:{width:1500,height:950}});admin.on('pageerror',e=>errors.push(e.message));
  await admin.route('**/api/account/admin',r=>r.fulfill({contentType:'text/html',body:fs.readFileSync('templates/admin.html','utf8')}));
  await admin.route('**/api/account/session',r=>r.fulfill({json:{user:{id:99999,name:'Admin test',role:'admin'},csrf:'test'}}));

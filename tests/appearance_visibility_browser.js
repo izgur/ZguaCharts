@@ -1,0 +1,24 @@
+const assert=require('node:assert/strict');
+const {chromium}=require('playwright');
+(async()=>{const browser=await chromium.launch({channel:'msedge',headless:true});try{
+ const page=await browser.newPage({viewport:{width:1500,height:950}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('http://127.0.0.1:5000/charts');await page.waitForFunction(()=>panes[0]?.historyLoaded);
+ const original=await page.evaluate(()=>[...panes[0].node.querySelectorAll('.timeframe-shortcuts button')].map(b=>b.dataset.timeframe));
+ await page.locator('#account-button').click();await page.getByRole('menuitem',{name:'Appearance',exact:true}).click();
+ assert.equal(await page.getByRole('button',{name:'Font',exact:true}).getAttribute('aria-pressed'),'true');
+ await page.getByLabel('Header font size', {exact:true}).fill('13');
+ await page.getByRole('button',{name:'Header timeframes',exact:true}).click();
+ const checked=await page.locator('.appearance-timeframes input:checked').evaluateAll(inputs=>inputs.map(i=>i.value));assert.deepEqual([...checked].sort(),[...original].sort());
+ await page.locator('.appearance-timeframes input[value="1m"]').uncheck();assert.equal(await page.locator('.timeframe-shortcuts button[data-timeframe="1m"]').count(),0);
+ await page.getByRole('button',{name:'Close',exact:true}).click();await page.reload();await page.waitForFunction(()=>panes[0]?.historyLoaded);
+ assert.equal(await page.locator('.timeframe-shortcuts button[data-timeframe="1m"]').count(),0);assert.equal(await page.evaluate(()=>ChartTypography.get('headerFontSize')),13);
+ await page.evaluate(async()=>{const p=panes[0];p.indicatorHeights={rsi:128,macd:128};p.studyViewportHeight=256;restoreIndicators(p,['rsi','macd']);await renderIndicators(p,p.requestId);});await page.waitForTimeout(200);
+ const before=await page.evaluate(()=>({lower:panes[0].indicatorPanesEl.clientHeight,main:panes[0].chartEl.clientHeight}));assert.ok(Math.abs(before.lower-256)<3);
+ await page.evaluate(()=>{const p=panes[0];p.hiddenIndicators.add('rsi');applyIndividualIndicatorVisibility(p);});await page.waitForTimeout(200);
+ const one=await page.evaluate(()=>({lower:panes[0].indicatorPanesEl.clientHeight,hidden:panes[0].indicatorCharts.find(i=>i.element.dataset.indicatorId==='rsi').element.getBoundingClientRect().height}));assert.ok(Math.abs(one.lower-128)<3);assert.equal(one.hidden,0);
+ await page.evaluate(async()=>{const p=panes[0];p.hiddenIndicators.add('macd');applyIndividualIndicatorVisibility(p);await renderIndicators(p,p.requestId);});await page.waitForTimeout(200);
+ const none=await page.evaluate(()=>({lower:panes[0].indicatorPanesEl.clientHeight,main:panes[0].chartEl.clientHeight}));assert.equal(none.lower,0);assert.ok(none.main>=before.main+250);
+ await page.evaluate(()=>{const p=panes[0];p.hiddenIndicators.delete('rsi');applyIndividualIndicatorVisibility(p);});await page.waitForTimeout(200);assert.ok(Math.abs(await page.evaluate(()=>panes[0].indicatorPanesEl.clientHeight)-128)<3);
+ await page.locator('#account-button').click();await page.getByRole('menuitem',{name:'Appearance',exact:true}).click();await page.getByRole('button',{name:'Header timeframes',exact:true}).click();await page.screenshot({path:'reports/appearance-20261012.png'});
+ assert.deepEqual(errors,[]);console.log('Guest Appearance/font/timeframe defaults and persistence; hidden lower panes collapse and restore correctly.');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});

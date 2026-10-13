@@ -31,12 +31,13 @@ function pane() {
     performanceTimings: {},
     sourceSelect: { value: "bybit" }, symbolSelect: { value: "BTCUSDT" }, timeframeSelect: { value: "1h" },
     status: {}, series: { update() {}, setData() {} }, tickerSymbol: {}, tickerPrice: {},
+    chart: { timeScale: () => ({ applyOptions() {} }) },
   };
 }
 
 async function main() {
   const context = loadFunctions({
-    WebSocket: Socket, BYBIT_WS: "bybit", HYPERLIQUID_WS: "hyperliquid", updateTicker() {},
+    WebSocket: Socket, BYBIT_WS: "bybit", HYPERLIQUID_WS: "hyperliquid", updateTicker() {}, freezeLivePriceScale() {},
   }, ["connectBybit", "connectHyperliquid", "mergeLiveCandle", "bybitInterval"]);
   for (const [connect, message] of [
     ["connectBybit", (time) => ({ topic: "kline.60.BTCUSDT", data: [{ start: time * 1000, open: 10, high: 12, low: 9, close: 11, volume: "42.5" }] })],
@@ -83,7 +84,7 @@ async function main() {
   let connections = 0;
   const noop = () => {};
   const loading = loadFunctions({
-    performance, console, clearInterval: noop, clearIndicatorSeries: noop, clearSignalMarkers: noop, updateSymbolPickerButton: noop,
+    performance, console, config: { sources: { bybit: { live: 'websocket' } } }, clearInterval: noop, clearIndicatorSeries: noop, clearSignalMarkers: noop, updateSymbolPickerButton: noop, refreshHeaderSignalStrip: noop,
     clearBacktestMarkers: noop, historyLimitForPane: () => 2000, jumpPaneToNow: noop, updateTicker: noop,
     loadCandles: async () => ({ candles: [candle(100)] }),
     renderIndicators: () => new Promise((resolve) => { completeIndicators = resolve; }),

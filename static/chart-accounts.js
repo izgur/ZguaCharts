@@ -1,6 +1,7 @@
 (function (root) {
   "use strict";
-  let user = null, csrf = "", timer, saving = false, dirty = false, registrationEnabled = false;
+  let user = null, csrf = "", timer, saving = false, dirty = false, registrationEnabled = false, mailEnabled = false;
+  let profileRevision = 0, profileConflict = null, pendingSave = null;
   const baseKeys = ["tvk-dashboard-state", "zgua-ui-preferences", "zgua-default-chart-layout-v2", "zgua-manual-backtest-comparisons", "zgua-good-people-presets", "zgua-layouts-v1"];
   const key = (name) => user ? `account:${user.id}:${name}` : name;
   const accepted = (name) => baseKeys.includes(name) || ["zgua-indicator-favourites-v1", "zgua-custom-indicators-v1", "zgua-custom-tactics-v1"].includes(name) || name.startsWith("zgua-drawings-v1:") || name.startsWith("zgua-drawing-controls-v1:");
@@ -9,7 +10,11 @@
   async function api(path, method = "GET", body) {
     const response = await fetch("/api/account/" + path, { method, headers: { "Content-Type": "application/json", "X-CSRF-Token": csrf }, ...(body ? { body: JSON.stringify(body) } : {}) });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Account request failed");
+    if (!response.ok) {
+      const error = new Error(result.error || "Account request failed");
+      error.status = response.status;
+      throw error;
+    }
     if (result.csrf) csrf = result.csrf;
     return result;
   }
@@ -34,11 +39,24 @@
   function storeLayouts(value) { localStorage.setItem(key("zgua-layouts-v1"), JSON.stringify(value)); }
   function chartSnapshot() { const values = capture(); delete values["zgua-layouts-v1"]; return values; }
   async function persist() {
-    if (!user || saving) { if (saving) dirty = true; return; }
+    if (!user) return;
+    if (profileConflict) throw profileConflict;
+    if (saving) { dirty = true; await pendingSave; return persist(); }
     saving = true; dirty = false;
-    try { await api("profile", "PUT", capture()); document.querySelector("#layout-save-status").textContent = "Saved " + new Date().toLocaleTimeString(); }
-    catch (error) { document.querySelector("#layout-save-status").textContent = error.message; }
-    finally { saving = false; if (dirty) changed(); }
+    pendingSave = (async () => {
+      try {
+        const result = await api("profile", "PUT", { profile: capture(), revision: profileRevision });
+        profileRevision = result.revision;
+        document.querySelector("#layout-save-status").textContent = "Saved " + new Date().toLocaleTimeString();
+      }
+      catch (error) {
+        if (error.status === 409) { profileConflict = error; clearTimeout(timer); }
+        document.querySelector("#layout-save-status").textContent = error.message;
+        throw error;
+      }
+      finally { saving = false; if (dirty && !profileConflict) changed(); }
+    })();
+    return pendingSave;
   }
   function changed() {
     const value = layouts();
@@ -46,7 +64,8 @@
       const active = value.items.find((item) => item.id === value.active);
       if (active) { active.values = chartSnapshot(); active.saved = Date.now(); storeLayouts(value); }
     }
-    clearTimeout(timer); timer = setTimeout(persist, 600);
+    clearTimeout(timer);
+    if (!profileConflict) timer = setTimeout(() => persist().catch(() => {}), 600);
   }
   function dialog(title, build) {
     const backdrop = document.createElement("div"); backdrop.className = "alert-backdrop";
@@ -84,8 +103,9 @@
         const email = register || resend ? '<label>Email address<input name="email" type="email" autocomplete="email" maxlength="254" required></label>' : '';
         const password = resend ? '' : `<label>Password<div class="account-password"><input name="password" type="password" autocomplete="${register ? "new-password" : "current-password"}" minlength="12" maxlength="128" required><button type="button" class="password-visibility" aria-label="Show password"><i data-lucide="eye"></i></button></div></label>`;
         const confirm = register ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label><small class="account-hint">Use 12 or more characters. Confirm your email before signing in.</small>' : '';
-        const mailNotice = mode !== "login" && !registrationEnabled ? '<p class="account-email-notice" role="status">Email delivery is unavailable. Please try again once the mail service is connected.</p>' : '';
-        host.innerHTML = `<form class="account-form">${names}${username}${email}${password}${confirm}${mode === "login" ? '<label class="account-remember"><input name="remember" type="checkbox" checked>Remember me for 30 days</label>' : ''}${mailNotice}<p class="account-error ${notice && success ? 'account-success' : ''}" role="status" aria-live="polite">${escape(notice)}</p><button type="submit" class="account-primary" ${mode !== "login" && !registrationEnabled ? 'disabled' : ''}>${register ? "Create account" : forgot ? "Send reset link" : resend ? "Resend verification email" : "Sign in"}</button><button type="button" class="account-secondary">${resend ? "Back to sign in" : "Resend verification email"}</button>${mode === "login" ? '<button type="button" class="account-secondary account-forgot">Forgot password?</button>' : ''}</form>`;
+        const unavailable = register ? !registrationEnabled : mode !== 'login' && !mailEnabled;
+        const mailNotice = unavailable ? `<p class="account-email-notice" role="status">${register && mailEnabled ? 'Registration is currently closed.' : 'Email delivery is unavailable. Please try again once the mail service is connected.'}</p>` : '';
+        host.innerHTML = `<form class="account-form">${names}${username}${email}${password}${confirm}${mode === "login" ? '<label class="account-remember"><input name="remember" type="checkbox" checked>Remember me for 30 days</label>' : ''}${mailNotice}<p class="account-error ${notice && success ? 'account-success' : ''}" role="status" aria-live="polite">${escape(notice)}</p><button type="submit" class="account-primary" ${unavailable ? 'disabled' : ''}>${register ? "Create account" : forgot ? "Send reset link" : resend ? "Resend verification email" : "Sign in"}</button><button type="button" class="account-secondary">${resend ? "Back to sign in" : "Resend verification email"}</button>${mode === "login" ? '<button type="button" class="account-secondary account-forgot">Forgot password?</button>' : ''}</form>`;
         notice = "";
         const form = host.querySelector("form");
         if (mode === 'login') {
@@ -144,13 +164,14 @@
         command('Edit account','user-round-pen',() => accountDialog());
         if (user.role === 'admin') command('Admin dashboard','shield-check',null,'/api/account/admin');
         command('Sign out','log-out',async () => {
-          try { await persist(); await api('logout','POST',{}); location.reload(); }
+          try { try { await persist(); } catch { /* A stale profile must not prevent sign-out. */ } await api('logout','POST',{}); location.reload(); }
           catch (error) { accountDialog(error.message,false); }
         });
       } else {
         command('Sign in','log-in',() => accountDialog());
         command('Register','user-round-plus',() => accountDialog('',true,'register'));
       }
+      command('Appearance','sliders-horizontal',() => appearanceDialog());
       command('Forgot password?','key-round',() => accountDialog('',true,'forgot'));
       (document.fullscreenElement || document.body).append(menu); menu.hidden = false; position();
       button.setAttribute('aria-expanded','true'); root.lucide?.createIcons(); menu.querySelector('[role="menuitem"]').focus();
@@ -166,16 +187,36 @@
     });
     window.addEventListener('resize',() => { if (!menu.hidden) position(); });
   }
+  function appearanceDialog() {
+    dialog('Appearance',content => {
+      content.closest('.account-dialog').classList.add('account-settings-dialog');
+      content.innerHTML = '<nav class="account-tabs" aria-label="Appearance"><button type="button" data-appearance-tab="font" aria-pressed="true">Font</button><button type="button" data-appearance-tab="timeframes" aria-pressed="false">Header timeframes</button></nav><section data-appearance-section="font"><div class="account-typography"></div><button type="button" class="account-font-reset">Reset font sizes</button></section><section data-appearance-section="timeframes" hidden><div class="appearance-timeframes"></div></section>';
+      content.querySelectorAll('[data-appearance-tab]').forEach(button => { button.onclick = () => {
+        content.querySelectorAll('[data-appearance-tab]').forEach(item => item.setAttribute('aria-pressed',String(item === button)));
+        content.querySelectorAll('[data-appearance-section]').forEach(section => { section.hidden = section.dataset.appearanceSection !== button.dataset.appearanceTab; });
+      }; });
+      const typography = content.querySelector('.account-typography'), fonts = root.ChartTypography;
+      typography.innerHTML = fonts.fields.map(field => `<label>${escape(field.label)}<input type="number" data-account-font="${field.key}" aria-label="${escape(field.label)} font size" min="${field.min}" max="${field.max}" value="${fonts.get(field.key)}"><span>px</span></label>`).join('');
+      typography.querySelectorAll('input').forEach(input => { input.oninput = () => { if (input.value && input.checkValidity()) fonts.set(input.dataset.accountFont,Number(input.value)); }; });
+      content.querySelector('.account-font-reset').onclick = () => { fonts.reset(); typography.querySelectorAll('input').forEach(input => { input.value = fonts.get(input.dataset.accountFont); }); };
+      const frames = root.ChartHeaderTimeframes, host = content.querySelector('.appearance-timeframes'), selected = frames.get();
+      for (const value of frames.options()) {
+        const label = document.createElement('label'), input = document.createElement('input'); input.type = 'checkbox'; input.value = value; input.checked = selected.includes(value);
+        label.append(input,document.createTextNode(root.ChartWorkspace.label(value))); host.append(label);
+        input.onchange = () => frames.set([...host.querySelectorAll('input:checked')].map(item => item.value));
+      }
+    });
+  }
   async function settingsDialogContent(content) {
     content.closest(".account-dialog").classList.add("account-settings-dialog");
     content.innerHTML = '<p role="status">Loading account settings...</p>';
     try { user = (await api("session")).user; } catch (error) { content.textContent = error.message; return; }
     if (!user) { content.textContent = "Session expired. Close and sign in again."; return; }
     let avatar = user.avatar || "";
-    content.innerHTML = `<nav class="account-tabs" aria-label="Account settings"><button type="button" data-tab="profile" aria-pressed="true">Profile</button><button type="button" data-tab="security" aria-pressed="false">Security</button><button type="button" data-tab="appearance" aria-pressed="false">Appearance</button></nav>
+    content.innerHTML = `<nav class="account-tabs" aria-label="Account settings"><button type="button" data-tab="profile" aria-pressed="true">Profile</button><button type="button" data-tab="security" aria-pressed="false">Security</button></nav>
       <section data-account-section="profile"><form class="account-form account-details"><div class="account-avatar-row"><div class="account-avatar-preview"></div><label class="avatar-upload">Avatar<input name="avatar" type="file" accept="image/png,image/jpeg,image/webp"></label><button type="button" class="avatar-remove" title="Remove avatar" aria-label="Remove avatar"><i data-lucide="trash-2"></i></button></div><div class="account-name-row"><label>First name<input name="firstName" value="${escape(user.first_name)}" maxlength="80" required></label><label>Surname<input name="lastName" value="${escape(user.last_name)}" maxlength="80" required></label></div><label>Username<input name="username" value="${escape(user.name)}" pattern="${usernamePattern}" maxlength="40" required></label><label>Email address<input value="${escape(user.email)}" readonly></label><p class="account-error" role="status"></p><button type="submit" class="account-primary">Save profile</button></form></section>
       <section data-account-section="security" hidden><form class="account-form account-change-password"><h3>Password</h3><label>Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label><label>New password<input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label><label>Confirm new password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" required></label><p class="account-error" role="status"></p><button type="submit" class="account-primary">Change password</button></form><form class="account-form account-change-email"><h3>Email address</h3><label>New email<input name="email" type="email" maxlength="254" required></label><label>Current password<input name="currentPassword" type="password" autocomplete="current-password" maxlength="128" required></label><p class="account-error" role="status"></p><button type="submit">Send confirmation</button></form><button type="button" class="account-revoke">Sign out other sessions</button><p class="account-session-status" role="status"></p></section>
-      <section data-account-section="appearance" hidden><div class="account-typography"></div><button type="button" class="account-font-reset">Reset font sizes</button></section><footer class="account-settings-footer"><button type="button" class="account-logout"><i data-lucide="log-out"></i>Sign out</button></footer>`;
+      <footer class="account-settings-footer"><button type="button" class="account-logout"><i data-lucide="log-out"></i>Sign out</button></footer>`;
     content.querySelectorAll("[data-tab]").forEach((button) => { button.onclick = () => {
       content.querySelectorAll("[data-tab]").forEach((item) => item.setAttribute("aria-pressed", String(item === button)));
       content.querySelectorAll("[data-account-section]").forEach((section) => { section.hidden = section.dataset.accountSection !== button.dataset.tab; });
@@ -216,13 +257,7 @@
     }
     wire(".account-change-email", "email", "POST", (form) => Object.fromEntries(new FormData(form)));
     content.querySelector(".account-revoke").onclick = async () => { const status = content.querySelector(".account-session-status"); try { status.textContent = (await api("sessions/revoke", "POST", {})).message; } catch (error) { status.textContent = error.message; } };
-    const typography = content.querySelector(".account-typography"), fonts = root.ChartTypography;
-    if (fonts) {
-      typography.innerHTML = fonts.fields.map((field) => `<label>${escape(field.label)}<input type="number" data-account-font="${field.key}" aria-label="${escape(field.label)} font size" min="${field.min}" max="${field.max}" value="${fonts.get(field.key)}"><span>px</span></label>`).join("");
-      typography.querySelectorAll("input").forEach((input) => { input.oninput = () => { if (input.value && input.checkValidity()) fonts.set(input.dataset.accountFont, Number(input.value)); }; });
-      content.querySelector(".account-font-reset").onclick = () => { fonts.reset(); typography.querySelectorAll("input").forEach((input) => { input.value = fonts.get(input.dataset.accountFont); }); };
-    }
-    content.querySelector(".account-logout").onclick = async () => { try { await persist(); await api("logout", "POST", {}); location.reload(); } catch (error) { content.querySelector(".account-session-status").textContent = error.message; } };
+    content.querySelector(".account-logout").onclick = async () => { try { try { await persist(); } catch { /* A stale profile must not prevent sign-out. */ } await api("logout", "POST", {}); location.reload(); } catch (error) { content.querySelector(".account-session-status").textContent = error.message; } };
     const mfa = document.createElement('form'); mfa.className = 'account-form';
     mfa.innerHTML = `<h3>Two-factor authentication</h3><p>${user.twoFactorEnabled ? 'Enabled' : 'Not enabled'}</p><label>Current password<input name="currentPassword" type="password" autocomplete="current-password" required maxlength="128"></label>${user.twoFactorEnabled ? '<label>Authenticator or recovery code<input name="twoFactorCode" autocomplete="one-time-code" required maxlength="80"></label>' : ''}<p class="account-error" role="status"></p><button type="submit">${user.twoFactorEnabled ? 'Disable 2FA' : 'Set up authenticator'}</button>`;
     content.querySelector('[data-account-section="security"]').append(mfa);
@@ -244,7 +279,8 @@
   }
   function refreshAccountButton() {
     document.documentElement.dataset.accountSession = user ? 'signed-in' : 'guest';
-    document.documentElement.dataset.tacticAccess = ['admin','tactics'].includes(user?.role) ? 'allowed' : 'denied';
+    document.documentElement.dataset.tacticAccess = 'allowed';
+    document.documentElement.dataset.tacticManagement = ['admin','tactics'].includes(user?.role) ? 'allowed' : 'denied';
     const button = document.querySelector("#account-button"); button.title = user ? "Account menu: " + user.name : "Sign in, register or reset password";
     button.querySelector(".account-button-avatar")?.remove();
     if (user?.avatar) { const image = document.createElement("img"); image.className = "account-button-avatar"; image.src = user.avatar; image.alt = ""; button.append(image); }
@@ -271,14 +307,18 @@
     const host = document.querySelector("#saved-layouts"); host.replaceChildren();
     for (const item of value.items) {
       const button = document.createElement("button"); button.textContent = item.name; button.type = "button";
-      button.onclick = async () => { value.active = item.id; restore({ ...item.values, "zgua-layouts-v1": JSON.stringify(value) }); await persist(); location.reload(); }; host.append(button);
+      button.onclick = async () => {
+        value.active = item.id; restore({ ...item.values, "zgua-layouts-v1": JSON.stringify(value) });
+        try { await persist(); location.reload(); }
+        catch (error) { document.querySelector("#layout-save-status").textContent = error.message; }
+      }; host.append(button);
     }
   }
   function saveLayout(name, create = false) {
     const value = layouts(); let active = !create && value.items.find((item) => item.id === value.active);
     if (!active) { active = { id: crypto.randomUUID(), name }; value.items.push(active); value.active = active.id; }
     active.name = name || active.name; active.values = chartSnapshot(); active.saved = Date.now();
-    storeLayouts(value); refreshMenu(); changed(); document.querySelector("#layout-save-status").textContent = "Saved " + new Date().toLocaleTimeString();
+    storeLayouts(value); refreshMenu(); changed(); document.querySelector("#layout-save-status").textContent = profileConflict ? profileConflict.message : "Saved " + new Date().toLocaleTimeString();
   }
   async function copyChart() {
     const pane = document.querySelector(".pane.active-chart"), stack = pane?.querySelector(".chart-stack");
@@ -295,7 +335,7 @@
     catch { const url = URL.createObjectURL(blob), link = document.createElement("a"); link.href = url; link.download = "ZguaCharts.png"; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); }
   }
   const ready = (async () => {
-    try { const result = await api("session"); user = result.user; registrationEnabled = result.registrationEnabled === true; if (user && result.profile) restore(result.profile); }
+    try { const result = await api("session"); user = result.user; profileRevision = result.revision ?? 0; registrationEnabled = result.registrationEnabled === true; mailEnabled = (result.mailEnabled ?? result.registrationEnabled) === true; if (user && result.profile) restore(result.profile); }
     catch (error) { document.querySelector("#layout-save-status").textContent = error.message; }
     setupAccountMenu(); refreshAccountButton();
     document.querySelector("#layout-menu").addEventListener("toggle", refreshMenu);
@@ -314,5 +354,5 @@
     const reset = /^#reset-password=([A-Za-z0-9_-]{43})$/.exec(location.hash);
     if (reset) { history.replaceState(null, "", location.pathname + location.search); passwordResetDialog(reset[1]); }
   })();
-  root.ChartAccounts = { ready, key, changed, isSignedIn: () => !!user, canUseTactics: () => ['admin','tactics'].includes(user?.role), csrfToken: () => csrf, api, dialog };
+  root.ChartAccounts = { ready, key, changed, isSignedIn: () => !!user, canUseTactics: () => true, canManageTactics: () => ['admin','tactics'].includes(user?.role), csrfToken: () => csrf, api, dialog };
 })(window);

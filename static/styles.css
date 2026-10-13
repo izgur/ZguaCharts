@@ -1935,6 +1935,7 @@ button:hover {
 }
 
 .indicator-info-button,
+.indicator-fit-button,
 .indicator-sync-button {
   height: 21px;
   border: none;
@@ -1947,6 +1948,8 @@ button:hover {
 .indicator-sync-button {
   color: var(--amber);
 }
+.indicator-fit-button { width: 23px; padding: 2px; }
+.indicator-fit-button svg { width: 14px; height: 14px; }
 
 .indicator-info-grid {
   display: grid;
@@ -3864,6 +3867,10 @@ select option { background: #20262e; color: #edf5fb; }
 .donation-panel > a { color: #a0ebd5; padding: 10px; border: 1px solid #43515e; border-radius: 4px; text-decoration: none; }
 .donation-panel section { border-top: 1px solid #43515e; padding-top: 8px; overflow-wrap: anywhere; }
 .mfa-setup-key,.mfa-recovery { white-space: pre-wrap; overflow-wrap: anywhere; }
+.indicator-pane[hidden] { display: none !important; }
+.appearance-timeframes { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 12px; }
+.appearance-timeframes label { display: flex; align-items: center; gap: 7px; font-size: var(--panel-font-size,12px); }
+.appearance-timeframes input { width: 15px; height: 15px; accent-color: #40c9ac; }
 .layout-menu { order: 8; flex: 0 0 auto; position: relative; }
 .layout-menu summary { display: flex; gap: 5px; align-items: center; height: 28px; padding: 0 5px; cursor: pointer; list-style: none; font-size: calc(11px * var(--ui-font-scale, 1)); }
 .layout-menu summary svg { width: 15px; height: 15px; }
@@ -4028,7 +4035,8 @@ html:not([data-tactic-access="allowed"]) .preset-select,
 html:not([data-tactic-access="allowed"]) .tactic-source-button,
 html:not([data-tactic-access="allowed"]) .tactic-visibility-button,
 html:not([data-tactic-access="allowed"]) .backtest-button,
-html:not([data-tactic-access="allowed"]) .page-menu,
+html:not([data-tactic-management="allowed"]) .page-menu,
+html:not([data-tactic-management="allowed"]) #backtest-history-button,
 html:not([data-tactic-access="allowed"]) #header-signal-strip,
 html:not([data-tactic-access="allowed"]) #current-strategy-section,
 html:not([data-tactic-access="allowed"]) #active-signals-section,

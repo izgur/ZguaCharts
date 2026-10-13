@@ -1,6 +1,7 @@
 __pycache__/
 .yfinance-cache/
 .venv/
+.venv-production/
 *.pyc
 *.pyo
 *.log
@@ -26,3 +27,7 @@ config/local/
 zguacharts-*.patch
 zguacharts-local-commits.txt
 /static/pyodide/
+.env
+.env.*
+!.env.example
+.neon/

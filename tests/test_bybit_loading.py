@@ -31,6 +31,18 @@ def row(timestamp_ms, close):
 
 
 class BybitLoadingTests(unittest.TestCase):
+    def test_memory_cache_budget_evicts_oldest_without_changing_input(self):
+        data_source.clear_bybit_cache()
+        rows = [{"time": i} for i in range(4)]
+        with patch.object(data_source, "BYBIT_CACHE_CANDLE_BUDGET", 6):
+            with data_source._bybit_cache_lock:
+                data_source.store_bybit_memory_cache(("BTCUSDT", "1m"), rows)
+                data_source.store_bybit_memory_cache(("ETHUSDT", "1m"), rows)
+                self.assertNotIn(("BTCUSDT", "1m"), data_source._bybit_cache)
+                self.assertEqual(len(data_source._bybit_cache[("ETHUSDT", "1m")]), 4)
+        self.assertEqual(len(rows), 4)
+        data_source.clear_bybit_cache()
+
     def setUp(self):
         self._tmp_cache = tempfile.TemporaryDirectory()
         self._cache_patch = patch.object(data_source, "BYBIT_DISK_CACHE_DIR", data_source.Path(self._tmp_cache.name))
@@ -56,6 +68,19 @@ class BybitLoadingTests(unittest.TestCase):
         self.assertEqual(len(candles), 1)
         self.assertTrue(calls)
         self.assertTrue(all(call["limit"] == 1000 for call in calls))
+
+    def test_fresh_tail_does_not_make_disconnected_cache_usable(self):
+        now = int(time.time() // 60) * 60
+        old = [{'time':now-86400*100+i*60,'open':100,'high':101,'low':99,'close':100,'volume':10} for i in range(1000)]
+        recent = [{'time':now-i*60,'open':200,'high':201,'low':199,'close':200,'volume':10} for i in range(100)][::-1]
+        data_source._bybit_cache[('ETHUSDT','1m')] = old + recent
+        batch = [row((now-i*60)*1000,200) for i in range(100,1100)]
+        with patch.object(data_source,'request_bybit_kline_batch',return_value=batch) as fetch:
+            candles, diagnostics = data_source.fetch_bybit_candles_with_diagnostics('ETHUSDT','1m',1000)
+        self.assertEqual(len(candles),1000)
+        self.assertTrue(fetch.called)
+        self.assertTrue(all(b['time']-a['time']==60 for a,b in zip(candles,candles[1:])))
+        self.assertTrue(any('Disconnected' in warning for warning in diagnostics['warnings']))
 
     def test_pagination_collects_more_than_1000_candles(self):
         first = [row((2_000 + i) * 60_000, i) for i in range(1000)]
@@ -126,7 +151,8 @@ class BybitLoadingTests(unittest.TestCase):
 
         self.assertTrue(calls)
         self.assertTrue(diagnostics["network_fetch_attempted"])
-        self.assertEqual(diagnostics["bybit_requests"], 1)
+        self.assertEqual(diagnostics["bybit_requests"], 2)
+        self.assertEqual(len(candles), 1, 'A disconnected old cache must not be appended to the fresh bar.')
         self.assertEqual(candles[-1]["time"], fresh_time_ms // 1000)
 
     def test_concurrency_limit_holds_multiple_chart_loads_to_two_requests(self):

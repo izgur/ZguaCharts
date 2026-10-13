@@ -1,5 +1,6 @@
 .git
 .venv
+.venv-production
 __pycache__
 *.pyc
 *.pyo
@@ -11,3 +12,15 @@ reports-smoke
 reports-cli-smoke
 server.out.log
 server.err.log
+.env
+.env.*
+.neon
+.codex
+.agents
+config/local
+config/backups
+data
+static/pyodide
+server.pid
+zguacharts-*.patch
+zguacharts-local-commits.txt

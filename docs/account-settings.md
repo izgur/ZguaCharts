@@ -1,6 +1,7 @@
 # Local accounts and settings
 
-The user icon opens Profile, Security and Appearance tabs when signed in.
+The user icon opens a menu. Edit account contains Profile and Security when signed in.
+Appearance is a separate menu entry available to guests and signed-in users.
 Profile supports first name, surname, username and avatar upload/removal.
 Images are resized/cropped to 128px PNG in the browser. The server checks PNG
 dimensions, bit depth, CRC and bounded decompressed pixel data, rejects executable
@@ -20,7 +21,10 @@ Existing same-origin/CSRF/local-host guards and attempt limits cover these route
 Appearance exposes seven font groups: interface, chart axes, indicator labels /
 footer, header, watchlist, dialogs / panels and backtest / data tables. Preferences
 apply immediately and persist with the account's existing layout/profile system.
-The Settings page exposes the same controls for guests. Font reset does not
+Appearance's first tab is Font; its second tab selects the timeframes shown in
+the header. Initially the existing header timeframes are checked; additional
+exchange intervals are unchecked. The selection is saved and intersected with
+each chart's supported intervals. Font reset does not
 change layouts, indicators, trading configuration or research candidates.
 
 Registration now distinguishes duplicate email and username errors. This is a

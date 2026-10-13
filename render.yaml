@@ -3,13 +3,37 @@ services:
     name: zguacharts
     runtime: python
     plan: free
-    buildCommand: pip install -r requirements.txt && npm install
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 180
+    buildCommand: pip install -r requirements-production.lock && npm install --omit=dev && python scripts/install_indicator_runtime.py
+    startCommand: python scripts/start_web.py
     healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.12.14
       - key: NODE_VERSION
-        value: 20
+        value: "24"
       - key: ZGUA_QUIET
         value: "1"
+      - key: ZGUA_CACHE_CANDLE_BUDGET
+        value: "60000"
+      - key: ZGUA_ENV
+        value: production
+      - key: ZGUA_NEON_PROJECT_ID
+        value: cool-tree-27722416
+      - key: PUBLIC_APP_URL
+        value: https://zguacharts.onrender.com
+      - key: ZGUA_PUBLIC_ACCOUNTS
+        value: "1"
+      - key: ZGUA_REGISTRATION_ENABLED
+        value: "0"
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=128
+      - key: DATABASE_URL
+        sync: false
+      - key: ACCOUNT_MFA_KEY
+        sync: false
+      - key: ZGUA_MAIL_PROVIDER
+        value: resend
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ZGUA_MAIL_FROM
+        sync: false

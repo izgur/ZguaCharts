@@ -1,7 +1,17 @@
-"""Local persisted alerts. Notifications only; never submits trading orders."""
+"""User-owned database alerts or legacy local JSON. Notifications only.
+
+PostgreSQL commits the trigger, pending email event and immutable emailAlert
+snapshot before delivery. Each cycle recovers pending events under the original
+chart-alert/<event-id> ledger identity. Accepted claims restore receipts without
+provider I/O; sending/failed claims require review and are never resent. Legacy
+pending events without snapshots require review rather than rendering edited
+alerts. Storage failures leave pending events available for a later cycle.
+"""
 from __future__ import annotations
 
 import json
+import hmac
+import logging
 import math
 import re
 import threading
@@ -9,11 +19,12 @@ import time
 import uuid
 from pathlib import Path
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from data_source import DATA_SOURCE_CONFIG, custom_chart_base, fetch_candles, interval_to_ms
 from indicators import available_indicators, build_indicator_payload
 from services import account_mail, mail_templates
+from services.storage import database, postgres_enabled
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT / "data" / "chart-alerts.json"
@@ -21,6 +32,63 @@ LOCK = threading.RLock()
 OPERATORS = {"crossing", "crossing-up", "crossing-down", "above", "below"}
 _started = False
 blueprint = Blueprint("chart_alerts", __name__)
+logger = logging.getLogger(__name__)
+
+
+def log_monitor_failure(message, exc):
+    # Driver messages may contain DSNs, credentials or provider responses.
+    # Keep the stack for diagnosis but replace the exception value and type.
+    logger.exception(message, exc_info=(RuntimeError, RuntimeError("Alert monitor operation failed"), exc.__traceback__))
+
+
+@blueprint.before_request
+def authorize():
+    if not postgres_enabled():
+        return
+    from services.chart_accounts import COOKIE, account_origin, digest
+    with database() as db:
+        user = db.execute(
+            "SELECT users.id, users.email, users.email_verified, sessions.csrf "
+            "FROM users JOIN sessions ON sessions.user_id=users.id "
+            "WHERE sessions.token=? AND sessions.expires>? AND users.disabled=0",
+            (digest(request.cookies.get(COOKIE, "")), time.time())).fetchone()
+    if not user:
+        return jsonify(error="Sign in to manage alerts."), 401
+    g.alert_user = dict(user)
+    if request.method != "GET":
+        if request.headers.get("Origin") not in (None, account_origin()) or request.headers.get("Sec-Fetch-Site") == "cross-site":
+            return jsonify(error="Cross-origin request blocked."), 403
+        if not hmac.compare_digest(user["csrf"], request.headers.get("X-CSRF-Token", "")):
+            return jsonify(error="Invalid CSRF token."), 403
+
+
+def user_store(user_id):
+    with database() as db:
+        records = db.execute("SELECT id, body, revision FROM alert_records WHERE user_id=?", (user_id,)).fetchall()
+        events = db.execute("SELECT body FROM alert_events WHERE user_id=? ORDER BY created DESC LIMIT 200", (user_id,)).fetchall()
+    return {"alerts": [record_alert(row) for row in records],
+            "events": [json.loads(row["body"]) for row in reversed(events)]}
+
+
+def record_alert(row):
+    alert = json.loads(row["body"])
+    alert.update(id=row["id"], revision=row["revision"])
+    return alert
+
+
+def commit_alert(alert, user_id, revision, event=None):
+    # The database context commits both the claim and event, or rolls both back.
+    with database() as db:
+        changed = db.execute(
+            "UPDATE alert_records SET body=?, revision=?, updated=? WHERE id=? AND user_id=? AND revision=? "
+            "AND EXISTS (SELECT 1 FROM users WHERE users.id=alert_records.user_id AND disabled=0)",
+            (json.dumps(alert), alert["revision"], time.time(), alert["id"], user_id, revision)).rowcount
+        if changed != 1:
+            return False
+        if event:
+            db.execute("INSERT INTO alert_events(id,user_id,alert_id,body,created) VALUES (?,?,?,?,?)",
+                       (event["id"], user_id, alert["id"], json.dumps(event), event["time"]))
+    return True
 
 
 def load_store():
@@ -42,13 +110,18 @@ def mail_config():
 
 def email_ready():
     config = mail_config()
+    if postgres_enabled():
+        user = g.alert_user
+        return bool(account_mail.configured(config) and user["email"] and user["email_verified"])
     return bool(account_mail.configured(config) and config.get("to"))
 
 
-def send_email(message, alert=None, event=None):
+def send_email(message, alert=None, event=None, recipient=None):
+    if postgres_enabled() and recipient is None:
+        raise account_mail.MailDeliveryError("An authenticated alert owner's email is required")
     config = mail_config()
     subject, text, html = mail_templates.chart_alert(alert, event) if alert and event else ("ZguaCharts alert", message, None)
-    return account_mail.send(config.get("to", ""), subject, text, html=html,
+    return account_mail.send(recipient if recipient is not None else config.get("to", ""), subject, text, html=html,
                              idempotency_key="chart-alert/" + event["id"] if event else None, config=config)
 
 
@@ -111,7 +184,116 @@ def evaluate_alert(alert, values, now):
     return fired
 
 
+def email_ledger(event_id):
+    with database() as db:
+        return db.execute("SELECT status, provider_id FROM mail_deliveries WHERE id=?",
+                          ("chart-alert/" + event_id,)).fetchone()
+
+
+def deliver_pending_email(row):
+    original = row["body"]
+    event = json.loads(original)
+    if event.get("emailStatus") != "pending":
+        return
+    event["id"] = row["id"]
+    snapshot = event.get("emailAlert")
+    with database() as db:
+        owner = db.execute("SELECT email, email_verified FROM users WHERE id=? AND disabled=0",
+                           (row["user_id"],)).fetchone()
+    if not isinstance(snapshot, dict):
+        event["emailStatus"] = "needs-review"
+    elif not owner or not owner["email_verified"] or not owner["email"]:
+        event["emailStatus"] = "skipped"
+    else:
+        prior = email_ledger(event["id"])
+        if prior and prior["status"] != "accepted":
+            event["emailStatus"] = "needs-review"
+        else:
+            try:
+                # The mail ledger arbitrates competing workers, including a claim
+                # made after our lookup. Accepted entries do not contact providers.
+                delivery = send_email(event["message"], snapshot, event, recipient=owner["email"])
+                event.update(emailStatus="accepted", emailProvider=delivery["provider"])
+                if delivery.get("id"):
+                    event["emailId"] = delivery["id"]
+            except Exception:
+                prior = email_ledger(event["id"])
+                if prior and prior["status"] == "accepted":
+                    event.update(emailStatus="accepted", emailProvider="resend" if prior["provider_id"] else "smtp")
+                    if prior["provider_id"]:
+                        event["emailId"] = prior["provider_id"]
+                else:
+                    event["emailStatus"] = "needs-review" if prior else "failed"
+    with database() as db:
+        # A losing worker must not replace an acceptance with its ambiguous
+        # outcome. An authoritative acceptance may repair a competing review.
+        sql = "UPDATE alert_events SET body=? WHERE id=? AND user_id=?"
+        params = (json.dumps(event), row["id"], row["user_id"])
+        if event["emailStatus"] != "accepted":
+            sql += " AND body=?"
+            params += (original,)
+        db.execute(sql, params)
+
+
+def recover_pending_email():
+    try:
+        with database() as db:
+            rows = db.execute("SELECT id, user_id, body FROM alert_events WHERE body LIKE ? OR body LIKE ? ORDER BY created",
+                              ('%"emailStatus": "pending"%', '%"emailStatus":"pending"%')).fetchall()
+    except Exception as exc:
+        log_monitor_failure("Could not load pending chart alert emails", exc)
+        return
+    for row in rows:
+        try:
+            deliver_pending_email(row)
+        except Exception as exc:
+            log_monitor_failure("Could not recover pending chart alert email", exc)
+
+
+def postgres_monitor_cycle():
+    try:
+        with database() as db:
+            rows = db.execute("SELECT alert_records.id, alert_records.user_id, body, revision FROM alert_records "
+                              "JOIN users ON users.id=alert_records.user_id WHERE users.disabled=0").fetchall()
+    except Exception as exc:
+        log_monitor_failure("Could not load PostgreSQL chart alerts", exc)
+        raise RuntimeError("Could not load PostgreSQL chart alerts") from None
+    recover_pending_email()
+    snapshots = {}
+    for row in rows:
+        try:
+            alert = record_alert(row)
+            if not alert.get("enabled"):
+                continue
+            now = time.time()
+            event = None
+            try:
+                key = (alert["source"], alert["symbol"], alert["timeframe"])
+                if alert["expiresAt"] > now and key not in snapshots:
+                    snapshots[key] = market_values(*key)
+                if evaluate_alert(alert, snapshots.get(key, {}), now):
+                    event = {"id": str(uuid.uuid5(uuid.NAMESPACE_URL, f"chart-alert/{alert['id']}/{row['revision']}")),
+                             "alertId": alert["id"], "time": now, "message": alert["message"],
+                             "symbol": alert["symbol"], "notifications": alert["notifications"]}
+                    if alert["notifications"].get("email"):
+                        event["emailStatus"] = "pending"
+                        event["emailAlert"] = json.loads(json.dumps(alert))
+            except Exception as exc:
+                alert["error"] = str(exc)[:200]
+            alert["revision"] = row["revision"] + 1
+            if not commit_alert(alert, row["user_id"], row["revision"], event):
+                continue
+            if event and alert["notifications"].get("email"):
+                deliver_pending_email({"id": event["id"], "user_id": row["user_id"], "body": json.dumps(event)})
+        except Exception as exc:
+            # One bad record or failed transaction must not block other owners.
+            log_monitor_failure("Could not process PostgreSQL chart alert record", exc)
+            continue
+
+
 def monitor_cycle():
+    if postgres_enabled():
+        return postgres_monitor_cycle()
     with LOCK:
         alerts = [dict(row) for row in load_store()["alerts"] if row.get("enabled")]
     snapshots = {}
@@ -158,6 +340,8 @@ def monitor_cycle():
 
 def start_monitor():
     global _started
+    if postgres_enabled():
+        return
     with LOCK:
         if _started:
             return
@@ -166,9 +350,9 @@ def start_monitor():
         while True:
             try:
                 monitor_cycle()
-            except Exception:
+            except Exception as exc:
                 # Store failures are visible on GET; keep the monitor alive for recovery.
-                pass
+                log_monitor_failure("Chart alert monitor cycle failed", exc)
             time.sleep(30)
     threading.Thread(target=watch, name="chart-alerts", daemon=True).start()
 
@@ -189,7 +373,8 @@ def collection(alert_id=None):
     start_monitor()
     try:
         with LOCK:
-            store = load_store()
+            pg = postgres_enabled()
+            store = user_store(g.alert_user["id"]) if pg else load_store()
             if request.method == "GET":
                 return jsonify({**store, "emailReady": email_ready(), "monitorIntervalSeconds": 30})
             body = request.get_json() or {}
@@ -221,7 +406,7 @@ def collection(alert_id=None):
                 raise ValueError("Expiration must be in the future")
             notifications = {field: bool((body.get("notifications") or {}).get(field)) for field in ("toast", "sound", "email")}
             if notifications["email"] and not email_ready():
-                raise ValueError("Configure config/local/alert-email.json before enabling email")
+                raise ValueError("Verify your email and configure email delivery before enabling email" if pg else "Configure config/local/alert-email.json before enabling email")
             if not existing and len(store["alerts"]) >= 100:
                 raise ValueError("Maximum 100 saved alerts")
             alert = {"id": alert_id or str(uuid.uuid4()), "source": source, "symbol": symbol, "timeframe": timeframe,
@@ -230,6 +415,15 @@ def collection(alert_id=None):
                      "notifications": notifications, "enabled": body.get("enabled", True) is True, "createdAt": existing["createdAt"] if existing else time.time(),
                      "revision": existing.get("revision", 0) + 1 if existing else 0}
             evaluate_alert(alert, values, time.time())
+            if pg:
+                if existing:
+                    if not commit_alert(alert, g.alert_user["id"], existing["revision"]):
+                        return jsonify(error="Alert changed during update. Reload and try again."), 409
+                else:
+                    with database() as db:
+                        db.execute("INSERT INTO alert_records(id,user_id,body,revision,updated) VALUES (?,?,?,?,?)",
+                                   (alert["id"], g.alert_user["id"], json.dumps(alert), alert["revision"], time.time()))
+                return jsonify(alert), 200 if existing else 201
             if existing:
                 store["alerts"][store["alerts"].index(existing)] = alert
             else:
@@ -244,6 +438,12 @@ def collection(alert_id=None):
 
 @blueprint.delete("/api/chart-alerts/<alert_id>")
 def remove(alert_id):
+    if postgres_enabled():
+        with database() as db:
+            changed = db.execute("DELETE FROM alert_records WHERE id=? AND user_id=?", (alert_id, g.alert_user["id"])).rowcount
+        if not changed:
+            return jsonify(error="Alert not found"), 404
+        return jsonify(ok=True)
     with LOCK:
         store = load_store()
         store["alerts"] = [row for row in store["alerts"] if row["id"] != alert_id]

@@ -1,0 +1,34 @@
+# Optional separate worker. This is NOT included in render.yaml or provisioned.
+# Review hosting cost before applying; do not run research/paper scripts here.
+services:
+  - type: worker
+    name: zguacharts-alerts
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements-production.lock
+    startCommand: python scripts/run_alert_worker.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.14
+      - key: ZGUA_ENV
+        value: production
+      - key: ZGUA_NEON_PROJECT_ID
+        value: cool-tree-27722416
+      - key: PUBLIC_APP_URL
+        value: https://zguacharts.onrender.com
+      - key: ZGUA_PUBLIC_ACCOUNTS
+        value: "1"
+      - key: ZGUA_REGISTRATION_ENABLED
+        value: "0"
+      - key: ZGUA_CACHE_CANDLE_BUDGET
+        value: "60000"
+      - key: DATABASE_URL
+        sync: false
+      - key: ACCOUNT_MFA_KEY
+        sync: false
+      - key: ZGUA_MAIL_PROVIDER
+        value: resend
+      - key: RESEND_API_KEY
+        sync: false
+      - key: ZGUA_MAIL_FROM
+        sync: false
