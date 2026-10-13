@@ -52,6 +52,10 @@ const visibility=drawings.slice(visibilityStart,drawings.indexOf('    function b
     assert.equal(await page.evaluate(()=>testPane.backtestOverlaySeries[0].visible),false);
     await page.evaluate(()=>unhideStudy());
     assert.equal(await page.locator('.chart-indicator-label').isVisible(),true);
+    await page.evaluate(()=>testPane.node.classList.add('drawing-hide-indicators'));
+    assert.equal(await page.locator('.chart-indicator-label').isVisible(),false);
+    await page.evaluate(()=>testPane.node.classList.remove('drawing-hide-indicators'));
+    assert.equal(await page.locator('.chart-indicator-label').isVisible(),true);
     await page.evaluate(()=>removeStudy());
     assert.equal(await page.locator('.chart-indicator-label').count(),0);
     console.log('Hidden study labels, tactic eye, asynchronous overlays and drawing refresh visibility passed.');

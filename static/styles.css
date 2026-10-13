@@ -3840,6 +3840,7 @@ select option { background: #20262e; color: #edf5fb; }
 .chart-indicator-labels { position: absolute; z-index: 37; top: 30px; left: 47px; max-width: calc(100% - 130px); }
 .chart-indicator-label { display: flex; align-items: center; gap: 2px; height: 18px; color: #b7c3ce; font-size: calc(9px * var(--ui-font-scale, 1)); background: #11161dcc; }
 .chart-indicator-label[hidden] { display: none; }
+.drawing-hide-indicators .chart-indicator-labels { display: none; }
 .chart-indicator-label > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .chart-indicator-label button { flex: 0 0 18px; width: 18px; height: 17px; padding: 2px; border: 0; background: transparent; visibility: hidden; }
 .chart-indicator-label:is(:hover,:focus-within) button { visibility: visible; }
