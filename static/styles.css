@@ -4078,3 +4078,5 @@ html:not([data-tactic-access="allowed"]) .signal-marker-setting,
 .watchlist-table .watch-symbol-cell { min-width: calc(11ch + 7px); }
 #chart-grid .pane-toolbar .pane-right .backtest-button { width:26px;min-width:26px;height:26px;padding:4px; }
 #chart-grid .pane-toolbar .pane-right .backtest-button svg { width:14px;height:14px; }
+.relative-strength-params { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.relative-strength-params[hidden] { display: none; }

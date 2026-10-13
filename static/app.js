@@ -259,8 +259,26 @@ async function apiPost(url, body) {
   });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
-  if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(payload.error || `Request failed: ${response.status}`);
+    error.status = response.status;
+    error.retryAfter = Math.max(1, Math.min(10, Number(response.headers.get('Retry-After')) || 3));
+    throw error;
+  }
   return payload;
+}
+
+async function postBacktestWhenAvailable(body, isCurrent, onWaiting) {
+  const deadline = Date.now() + 120000;
+  while (isCurrent()) {
+    try { return await apiPost('/api/backtest/run-custom', body); }
+    catch (error) {
+      if (error.status !== 503 || !/backtest.*already running/i.test(error.message) || Date.now() >= deadline) throw error;
+      onWaiting();
+      await new Promise(resolve => setTimeout(resolve, error.retryAfter * 1000));
+    }
+  }
+  throw new Error('The chart changed. Reopen Backtest for the current chart.');
 }
 
 function strategyCacheKey(pane, preset, candleLimit) {
@@ -4576,6 +4594,15 @@ function openBacktestControls(pane) {
         <input id="modal-allow-shorts" type="checkbox">
         <span>Allow shorts when strategy supports them</span>
       </label>
+      <div id="modal-rs-params" class="relative-strength-params" hidden>
+        <label>RS lookback<input id="modal-rs-lookback" type="number" min="2" max="200" step="1" value="24"></label>
+        <label>RS advantage %<input id="modal-rs-threshold" type="number" min="-10" max="10" step="0.1" value="0"></label>
+        <label>Long RSI minimum<input id="modal-rsi-min" type="number" min="1" max="99" value="48"></label>
+        <label>Long RSI maximum<input id="modal-rsi-max" type="number" min="1" max="99" value="74"></label>
+        <label>ATR stop multiplier<input id="modal-atr-multiplier" type="number" min="0.25" max="10" step="0.05" value="2.4"></label>
+        <label>Cooldown bars<input id="modal-cooldown-bars" type="number" min="0" max="200" step="1" value="0"></label>
+        <label>Trend filter<select id="modal-regime-mode"><option value="looseBtcBull">BTC above/below EMA200</option><option value="strictBtcBull">BTC confirmed trend</option><option value="symbolTrend">Symbol above/below EMA200</option><option value="symbolFastTrend">Symbol EMA50/200</option><option value="noRegime">None</option></select></label>
+      </div>
       <p class="modal-note">Short mode enables explicit short-side strategy rules where implemented; long-only presets remain long-only.</p>
       <div class="backtest-actions">
         <button id="modal-run-backtest" type="button">Run Backtest</button>
@@ -4593,9 +4620,15 @@ function openBacktestControls(pane) {
     note.textContent = preset?.custom ? 'Personal tactic: isolated local backtest; worker cost and 1x limits apply.' : 'Historical simulation, not evidence that this tactic is profitable. Modeled costs are included.';
     for (const id of ['modal-limit-input','modal-fee-input','modal-slippage-input','modal-allow-shorts']) {
       const input = document.getElementById(id);
-      input.disabled = Boolean(preset?.custom || preset?.demo);
+      input.disabled = Boolean(preset?.custom || (preset?.demo && ['modal-fee-input','modal-slippage-input'].includes(id)));
       input.title = preset?.custom ? 'Personal tactics use loaded candles and fixed isolated-worker costs/settings.' : '';
     }
+    document.getElementById('modal-rs-params').hidden = preset?.strategy !== 'RelativeStrengthV2' || Boolean(preset?.custom);
+    const defaults = {rsLookback:24,rsThreshold:0,rsiMin:48,rsiMax:74,atrMultiplier:2.4,cooldownBars:0,regimeMode:'looseBtcBull',...preset?.params};
+    for (const [id,key] of [['modal-rs-lookback','rsLookback'],['modal-rs-threshold','rsThreshold'],['modal-rsi-min','rsiMin'],['modal-rsi-max','rsiMax'],['modal-atr-multiplier','atrMultiplier'],['modal-cooldown-bars','cooldownBars'],['modal-regime-mode','regimeMode']]) {
+      document.getElementById(id).value = key === 'rsThreshold' ? defaults[key] * 100 : defaults[key];
+    }
+    if (preset?.demo) document.getElementById('modal-limit-input').innerHTML = '<option value="auto">Auto</option><option value="1000">1000</option><option value="2500">2500</option>';
   };
   presetSelect.addEventListener("change", syncNote);
   syncNote();
@@ -6433,26 +6466,40 @@ async function runBacktest(pane, presetId) {
   pane.backtestButton.setAttribute('aria-busy', 'true');
   const resultsEl = document.querySelector("#modal-results") || backtestContent;
   const requestId = pane.requestId;
+  const runButton = document.querySelector('#modal-run-backtest');
+  if (runButton?.disabled) return;
+  if (runButton) runButton.disabled = true;
   resultsEl.innerHTML = `<p class="pane-status">Running backtest for ${pane.symbolSelect.value}...</p>`;
 
   try {
     const settings = backtestSettings(presetId);
     const preset = (config.chart_signal_strategies || []).find(item => item.id === presetId);
     if (!preset) throw new Error('Choose an available chart tactic.');
+    const params = {...preset.params};
+    if (preset.strategy === 'RelativeStrengthV2' && !preset.custom) {
+      for (const [id,key] of [['modal-rs-lookback','rsLookback'],['modal-rs-threshold','rsThreshold'],['modal-rsi-min','rsiMin'],['modal-rsi-max','rsiMax'],['modal-atr-multiplier','atrMultiplier'],['modal-cooldown-bars','cooldownBars']]) {
+        const input = document.getElementById(id);
+        if (!input || !input.checkValidity()) throw new Error('Check the RelativeStrengthV2 parameter values.');
+        params[key] = Number(input.value) / (key === 'rsThreshold' ? 100 : 1);
+      }
+      if (params.rsiMin > params.rsiMax) throw new Error('RSI minimum must not exceed its maximum.');
+      params.regimeMode = document.getElementById('modal-regime-mode').value;
+    }
     const limit = settings.limit === 'auto' ? Math.min(5000, Math.max(300, pane.candles.length)) : Number(settings.limit);
     const payload = preset.custom
       ? await window.ChartCustomTactics.backtest(window.ChartCustomTactics.get(preset.id), pane)
-      : await apiPost('/api/backtest/run-custom', {
+      : await postBacktestWhenAvailable({
       source: pane.sourceSelect.value,
       symbol: pane.symbolSelect.value,
       timeframe: pane.timeframeSelect.value,
       executionTimeframe: defaultExecutionTimeframe(pane.timeframeSelect.value),
       period: periodForChartCandles(pane.timeframeSelect.value, limit),
-      strategy: preset.strategy, params: preset.params || {}, paramsSource: preset.label,
+      strategy: preset.strategy, params, paramsSource: preset.label,
       limit, feePct: Number(settings.fee_pct), slippagePct: Number(settings.slippage_pct),
       allowShorts: settings.allowShorts === 'true', includeFullTrades: true,
       saveHistory: !preset.demo, mode: preset.demo ? 'guest-demo' : 'manual',
-    });
+    }, () => !pane.disposed && pane.requestId === requestId && resultsEl.isConnected && !backtestModal.hidden,
+    () => { resultsEl.textContent = 'Waiting for the previous backtest to finish...'; });
 
     if (pane.disposed || pane.requestId !== requestId) {
       resultsEl.innerHTML = '<p>The chart changed during the backtest. Reopen Backtest for the current chart.</p>';
@@ -6467,6 +6514,7 @@ async function runBacktest(pane, presetId) {
   } catch (error) {
     resultsEl.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
   } finally {
+    if (runButton?.isConnected) runButton.disabled = false;
     pane.backtestButton.disabled = false;
     pane.backtestButton.removeAttribute('aria-busy');
   }
@@ -7311,7 +7359,7 @@ function renderZeroTradePanel(payload) {
     <section class="zero-trade-panel">
       <h3 class="modal-section-title">Why no trades?</h3>
       <p class="modal-note">Backend-owned trade-generation diagnostics. Strategy formulas are not calculated in the browser.</p>
-      ${tradeDiag ? renderTradeGenerationDiagnostics(tradeDiag) : `<p class="pane-status">No detailed diagnosis is attached yet.</p>`}
+      ${tradeDiag ? renderTradeGenerationDiagnostics(tradeDiag) : `<table class="diagnostics-table"><thead><tr><th>Entry blocker</th><th>Bars</th></tr></thead><tbody>${Object.entries(payload.diagnostics?.blockerCounts || {}).filter(([,count])=>count>0).sort((a,b)=>b[1]-a[1]).map(([reason,count])=>`<tr><td>${escapeHtml(formatReason(reason))}</td><td>${Number(count)}</td></tr>`).join('') || '<tr><td colspan="2">No eligible entries in this period.</td></tr>'}</tbody></table>`}
       ${payload.guestDemo ? '' : `<button type="button" class="small-action-button" data-diagnose-backtest="${escapeHtml(params.toString())}">Diagnose Backtest</button>`}
       <div class="zero-trade-diagnostics"></div>
     </section>

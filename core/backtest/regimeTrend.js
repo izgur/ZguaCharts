@@ -1065,7 +1065,26 @@ function relativeStrengthV2Entry(frame, index, state, params) {
     var benchmarkReturn = (benchmarkClose - previousBenchmarkClose) / previousBenchmarkClose;
     if (!(symbolReturn > benchmarkReturn + params.rsThreshold && row.rsi14 >= params.rsiMin && row.rsi14 <= params.rsiMax && row.close > row.ema20)) blockers.push("relativeStrengthFailed");
   }
-  return signalFromBlockers(blockers);
+  if (!params.shortMode || blockers.length === 0) return signalFromBlockers(blockers);
+  var shortBlockers = baseV2Blockers(row, state, Object.assign({}, params, { regimeMode: 'noRegime' }));
+  var mode = params.regimeMode || 'strictBtcBull';
+  var bearish = mode === 'noRegime' ||
+    (mode === 'looseBtcBull' && row.btcClose4h && row.btcEma200_4h && row.btcClose4h < row.btcEma200_4h) ||
+    (mode === 'strictBtcBull' && row.btcRegime === 'bearish') ||
+    (mode === 'symbolTrend' && row.close < row.ema200) ||
+    (mode === 'symbolFastTrend' && row.ema50 < row.ema200);
+  if (!bearish) shortBlockers.push('regimeNotBearish');
+  var shortFrame = frame.slice(0, index + 1);
+  var mirror = Object.assign({}, row);
+  for (var field of ['cmf20','obv','obvMa20']) if (mirror[field] != null) mirror[field] = -mirror[field];
+  if (mirror.stochRsiK != null) mirror.stochRsiK = 100 - mirror.stochRsiK;
+  shortFrame[index] = mirror;
+  appendIndicatorFilterBlockers(shortFrame, index, shortBlockers, params);
+  if (index < lookback || !previousBenchmarkClose || !benchmarkClose ||
+      !(symbolReturn < benchmarkReturn - params.rsThreshold && row.rsi14 >= 100 - params.rsiMax &&
+        row.rsi14 <= 100 - params.rsiMin && row.close < row.ema20)) shortBlockers.push('relativeStrengthFailed');
+  if (!shortBlockers.length) return { passed: true, side: 'short', blockers: [] };
+  return { passed: false, side: 'long', blockers: Array.from(new Set(blockers.concat(shortBlockers))) };
 }
 
 function simpleAtrTrendV2Entry(frame, index, state, params) {
@@ -1553,7 +1572,7 @@ function exitSignal(position, frame, index, params, execution) {
       var shortTarget = row.vwap || row.ema20;
       if (shortTarget && row.low <= shortTarget) return { price: shortTarget, reason: "VWAP reversion exit", kind: "close-signal" };
     }
-    if (canShortRuleExit && params.strategyName === "MtfPullback15mV1" && row.close > row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
+    if (canShortRuleExit && ["MtfPullback15mV1", "RelativeStrengthV2"].includes(params.strategyName) && row.close > row.ema50) return { price: row.close, reason: "EMA50 exit", kind: "close-signal" };
     if (crossesAboveDonchian(row, previous, params.donchianExit)) return { price: row.close, reason: "Donchian exit", kind: "close-signal" };
   }
   return null;
@@ -2405,6 +2424,7 @@ module.exports = {
     closePositionAtFillRow: closePositionAtFillRow,
     entryReadiness: entryReadiness,
     relativeStrengthFreshV3Entry: relativeStrengthFreshV3Entry,
+    relativeStrengthV2Entry: relativeStrengthV2Entry,
     exitBasePrice: exitBasePrice,
     softExecutionExitSignal: softExecutionExitSignal,
     shouldDeferEntry: shouldDeferEntry,

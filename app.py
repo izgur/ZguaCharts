@@ -648,7 +648,7 @@ def backtest_run_custom():
         try:
             limit = 2000 if body.get('limit') in (None,'auto') else max(300,min(2500,int(body['limit'])))
             period = str(max(1,math.ceil(limit*interval_to_chart_seconds(timeframe)/86400)))+'d'
-            result = run_shared_backtest_engine(source,symbol,timeframe,period,'RelativeStrengthV2',0.055,0.02,limit,strategy_params={'accountEquity':10000,'maxPositionPct':100,'maxNotional':10000},execution_timeframe=normalize_execution_timeframe(None,timeframe),max_signal_candles=limit)
+            result = run_shared_backtest_engine(source,symbol,timeframe,period,'RelativeStrengthV2',0.055,0.02,limit,allow_shorts=body.get('allowShorts',False),strategy_params={**(body.get('params') or {}),'accountEquity':10000,'maxPositionPct':100,'maxNotional':10000},execution_timeframe=normalize_execution_timeframe(None,timeframe),max_signal_candles=limit)
             result.pop('presets',None)
             metrics = manual_backtest_result_summary(result,period)
             result.update(ok=True,guestDemo=True,historySaved=False,trades=metrics['trades'],totalReturnPct=metrics['totalReturnPct'],winRate=metrics['winRate'])

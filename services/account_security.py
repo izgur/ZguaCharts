@@ -2,6 +2,7 @@
 import hmac
 import binascii
 import json
+import math
 from pathlib import Path
 import secrets
 import time
@@ -31,8 +32,22 @@ def protect_public_demo():
     body = request.get_json(silent=True)
     if not isinstance(body,dict) or body.get('strategy') != 'RelativeStrengthV2':
         return jsonify(error='Guest demo is limited to RelativeStrengthV2.'),403
-    if body.get('params') not in (None,{}):
-        return jsonify(error='Guest demo uses fixed RelativeStrengthV2 rules.'),403
+    params = body.get('params') or {}
+    bounds = {'rsLookback':(2,200), 'rsThreshold':(-0.1,0.1),
+              'rsiMin':(1,99), 'rsiMax':(1,99), 'atrMultiplier':(0.25,10),
+              'cooldownBars':(0,200)}
+    if not isinstance(params,dict) or set(params) - set(bounds) - {'regimeMode'}:
+        return jsonify(error='Unsupported guest tactic parameter.'),403
+    for key,value in params.items():
+        if key == 'regimeMode':
+            if value not in ('looseBtcBull','strictBtcBull','symbolTrend','symbolFastTrend','noRegime'):
+                return jsonify(error='Invalid trend filter.'),400
+        elif type(value) not in (int,float) or not bounds[key][0] <= value <= bounds[key][1] or not math.isfinite(value) or key in ('rsLookback','cooldownBars') and value != int(value):
+            return jsonify(error='Invalid guest tactic parameter: '+key),400
+    if params.get('rsiMin',48) > params.get('rsiMax',74):
+        return jsonify(error='RSI minimum must not exceed its maximum.'),400
+    if type(body.get('allowShorts',False)) is not bool:
+        return jsonify(error='Short mode must be a checkbox value.'),400
     with _demo_lock:
         now = time.time()
         for address in list(_demo_requests):

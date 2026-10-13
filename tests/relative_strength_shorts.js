@@ -1,0 +1,25 @@
+const assert = require('node:assert/strict');
+const engine = require('../core/backtest/regimeTrend');
+const params = {...engine.defaultParams('RelativeStrengthV2'),rsLookback:2,shortMode:true};
+const flat = {position:null,cooldown:0};
+const frame = [105,102,100].map(close=>({close,ema20:104,ema50:108,ema200:110,atr14:2,rsi14:40,
+  btcClose4h:100,btcEma200_4h:120,btcRegime:'bearish'}));
+const entry = engine.testHooks.relativeStrengthV2Entry(frame,2,flat,params);
+assert.equal(entry.passed,true);
+assert.equal(entry.side,'short');
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame,2,flat,{...params,shortMode:false}).passed,false);
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame,2,{position:{},cooldown:0},params).passed,false);
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame,2,{position:null,cooldown:2},params).passed,false);
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame,1,flat,params).passed,false);
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame.map(row=>({...row,btcClose4h:null})),2,flat,params).passed,false);
+assert.equal(engine.testHooks.relativeStrengthV2Entry(frame.map(row=>({...row,rsi14:70})),2,flat,params).passed,false);
+const start=1700000400;
+const candles=Array.from({length:800},(_,i)=>{const close=200-i*.08+Math.sin(i/4);return {time:start+i*3600,open:close+.1,high:close+1,low:close-1,close,volume:100};});
+const regimeCandles=Array.from({length:600},(_,i)=>{const close=500-i*.15;return {time:start-1000*3600+i*14400,open:close+.1,high:close+1,low:close-1,close,volume:100};});
+const result=engine.run({strategy:'RelativeStrengthV2',interval:'1h',candles,regimeCandles,params:{shortMode:true,feePct:.055,slippagePct:.02}});
+assert.ok(result.tradeList.length>0,JSON.stringify(result.diagnostics.blockerCounts));
+assert.ok(result.tradeList.some(trade=>trade.side==='short'));
+assert.ok(result.totalFees>0);
+const longOnly=engine.run({strategy:'RelativeStrengthV2',interval:'1h',candles,regimeCandles});
+assert.equal(longOnly.tradeList.length,0);
+console.log('V2 explicit shorts, disabled defaults, blockers and costed bearish-market trades passed.');

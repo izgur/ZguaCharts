@@ -28,6 +28,18 @@ class GuestDemoTests(unittest.TestCase):
             response=self.client.post('/api/backtest/run-custom',json={'strategy':'RelativeStrengthV2','source':'bybit','symbol':'BTCUSDT','timeframe':'1h','limit':50000,'saveHistory':True,'allowShorts':True,'feePct':0})
         self.assertEqual(response.status_code,200,response.get_json());payload=response.get_json();self.assertTrue(payload['guestDemo']);self.assertFalse(payload['historySaved']);self.assertNotIn('presets',payload);save.assert_not_called()
         self.assertEqual(run.call_args[0][6],.02);self.assertEqual(run.call_args[0][7],2500)
+        self.assertTrue(run.call_args.kwargs['allow_shorts'])
+    def test_guest_parameters_are_bounded_and_forwarded(self):
+        params={'rsLookback':12,'rsThreshold':-.01,'rsiMin':40,'rsiMax':80,'atrMultiplier':2,'regimeMode':'symbolTrend','cooldownBars':3}
+        with patch('app.run_shared_backtest_engine',return_value={}) as run,patch('app.manual_backtest_result_summary',return_value={'trades':0,'totalReturnPct':0,'winRate':0}):
+            response=self.client.post('/api/backtest/run-custom',json={'strategy':'RelativeStrengthV2','params':params,'allowShorts':True})
+        self.assertEqual(response.status_code,200,response.get_json())
+        for key,value in params.items(): self.assertEqual(run.call_args.kwargs['strategy_params'][key],value)
+        self.assertEqual(run.call_args.kwargs['strategy_params']['maxPositionPct'],100)
+        for invalid in ({'rsLookback':1},{'rsLookback':2.5},{'rsThreshold':1},{'rsiMin':80,'rsiMax':40},{'regimeMode':'anything'},{'accountEquity':1000000},{'rsLookback':True}):
+            response=self.client.post('/api/backtest/run-custom',json={'strategy':'RelativeStrengthV2','params':invalid})
+            self.assertIn(response.status_code,(400,403))
+        self.assertEqual(self.client.post('/api/backtest/run-custom',json={'strategy':'RelativeStrengthV2','allowShorts':'true'}).status_code,400)
     def test_cross_site_demo_blocked(self):
         self.assertEqual(self.client.post('/api/backtest/run-custom',json={'strategy':'RelativeStrengthV2'},headers={'Origin':'https://evil.example'}).status_code,403)
 
